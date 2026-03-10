@@ -6,6 +6,20 @@
 <title>Forge</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
+  @font-face {
+    font-family: 'FiraCode Nerd Font';
+    src: url('https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.3.0/patched-fonts/FiraCode/Regular/FiraCodeNerdFont-Regular.ttf') format('truetype');
+    font-weight: 400;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: 'FiraCode Nerd Font';
+    src: url('https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.3.0/patched-fonts/FiraCode/Bold/FiraCodeNerdFont-Bold.ttf') format('truetype');
+    font-weight: 700;
+    font-style: normal;
+  }
+</style>
+<style>
   /* === Design tokens (shadcn/zinc-inspired) === */
   :root {
     --bg: #09090b;
@@ -299,7 +313,7 @@
   #placeholder .subtitle { font-size: 13px; }
 
   /* Terminal */
-  #terminal-container { flex: 1; padding: 4px; background: var(--bg); display: none; overflow: hidden; }
+  #terminal-container { flex: 1; padding: 4px; background: var(--bg); overflow: hidden; }
   #terminal-container .xterm { height: 100%; }
 
   /* Sandbox detail bar */
@@ -507,7 +521,7 @@
       <div class="subtitle">Create or select a sandbox from the sidebar</div>
     </div>
 
-    <div id="terminal-container"></div>
+    <div id="terminal-container" style="display:none"></div>
   </div>
 </div>
 
@@ -853,11 +867,14 @@ function setConnState(state) {
   if (state === 'disconnected') text.textContent = 'Disconnected';
 }
 
-function initTerminal(sandboxId) {
+async function initTerminal(sandboxId) {
+  // Wait for Nerd Font to load so xterm.js measures glyphs correctly
+  try { await document.fonts.load("14px 'FiraCode Nerd Font'"); } catch(e) {}
+
   term = new Terminal({
     cursorBlink: true,
     fontSize: 14,
-    fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', Menlo, monospace",
+    fontFamily: "'FiraCode Nerd Font', 'FiraCode Nerd Font Mono', Menlo, monospace",
     theme: {
       background: '#09090b',
       foreground: '#fafafa',

@@ -1,8 +1,8 @@
 # forge sandbox — Linux-compatible zshrc
 # Stripped of: brew, yabai, skhd, LM Studio, bun, supabase, twilio, slicer, opencode
 
-# Secrets (injected as env vars by forge, but source file if present)
-[ -f "$HOME/.secrets" ] && source "$HOME/.secrets"
+# Secrets — baked into image from ~/.dotfiles/shell/.secrets
+[ -f "$HOME/.dotfiles/shell/.secrets" ] && source "$HOME/.dotfiles/shell/.secrets"
 
 # nvm
 export NVM_DIR="$HOME/.nvm"
