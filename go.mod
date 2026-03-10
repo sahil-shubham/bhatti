@@ -1,4 +1,4 @@
-module github.com/sahillavingia/forge
+module github.com/sahilshubham/forge
 
 go 1.25.6
 
