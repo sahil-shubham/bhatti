@@ -74,8 +74,24 @@ RUN mkdir -p ~/.config \
 # Write a Linux-compatible .zshrc (stripped of macOS-specific stuff)
 COPY --chown=sahil:sahil sandbox-zshrc /home/sahil/.zshrc
 
-# --- Zinit + plugins (pre-install so first shell is fast) ---
-RUN git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git
+# --- Zinit + plugins (pre-cloned so first shell is instant) ---
+RUN git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git \
+  && mkdir -p ~/.local/share/zinit/plugins \
+  && git clone https://github.com/zdharma-continuum/zinit-annex-as-monitor ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-as-monitor \
+  && git clone https://github.com/zdharma-continuum/zinit-annex-bin-gem-node ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-bin-gem-node \
+  && git clone https://github.com/zdharma-continuum/zinit-annex-patch-dl ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-patch-dl \
+  && git clone https://github.com/zdharma-continuum/zinit-annex-rust ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-rust \
+  && git clone https://github.com/marlonrichert/zsh-autocomplete ~/.local/share/zinit/plugins/marlonrichert---zsh-autocomplete \
+  && git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.local/share/zinit/plugins/zsh-users---zsh-syntax-highlighting \
+  && git clone https://github.com/zsh-users/zsh-autosuggestions ~/.local/share/zinit/plugins/zsh-users---zsh-autosuggestions \
+  && git clone https://github.com/agkozak/zsh-z ~/.local/share/zinit/plugins/agkozak---zsh-z \
+  && mkdir -p ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit \
+  && curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/plugins/git/git.plugin.zsh \
+     -o ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/git.plugin.zsh \
+  && echo -n "OMZ::plugins/git/git.plugin.zsh" > ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/url \
+  && echo -n "OMZ::plugins/git/git.plugin.zsh" > ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/teleid \
+  && touch ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/is-snippet \
+  && echo -n "auto" > ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/mode
 
 # --- tmux plugins (cloned directly, no TPM runtime needed) ---
 RUN mkdir -p ~/.tmux/plugins \
