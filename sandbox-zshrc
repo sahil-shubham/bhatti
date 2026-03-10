@@ -1,0 +1,55 @@
+# forge sandbox — Linux-compatible zshrc
+# Stripped of: brew, yabai, skhd, LM Studio, bun, supabase, twilio, slicer, opencode
+
+# Secrets (injected as env vars by forge, but source file if present)
+[ -f "$HOME/.secrets" ] && source "$HOME/.secrets"
+
+# nvm
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+# Cargo/Rust
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+# Go
+export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
+
+# --- Zinit ---
+if [[ ! -f $HOME/.local/share/zinit/zinit.git/zinit.zsh ]]; then
+    command mkdir -p "$HOME/.local/share/zinit" && command chmod g-rwX "$HOME/.local/share/zinit"
+    command git clone https://github.com/zdharma-continuum/zinit "$HOME/.local/share/zinit/zinit.git"
+fi
+
+source "$HOME/.local/share/zinit/zinit.git/zinit.zsh"
+autoload -Uz _zinit
+(( ${+_comps} )) && _comps[zinit]=_zinit
+
+zinit light-mode for \
+    zdharma-continuum/zinit-annex-as-monitor \
+    zdharma-continuum/zinit-annex-bin-gem-node \
+    zdharma-continuum/zinit-annex-patch-dl \
+    zdharma-continuum/zinit-annex-rust
+
+# Plugins
+zinit light marlonrichert/zsh-autocomplete
+zinit light zsh-users/zsh-syntax-highlighting
+zinit light zsh-users/zsh-autosuggestions
+zinit light agkozak/zsh-z
+zinit snippet OMZ::plugins/git/git.plugin.zsh
+
+autoload -Uz compinit
+compinit
+
+# --- Aliases ---
+alias ls='eza --icons=auto --group-directories-first'
+alias ll='eza --icons=auto --group-directories-first -lah --git'
+alias lt='eza --icons=auto --tree --level=2'
+
+# pi agent (if built)
+if [ -f "$HOME/Projects/pi-mono/pi-test.sh" ]; then
+    alias pi='$HOME/Projects/pi-mono/pi-test.sh'
+fi
+
+# --- Starship prompt ---
+eval "$(starship init zsh)"

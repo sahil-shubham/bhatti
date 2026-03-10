@@ -2,139 +2,684 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Forge</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; display: flex; height: 100vh; overflow: hidden; }
-
-  /* Sidebar */
-  #sidebar { width: 260px; background: #161b22; border-right: 1px solid #30363d; display: flex; flex-direction: column; flex-shrink: 0; }
-  #sidebar-header { padding: 16px; border-bottom: 1px solid #30363d; }
-  #sidebar-header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
-  #sidebar-header p { font-size: 12px; color: #8b949e; margin-top: 4px; }
-
-  #create-section { padding: 12px 16px; border-bottom: 1px solid #30363d; }
-  #create-section select, #create-section input, #create-section button {
-    width: 100%; padding: 6px 10px; margin-bottom: 8px; border-radius: 6px; border: 1px solid #30363d;
-    background: #0d1117; color: #c9d1d9; font-size: 13px;
+  /* === Design tokens (shadcn/zinc-inspired) === */
+  :root {
+    --bg: #09090b;
+    --bg-card: #0c0c0e;
+    --bg-elevated: #18181b;
+    --bg-hover: #1e1e22;
+    --bg-active: #27272a;
+    --border: #27272a;
+    --border-hover: #3f3f46;
+    --fg: #fafafa;
+    --fg-muted: #a1a1aa;
+    --fg-dim: #71717a;
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --destructive: #ef4444;
+    --destructive-hover: #dc2626;
+    --success: #22c55e;
+    --warning: #eab308;
+    --radius: 8px;
+    --radius-sm: 6px;
+    --sidebar-w: 300px;
+    --toolbar-h: 48px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+    --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', Menlo, monospace;
   }
-  #create-section button { background: #238636; border-color: #238636; color: #fff; cursor: pointer; font-weight: 500; }
-  #create-section button:hover { background: #2ea043; }
-  #create-section button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-  #sandbox-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+  /* === Reset === */
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--fg);
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* Prevent iOS input zoom */
+  input, select, textarea, button { font-size: 16px; }
+
+  /* === Layout === */
+  #app { display: flex; height: 100%; position: relative; }
+
+  /* === Sidebar === */
+  #sidebar {
+    width: var(--sidebar-w);
+    background: var(--bg-card);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    z-index: 100;
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  #sidebar-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: var(--toolbar-h);
+  }
+  #sidebar-header .brand { display: flex; align-items: center; gap: 10px; }
+  #sidebar-header h1 { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; }
+  #sidebar-header .badge {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--fg-dim);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    padding: 2px 7px;
+    border-radius: 99px;
+  }
+
+  #close-sidebar {
+    display: none;
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    cursor: pointer;
+    padding: 8px;
+    border-radius: var(--radius-sm);
+  }
+  #close-sidebar:hover { background: var(--bg-hover); }
+
+  /* Create section */
+  #create-section { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  #create-section .form-group { display: flex; flex-direction: column; gap: 8px; }
+  #create-section select, #create-section input {
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  #create-section select:focus, #create-section input:focus { border-color: var(--accent); }
+  #create-section select { cursor: pointer; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 32px;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    border: none;
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+    min-height: 36px;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: var(--fg); color: var(--bg); }
+  .btn-primary:hover:not(:disabled) { opacity: 0.9; }
+  .btn-ghost { background: transparent; color: var(--fg-muted); }
+  .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--fg); }
+  .btn-destructive { background: var(--destructive); color: #fff; }
+  .btn-destructive:hover:not(:disabled) { background: var(--destructive-hover); }
+  .btn-sm { padding: 4px 10px; min-height: 28px; font-size: 13px; }
+
+  /* Sandbox list */
+  #sandbox-list { flex: 1; overflow-y: auto; padding: 8px; }
+  #sandbox-list::-webkit-scrollbar { width: 4px; }
+  #sandbox-list::-webkit-scrollbar-track { background: transparent; }
+  #sandbox-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
   .sandbox-item {
-    padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 10px;
-    border-left: 3px solid transparent; transition: background 0.1s;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background 0.1s;
+    position: relative;
+    min-height: 48px;
+    user-select: none;
+    -webkit-user-select: none;
   }
-  .sandbox-item:hover { background: #1c2128; }
-  .sandbox-item.active { background: #1c2128; border-left-color: #58a6ff; }
-  .sandbox-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .sandbox-item .dot.running { background: #3fb950; }
-  .sandbox-item .dot.stopped { background: #f85149; }
-  .sandbox-item .dot.unknown { background: #8b949e; }
+  .sandbox-item:hover { background: var(--bg-hover); }
+  .sandbox-item.active { background: var(--bg-active); }
+
+  .sandbox-item .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .sandbox-item .status-dot.running { background: var(--success); box-shadow: 0 0 6px rgba(34,197,94,0.4); }
+  .sandbox-item .status-dot.stopped { background: var(--destructive); }
+  .sandbox-item .status-dot.unknown { background: var(--fg-dim); }
+
   .sandbox-item .info { flex: 1; min-width: 0; }
-  .sandbox-item .name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sandbox-item .meta { font-size: 11px; color: #8b949e; }
-  .sandbox-item .actions { display: flex; gap: 4px; }
-  .sandbox-item .actions button {
-    background: none; border: 1px solid #30363d; color: #8b949e; border-radius: 4px;
-    padding: 2px 6px; font-size: 11px; cursor: pointer;
+  .sandbox-item .name {
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .sandbox-item .actions button:hover { color: #f85149; border-color: #f85149; }
+  .sandbox-item .meta {
+    font-size: 11px;
+    color: var(--fg-dim);
+    margin-top: 2px;
+  }
 
-  /* Main area */
-  #main { flex: 1; display: flex; flex-direction: column; }
-  #toolbar { padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; min-height: 40px; }
-  #toolbar .title { font-size: 14px; font-weight: 500; }
-  #toolbar .status-badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
-  #toolbar .status-badge.running { background: #238636; color: #fff; }
-  #toolbar .status-badge.stopped { background: #da3633; color: #fff; }
+  .sandbox-item .delete-btn {
+    opacity: 0;
+    transition: opacity 0.15s;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
+    cursor: pointer;
+    font-size: 12px;
+    min-width: 32px;
+    min-height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sandbox-item:hover .delete-btn { opacity: 1; }
+  .sandbox-item .delete-btn:hover { color: var(--destructive); border-color: var(--destructive); }
 
-  #terminal-container { flex: 1; padding: 4px; background: #0d1117; }
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+    color: var(--fg-dim);
+    font-size: 13px;
+    text-align: center;
+    gap: 4px;
+  }
+  .empty-state .icon { font-size: 24px; margin-bottom: 4px; opacity: 0.5; }
+
+  /* === Main area === */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  #toolbar {
+    padding: 0 16px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: var(--toolbar-h);
+    flex-shrink: 0;
+  }
+
+  #hamburger {
+    display: none;
+    background: none;
+    border: none;
+    color: var(--fg);
+    cursor: pointer;
+    padding: 8px;
+    border-radius: var(--radius-sm);
+    margin-left: -8px;
+  }
+  #hamburger:hover { background: var(--bg-hover); }
+  #hamburger svg { display: block; }
+
+  #toolbar-title { font-size: 14px; font-weight: 500; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .status-pill {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 99px;
+    text-transform: capitalize;
+  }
+  .status-pill.running { background: rgba(34,197,94,0.15); color: var(--success); }
+  .status-pill.stopped { background: rgba(239,68,68,0.15); color: var(--destructive); }
+  .status-pill.unknown { background: var(--bg-active); color: var(--fg-dim); }
+
+  /* Connection indicator */
+  #conn-indicator {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    padding: 3px 10px;
+    border-radius: 99px;
+    background: var(--bg-active);
+    white-space: nowrap;
+  }
+  #conn-indicator .conn-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  #conn-indicator.connected { display: none; }
+  #conn-indicator.connecting { display: flex; }
+  #conn-indicator.connecting .conn-dot { background: var(--warning); animation: pulse 1.5s infinite; }
+  #conn-indicator.disconnected { display: flex; }
+  #conn-indicator.disconnected .conn-dot { background: var(--destructive); }
+
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  /* Placeholder */
+  #placeholder {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--fg-dim);
+    gap: 8px;
+    padding: 24px;
+    text-align: center;
+  }
+  #placeholder .icon { font-size: 36px; opacity: 0.3; margin-bottom: 4px; }
+  #placeholder .title { font-size: 15px; font-weight: 500; color: var(--fg-muted); }
+  #placeholder .subtitle { font-size: 13px; }
+
+  /* Terminal */
+  #terminal-container { flex: 1; padding: 4px; background: var(--bg); display: none; overflow: hidden; }
   #terminal-container .xterm { height: 100%; }
 
-  #placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: #484f58; font-size: 15px; }
-
-  /* Template management */
-  #template-section { padding: 12px 16px; border-top: 1px solid #30363d; }
-  #template-section summary { font-size: 12px; color: #8b949e; cursor: pointer; }
-  #template-section .tmpl-form input, #template-section .tmpl-form button {
-    width: 100%; padding: 5px 8px; margin-top: 6px; border-radius: 6px; border: 1px solid #30363d;
-    background: #0d1117; color: #c9d1d9; font-size: 12px;
+  /* Sandbox detail bar */
+  #detail-bar {
+    display: none;
+    padding: 8px 16px;
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--fg-dim);
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: center;
   }
-  #template-section .tmpl-form button { background: #30363d; cursor: pointer; }
+  #detail-bar .detail-item { display: flex; align-items: center; gap: 4px; }
+  #detail-bar .detail-label { color: var(--fg-dim); }
+  #detail-bar .detail-value { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
+
+  /* === Overlay === */
+  #sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 99;
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+  }
+
+  /* === Auth modal === */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    padding: 24px;
+  }
+  .modal-backdrop.hidden { display: none; }
+  .modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    width: 100%;
+    max-width: 380px;
+  }
+  .modal h2 { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .modal p { font-size: 13px; color: var(--fg-dim); margin-bottom: 16px; }
+  .modal input {
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-mono);
+    outline: none;
+    margin-bottom: 16px;
+    transition: border-color 0.15s;
+  }
+  .modal input:focus { border-color: var(--accent); }
+  .modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* === Toast === */
+  #toast-container {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 300;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+  }
+  .toast {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 16px;
+    font-size: 13px;
+    color: var(--fg);
+    pointer-events: auto;
+    animation: toast-in 0.25s ease-out;
+    max-width: 360px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .toast.error { border-color: var(--destructive); }
+  .toast.success { border-color: var(--success); }
+  .toast-icon { flex-shrink: 0; }
+
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* === Confirm dialog === */
+  .confirm-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 250;
+    padding: 24px;
+  }
+  .confirm-backdrop.hidden { display: none; }
+  .confirm-dialog {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    width: 100%;
+    max-width: 340px;
+  }
+  .confirm-dialog h3 { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+  .confirm-dialog p { font-size: 13px; color: var(--fg-muted); margin-bottom: 20px; }
+  .confirm-dialog .actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* === Mobile breakpoint === */
+  @media (max-width: 768px) {
+    #sidebar {
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      transform: translateX(-100%);
+      box-shadow: 4px 0 24px rgba(0,0,0,0.5);
+    }
+    #sidebar.open { transform: translateX(0); }
+    #sidebar-overlay.open { display: block; }
+    #hamburger { display: flex; }
+    #close-sidebar { display: flex; }
+
+    #toast-container { bottom: 12px; right: 12px; left: 12px; }
+    .toast { max-width: 100%; }
+
+    /* On mobile, make delete always visible */
+    .sandbox-item .delete-btn { opacity: 1; }
+
+    #detail-bar { padding: 6px 12px; gap: 10px; }
+  }
 </style>
 </head>
 <body>
 
-<div id="sidebar">
-  <div id="sidebar-header">
-    <h1>⚒ Forge</h1>
-    <p>Sandbox Manager</p>
-  </div>
+<div id="app">
+  <!-- Sidebar overlay for mobile -->
+  <div id="sidebar-overlay" onclick="closeSidebar()"></div>
 
-  <div id="create-section">
-    <select id="template-select"><option value="">Select template...</option></select>
-    <input id="sandbox-name" type="text" placeholder="Sandbox name (optional)">
-    <button id="create-btn" onclick="createSandbox()" disabled>Create Sandbox</button>
-  </div>
-
-  <div id="sandbox-list"></div>
-
-  <div id="template-section">
-    <details>
-      <summary>+ Add Template</summary>
-      <div class="tmpl-form">
-        <input id="tmpl-name" placeholder="Name (e.g. ubuntu-dev)">
-        <input id="tmpl-image" placeholder="Image (e.g. ubuntu:22.04)">
-        <input id="tmpl-cpus" placeholder="CPUs (default: 1)" type="number" step="0.5" min="0.5">
-        <input id="tmpl-memory" placeholder="Memory MB (default: 512)" type="number" min="64">
-        <button onclick="createTemplate()">Add Template</button>
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <div class="brand">
+        <h1>⚒ Forge</h1>
+        <span class="badge">sandbox</span>
       </div>
-    </details>
+      <button id="close-sidebar" onclick="closeSidebar()" aria-label="Close sidebar">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+
+    <div id="create-section">
+      <div class="form-group">
+        <select id="template-select">
+          <option value="">Select template…</option>
+        </select>
+        <input id="sandbox-name" type="text" placeholder="Name (optional)">
+        <button class="btn btn-primary" id="create-btn" onclick="createSandbox()" disabled>
+          Create Sandbox
+        </button>
+      </div>
+    </div>
+
+    <div id="sandbox-list"></div>
+  </div>
+
+  <!-- Main -->
+  <div id="main">
+    <div id="toolbar">
+      <button id="hamburger" onclick="openSidebar()" aria-label="Open sidebar">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg>
+      </button>
+      <span id="toolbar-title"></span>
+      <span id="toolbar-status" class="status-pill" style="display:none"></span>
+      <div id="conn-indicator"><span class="conn-dot"></span><span id="conn-text"></span></div>
+    </div>
+
+    <div id="detail-bar">
+      <div class="detail-item"><span class="detail-label">IP</span><span class="detail-value" id="detail-ip">—</span></div>
+      <div class="detail-item"><span class="detail-label">Template</span><span class="detail-value" id="detail-template">—</span></div>
+      <div class="detail-item"><span class="detail-label">Created</span><span class="detail-value" id="detail-created">—</span></div>
+    </div>
+
+    <div id="placeholder">
+      <div class="icon">⚒</div>
+      <div class="title">No sandbox selected</div>
+      <div class="subtitle">Create or select a sandbox from the sidebar</div>
+    </div>
+
+    <div id="terminal-container"></div>
   </div>
 </div>
 
-<div id="main">
-  <div id="toolbar">
-    <span class="title" id="toolbar-title"></span>
-    <span class="status-badge" id="toolbar-status" style="display:none"></span>
+<!-- Auth modal -->
+<div id="auth-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <h2>Authentication</h2>
+    <p>Enter your token to connect to the Forge server.</p>
+    <input id="auth-token-input" type="password" placeholder="Bearer token" autocomplete="off">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="skipAuth()">Skip</button>
+      <button class="btn btn-primary" onclick="submitAuth()">Connect</button>
+    </div>
   </div>
-  <div id="placeholder">Select or create a sandbox to start</div>
-  <div id="terminal-container" style="display:none"></div>
 </div>
+
+<!-- Confirm dialog -->
+<div id="confirm-dialog" class="confirm-backdrop hidden">
+  <div class="confirm-dialog">
+    <h3 id="confirm-title">Are you sure?</h3>
+    <p id="confirm-message">This action cannot be undone.</p>
+    <div class="actions">
+      <button class="btn btn-ghost" onclick="cancelConfirm()">Cancel</button>
+      <button class="btn btn-destructive" id="confirm-action-btn" onclick="executeConfirm()">Destroy</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script>
+// ============================================================
+// State
+// ============================================================
 const API = location.origin;
 let token = localStorage.getItem('forge_token') || '';
 let currentSandbox = null;
 let term = null;
 let ws = null;
 let fitAddon = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY = 15000;
+let templates = [];     // cached for detail view lookups
+let confirmCallback = null;
 
-// --- API helpers ---
+// ============================================================
+// Auth
+// ============================================================
+function checkAuth() {
+  if (!token) {
+    // Try loading without auth first — if server has no auth configured, it will just work
+    api('GET', '/templates').then(({ status }) => {
+      if (status === 401) {
+        document.getElementById('auth-modal').classList.remove('hidden');
+        document.getElementById('auth-token-input').focus();
+      } else {
+        init();
+      }
+    });
+    return;
+  }
+  init();
+}
+
+function submitAuth() {
+  const input = document.getElementById('auth-token-input');
+  token = input.value.trim();
+  if (token) {
+    localStorage.setItem('forge_token', token);
+  }
+  document.getElementById('auth-modal').classList.add('hidden');
+  init();
+}
+
+function skipAuth() {
+  document.getElementById('auth-modal').classList.add('hidden');
+  init();
+}
+
+document.getElementById('auth-token-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitAuth();
+});
+
+// ============================================================
+// Toast
+// ============================================================
+function toast(message, type = 'info') {
+  const container = document.getElementById('toast-container');
+  const el = document.createElement('div');
+  el.className = 'toast' + (type !== 'info' ? ' ' + type : '');
+
+  const icons = { error: '✕', success: '✓', info: 'ℹ' };
+  el.innerHTML = `<span class="toast-icon">${icons[type] || icons.info}</span><span>${message}</span>`;
+  container.appendChild(el);
+
+  setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(8px)';
+    el.style.transition = 'all 0.2s';
+    setTimeout(() => el.remove(), 200);
+  }, 4000);
+}
+
+// ============================================================
+// Confirm dialog
+// ============================================================
+function showConfirm(title, message, callback) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-message').textContent = message;
+  document.getElementById('confirm-dialog').classList.remove('hidden');
+  confirmCallback = callback;
+}
+
+function cancelConfirm() {
+  document.getElementById('confirm-dialog').classList.add('hidden');
+  confirmCallback = null;
+}
+
+function executeConfirm() {
+  document.getElementById('confirm-dialog').classList.add('hidden');
+  if (confirmCallback) confirmCallback();
+  confirmCallback = null;
+}
+
+// ============================================================
+// Sidebar (mobile)
+// ============================================================
+function openSidebar() {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebar-overlay').classList.add('open');
+}
+
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+}
+
+// ============================================================
+// API
+// ============================================================
 async function api(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (token) opts.headers['Authorization'] = 'Bearer ' + token;
   if (body) opts.body = JSON.stringify(body);
-  const resp = await fetch(API + path, opts);
-  return { status: resp.status, data: await resp.json() };
+  try {
+    const resp = await fetch(API + path, opts);
+    return { status: resp.status, data: await resp.json() };
+  } catch (e) {
+    return { status: 0, data: { error: e.message } };
+  }
 }
 
-// --- Templates ---
+// ============================================================
+// Templates
+// ============================================================
 async function loadTemplates() {
-  const { data } = await api('GET', '/templates');
+  const { status, data } = await api('GET', '/templates');
+  if (status === 401) {
+    document.getElementById('auth-modal').classList.remove('hidden');
+    return;
+  }
+  templates = data || [];
   const sel = document.getElementById('template-select');
-  sel.innerHTML = '<option value="">Select template...</option>';
-  (data || []).forEach(t => {
+  sel.innerHTML = '<option value="">Select template…</option>';
+  templates.forEach(t => {
     const opt = document.createElement('option');
     opt.value = t.id;
-    opt.textContent = `${t.name} (${t.image})`;
+    opt.textContent = `${t.name} — ${t.image}`;
     sel.appendChild(opt);
   });
 }
@@ -143,38 +688,56 @@ document.getElementById('template-select').addEventListener('change', (e) => {
   document.getElementById('create-btn').disabled = !e.target.value;
 });
 
-async function createTemplate() {
-  const name = document.getElementById('tmpl-name').value.trim();
-  const image = document.getElementById('tmpl-image').value.trim();
-  if (!name || !image) return alert('Name and image required');
-  const cpus = parseFloat(document.getElementById('tmpl-cpus').value) || 1;
-  const memory = parseInt(document.getElementById('tmpl-memory').value) || 512;
-  await api('POST', '/templates', { name, image, cpus, memory_mb: memory });
-  document.getElementById('tmpl-name').value = '';
-  document.getElementById('tmpl-image').value = '';
-  document.getElementById('tmpl-cpus').value = '';
-  document.getElementById('tmpl-memory').value = '';
-  loadTemplates();
+function getTemplateName(templateId) {
+  const t = templates.find(t => t.id === templateId);
+  return t ? t.name : templateId.slice(0, 8);
 }
 
-// --- Sandboxes ---
+// ============================================================
+// Sandboxes
+// ============================================================
 async function loadSandboxes() {
   const { data } = await api('GET', '/sandboxes');
   const list = document.getElementById('sandbox-list');
+
+  const sandboxes = data || [];
+
+  if (sandboxes.length === 0) {
+    list.innerHTML = `<div class="empty-state"><div class="icon">📦</div><div>No sandboxes yet</div></div>`;
+    return;
+  }
+
   list.innerHTML = '';
-  (data || []).forEach(sb => {
+  sandboxes.forEach(sb => {
     const div = document.createElement('div');
     div.className = 'sandbox-item' + (currentSandbox && currentSandbox.id === sb.id ? ' active' : '');
     div.innerHTML = `
-      <div class="dot ${sb.status}"></div>
-      <div class="info" onclick="connectSandbox('${sb.id}')">
-        <div class="name">${sb.name}</div>
-        <div class="meta">${sb.ip || 'no ip'} · ${sb.status}</div>
+      <div class="status-dot ${sb.status}"></div>
+      <div class="info">
+        <div class="name">${esc(sb.name)}</div>
+        <div class="meta">${sb.status}${sb.ip ? ' · ' + sb.ip : ''}</div>
       </div>
-      <div class="actions">
-        <button onclick="event.stopPropagation(); destroySandbox('${sb.id}')" title="Destroy">✕</button>
-      </div>
+      <button class="delete-btn" data-id="${sb.id}" aria-label="Destroy sandbox" title="Destroy">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+      </button>
     `;
+
+    // Click on info area → connect
+    div.querySelector('.info').addEventListener('click', () => {
+      connectSandbox(sb.id);
+      closeSidebar();
+    });
+    div.querySelector('.status-dot').addEventListener('click', () => {
+      connectSandbox(sb.id);
+      closeSidebar();
+    });
+
+    // Delete button
+    div.querySelector('.delete-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      destroySandbox(sb.id, sb.name);
+    });
+
     list.appendChild(div);
   });
 }
@@ -182,50 +745,81 @@ async function loadSandboxes() {
 async function createSandbox() {
   const templateId = document.getElementById('template-select').value;
   if (!templateId) return;
+
   const name = document.getElementById('sandbox-name').value.trim();
   const btn = document.getElementById('create-btn');
   btn.disabled = true;
-  btn.textContent = 'Creating...';
-  try {
-    const { status, data } = await api('POST', '/sandboxes', { template_id: templateId, name: name || undefined });
-    if (status === 201) {
-      document.getElementById('sandbox-name').value = '';
-      await loadSandboxes();
-      connectSandbox(data.id);
-    } else {
-      alert('Error: ' + (data.error || 'unknown'));
+  btn.textContent = 'Creating…';
+
+  const { status, data } = await api('POST', '/sandboxes', {
+    template_id: templateId,
+    name: name || undefined
+  });
+
+  btn.disabled = false;
+  btn.textContent = 'Create Sandbox';
+
+  if (status === 201) {
+    document.getElementById('sandbox-name').value = '';
+    toast('Sandbox created', 'success');
+    await loadSandboxes();
+    connectSandbox(data.id);
+    closeSidebar();
+  } else {
+    toast(data.error || 'Failed to create sandbox', 'error');
+  }
+}
+
+function destroySandbox(id, name) {
+  showConfirm(
+    'Destroy sandbox',
+    `"${name}" will be permanently destroyed. This cannot be undone.`,
+    async () => {
+      const { status, data } = await api('DELETE', '/sandboxes/' + id);
+      if (status === 200) {
+        toast('Sandbox destroyed', 'success');
+        if (currentSandbox && currentSandbox.id === id) {
+          disconnectTerminal();
+          currentSandbox = null;
+          showPlaceholder();
+        }
+        loadSandboxes();
+      } else {
+        toast(data.error || 'Failed to destroy sandbox', 'error');
+      }
     }
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Create Sandbox';
-  }
+  );
 }
 
-async function destroySandbox(id) {
-  if (!confirm('Destroy this sandbox?')) return;
-  await api('DELETE', '/sandboxes/' + id);
-  if (currentSandbox && currentSandbox.id === id) {
-    disconnectTerminal();
-    currentSandbox = null;
-    showPlaceholder();
-  }
-  loadSandboxes();
-}
-
-// --- Terminal ---
+// ============================================================
+// Terminal connection
+// ============================================================
 async function connectSandbox(id) {
   const { data } = await api('GET', '/sandboxes/' + id);
-  currentSandbox = data;
-  loadSandboxes(); // refresh active state
+  if (!data || data.error) {
+    toast(data?.error || 'Failed to load sandbox', 'error');
+    return;
+  }
 
+  currentSandbox = data;
+  loadSandboxes();
+
+  // Toolbar
   document.getElementById('toolbar-title').textContent = data.name;
   const badge = document.getElementById('toolbar-status');
   badge.textContent = data.status;
-  badge.className = 'status-badge ' + data.status;
+  badge.className = 'status-pill ' + data.status;
   badge.style.display = '';
+
+  // Detail bar
+  document.getElementById('detail-ip').textContent = data.ip || '—';
+  document.getElementById('detail-template').textContent = getTemplateName(data.template_id);
+  document.getElementById('detail-created').textContent = formatTime(data.created_at);
+  document.getElementById('detail-bar').style.display = 'flex';
 
   hidePlaceholder();
   disconnectTerminal();
+  reconnectAttempts = 0;
   initTerminal(id);
 }
 
@@ -234,6 +828,8 @@ function showPlaceholder() {
   document.getElementById('terminal-container').style.display = 'none';
   document.getElementById('toolbar-title').textContent = '';
   document.getElementById('toolbar-status').style.display = 'none';
+  document.getElementById('detail-bar').style.display = 'none';
+  setConnState('connected'); // hides indicator
 }
 
 function hidePlaceholder() {
@@ -242,23 +838,35 @@ function hidePlaceholder() {
 }
 
 function disconnectTerminal() {
+  clearTimeout(reconnectTimer);
   if (ws) { ws.close(); ws = null; }
   if (term) { term.dispose(); term = null; }
   document.getElementById('terminal-container').innerHTML = '';
+  setConnState('connected');
+}
+
+function setConnState(state) {
+  const el = document.getElementById('conn-indicator');
+  const text = document.getElementById('conn-text');
+  el.className = state; // 'connected' hides it via CSS
+  if (state === 'connecting') text.textContent = reconnectAttempts > 0 ? 'Reconnecting…' : 'Connecting…';
+  if (state === 'disconnected') text.textContent = 'Disconnected';
 }
 
 function initTerminal(sandboxId) {
   term = new Terminal({
     cursorBlink: true,
     fontSize: 14,
-    fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
+    fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', Menlo, monospace",
     theme: {
-      background: '#0d1117',
-      foreground: '#c9d1d9',
-      cursor: '#58a6ff',
+      background: '#09090b',
+      foreground: '#fafafa',
+      cursor: '#3b82f6',
       selectionBackground: '#264f78',
-      black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
-      blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39d353', white: '#b1bac4',
+      black: '#3f3f46', red: '#ef4444', green: '#22c55e', yellow: '#eab308',
+      blue: '#3b82f6', magenta: '#a855f7', cyan: '#06b6d4', white: '#d4d4d8',
+      brightBlack: '#71717a', brightRed: '#f87171', brightGreen: '#4ade80', brightYellow: '#facc15',
+      brightBlue: '#60a5fa', brightMagenta: '#c084fc', brightCyan: '#22d3ee', brightWhite: '#fafafa',
     }
   });
 
@@ -267,14 +875,22 @@ function initTerminal(sandboxId) {
   term.open(document.getElementById('terminal-container'));
   fitAddon.fit();
 
-  // WebSocket
+  connectWebSocket(sandboxId);
+}
+
+function connectWebSocket(sandboxId) {
+  setConnState('connecting');
+
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = proto + '//' + location.host + '/sandboxes/' + sandboxId + '/ws';
+  let wsUrl = proto + '//' + location.host + '/sandboxes/' + sandboxId + '/ws';
+  if (token) wsUrl += '?token=' + encodeURIComponent(token);
+
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    // Send initial resize
+    reconnectAttempts = 0;
+    setConnState('connected');
     ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }));
   };
 
@@ -283,9 +899,24 @@ function initTerminal(sandboxId) {
     term.write(data);
   };
 
-  ws.onclose = () => {
-    term.write('\r\n\x1b[33m[connection closed]\x1b[0m\r\n');
+  ws.onclose = (e) => {
+    setConnState('disconnected');
+    // Don't reconnect if we intentionally disconnected or sandbox changed
+    if (!currentSandbox || currentSandbox.id !== sandboxId) return;
+
+    reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
+
+    term.write(`\r\n\x1b[33m[disconnected — reconnecting in ${Math.round(delay/1000)}s…]\x1b[0m\r\n`);
+
+    reconnectTimer = setTimeout(() => {
+      if (currentSandbox && currentSandbox.id === sandboxId) {
+        connectWebSocket(sandboxId);
+      }
+    }, delay);
   };
+
+  ws.onerror = () => {}; // onclose handles everything
 
   term.onData((data) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -298,26 +929,52 @@ function initTerminal(sandboxId) {
       ws.send(JSON.stringify({ type: 'resize', rows, cols }));
     }
   });
-
-  // Handle window resize
-  window.addEventListener('resize', () => { if (fitAddon) fitAddon.fit(); });
 }
 
-// --- Auth ---
-function setToken() {
-  const t = prompt('Enter auth token (leave empty for no auth):');
-  if (t !== null) {
-    token = t;
-    localStorage.setItem('forge_token', t);
-    loadTemplates();
-    loadSandboxes();
-  }
+// ============================================================
+// Resize handling
+// ============================================================
+let resizeTimeout;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimeout);
+  resizeTimeout = setTimeout(() => { if (fitAddon) fitAddon.fit(); }, 100);
+});
+
+// ============================================================
+// Helpers
+// ============================================================
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
-// --- Init ---
-loadTemplates();
-loadSandboxes();
-setInterval(loadSandboxes, 5000); // refresh every 5s
+function formatTime(iso) {
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffMs = now - d;
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'just now';
+    if (diffMin < 60) return diffMin + 'm ago';
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return diffHr + 'h ago';
+    const diffDay = Math.floor(diffHr / 24);
+    if (diffDay < 7) return diffDay + 'd ago';
+    return d.toLocaleDateString();
+  } catch { return '—'; }
+}
+
+// ============================================================
+// Init
+// ============================================================
+function init() {
+  loadTemplates();
+  loadSandboxes();
+  setInterval(loadSandboxes, 5000);
+}
+
+checkAuth();
 </script>
 </body>
 </html>

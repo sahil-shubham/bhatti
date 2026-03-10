@@ -1,0 +1,101 @@
+# forge-sandbox: full dev environment
+# Build: docker build -t forge-sandbox -f Dockerfile.sandbox .
+# Rebuild when dotfiles or tools change.
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# --- System packages ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    zsh git curl wget ca-certificates gnupg \
+    build-essential pkg-config libssl-dev \
+    tmux vim htop jq unzip \
+    openssh-server locales sudo \
+    python3 python3-pip python3-venv \
+  && locale-gen en_US.UTF-8 \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+# --- eza (modern ls) ---
+RUN mkdir -p /etc/apt/keyrings \
+  && wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg \
+  && echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" > /etc/apt/sources.list.d/gierens.list \
+  && apt-get update && apt-get install -y eza \
+  && rm -rf /var/lib/apt/lists/*
+
+# --- gh CLI ---
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update && apt-get install -y gh \
+  && rm -rf /var/lib/apt/lists/*
+
+# --- Starship prompt ---
+RUN curl -fsSL https://starship.rs/install.sh | sh -s -- -y
+
+# --- Create user ---
+RUN useradd -m -s /bin/zsh -G sudo sahil \
+  && echo "sahil ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER sahil
+WORKDIR /home/sahil
+ENV HOME=/home/sahil
+
+# --- nvm + Node.js ---
+ENV NVM_DIR=/home/sahil/.nvm
+RUN curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+  && . "$NVM_DIR/nvm.sh" && nvm install 22 && nvm alias default 22
+
+# --- Go ---
+ENV GOVERSION=1.24.4
+RUN curl -fsSL "https://go.dev/dl/go${GOVERSION}.linux-$(dpkg --print-architecture).tar.gz" \
+    | sudo tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:/home/sahil/go/bin:${PATH}"
+
+# --- Rust ---
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/home/sahil/.cargo/bin:${PATH}"
+
+# --- Claude CLI ---
+RUN . "$NVM_DIR/nvm.sh" && npm install -g @anthropic-ai/claude-code
+
+# --- pi agent ---
+# Copied from host build context (Makefile handles this)
+COPY --chown=sahil:sahil pi-mono/ /home/sahil/Projects/pi-mono/
+RUN if [ -f /home/sahil/Projects/pi-mono/package.json ]; then \
+      . "$NVM_DIR/nvm.sh" \
+      && cd /home/sahil/Projects/pi-mono \
+      && npm install && npm run build; \
+    fi
+
+# --- Dotfiles ---
+COPY --chown=sahil:sahil dotfiles/ /home/sahil/.dotfiles/
+
+# Symlink dotfiles (Linux-compatible subset)
+RUN mkdir -p ~/.config \
+  && ln -sf ~/.dotfiles/vim/.vimrc ~/.vimrc \
+  && ln -sf ~/.dotfiles/tmux/.tmux.conf ~/.tmux.conf \
+  && ln -sf ~/.dotfiles/git/.gitconfig ~/.gitconfig \
+  && ln -sf ~/.dotfiles/config/starship.toml ~/.config/starship.toml \
+  && mkdir -p ~/.config/htop \
+  && ln -sf ~/.dotfiles/config/htop/htoprc ~/.config/htop/htoprc
+
+# Write a Linux-compatible .zshrc (stripped of macOS-specific stuff)
+COPY --chown=sahil:sahil sandbox-zshrc /home/sahil/.zshrc
+
+# --- Zinit + plugins (pre-install so first shell is fast) ---
+RUN git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git
+
+# --- tmux plugin manager ---
+RUN git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm \
+  && ~/.tmux/plugins/tpm/bin/install_plugins || true
+
+# --- Default shell ---
+RUN sudo chsh -s /bin/zsh sahil
+
+# Forge manages lifecycle
+CMD ["sleep", "infinity"]
