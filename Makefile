@@ -11,6 +11,7 @@ sandbox:
 	mkdir -p .build-ctx
 	cp Dockerfile.sandbox .build-ctx/Dockerfile
 	cp sandbox-zshrc .build-ctx/sandbox-zshrc
+	cp sandbox-tmux.conf .build-ctx/sandbox-tmux.conf
 	cp -rL ~/.dotfiles .build-ctx/dotfiles
 	rm -rf .build-ctx/dotfiles/.git
 	rm -f .build-ctx/dotfiles/wm/.yabairc .build-ctx/dotfiles/wm/.skhdrc .build-ctx/dotfiles/wm/cycle-space.sh

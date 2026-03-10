@@ -76,9 +76,9 @@ RUN if [ -f /home/sahil/Projects/pi-mono/package.json ]; then \
 COPY --chown=sahil:sahil dotfiles/ /home/sahil/.dotfiles/
 
 # Symlink dotfiles (Linux-compatible subset)
+COPY --chown=sahil:sahil sandbox-tmux.conf /home/sahil/.tmux.conf
 RUN mkdir -p ~/.config \
   && ln -sf ~/.dotfiles/vim/.vimrc ~/.vimrc \
-  && ln -sf ~/.dotfiles/tmux/.tmux.conf ~/.tmux.conf \
   && ln -sf ~/.dotfiles/git/.gitconfig ~/.gitconfig \
   && ln -sf ~/.dotfiles/config/starship.toml ~/.config/starship.toml \
   && mkdir -p ~/.config/htop \
@@ -90,9 +90,14 @@ COPY --chown=sahil:sahil sandbox-zshrc /home/sahil/.zshrc
 # --- Zinit + plugins (pre-install so first shell is fast) ---
 RUN git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git
 
-# --- tmux plugin manager ---
-RUN git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm \
-  && ~/.tmux/plugins/tpm/bin/install_plugins || true
+# --- tmux plugins (cloned directly, no TPM runtime needed) ---
+RUN mkdir -p ~/.tmux/plugins \
+  && git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm \
+  && git clone https://github.com/tmux-plugins/tmux-sensible ~/.tmux/plugins/tmux-sensible \
+  && git clone https://github.com/tmux-plugins/tmux-resurrect ~/.tmux/plugins/tmux-resurrect \
+  && git clone https://github.com/tmux-plugins/tmux-continuum ~/.tmux/plugins/tmux-continuum \
+  && git clone https://github.com/dracula/tmux ~/.tmux/plugins/tmux \
+  && git clone https://github.com/tmux-plugins/tmux-cpu ~/.tmux/plugins/tmux-cpu
 
 # --- Default shell ---
 RUN sudo chsh -s /bin/zsh sahil
