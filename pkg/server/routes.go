@@ -25,6 +25,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/secrets/", s.handleSecret)
 	s.mux.HandleFunc("/volumes", s.handleVolumes)
 	s.mux.HandleFunc("/volumes/", s.handleVolume)
+	s.mux.HandleFunc("/ports", s.handleAllPorts)
 }
 
 // --- Templates ---
@@ -219,6 +220,8 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			s.handleSandboxStart(w, r, id)
 		case "exec":
 			s.handleSandboxExec(w, r, id)
+		case "ports":
+			s.handleSandboxPorts(w, r, id)
 		case "ws":
 			s.handleSandboxWS(w, r, id)
 		default:
@@ -251,6 +254,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		if err := s.engine.Destroy(r.Context(), sb.EngineID); err != nil {
 			log.Printf("engine destroy warning: %v", err)
 		}
+		s.proxy.StopAll(id)
 		s.store.DetachVolumes(id)
 		if err := s.store.DeleteSandbox(id); err != nil {
 			errResp(w, 500, err.Error())
@@ -276,6 +280,7 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 		errResp(w, 500, err.Error())
 		return
 	}
+	s.proxy.StopAll(sb.ID)
 	s.store.StopSandbox(id)
 	updated, _ := s.store.GetSandbox(id)
 	writeJSON(w, 200, updated)
@@ -467,6 +472,50 @@ func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
 	default:
 		errResp(w, 405, "method not allowed")
 	}
+}
+
+// --- Ports ---
+
+type portInfo struct {
+	SandboxID     string `json:"sandbox_id,omitempty"`
+	ContainerPort int    `json:"container_port"`
+	HostPort      int    `json:"host_port"`
+	URL           string `json:"url"`
+}
+
+func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	forwards := s.proxy.ActiveForwards(id)
+	out := make([]portInfo, 0, len(forwards))
+	for _, f := range forwards {
+		out = append(out, portInfo{
+			ContainerPort: f.ContainerPort,
+			HostPort:      f.HostPort,
+			URL:           fmt.Sprintf("http://localhost:%d", f.HostPort),
+		})
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleAllPorts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	forwards := s.proxy.AllForwards()
+	out := make([]portInfo, 0, len(forwards))
+	for _, f := range forwards {
+		out = append(out, portInfo{
+			SandboxID:     f.SandboxID,
+			ContainerPort: f.ContainerPort,
+			HostPort:      f.HostPort,
+			URL:           fmt.Sprintf("http://localhost:%d", f.HostPort),
+		})
+	}
+	writeJSON(w, 200, out)
 }
 
 // --- Volumes ---

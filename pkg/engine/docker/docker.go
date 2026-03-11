@@ -247,6 +247,73 @@ func (e *Engine) Exec(ctx context.Context, id string, cmd []string) (engine.Exec
 	}, nil
 }
 
+func (e *Engine) ListeningPorts(ctx context.Context, id string) ([]int, error) {
+	result, err := e.Exec(ctx, id, []string{"ss", "-tln4", "--no-header"})
+	if err != nil {
+		// Fallback: try netstat if ss not available
+		result, err = e.Exec(ctx, id, []string{"sh", "-c", "cat /proc/net/tcp 2>/dev/null || true"})
+		if err != nil {
+			return nil, err
+		}
+		return parseProcNetTCP(result.Stdout), nil
+	}
+	return parseSSOutput(result.Stdout), nil
+}
+
+func parseSSOutput(output string) []int {
+	seen := map[int]bool{}
+	var ports []int
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		addr := fields[3]
+		idx := strings.LastIndex(addr, ":")
+		if idx < 0 {
+			continue
+		}
+		var p int
+		fmt.Sscanf(addr[idx+1:], "%d", &p)
+		if p > 0 && p < 65536 && !seen[p] {
+			seen[p] = true
+			ports = append(ports, p)
+		}
+	}
+	return ports
+}
+
+func parseProcNetTCP(output string) []int {
+	// /proc/net/tcp format: local_address is hex ip:port in field 1
+	seen := map[int]bool{}
+	var ports []int
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		// Skip header
+		if fields[0] == "sl" {
+			continue
+		}
+		// field 1 is local_address (hex), field 3 is state (0A = LISTEN)
+		if fields[3] != "0A" {
+			continue
+		}
+		parts := strings.Split(fields[1], ":")
+		if len(parts) != 2 {
+			continue
+		}
+		var p int
+		fmt.Sscanf(parts[1], "%X", &p)
+		if p > 0 && p < 65536 && !seen[p] {
+			seen[p] = true
+			ports = append(ports, p)
+		}
+	}
+	return ports
+}
+
 // termConn wraps a Docker exec attach for TTY usage.
 type termConn struct {
 	execID string

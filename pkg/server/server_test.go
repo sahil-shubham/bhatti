@@ -82,6 +82,10 @@ func (m *mockEngine) Shell(_ context.Context, id string) (engine.TerminalConn, e
 	return nil, io.EOF // not tested via HTTP in unit tests
 }
 
+func (m *mockEngine) ListeningPorts(_ context.Context, id string) ([]int, error) {
+	return nil, nil // no ports in mock
+}
+
 func setup(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
@@ -93,7 +97,10 @@ func setup(t *testing.T) (*Server, *httptest.Server) {
 
 	srv := New(newMockEngine(), st, "test-token")
 	ts := httptest.NewServer(srv)
-	t.Cleanup(ts.Close)
+	t.Cleanup(func() {
+		srv.Close()
+		ts.Close()
+	})
 	return srv, ts
 }
 
@@ -465,6 +472,49 @@ func TestVolumeValidation(t *testing.T) {
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
+}
+
+func TestPortEndpoints(t *testing.T) {
+	_, ts := setup(t)
+
+	// Global ports — should be empty
+	resp := doReq(t, ts, "GET", "/ports", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var ports []portInfo
+	decodeJSON(t, resp, &ports)
+	if len(ports) != 0 {
+		t.Fatalf("expected 0 ports, got %d", len(ports))
+	}
+
+	// Create template + sandbox
+	resp = doReq(t, ts, "POST", "/templates", map[string]any{
+		"name":  "alpine",
+		"image": "alpine:latest",
+	})
+	var tmpl store.Template
+	decodeJSON(t, resp, &tmpl)
+
+	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"template_id": tmpl.ID,
+		"name":        "port-test",
+	})
+	var sb store.Sandbox
+	decodeJSON(t, resp, &sb)
+
+	// Sandbox ports — should be empty (mock engine returns no ports)
+	resp = doReq(t, ts, "GET", "/sandboxes/"+sb.ID+"/ports", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &ports)
+	if len(ports) != 0 {
+		t.Fatalf("expected 0 ports, got %d", len(ports))
+	}
+
+	// Cleanup
+	doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
 }
 
 func TestSecretValidation(t *testing.T) {

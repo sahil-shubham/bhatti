@@ -57,4 +57,5 @@ type Engine interface {
 	List(ctx context.Context) ([]SandboxInfo, error)
 	Exec(ctx context.Context, id string, cmd []string) (ExecResult, error)
 	Shell(ctx context.Context, id string) (TerminalConn, error)
+	ListeningPorts(ctx context.Context, id string) ([]int, error)
 }
