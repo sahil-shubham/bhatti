@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,15 +15,9 @@ import (
 	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
-func skipIfNoDocker(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not found")
-	}
-}
-
 func TestWebSocketTerminal(t *testing.T) {
 	skipIfNoDocker(t)
+	ensureAlpinePulled(t)
 
 	dir := t.TempDir()
 	st, err := store.New(filepath.Join(dir, "test.db"))
@@ -38,9 +31,11 @@ func TestWebSocketTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(eng, st, "") // no auth for test simplicity
+	srv := New(eng, st, "") // no auth — websocket.Dialer doesn't set headers easily
 	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	defer func() { srv.Close(); ts.Close() }()
+
+	name := uniqueName(t, "ws")
 
 	// Create template
 	resp := doReqNoAuth(t, ts, "POST", "/templates", map[string]any{
@@ -53,7 +48,7 @@ func TestWebSocketTerminal(t *testing.T) {
 	// Create sandbox
 	resp = doReqNoAuth(t, ts, "POST", "/sandboxes", map[string]any{
 		"template_id": tmpl.ID,
-		"name":        "ws-test",
+		"name":        name,
 	})
 	if resp.StatusCode != 201 {
 		t.Fatalf("expected 201, got %d", resp.StatusCode)

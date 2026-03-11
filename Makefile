@@ -33,7 +33,7 @@ sandbox:
 	rm -rf .build-ctx
 
 test:
-	go test ./... -count=1 -timeout 60s
+	go test ./... -count=1 -timeout 120s
 
 clean:
 	rm -f bhatti

@@ -268,3 +268,149 @@ func TestDockerShell(t *testing.T) {
 		t.Fatalf("resize failed: %v", err)
 	}
 }
+
+func TestDockerVolumeMount(t *testing.T) {
+	skipIfNoDocker(t)
+
+	e, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	volName := "bhatti-test-vol-" + time.Now().Format("150405.000")
+	name := "bhatti-test-volmount-" + time.Now().Format("150405.000")
+
+	// Create a real Docker volume
+	if out, err := exec.Command("docker", "volume", "create", volName).CombinedOutput(); err != nil {
+		t.Fatalf("docker volume create: %v\n%s", err, out)
+	}
+	defer exec.Command("docker", "volume", "rm", "-f", volName).Run()
+
+	info, err := e.Create(ctx, engine.SandboxSpec{
+		Name:     name,
+		Image:    "alpine:latest",
+		CPUs:     0.5,
+		MemoryMB: 64,
+		Volumes: []engine.VolumeMount{
+			{Name: volName, Target: "/data"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Destroy(ctx, info.EngineID)
+
+	// Write to the mounted volume
+	result, err := e.Exec(ctx, info.EngineID, []string{"sh", "-c", "echo vol-test > /data/file.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("write failed: exit=%d stderr=%s", result.ExitCode, result.Stderr)
+	}
+
+	// Read back
+	result, err = e.Exec(ctx, info.EngineID, []string{"cat", "/data/file.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.Stdout) != "vol-test" {
+		t.Fatalf("expected 'vol-test', got %q", result.Stdout)
+	}
+}
+
+func TestDockerVolumePersistence(t *testing.T) {
+	skipIfNoDocker(t)
+
+	e, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	volName := "bhatti-test-persist-" + time.Now().Format("150405.000")
+	name1 := "bhatti-test-persist1-" + time.Now().Format("150405.000")
+	name2 := "bhatti-test-persist2-" + time.Now().Format("150405.000")
+
+	if out, err := exec.Command("docker", "volume", "create", volName).CombinedOutput(); err != nil {
+		t.Fatalf("docker volume create: %v\n%s", err, out)
+	}
+	defer exec.Command("docker", "volume", "rm", "-f", volName).Run()
+
+	// First container: write data
+	info1, err := e.Create(ctx, engine.SandboxSpec{
+		Name:     name1,
+		Image:    "alpine:latest",
+		Volumes:  []engine.VolumeMount{{Name: volName, Target: "/data"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := e.Exec(ctx, info1.EngineID, []string{"sh", "-c", "echo persist-me > /data/survive.txt"})
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("write failed: err=%v exit=%d stderr=%s", err, result.ExitCode, result.Stderr)
+	}
+
+	// Destroy first container
+	if err := e.Destroy(ctx, info1.EngineID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second container: verify data survived
+	info2, err := e.Create(ctx, engine.SandboxSpec{
+		Name:     name2,
+		Image:    "alpine:latest",
+		Volumes:  []engine.VolumeMount{{Name: volName, Target: "/data"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Destroy(ctx, info2.EngineID)
+
+	result, err = e.Exec(ctx, info2.EngineID, []string{"cat", "/data/survive.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.Stdout) != "persist-me" {
+		t.Fatalf("data did not persist: expected 'persist-me', got %q", result.Stdout)
+	}
+}
+
+func TestDockerVolumeReadOnly(t *testing.T) {
+	skipIfNoDocker(t)
+
+	e, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	volName := "bhatti-test-ro-" + time.Now().Format("150405.000")
+	name := "bhatti-test-romount-" + time.Now().Format("150405.000")
+
+	if out, err := exec.Command("docker", "volume", "create", volName).CombinedOutput(); err != nil {
+		t.Fatalf("docker volume create: %v\n%s", err, out)
+	}
+	defer exec.Command("docker", "volume", "rm", "-f", volName).Run()
+
+	info, err := e.Create(ctx, engine.SandboxSpec{
+		Name:     name,
+		Image:    "alpine:latest",
+		Volumes:  []engine.VolumeMount{{Name: volName, Target: "/data", ReadOnly: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Destroy(ctx, info.EngineID)
+
+	// Writing to a readonly mount must fail
+	result, err := e.Exec(ctx, info.EngineID, []string{"sh", "-c", "echo test > /data/file.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ExitCode == 0 {
+		t.Fatal("expected write to readonly volume to fail, but it succeeded")
+	}
+}

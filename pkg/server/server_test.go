@@ -3,107 +3,137 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sahilshubham/bhatti/pkg/engine"
+	dockerengine "github.com/sahilshubham/bhatti/pkg/engine/docker"
 	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
-// mockEngine implements engine.Engine for testing without Docker.
-type mockEngine struct {
-	containers map[string]*engine.SandboxInfo
+var (
+	dockerCheckOnce sync.Once
+	dockerAvailable bool
+	alpinePullOnce  sync.Once
+)
+
+// TestMain runs once per package. It cleans up stale containers and volumes
+// left behind by previous crashed test runs before any tests execute.
+func TestMain(m *testing.M) {
+	cleanupStaleTestResources()
+	os.Exit(m.Run())
 }
 
-func newMockEngine() *mockEngine {
-	return &mockEngine{containers: make(map[string]*engine.SandboxInfo)}
-}
-
-func (m *mockEngine) Create(_ context.Context, spec engine.SandboxSpec) (engine.SandboxInfo, error) {
-	id := "mock-" + spec.Name + "-000000000000"
-	info := engine.SandboxInfo{
-		ID:       id[:12],
-		Name:     spec.Name,
-		Status:   "running",
-		IP:       "172.17.0.2",
-		EngineID: id,
+func cleanupStaleTestResources() {
+	// Only clean stopped/exited/dead containers — never running ones,
+	// because other test packages may be running in parallel.
+	for _, status := range []string{"exited", "dead", "created"} {
+		out, err := exec.Command(
+			"docker", "ps", "-a",
+			"--filter", "label=bhatti.managed=true",
+			"--filter", "status="+status,
+			"--format", "{{.Names}}",
+		).Output()
+		if err != nil {
+			return
+		}
+		for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if strings.HasPrefix(name, "bhatti-test-") {
+				exec.Command("docker", "rm", "-f", name).Run()
+			}
+		}
 	}
-	m.containers[id] = &info
-	return info, nil
-}
-
-func (m *mockEngine) Destroy(_ context.Context, id string) error {
-	delete(m.containers, id)
-	return nil
-}
-
-func (m *mockEngine) Stop(_ context.Context, id string) error {
-	if c, ok := m.containers[id]; ok {
-		c.Status = "stopped"
+	// Clean orphaned test volumes (only those not currently mounted)
+	out, _ := exec.Command("docker", "volume", "ls", "--format", "{{.Name}}").Output()
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(name, "bhatti-test-") {
+			// -f won't remove in-use volumes, so this is safe
+			exec.Command("docker", "volume", "rm", name).Run()
+		}
 	}
-	return nil
 }
 
-func (m *mockEngine) Start(_ context.Context, id string) error {
-	if c, ok := m.containers[id]; ok {
-		c.Status = "running"
+func skipIfNoDocker(t *testing.T) {
+	t.Helper()
+	dockerCheckOnce.Do(func() {
+		if _, err := exec.LookPath("docker"); err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := exec.CommandContext(ctx, "docker", "info").Run(); err != nil {
+			return
+		}
+		dockerAvailable = true
+	})
+	if !dockerAvailable {
+		t.Skip("docker not available, skipping integration test")
 	}
-	return nil
 }
 
-func (m *mockEngine) Status(_ context.Context, id string) (engine.SandboxInfo, error) {
-	if c, ok := m.containers[id]; ok {
-		return *c, nil
-	}
-	return engine.SandboxInfo{}, io.EOF
+func ensureAlpinePulled(t *testing.T) {
+	t.Helper()
+	alpinePullOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "docker", "pull", "alpine:latest")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed to pre-pull alpine:latest: %v\n%s", err, out)
+		}
+	})
 }
 
-func (m *mockEngine) List(_ context.Context) ([]engine.SandboxInfo, error) {
-	var out []engine.SandboxInfo
-	for _, c := range m.containers {
-		out = append(out, *c)
-	}
-	return out, nil
+// uniqueName generates a collision-free resource name for tests.
+// All names start with "bhatti-test-" so cleanupStaleTestResources can find them.
+func uniqueName(t *testing.T, prefix string) string {
+	t.Helper()
+	b := make([]byte, 4)
+	rand.Read(b)
+	return fmt.Sprintf("bhatti-test-%s-%s", prefix, hex.EncodeToString(b))
 }
 
-func (m *mockEngine) Exec(_ context.Context, id string, cmd []string) (engine.ExecResult, error) {
-	return engine.ExecResult{
-		ExitCode: 0,
-		Stdout:   "mock output: " + strings.Join(cmd, " "),
-	}, nil
-}
-
-func (m *mockEngine) Shell(_ context.Context, id string) (engine.TerminalConn, error) {
-	return nil, io.EOF // not tested via HTTP in unit tests
-}
-
-func (m *mockEngine) ListeningPorts(_ context.Context, id string) ([]int, error) {
-	return nil, nil // no ports in mock
-}
-
-func (m *mockEngine) Tunnel(_ context.Context, id string, port int) (io.ReadWriteCloser, error) {
-	return nil, io.EOF // not tested in unit tests
+// cleanupDockerVolume defers removal of a Docker volume created during a test.
+func cleanupDockerVolume(t *testing.T, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		exec.Command("docker", "volume", "rm", "-f", name).Run()
+	})
 }
 
 func setup(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
+	skipIfNoDocker(t)
+	ensureAlpinePulled(t)
+
 	dir := t.TempDir()
 	st, err := store.New(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
 
-	srv := New(newMockEngine(), st, "test-token")
+	eng, err := dockerengine.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(eng, st, "test-token")
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() {
 		srv.Close()
 		ts.Close()
+		st.Close()
 	})
 	return srv, ts
 }
@@ -133,12 +163,51 @@ func decodeJSON(t *testing.T, resp *http.Response, v any) {
 	}
 }
 
+// createTemplateAndSandbox is a helper that creates an alpine template and a
+// sandbox from it, returning both. The sandbox container is automatically
+// destroyed via t.Cleanup.
+func createTemplateAndSandbox(t *testing.T, ts *httptest.Server, sbName string, volumes []map[string]any) (store.Template, store.Sandbox) {
+	t.Helper()
+
+	resp := doReq(t, ts, "POST", "/templates", map[string]any{
+		"name":  "alpine",
+		"image": "alpine:latest",
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create template: expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	var tmpl store.Template
+	decodeJSON(t, resp, &tmpl)
+
+	sbReq := map[string]any{
+		"template_id": tmpl.ID,
+		"name":        sbName,
+	}
+	if volumes != nil {
+		sbReq["volumes"] = volumes
+	}
+
+	resp = doReq(t, ts, "POST", "/sandboxes", sbReq)
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create sandbox: expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	var sb store.Sandbox
+	decodeJSON(t, resp, &sb)
+
+	t.Cleanup(func() {
+		doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
+	})
+
+	return tmpl, sb
+}
+
 // --- Tests ---
 
 func TestAuthRequired(t *testing.T) {
 	_, ts := setup(t)
 	req, _ := http.NewRequest("GET", ts.URL+"/templates", nil)
-	// No auth header
 	resp, _ := http.DefaultClient.Do(req)
 	if resp.StatusCode != 401 {
 		t.Fatalf("expected 401, got %d", resp.StatusCode)
@@ -146,13 +215,21 @@ func TestAuthRequired(t *testing.T) {
 }
 
 func TestNoAuthWhenTokenEmpty(t *testing.T) {
+	skipIfNoDocker(t)
+	ensureAlpinePulled(t)
+
 	dir := t.TempDir()
 	st, _ := store.New(filepath.Join(dir, "test.db"))
 	defer st.Close()
 
-	srv := New(newMockEngine(), st, "") // empty token = no auth
+	eng, err := dockerengine.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(eng, st, "") // empty token = no auth
 	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	defer func() { srv.Close(); ts.Close() }()
 
 	resp, _ := http.Get(ts.URL + "/templates")
 	if resp.StatusCode != 200 {
@@ -207,92 +284,108 @@ func TestTemplateCRUD(t *testing.T) {
 
 func TestSandboxLifecycle(t *testing.T) {
 	_, ts := setup(t)
+	name := uniqueName(t, "lifecycle")
 
-	// Create template first
-	resp := doReq(t, ts, "POST", "/templates", map[string]any{
-		"name":  "alpine",
-		"image": "alpine:latest",
-	})
-	var tmpl store.Template
-	decodeJSON(t, resp, &tmpl)
+	tmpl, sb := createTemplateAndSandbox(t, ts, name, nil)
+	_ = tmpl
 
-	// Create sandbox
-	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
-		"template_id": tmpl.ID,
-		"name":        "test-sb",
-	})
-	if resp.StatusCode != 201 {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, body)
-	}
-	var sb store.Sandbox
-	decodeJSON(t, resp, &sb)
-	if sb.Name != "test-sb" || sb.Status != "running" {
+	if sb.Name != name || sb.Status != "running" {
 		t.Fatalf("unexpected sandbox: %+v", sb)
 	}
 
-	// List
-	resp = doReq(t, ts, "GET", "/sandboxes", nil)
+	// List — should contain our sandbox
+	resp := doReq(t, ts, "GET", "/sandboxes", nil)
 	var sbList []store.Sandbox
 	decodeJSON(t, resp, &sbList)
-	if len(sbList) != 1 {
-		t.Fatalf("expected 1 sandbox, got %d", len(sbList))
+	found := false
+	for _, s := range sbList {
+		if s.ID == sb.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("sandbox not found in list")
 	}
 
-	// Exec
+	// Exec — real command runs inside the container
 	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
 		"cmd": []string{"echo", "hello"},
 	})
 	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Fatalf("exec: expected 200, got %d", resp.StatusCode)
 	}
 	var result engine.ExecResult
 	decodeJSON(t, resp, &result)
-	if !strings.Contains(result.Stdout, "echo hello") {
-		t.Fatalf("unexpected exec result: %+v", result)
+	if strings.TrimSpace(result.Stdout) != "hello" {
+		t.Fatalf("exec: expected 'hello', got %q", result.Stdout)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exec: expected exit code 0, got %d", result.ExitCode)
 	}
 
-	// Stop — should return full sandbox object
+	// Exec — env var from template (none set, just verify exec works with sh)
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd": []string{"sh", "-c", "echo $HOME"},
+	})
+	var envResult engine.ExecResult
+	decodeJSON(t, resp, &envResult)
+	if envResult.ExitCode != 0 {
+		t.Fatalf("env exec failed: exit=%d stderr=%s", envResult.ExitCode, envResult.Stderr)
+	}
+
+	// Stop
 	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/stop", nil)
 	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Fatalf("stop: expected 200, got %d", resp.StatusCode)
 	}
 	var stoppedSB store.Sandbox
 	decodeJSON(t, resp, &stoppedSB)
 	if stoppedSB.Status != "stopped" {
-		t.Fatalf("expected stopped status, got %s", stoppedSB.Status)
+		t.Fatalf("expected stopped, got %s", stoppedSB.Status)
 	}
 	if stoppedSB.StoppedAt == nil {
 		t.Fatal("expected stopped_at to be set")
 	}
-	if stoppedSB.ID != sb.ID {
-		t.Fatalf("expected same sandbox ID, got %s", stoppedSB.ID)
+
+	// Exec on stopped container — should fail
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd": []string{"echo", "should-fail"},
+	})
+	if resp.StatusCode != 500 {
+		t.Fatalf("exec on stopped: expected 500, got %d", resp.StatusCode)
 	}
 
-	// Start — should return full sandbox object with refreshed info
+	// Start
 	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/start", nil)
 	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Fatalf("start: expected 200, got %d", resp.StatusCode)
 	}
 	var startedSB store.Sandbox
 	decodeJSON(t, resp, &startedSB)
 	if startedSB.Status != "running" {
-		t.Fatalf("expected running status, got %s", startedSB.Status)
-	}
-	if startedSB.ID != sb.ID {
-		t.Fatalf("expected same sandbox ID, got %s", startedSB.ID)
+		t.Fatalf("expected running, got %s", startedSB.Status)
 	}
 
-	// Destroy
+	// Exec after restart — should work again
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd": []string{"echo", "back"},
+	})
+	var restartResult engine.ExecResult
+	decodeJSON(t, resp, &restartResult)
+	if strings.TrimSpace(restartResult.Stdout) != "back" {
+		t.Fatalf("exec after restart: expected 'back', got %q", restartResult.Stdout)
+	}
+
+	// Destroy (explicit — t.Cleanup is the safety net)
 	resp = doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
 	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Fatalf("destroy: expected 200, got %d", resp.StatusCode)
 	}
 
 	// Verify gone
 	resp = doReq(t, ts, "GET", "/sandboxes/"+sb.ID, nil)
 	if resp.StatusCode != 404 {
-		t.Fatalf("expected 404, got %d", resp.StatusCode)
+		t.Fatalf("expected 404 after destroy, got %d", resp.StatusCode)
 	}
 }
 
@@ -336,16 +429,17 @@ func TestSecretsCRUD(t *testing.T) {
 
 func TestVolumeCRUD(t *testing.T) {
 	_, ts := setup(t)
+	volName := uniqueName(t, "crud")
 
 	// Create
-	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": "test-vol"})
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName})
 	if resp.StatusCode != 201 {
 		t.Fatalf("expected 201, got %d", resp.StatusCode)
 	}
 	var vol store.Volume
 	decodeJSON(t, resp, &vol)
-	if vol.Name != "test-vol" {
-		t.Fatalf("expected test-vol, got %s", vol.Name)
+	if vol.Name != volName {
+		t.Fatalf("expected %s, got %s", volName, vol.Name)
 	}
 
 	// List
@@ -357,19 +451,19 @@ func TestVolumeCRUD(t *testing.T) {
 	}
 
 	// Get
-	resp = doReq(t, ts, "GET", "/volumes/test-vol", nil)
+	resp = doReq(t, ts, "GET", "/volumes/"+volName, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
 	// Delete
-	resp = doReq(t, ts, "DELETE", "/volumes/test-vol", nil)
+	resp = doReq(t, ts, "DELETE", "/volumes/"+volName, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	// Get deleted
-	resp = doReq(t, ts, "GET", "/volumes/test-vol", nil)
+	// Verify gone
+	resp = doReq(t, ts, "GET", "/volumes/"+volName, nil)
 	if resp.StatusCode != 404 {
 		t.Fatalf("expected 404, got %d", resp.StatusCode)
 	}
@@ -378,38 +472,27 @@ func TestVolumeCRUD(t *testing.T) {
 func TestVolumeDeleteConflict(t *testing.T) {
 	_, ts := setup(t)
 
-	// Create volume
-	doReq(t, ts, "POST", "/volumes", map[string]any{"name": "busy-vol"})
+	volName := uniqueName(t, "busy")
+	sbName := uniqueName(t, "volsb")
+	cleanupDockerVolume(t, volName)
 
-	// Create template and sandbox with that volume
-	resp := doReq(t, ts, "POST", "/templates", map[string]any{
-		"name":  "alpine",
-		"image": "alpine:latest",
+	// Create volume in store
+	doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName})
+
+	// Create sandbox that mounts the volume
+	_, sb := createTemplateAndSandbox(t, ts, sbName, []map[string]any{
+		{"name": volName, "target": "/data"},
 	})
-	var tmpl store.Template
-	decodeJSON(t, resp, &tmpl)
 
-	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
-		"template_id": tmpl.ID,
-		"name":        "vol-sb",
-		"volumes":     []map[string]any{{"name": "busy-vol", "target": "/data"}},
-	})
-	if resp.StatusCode != 201 {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, body)
-	}
-	var sb store.Sandbox
-	decodeJSON(t, resp, &sb)
-
-	// Try delete volume — should fail with 409
-	resp = doReq(t, ts, "DELETE", "/volumes/busy-vol", nil)
+	// Delete volume — should fail with 409 while sandbox is attached
+	resp := doReq(t, ts, "DELETE", "/volumes/"+volName, nil)
 	if resp.StatusCode != 409 {
 		t.Fatalf("expected 409, got %d", resp.StatusCode)
 	}
 
-	// Destroy sandbox, then delete volume
+	// Destroy sandbox, then delete volume should succeed
 	doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
-	resp = doReq(t, ts, "DELETE", "/volumes/busy-vol", nil)
+	resp = doReq(t, ts, "DELETE", "/volumes/"+volName, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
@@ -417,13 +500,18 @@ func TestVolumeDeleteConflict(t *testing.T) {
 
 func TestSandboxWithTemplateMounts(t *testing.T) {
 	_, ts := setup(t)
+	sbName := uniqueName(t, "tmplmnt")
+	sharedVol := uniqueName(t, "shared")
+	autoVol := "bhatti-" + sbName + "-workspace"
+	cleanupDockerVolume(t, sharedVol)
+	cleanupDockerVolume(t, autoVol)
 
 	// Create template with default mounts
 	resp := doReq(t, ts, "POST", "/templates", map[string]any{
 		"name":  "dev-template",
 		"image": "alpine:latest",
 		"mounts": []map[string]any{
-			{"volume_name": "shared-data", "target": "/data", "auto_create": true},
+			{"volume_name": sharedVol, "target": "/data", "auto_create": true},
 			{"target": "/workspace", "auto_create": true},
 		},
 	})
@@ -439,7 +527,7 @@ func TestSandboxWithTemplateMounts(t *testing.T) {
 	// Create sandbox — should use template mounts
 	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
 		"template_id": tmpl.ID,
-		"name":        "mount-test",
+		"name":        sbName,
 	})
 	if resp.StatusCode != 201 {
 		body, _ := io.ReadAll(resp.Body)
@@ -447,31 +535,171 @@ func TestSandboxWithTemplateMounts(t *testing.T) {
 	}
 	var sb store.Sandbox
 	decodeJSON(t, resp, &sb)
+	t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil) })
 
-	// Verify the auto-created volumes exist
+	// Verify auto-created volumes exist in store
 	resp = doReq(t, ts, "GET", "/volumes", nil)
 	var vols []store.Volume
 	decodeJSON(t, resp, &vols)
-
 	volNames := map[string]bool{}
 	for _, v := range vols {
 		volNames[v.Name] = true
 	}
-	if !volNames["shared-data"] {
-		t.Fatal("expected shared-data volume to be auto-created")
+	if !volNames[sharedVol] {
+		t.Fatalf("expected %s volume to be auto-created, got %v", sharedVol, volNames)
 	}
-	if !volNames["bhatti-mount-test-workspace"] {
-		t.Fatalf("expected bhatti-mount-test-workspace volume, got %v", volNames)
+	if !volNames[autoVol] {
+		t.Fatalf("expected %s volume, got %v", autoVol, volNames)
 	}
 
-	// Cleanup
-	doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
+	// Verify mounts actually work inside the container
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd": []string{"sh", "-c", "echo tmpl-mount > /data/test.txt && cat /data/test.txt"},
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("exec on /data: expected 200, got %d", resp.StatusCode)
+	}
+	var dataResult engine.ExecResult
+	decodeJSON(t, resp, &dataResult)
+	if dataResult.ExitCode != 0 {
+		t.Fatalf("/data mount write/read failed: exit=%d stderr=%s", dataResult.ExitCode, dataResult.Stderr)
+	}
+	if strings.TrimSpace(dataResult.Stdout) != "tmpl-mount" {
+		t.Fatalf("expected 'tmpl-mount', got %q", dataResult.Stdout)
+	}
+
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd": []string{"sh", "-c", "echo ws-mount > /workspace/test.txt && cat /workspace/test.txt"},
+	})
+	var wsResult engine.ExecResult
+	decodeJSON(t, resp, &wsResult)
+	if wsResult.ExitCode != 0 {
+		t.Fatalf("/workspace mount write/read failed: exit=%d stderr=%s", wsResult.ExitCode, wsResult.Stderr)
+	}
+	if strings.TrimSpace(wsResult.Stdout) != "ws-mount" {
+		t.Fatalf("expected 'ws-mount', got %q", wsResult.Stdout)
+	}
+}
+
+func TestSandboxWithExistingVolume(t *testing.T) {
+	_, ts := setup(t)
+
+	volName := uniqueName(t, "existing")
+	sbName1 := uniqueName(t, "volsb1")
+	sbName2 := uniqueName(t, "volsb2")
+
+	// Create a real Docker volume
+	if out, err := exec.Command("docker", "volume", "create", volName).CombinedOutput(); err != nil {
+		t.Fatalf("docker volume create failed: %v\n%s", err, out)
+	}
+	cleanupDockerVolume(t, volName)
+
+	// Track it in bhatti store
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName})
+	if resp.StatusCode != 201 {
+		t.Fatalf("store volume: expected 201, got %d", resp.StatusCode)
+	}
+
+	// Create template
+	resp = doReq(t, ts, "POST", "/templates", map[string]any{
+		"name":  "alpine",
+		"image": "alpine:latest",
+	})
+	var tmpl store.Template
+	decodeJSON(t, resp, &tmpl)
+
+	// --- First sandbox: write data to volume ---
+	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"template_id": tmpl.ID,
+		"name":        sbName1,
+		"volumes":     []map[string]any{{"name": volName, "target": "/data"}},
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create sb1: expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	var sb1 store.Sandbox
+	decodeJSON(t, resp, &sb1)
+
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb1.ID+"/exec", map[string]any{
+		"cmd": []string{"sh", "-c", "echo persistent-data > /data/test.txt"},
+	})
+	var writeResult engine.ExecResult
+	decodeJSON(t, resp, &writeResult)
+	if writeResult.ExitCode != 0 {
+		t.Fatalf("write to volume failed: exit=%d stderr=%s", writeResult.ExitCode, writeResult.Stderr)
+	}
+
+	// Verify data exists in first sandbox
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb1.ID+"/exec", map[string]any{
+		"cmd": []string{"cat", "/data/test.txt"},
+	})
+	var readResult engine.ExecResult
+	decodeJSON(t, resp, &readResult)
+	if strings.TrimSpace(readResult.Stdout) != "persistent-data" {
+		t.Fatalf("read from volume: expected 'persistent-data', got %q", readResult.Stdout)
+	}
+
+	// Destroy first sandbox
+	resp = doReq(t, ts, "DELETE", "/sandboxes/"+sb1.ID, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("destroy sb1: expected 200, got %d", resp.StatusCode)
+	}
+
+	// --- Second sandbox: verify data persisted ---
+	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"template_id": tmpl.ID,
+		"name":        sbName2,
+		"volumes":     []map[string]any{{"name": volName, "target": "/data"}},
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create sb2: expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	var sb2 store.Sandbox
+	decodeJSON(t, resp, &sb2)
+	t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb2.ID, nil) })
+
+	resp = doReq(t, ts, "POST", "/sandboxes/"+sb2.ID+"/exec", map[string]any{
+		"cmd": []string{"cat", "/data/test.txt"},
+	})
+	var persistResult engine.ExecResult
+	decodeJSON(t, resp, &persistResult)
+	if strings.TrimSpace(persistResult.Stdout) != "persistent-data" {
+		t.Fatalf("volume data did not persist: expected 'persistent-data', got %q", persistResult.Stdout)
+	}
+}
+
+func TestSandboxVolumeReadOnly(t *testing.T) {
+	_, ts := setup(t)
+
+	volName := uniqueName(t, "ro")
+	sbName := uniqueName(t, "rosb")
+	cleanupDockerVolume(t, volName)
+
+	// Create Docker volume
+	if out, err := exec.Command("docker", "volume", "create", volName).CombinedOutput(); err != nil {
+		t.Fatalf("docker volume create: %v\n%s", err, out)
+	}
+
+	_, sb := createTemplateAndSandbox(t, ts, sbName, []map[string]any{
+		{"name": volName, "target": "/data", "readonly": true},
+	})
+
+	// Writing to a readonly mount should fail
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd": []string{"sh", "-c", "echo test > /data/file.txt"},
+	})
+	var result engine.ExecResult
+	decodeJSON(t, resp, &result)
+	if result.ExitCode == 0 {
+		t.Fatal("expected write to readonly volume to fail, but it succeeded")
+	}
 }
 
 func TestVolumeValidation(t *testing.T) {
 	_, ts := setup(t)
 
-	// Missing name
 	resp := doReq(t, ts, "POST", "/volumes", map[string]any{})
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -492,22 +720,11 @@ func TestPortEndpoints(t *testing.T) {
 		t.Fatalf("expected 0 ports, got %d", len(ports))
 	}
 
-	// Create template + sandbox
-	resp = doReq(t, ts, "POST", "/templates", map[string]any{
-		"name":  "alpine",
-		"image": "alpine:latest",
-	})
-	var tmpl store.Template
-	decodeJSON(t, resp, &tmpl)
+	// Create sandbox
+	sbName := uniqueName(t, "ports")
+	_, sb := createTemplateAndSandbox(t, ts, sbName, nil)
 
-	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
-		"template_id": tmpl.ID,
-		"name":        "port-test",
-	})
-	var sb store.Sandbox
-	decodeJSON(t, resp, &sb)
-
-	// Sandbox ports — should be empty (mock engine returns no ports)
+	// alpine with sleep infinity has no listening ports
 	resp = doReq(t, ts, "GET", "/sandboxes/"+sb.ID+"/ports", nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
@@ -516,15 +733,11 @@ func TestPortEndpoints(t *testing.T) {
 	if len(ports) != 0 {
 		t.Fatalf("expected 0 ports, got %d", len(ports))
 	}
-
-	// Cleanup
-	doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
 }
 
 func TestSecretValidation(t *testing.T) {
 	_, ts := setup(t)
 
-	// Missing value
 	resp := doReq(t, ts, "POST", "/secrets", map[string]any{
 		"name": "test",
 	})

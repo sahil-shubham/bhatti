@@ -11,6 +11,66 @@ import (
 	"github.com/sahilshubham/bhatti/pkg/engine"
 )
 
+// mockEngine implements engine.Engine for proxy tests.
+// ProxyManager only uses Tunnel(), so other methods are stubs.
+type mockEngine struct {
+	containers map[string]*engine.SandboxInfo
+}
+
+func newMockEngine() *mockEngine {
+	return &mockEngine{containers: make(map[string]*engine.SandboxInfo)}
+}
+
+func (m *mockEngine) Create(_ context.Context, spec engine.SandboxSpec) (engine.SandboxInfo, error) {
+	id := "mock-" + spec.Name + "-000000000000"
+	info := engine.SandboxInfo{
+		ID: id[:12], Name: spec.Name, Status: "running", IP: "172.17.0.2", EngineID: id,
+	}
+	m.containers[id] = &info
+	return info, nil
+}
+func (m *mockEngine) Destroy(_ context.Context, id string) error {
+	delete(m.containers, id)
+	return nil
+}
+func (m *mockEngine) Stop(_ context.Context, id string) error {
+	if c, ok := m.containers[id]; ok {
+		c.Status = "stopped"
+	}
+	return nil
+}
+func (m *mockEngine) Start(_ context.Context, id string) error {
+	if c, ok := m.containers[id]; ok {
+		c.Status = "running"
+	}
+	return nil
+}
+func (m *mockEngine) Status(_ context.Context, id string) (engine.SandboxInfo, error) {
+	if c, ok := m.containers[id]; ok {
+		return *c, nil
+	}
+	return engine.SandboxInfo{}, io.EOF
+}
+func (m *mockEngine) List(_ context.Context) ([]engine.SandboxInfo, error) {
+	var out []engine.SandboxInfo
+	for _, c := range m.containers {
+		out = append(out, *c)
+	}
+	return out, nil
+}
+func (m *mockEngine) Exec(_ context.Context, _ string, _ []string) (engine.ExecResult, error) {
+	return engine.ExecResult{ExitCode: 0, Stdout: "mock"}, nil
+}
+func (m *mockEngine) Shell(_ context.Context, _ string) (engine.TerminalConn, error) {
+	return nil, io.EOF
+}
+func (m *mockEngine) ListeningPorts(_ context.Context, _ string) ([]int, error) {
+	return nil, nil
+}
+func (m *mockEngine) Tunnel(_ context.Context, _ string, _ int) (io.ReadWriteCloser, error) {
+	return nil, io.EOF
+}
+
 // tunnelMockEngine implements engine.Engine with a working Tunnel()
 // that connects to a local TCP server (simulating what socat does inside
 // a container).
