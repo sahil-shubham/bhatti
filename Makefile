@@ -26,7 +26,8 @@ sandbox:
 		cp "$$HOME/.claude/settings.json" .build-ctx/sandbox/claude/settings/settings.json; \
 	fi
 	@if command -v security >/dev/null 2>&1; then \
-		security find-generic-password -s "Claude Code-credentials" -w > .build-ctx/sandbox/claude/settings/.credentials.json 2>/dev/null || true; \
+		cred=$$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) && \
+		[ -n "$$cred" ] && echo "$$cred" > .build-ctx/sandbox/claude/settings/.credentials.json || true; \
 	fi
 	docker build -t bhatti-sandbox .build-ctx
 	rm -rf .build-ctx

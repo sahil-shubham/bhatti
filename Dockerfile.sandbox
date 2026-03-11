@@ -15,7 +15,7 @@ ARG NODE_VERSION=22.16.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
     zsh git curl wget ca-certificates gnupg \
     tmux vim-tiny htop jq unzip xz-utils \
-    locales sudo \
+    locales sudo socat \
   && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
   && locale-gen \
   && apt-get clean \
@@ -47,8 +47,6 @@ RUN npm install -g @anthropic-ai/claude-code
 # --- tmux: plugins (shallow clones, no TPM) ---
 RUN mkdir -p ~/.tmux/plugins \
   && git clone --depth 1 https://github.com/tmux-plugins/tmux-sensible ~/.tmux/plugins/tmux-sensible \
-  && git clone --depth 1 https://github.com/tmux-plugins/tmux-resurrect ~/.tmux/plugins/tmux-resurrect \
-  && git clone --depth 1 https://github.com/tmux-plugins/tmux-continuum ~/.tmux/plugins/tmux-continuum \
   && git clone --depth 1 https://github.com/dracula/tmux ~/.tmux/plugins/tmux \
   && git clone --depth 1 https://github.com/tmux-plugins/tmux-cpu ~/.tmux/plugins/tmux-cpu
 
@@ -75,7 +73,7 @@ RUN if [ -f ~/.dotfiles/.gitconfig ]; then ln -sf ~/.dotfiles/.gitconfig ~/.gitc
 COPY --chown=${USERNAME}:${USERNAME} sandbox/claude/ /home/${USERNAME}/.claude-inject/
 RUN if [ -f ~/.claude-inject/.claude.json ]; then mv ~/.claude-inject/.claude.json ~/; fi \
   && if [ -d ~/.claude-inject/settings ]; then \
-       mkdir -p ~/.claude && cp -r ~/.claude-inject/settings/* ~/.claude/; \
+       mkdir -p ~/.claude && cp -r ~/.claude-inject/settings/. ~/.claude/; \
      fi \
   && rm -rf ~/.claude-inject
 
