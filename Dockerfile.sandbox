@@ -1,113 +1,83 @@
-# forge-sandbox: full dev environment
-# Build: docker build -t forge-sandbox -f Dockerfile.sandbox .
-# Rebuild when dotfiles or tools change.
+# forge-sandbox: general-purpose dev sandbox
+#
+# A lean Ubuntu-based environment with zsh, node, tmux, and claude-code.
+# User dotfiles and Claude credentials are injected at build time if present.
+#
+# Build via: make sandbox
 
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG USERNAME=forge
+ARG NODE_VERSION=22.16.0
 
-# --- System packages ---
+# --- System packages (runtime only) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     zsh git curl wget ca-certificates gnupg \
-    build-essential pkg-config libssl-dev \
-    tmux vim htop jq unzip \
-    openssh-server locales sudo \
-    python3 python3-pip python3-venv \
-  && locale-gen en_US.UTF-8 \
-  && rm -rf /var/lib/apt/lists/*
+    tmux vim-tiny htop jq unzip xz-utils \
+    locales sudo \
+  && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
+  && locale-gen \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* \
+  && find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} + 2>/dev/null || true
 
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
-
-# --- eza (modern ls) ---
-RUN mkdir -p /etc/apt/keyrings \
-  && wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg \
-  && echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" > /etc/apt/sources.list.d/gierens.list \
-  && apt-get update && apt-get install -y eza \
-  && rm -rf /var/lib/apt/lists/*
-
-# --- gh CLI ---
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    > /etc/apt/sources.list.d/github-cli.list \
-  && apt-get update && apt-get install -y gh \
-  && rm -rf /var/lib/apt/lists/*
 
 # --- Starship prompt ---
 RUN curl -fsSL https://starship.rs/install.sh | sh -s -- -y
 
 # --- Create user ---
-RUN useradd -m -s /bin/zsh -G sudo sahil \
-  && echo "sahil ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+RUN useradd -m -s /bin/zsh -G sudo ${USERNAME} \
+  && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-USER sahil
-WORKDIR /home/sahil
-ENV HOME=/home/sahil
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+ENV HOME=/home/${USERNAME}
 
-# --- nvm + Node.js ---
-ENV NVM_DIR=/home/sahil/.nvm
-RUN curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
-  && . "$NVM_DIR/nvm.sh" && nvm install 22 && nvm alias default 22
+# --- Node.js (direct tarball, no nvm) ---
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz" \
+    | sudo tar -xJ --strip-components=1 -C /usr/local
 
-# --- Go ---
-ENV GOVERSION=1.24.4
-RUN curl -fsSL "https://go.dev/dl/go${GOVERSION}.linux-$(dpkg --print-architecture).tar.gz" \
-    | sudo tar -C /usr/local -xz
-ENV PATH="/usr/local/go/bin:/home/sahil/go/bin:${PATH}"
+# --- Claude Code CLI ---
+RUN npm install -g @anthropic-ai/claude-code
 
-# --- Claude CLI ---
-RUN . "$NVM_DIR/nvm.sh" && npm install -g @anthropic-ai/claude-code
-
-# --- Auth credentials (Claude) ---
-COPY --chown=sahil:sahil claude.json /home/sahil/.claude.json
-COPY --chown=sahil:sahil claude-settings/ /home/sahil/.claude/
-
-# --- Dotfiles ---
-COPY --chown=sahil:sahil dotfiles/ /home/sahil/.dotfiles/
-
-# Symlink dotfiles (Linux-compatible subset)
-COPY --chown=sahil:sahil sandbox-tmux.conf /home/sahil/.tmux.conf
-RUN mkdir -p ~/.config \
-  && ln -sf ~/.dotfiles/vim/.vimrc ~/.vimrc \
-  && ln -sf ~/.dotfiles/git/.gitconfig ~/.gitconfig \
-  && ln -sf ~/.dotfiles/config/starship.toml ~/.config/starship.toml \
-  && mkdir -p ~/.config/htop \
-  && ln -sf ~/.dotfiles/config/htop/htoprc ~/.config/htop/htoprc
-
-# Write a Linux-compatible .zshrc (stripped of macOS-specific stuff)
-COPY --chown=sahil:sahil sandbox-zshrc /home/sahil/.zshrc
-
-# --- Zinit + plugins (pre-cloned so first shell is instant) ---
-RUN git clone https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git \
-  && mkdir -p ~/.local/share/zinit/plugins \
-  && git clone https://github.com/zdharma-continuum/zinit-annex-as-monitor ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-as-monitor \
-  && git clone https://github.com/zdharma-continuum/zinit-annex-bin-gem-node ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-bin-gem-node \
-  && git clone https://github.com/zdharma-continuum/zinit-annex-patch-dl ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-patch-dl \
-  && git clone https://github.com/zdharma-continuum/zinit-annex-rust ~/.local/share/zinit/plugins/zdharma-continuum---zinit-annex-rust \
-  && git clone https://github.com/marlonrichert/zsh-autocomplete ~/.local/share/zinit/plugins/marlonrichert---zsh-autocomplete \
-  && git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.local/share/zinit/plugins/zsh-users---zsh-syntax-highlighting \
-  && git clone https://github.com/zsh-users/zsh-autosuggestions ~/.local/share/zinit/plugins/zsh-users---zsh-autosuggestions \
-  && git clone https://github.com/agkozak/zsh-z ~/.local/share/zinit/plugins/agkozak---zsh-z \
-  && mkdir -p ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit \
-  && curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/plugins/git/git.plugin.zsh \
-     -o ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/git.plugin.zsh \
-  && echo -n "OMZ::plugins/git/git.plugin.zsh" > ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/url \
-  && echo -n "OMZ::plugins/git/git.plugin.zsh" > ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/teleid \
-  && touch ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/is-snippet \
-  && echo -n "auto" > ~/.local/share/zinit/snippets/OMZ::plugins--git/git.plugin.zsh/._zinit/mode
-
-# --- tmux plugins (cloned directly, no TPM runtime needed) ---
+# --- tmux: plugins (shallow clones, no TPM) ---
 RUN mkdir -p ~/.tmux/plugins \
-  && git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm \
-  && git clone https://github.com/tmux-plugins/tmux-sensible ~/.tmux/plugins/tmux-sensible \
-  && git clone https://github.com/tmux-plugins/tmux-resurrect ~/.tmux/plugins/tmux-resurrect \
-  && git clone https://github.com/tmux-plugins/tmux-continuum ~/.tmux/plugins/tmux-continuum \
-  && git clone https://github.com/dracula/tmux ~/.tmux/plugins/tmux \
-  && git clone https://github.com/tmux-plugins/tmux-cpu ~/.tmux/plugins/tmux-cpu
+  && git clone --depth 1 https://github.com/tmux-plugins/tmux-sensible ~/.tmux/plugins/tmux-sensible \
+  && git clone --depth 1 https://github.com/tmux-plugins/tmux-resurrect ~/.tmux/plugins/tmux-resurrect \
+  && git clone --depth 1 https://github.com/tmux-plugins/tmux-continuum ~/.tmux/plugins/tmux-continuum \
+  && git clone --depth 1 https://github.com/dracula/tmux ~/.tmux/plugins/tmux \
+  && git clone --depth 1 https://github.com/tmux-plugins/tmux-cpu ~/.tmux/plugins/tmux-cpu
 
-# --- Default shell ---
-RUN sudo chsh -s /bin/zsh sahil
+# --- tmux: config ---
+COPY --chown=${USERNAME}:${USERNAME} sandbox/tmux.conf /home/${USERNAME}/.tmux.conf
+
+# --- zsh: zinit + plugins (shallow clones) ---
+RUN git clone --depth 1 https://github.com/zdharma-continuum/zinit.git ~/.local/share/zinit/zinit.git \
+  && mkdir -p ~/.local/share/zinit/plugins \
+  && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting ~/.local/share/zinit/plugins/zsh-users---zsh-syntax-highlighting \
+  && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ~/.local/share/zinit/plugins/zsh-users---zsh-autosuggestions \
+  && git clone --depth 1 https://github.com/agkozak/zsh-z ~/.local/share/zinit/plugins/agkozak---zsh-z
+
+# --- zsh: config ---
+COPY --chown=${USERNAME}:${USERNAME} sandbox/zshrc /home/${USERNAME}/.zshrc
+
+# --- User dotfiles (empty dir if not provided) ---
+COPY --chown=${USERNAME}:${USERNAME} sandbox/dotfiles/ /home/${USERNAME}/.dotfiles/
+RUN if [ -f ~/.dotfiles/.gitconfig ]; then ln -sf ~/.dotfiles/.gitconfig ~/.gitconfig; fi \
+  && if [ -f ~/.dotfiles/.vimrc ]; then ln -sf ~/.dotfiles/.vimrc ~/.vimrc; fi \
+  && if [ -d ~/.dotfiles/.config ]; then cp -rsn ~/.dotfiles/.config/ ~/.config/ 2>/dev/null || true; fi
+
+# --- Claude credentials (empty dir if not provided) ---
+COPY --chown=${USERNAME}:${USERNAME} sandbox/claude/ /home/${USERNAME}/.claude-inject/
+RUN if [ -f ~/.claude-inject/.claude.json ]; then mv ~/.claude-inject/.claude.json ~/; fi \
+  && if [ -d ~/.claude-inject/settings ]; then \
+       mkdir -p ~/.claude && cp -r ~/.claude-inject/settings/* ~/.claude/; \
+     fi \
+  && rm -rf ~/.claude-inject
 
 # Forge manages lifecycle
 CMD ["sleep", "infinity"]

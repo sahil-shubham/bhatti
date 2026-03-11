@@ -252,12 +252,42 @@ func (t *termConn) Resize(rows, cols int) error {
 }
 
 func (e *Engine) Shell(ctx context.Context, id string) (engine.TerminalConn, error) {
+	// Inspect container to determine user and shell
+	info, err := e.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("inspect for shell: %w", err)
+	}
+
+	user := info.Config.User
+	shell := "/bin/sh"
+	workDir := "/"
+
+	if user != "" && user != "root" {
+		// Try the user's login shell via getent
+		result, err := e.Exec(ctx, id, []string{"getent", "passwd", user})
+		if err == nil && result.ExitCode == 0 {
+			// getent output: user:x:uid:gid:gecos:home:shell
+			parts := strings.SplitN(strings.TrimSpace(result.Stdout), ":", 7)
+			if len(parts) == 7 {
+				if parts[5] != "" {
+					workDir = parts[5]
+				}
+				if parts[6] != "" {
+					shell = parts[6]
+				}
+			}
+		}
+	}
+
 	execCfg := types.ExecConfig{
-		Cmd:          []string{"/bin/sh"},
+		Cmd:          []string{shell, "-li"},
+		User:         user,
+		WorkingDir:   workDir,
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          true,
+		Env:          []string{"TERM=xterm-256color"},
 	}
 	exec, err := e.cli.ContainerExecCreate(ctx, id, execCfg)
 	if err != nil {

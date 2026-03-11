@@ -1,0 +1,29 @@
+# forge sandbox zshrc
+
+# --- Zinit plugin manager ---
+ZINIT_HOME="$HOME/.local/share/zinit/zinit.git"
+if [[ -f "$ZINIT_HOME/zinit.zsh" ]]; then
+  source "$ZINIT_HOME/zinit.zsh"
+  zinit light zsh-users/zsh-syntax-highlighting
+  zinit light zsh-users/zsh-autosuggestions
+  zinit light agkozak/zsh-z
+fi
+
+autoload -Uz compinit && compinit
+
+# --- History ---
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt share_history hist_ignore_dups hist_ignore_space
+
+# --- Aliases ---
+alias ll='ls -lah'
+alias la='ls -A'
+
+# --- User dotfiles ---
+[ -f "$HOME/.dotfiles/.aliases" ] && source "$HOME/.dotfiles/.aliases"
+[ -f "$HOME/.dotfiles/.zshrc.local" ] && source "$HOME/.dotfiles/.zshrc.local"
+
+# --- Starship prompt ---
+eval "$(starship init zsh)"
