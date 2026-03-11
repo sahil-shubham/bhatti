@@ -12,8 +12,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/sahilshubham/forge/pkg/engine"
-	"github.com/sahilshubham/forge/pkg/store"
+	"github.com/sahilshubham/bhatti/pkg/engine"
+	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
 func (s *Server) routes() {

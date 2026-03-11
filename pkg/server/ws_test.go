@@ -12,8 +12,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	dockerengine "github.com/sahilshubham/forge/pkg/engine/docker"
-	"github.com/sahilshubham/forge/pkg/store"
+	dockerengine "github.com/sahilshubham/bhatti/pkg/engine/docker"
+	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
 func skipIfNoDocker(t *testing.T) {

@@ -1,8 +1,8 @@
 .PHONY: build sandbox test clean
 
-# Build the forge binary
+# Build the bhatti binary
 build:
-	go build -o forge ./cmd/forge/
+	go build -o bhatti ./cmd/bhatti/
 
 # Build the sandbox Docker image
 # Gathers user dotfiles and Claude credentials if present, then builds.
@@ -28,12 +28,12 @@ sandbox:
 	@if command -v security >/dev/null 2>&1; then \
 		security find-generic-password -s "Claude Code-credentials" -w > .build-ctx/sandbox/claude/settings/.credentials.json 2>/dev/null || true; \
 	fi
-	docker build -t forge-sandbox .build-ctx
+	docker build -t bhatti-sandbox .build-ctx
 	rm -rf .build-ctx
 
 test:
 	go test ./... -count=1 -timeout 60s
 
 clean:
-	rm -f forge
+	rm -f bhatti
 	rm -rf .build-ctx

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sahilshubham/forge/pkg/engine"
+	"github.com/sahilshubham/bhatti/pkg/engine"
 )
 
 func skipIfNoDocker(t *testing.T) {
@@ -36,7 +36,7 @@ func TestDockerLifecycle(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	name := "forge-test-" + time.Now().Format("150405")
+	name := "bhatti-test-" + time.Now().Format("150405")
 
 	// Create
 	info, err := e.Create(ctx, engine.SandboxSpec{
@@ -141,7 +141,7 @@ func TestDockerShell(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	name := "forge-shell-" + time.Now().Format("150405")
+	name := "bhatti-shell-" + time.Now().Format("150405")
 
 	info, err := e.Create(ctx, engine.SandboxSpec{
 		Name:  name,
@@ -160,7 +160,7 @@ func TestDockerShell(t *testing.T) {
 	defer conn.Close()
 
 	// Write a command
-	_, err = conn.Write([]byte("echo forge-test\n"))
+	_, err = conn.Write([]byte("echo bhatti-test\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestDockerShell(t *testing.T) {
 				break
 			}
 			total += string(buf[:n])
-			if strings.Contains(total, "forge-test") {
+			if strings.Contains(total, "bhatti-test") {
 				done <- total
 				return
 			}
@@ -186,8 +186,8 @@ func TestDockerShell(t *testing.T) {
 
 	select {
 	case output := <-done:
-		if !strings.Contains(output, "forge-test") {
-			t.Fatalf("expected 'forge-test' in output, got %q", output)
+		if !strings.Contains(output, "bhatti-test") {
+			t.Fatalf("expected 'bhatti-test' in output, got %q", output)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for shell output")

@@ -1,4 +1,4 @@
-# forge-sandbox: general-purpose dev sandbox
+# bhatti-sandbox: general-purpose dev sandbox
 #
 # A lean Ubuntu-based environment with zsh, node, tmux, and claude-code.
 # User dotfiles and Claude credentials are injected at build time if present.
@@ -8,7 +8,7 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG USERNAME=forge
+ARG USERNAME=bhatti
 ARG NODE_VERSION=22.16.0
 
 # --- System packages (runtime only) ---
@@ -79,5 +79,5 @@ RUN if [ -f ~/.claude-inject/.claude.json ]; then mv ~/.claude-inject/.claude.js
      fi \
   && rm -rf ~/.claude-inject
 
-# Forge manages lifecycle
+# Bhatti manages lifecycle
 CMD ["sleep", "infinity"]

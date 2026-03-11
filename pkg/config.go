@@ -13,21 +13,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config holds all forge configuration.
+// Config holds all bhatti configuration.
 type Config struct {
 	Engine    string `yaml:"engine"`     // "docker" or "firecracker"
 	Listen    string `yaml:"listen"`     // e.g. ":8080"
 	AuthToken string `yaml:"auth_token"` // bearer token
-	DataDir   string `yaml:"data_dir"`   // defaults to ~/.forge
+	DataDir   string `yaml:"data_dir"`   // defaults to ~/.bhatti
 }
 
-// DefaultDataDir returns ~/.forge.
+// DefaultDataDir returns ~/.bhatti.
 func DefaultDataDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".forge")
+	return filepath.Join(home, ".bhatti")
 }
 
-// LoadConfig reads ~/.forge/config.yaml or returns sensible defaults.
+// LoadConfig reads ~/.bhatti/config.yaml or returns sensible defaults.
 func LoadConfig() (*Config, error) {
 	dir := DefaultDataDir()
 	cfg := &Config{

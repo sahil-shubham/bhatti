@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Forge</title>
+<title>Bhatti</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
   @font-face {
@@ -476,7 +476,7 @@
   <div id="sidebar">
     <div id="sidebar-header">
       <div class="brand">
-        <h1>⚒ Forge</h1>
+        <h1>⚒ Bhatti</h1>
         <span class="badge">sandbox</span>
       </div>
       <button id="close-sidebar" onclick="closeSidebar()" aria-label="Close sidebar">
@@ -529,7 +529,7 @@
 <div id="auth-modal" class="modal-backdrop hidden">
   <div class="modal">
     <h2>Authentication</h2>
-    <p>Enter your token to connect to the Forge server.</p>
+    <p>Enter your token to connect to the Bhatti server.</p>
     <input id="auth-token-input" type="password" placeholder="Bearer token" autocomplete="off">
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="skipAuth()">Skip</button>
@@ -560,7 +560,7 @@
 // State
 // ============================================================
 const API = location.origin;
-let token = localStorage.getItem('forge_token') || '';
+let token = localStorage.getItem('bhatti_token') || '';
 let currentSandbox = null;
 let term = null;
 let ws = null;
@@ -594,7 +594,7 @@ function submitAuth() {
   const input = document.getElementById('auth-token-input');
   token = input.value.trim();
   if (token) {
-    localStorage.setItem('forge_token', token);
+    localStorage.setItem('bhatti_token', token);
   }
   document.getElementById('auth-modal').classList.add('hidden');
   init();

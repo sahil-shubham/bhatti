@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sahilshubham/forge/pkg/engine"
-	"github.com/sahilshubham/forge/pkg/store"
+	"github.com/sahilshubham/bhatti/pkg/engine"
+	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
 // mockEngine implements engine.Engine for testing without Docker.

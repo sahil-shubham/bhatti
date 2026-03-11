@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sahilshubham/forge/pkg"
-	"github.com/sahilshubham/forge/pkg/engine/docker"
-	"github.com/sahilshubham/forge/pkg/server"
-	"github.com/sahilshubham/forge/pkg/store"
+	"github.com/sahilshubham/bhatti/pkg"
+	"github.com/sahilshubham/bhatti/pkg/engine/docker"
+	"github.com/sahilshubham/bhatti/pkg/server"
+	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
 func main() {
@@ -64,7 +64,7 @@ func main() {
 		port = port // already just ":PORT"
 	}
 
-	log.Printf("forge listening on %s", cfg.Listen)
+	log.Printf("bhatti listening on %s", cfg.Listen)
 	if lanIP := getLanIP(); lanIP != "" {
 		log.Printf("  → local:   http://localhost%s", port)
 		log.Printf("  → network: http://%s%s", lanIP, port)

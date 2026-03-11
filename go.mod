@@ -1,4 +1,4 @@
-module github.com/sahilshubham/forge
+module github.com/sahilshubham/bhatti
 
 go 1.25.6
 

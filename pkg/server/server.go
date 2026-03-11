@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sahilshubham/forge/pkg/engine"
-	"github.com/sahilshubham/forge/pkg/store"
+	"github.com/sahilshubham/bhatti/pkg/engine"
+	"github.com/sahilshubham/bhatti/pkg/store"
 )
 
 // Server is the HTTP API server.
