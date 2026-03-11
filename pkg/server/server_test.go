@@ -241,16 +241,35 @@ func TestSandboxLifecycle(t *testing.T) {
 		t.Fatalf("unexpected exec result: %+v", result)
 	}
 
-	// Stop
+	// Stop — should return full sandbox object
 	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/stop", nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
+	var stoppedSB store.Sandbox
+	decodeJSON(t, resp, &stoppedSB)
+	if stoppedSB.Status != "stopped" {
+		t.Fatalf("expected stopped status, got %s", stoppedSB.Status)
+	}
+	if stoppedSB.StoppedAt == nil {
+		t.Fatal("expected stopped_at to be set")
+	}
+	if stoppedSB.ID != sb.ID {
+		t.Fatalf("expected same sandbox ID, got %s", stoppedSB.ID)
+	}
 
-	// Start
+	// Start — should return full sandbox object with refreshed info
 	resp = doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/start", nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var startedSB store.Sandbox
+	decodeJSON(t, resp, &startedSB)
+	if startedSB.Status != "running" {
+		t.Fatalf("expected running status, got %s", startedSB.Status)
+	}
+	if startedSB.ID != sb.ID {
+		t.Fatalf("expected same sandbox ID, got %s", startedSB.ID)
 	}
 
 	// Destroy

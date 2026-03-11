@@ -199,9 +199,15 @@
     margin-top: 2px;
   }
 
-  .sandbox-item .delete-btn {
+  .sandbox-item .actions {
+    display: flex;
+    gap: 4px;
     opacity: 0;
     transition: opacity 0.15s;
+  }
+  .sandbox-item:hover .actions { opacity: 1; }
+
+  .sandbox-item .action-btn {
     background: none;
     border: 1px solid var(--border);
     color: var(--fg-dim);
@@ -214,9 +220,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    transition: color 0.15s, border-color 0.15s;
   }
-  .sandbox-item:hover .delete-btn { opacity: 1; }
-  .sandbox-item .delete-btn:hover { color: var(--destructive); border-color: var(--destructive); }
+  .sandbox-item .action-btn:hover { color: var(--fg); border-color: var(--border-hover); }
+  .sandbox-item .action-btn.delete-btn:hover { color: var(--destructive); border-color: var(--destructive); }
+  .sandbox-item .action-btn.resume-btn:hover { color: var(--success); border-color: var(--success); }
+  .sandbox-item .action-btn.pause-btn:hover { color: var(--warning); border-color: var(--warning); }
 
   .empty-state {
     display: flex;
@@ -459,8 +468,8 @@
     #toast-container { bottom: 12px; right: 12px; left: 12px; }
     .toast { max-width: 100%; }
 
-    /* On mobile, make delete always visible */
-    .sandbox-item .delete-btn { opacity: 1; }
+    /* On mobile, make actions always visible */
+    .sandbox-item .actions { opacity: 1; }
 
     #detail-bar { padding: 6px 12px; gap: 10px; }
   }
@@ -507,6 +516,8 @@
       </button>
       <span id="toolbar-title"></span>
       <span id="toolbar-status" class="status-pill" style="display:none"></span>
+      <button id="toolbar-pause" class="btn btn-ghost btn-sm" style="display:none" onclick="toolbarPause()" title="Pause sandbox">⏸</button>
+      <button id="toolbar-resume" class="btn btn-ghost btn-sm" style="display:none" onclick="toolbarResume()" title="Resume sandbox">▶</button>
       <div id="conn-indicator"><span class="conn-dot"></span><span id="conn-text"></span></div>
     </div>
 
@@ -725,15 +736,27 @@ async function loadSandboxes() {
   sandboxes.forEach(sb => {
     const div = document.createElement('div');
     div.className = 'sandbox-item' + (currentSandbox && currentSandbox.id === sb.id ? ' active' : '');
+
+    const pauseBtn = sb.status === 'running'
+      ? `<button class="action-btn pause-btn" title="Pause"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg></button>`
+      : '';
+    const resumeBtn = sb.status === 'stopped'
+      ? `<button class="action-btn resume-btn" title="Resume"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg></button>`
+      : '';
+
     div.innerHTML = `
       <div class="status-dot ${sb.status}"></div>
       <div class="info">
         <div class="name">${esc(sb.name)}</div>
         <div class="meta">${sb.status}${sb.ip ? ' · ' + sb.ip : ''}</div>
       </div>
-      <button class="delete-btn" data-id="${sb.id}" aria-label="Destroy sandbox" title="Destroy">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
-      </button>
+      <div class="actions">
+        ${pauseBtn}
+        ${resumeBtn}
+        <button class="action-btn delete-btn" title="Destroy">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+        </button>
+      </div>
     `;
 
     // Click on info area → connect
@@ -745,6 +768,24 @@ async function loadSandboxes() {
       connectSandbox(sb.id);
       closeSidebar();
     });
+
+    // Pause button
+    const pauseEl = div.querySelector('.pause-btn');
+    if (pauseEl) {
+      pauseEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pauseSandbox(sb.id, sb.name);
+      });
+    }
+
+    // Resume button
+    const resumeEl = div.querySelector('.resume-btn');
+    if (resumeEl) {
+      resumeEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        resumeSandbox(sb.id, sb.name);
+      });
+    }
 
     // Delete button
     div.querySelector('.delete-btn').addEventListener('click', (e) => {
@@ -806,6 +847,61 @@ function destroySandbox(id, name) {
 }
 
 // ============================================================
+// Pause / Resume
+// ============================================================
+async function pauseSandbox(id, name) {
+  const { status, data } = await api('POST', '/sandboxes/' + id + '/stop');
+  if (status === 200) {
+    toast('Sandbox paused', 'success');
+    if (currentSandbox && currentSandbox.id === id) {
+      currentSandbox = data;
+      updateToolbar(data);
+    }
+    loadSandboxes();
+  } else {
+    toast(data.error || 'Failed to pause sandbox', 'error');
+  }
+}
+
+async function resumeSandbox(id, name) {
+  const { status, data } = await api('POST', '/sandboxes/' + id + '/start');
+  if (status === 200) {
+    toast('Sandbox resumed', 'success');
+    if (currentSandbox && currentSandbox.id === id) {
+      currentSandbox = data;
+      updateToolbar(data);
+      // Reconnect terminal now that it's running
+      disconnectTerminal();
+      reconnectAttempts = 0;
+      hidePlaceholder();
+      initTerminal(id);
+    }
+    loadSandboxes();
+  } else {
+    toast(data.error || 'Failed to resume sandbox', 'error');
+  }
+}
+
+function updateToolbar(sb) {
+  document.getElementById('toolbar-title').textContent = sb.name;
+  const badge = document.getElementById('toolbar-status');
+  badge.textContent = sb.status;
+  badge.className = 'status-pill ' + sb.status;
+  badge.style.display = '';
+
+  document.getElementById('toolbar-pause').style.display = sb.status === 'running' ? '' : 'none';
+  document.getElementById('toolbar-resume').style.display = sb.status === 'stopped' ? '' : 'none';
+}
+
+function toolbarPause() {
+  if (currentSandbox) pauseSandbox(currentSandbox.id, currentSandbox.name);
+}
+
+function toolbarResume() {
+  if (currentSandbox) resumeSandbox(currentSandbox.id, currentSandbox.name);
+}
+
+// ============================================================
 // Terminal connection
 // ============================================================
 async function connectSandbox(id) {
@@ -817,13 +913,7 @@ async function connectSandbox(id) {
 
   currentSandbox = data;
   loadSandboxes();
-
-  // Toolbar
-  document.getElementById('toolbar-title').textContent = data.name;
-  const badge = document.getElementById('toolbar-status');
-  badge.textContent = data.status;
-  badge.className = 'status-pill ' + data.status;
-  badge.style.display = '';
+  updateToolbar(data);
 
   // Detail bar
   document.getElementById('detail-template').textContent = getTemplateName(data.template_id);
@@ -841,6 +931,8 @@ function showPlaceholder() {
   document.getElementById('terminal-container').style.display = 'none';
   document.getElementById('toolbar-title').textContent = '';
   document.getElementById('toolbar-status').style.display = 'none';
+  document.getElementById('toolbar-pause').style.display = 'none';
+  document.getElementById('toolbar-resume').style.display = 'none';
   document.getElementById('detail-bar').style.display = 'none';
   setConnState('connected'); // hides indicator
 }
@@ -915,10 +1007,25 @@ function connectWebSocket(sandboxId) {
     term.write(data);
   };
 
-  ws.onclose = (e) => {
+  ws.onclose = async (e) => {
     setConnState('disconnected');
     // Don't reconnect if we intentionally disconnected or sandbox changed
     if (!currentSandbox || currentSandbox.id !== sandboxId) return;
+
+    // Check if sandbox is stopped — if so, show paused message instead of reconnecting
+    const { status, data } = await api('GET', '/sandboxes/' + sandboxId);
+    if (status === 200 && data.status === 'stopped') {
+      currentSandbox = data;
+      updateToolbar(data);
+      loadSandboxes();
+      term.write(`\r\n\x1b[33m[Sandbox paused — click Resume to continue]\x1b[0m\r\n`);
+      return;
+    }
+    if (status === 404) {
+      // Sandbox was destroyed
+      term.write(`\r\n\x1b[31m[Sandbox destroyed]\x1b[0m\r\n`);
+      return;
+    }
 
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);

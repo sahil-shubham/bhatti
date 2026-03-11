@@ -277,7 +277,8 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	s.store.StopSandbox(id)
-	writeJSON(w, 200, map[string]string{"status": "stopped"})
+	updated, _ := s.store.GetSandbox(id)
+	writeJSON(w, 200, updated)
 }
 
 func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id string) {
@@ -294,8 +295,16 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 		errResp(w, 500, err.Error())
 		return
 	}
-	s.store.UpdateSandboxStatus(id, "running")
-	writeJSON(w, 200, map[string]string{"status": "running"})
+	// Refresh from engine — IP may have changed after restart
+	info, err := s.engine.Status(r.Context(), sb.EngineID)
+	if err == nil {
+		s.store.UpdateSandboxStatus(id, info.Status)
+		s.store.UpdateSandboxEngine(id, sb.EngineID, info.IP)
+	} else {
+		s.store.UpdateSandboxStatus(id, "running")
+	}
+	updated, _ := s.store.GetSandbox(id)
+	writeJSON(w, 200, updated)
 }
 
 type execReq struct {
