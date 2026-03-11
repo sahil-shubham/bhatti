@@ -1,23 +1,39 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/sahilshubham/bhatti/pkg/engine"
 )
 
-func TestProxyManagerForwardAndStop(t *testing.T) {
-	pm := NewProxyManager()
+// tunnelMockEngine implements engine.Engine with a working Tunnel()
+// that connects to a local TCP server (simulating what socat does inside
+// a container).
+type tunnelMockEngine struct {
+	mockEngine
+	tunnelAddr string // address of the mock service to tunnel to
+}
 
-	// Start a mock "container" server
+func (m *tunnelMockEngine) Tunnel(_ context.Context, id string, port int) (io.ReadWriteCloser, error) {
+	conn, err := net.DialTimeout("tcp", m.tunnelAddr, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func TestProxyManagerForwardAndStop(t *testing.T) {
+	// Start a mock "service inside the container"
 	mockServer, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mockServer.Close()
-	mockPort := mockServer.Addr().(*net.TCPAddr).Port
 
 	go func() {
 		for {
@@ -32,8 +48,14 @@ func TestProxyManagerForwardAndStop(t *testing.T) {
 		}
 	}()
 
+	eng := &tunnelMockEngine{
+		mockEngine: *newMockEngine(),
+		tunnelAddr: mockServer.Addr().String(),
+	}
+	pm := NewProxyManager(eng)
+
 	// Forward
-	entry, err := pm.Forward("sb1", "127.0.0.1", mockPort)
+	entry, err := pm.Forward("sb1", "engine-id-1", 4321)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +66,7 @@ func TestProxyManagerForwardAndStop(t *testing.T) {
 		t.Fatalf("expected sb1, got %s", entry.SandboxID)
 	}
 
-	// Connect through the forward
+	// Connect through the forward — data should tunnel through
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", entry.HostPort), 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +82,7 @@ func TestProxyManagerForwardAndStop(t *testing.T) {
 	conn.Close()
 
 	// Idempotent forward — same entry returned
-	entry2, err := pm.Forward("sb1", "127.0.0.1", mockPort)
+	entry2, err := pm.Forward("sb1", "engine-id-1", 4321)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,40 +102,27 @@ func TestProxyManagerForwardAndStop(t *testing.T) {
 		t.Fatalf("expected 1 total forward, got %d", len(all))
 	}
 
-	// PortOwner
-	owner, ok := pm.PortOwner(entry.HostPort)
-	if !ok || owner != "sb1" {
-		t.Fatalf("expected sb1 owns port %d", entry.HostPort)
-	}
-
 	// StopAll
 	pm.StopAll("sb1")
 	fwds = pm.ActiveForwards("sb1")
 	if len(fwds) != 0 {
 		t.Fatal("expected 0 forwards after StopAll")
 	}
-	_, ok = pm.PortOwner(entry.HostPort)
-	if ok {
-		t.Fatal("expected port to be released")
-	}
 }
 
 func TestProxyManagerStopForward(t *testing.T) {
-	pm := NewProxyManager()
+	eng := &tunnelMockEngine{mockEngine: *newMockEngine(), tunnelAddr: "127.0.0.1:1"}
+	pm := NewProxyManager(eng)
 
-	mockServer, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer mockServer.Close()
-	mockPort := mockServer.Addr().(*net.TCPAddr).Port
-
-	pm.Forward("sb1", "127.0.0.1", mockPort)
-	pm.Forward("sb1", "127.0.0.1", mockPort+1) // different container port (will fail to connect but that's fine for this test)
+	pm.Forward("sb1", "eid1", 3000)
+	pm.Forward("sb1", "eid1", 3001)
 
 	fwds := pm.ActiveForwards("sb1")
 	if len(fwds) != 2 {
 		t.Fatalf("expected 2 forwards, got %d", len(fwds))
 	}
 
-	pm.StopForward("sb1", mockPort)
+	pm.StopForward("sb1", 3000)
 	fwds = pm.ActiveForwards("sb1")
 	if len(fwds) != 1 {
 		t.Fatalf("expected 1 forward after stopping one, got %d", len(fwds))
@@ -121,14 +130,11 @@ func TestProxyManagerStopForward(t *testing.T) {
 }
 
 func TestProxyManagerMultipleSandboxes(t *testing.T) {
-	pm := NewProxyManager()
+	eng := &tunnelMockEngine{mockEngine: *newMockEngine(), tunnelAddr: "127.0.0.1:1"}
+	pm := NewProxyManager(eng)
 
-	mockServer, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer mockServer.Close()
-	mockPort := mockServer.Addr().(*net.TCPAddr).Port
-
-	pm.Forward("sb1", "127.0.0.1", mockPort)
-	pm.Forward("sb2", "127.0.0.1", mockPort)
+	pm.Forward("sb1", "eid1", 3000)
+	pm.Forward("sb2", "eid2", 3000)
 
 	all := pm.AllForwards()
 	if len(all) != 2 {
@@ -146,7 +152,8 @@ func TestProxyManagerMultipleSandboxes(t *testing.T) {
 }
 
 func TestProxyManagerEmptyForwards(t *testing.T) {
-	pm := NewProxyManager()
+	eng := &tunnelMockEngine{mockEngine: *newMockEngine(), tunnelAddr: "127.0.0.1:1"}
+	pm := NewProxyManager(eng)
 
 	fwds := pm.ActiveForwards("nonexistent")
 	if len(fwds) != 0 {
@@ -158,7 +165,10 @@ func TestProxyManagerEmptyForwards(t *testing.T) {
 		t.Fatalf("expected 0 forwards, got %d", len(all))
 	}
 
-	// StopAll on nonexistent sandbox should not panic
+	// Should not panic
 	pm.StopAll("nonexistent")
 	pm.StopForward("nonexistent", 8080)
 }
+
+// Ensure tunnelMockEngine satisfies engine.Engine at compile time.
+var _ engine.Engine = (*tunnelMockEngine)(nil)

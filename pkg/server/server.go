@@ -29,7 +29,7 @@ func New(eng engine.Engine, st *store.Store, authToken string, webDir ...string)
 		store:     st,
 		authToken: authToken,
 		mux:       http.NewServeMux(),
-		proxy:     NewProxyManager(),
+		proxy:     NewProxyManager(eng),
 	}
 	s.routes()
 	if len(webDir) > 0 && webDir[0] != "" {
@@ -72,7 +72,6 @@ func (s *Server) scanPorts() {
 	}
 	for _, sb := range sandboxes {
 		if sb.Status != "running" {
-			// Sandbox stopped — tear down any forwards
 			s.proxy.StopAll(sb.ID)
 			continue
 		}
@@ -89,16 +88,10 @@ func (s *Server) scanPorts() {
 			currentSet[f.ContainerPort] = true
 		}
 
-		// Get sandbox IP for forwarding
-		info, err := s.engine.Status(context.Background(), sb.EngineID)
-		if err != nil {
-			continue
-		}
-
-		// Forward new ports
+		// Forward new ports (tunneled through engine, no IP needed)
 		for _, p := range ports {
 			if !currentSet[p] {
-				s.proxy.Forward(sb.ID, info.IP, p)
+				s.proxy.Forward(sb.ID, sb.EngineID, p)
 			}
 		}
 

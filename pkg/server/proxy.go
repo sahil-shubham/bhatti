@@ -2,17 +2,17 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"sync"
-	"time"
+
+	"github.com/sahilshubham/bhatti/pkg/engine"
 )
 
 // ForwardEntry represents an active port forward from host to sandbox.
 type ForwardEntry struct {
 	SandboxID     string `json:"sandbox_id"`
-	SandboxIP     string `json:"sandbox_ip"`
+	EngineID      string `json:"-"`
 	ContainerPort int    `json:"container_port"`
 	HostPort      int    `json:"host_port"`
 	listener      net.Listener
@@ -20,34 +20,39 @@ type ForwardEntry struct {
 }
 
 // ProxyManager manages TCP port forwards from the host to sandbox containers.
+// Forwards are tunneled through Engine.Tunnel() — no direct network access
+// to the sandbox is required. This works on Docker Desktop (where container
+// IPs are unreachable) and will work identically with Firecracker via vsock.
 type ProxyManager struct {
 	mu        sync.Mutex
+	engine    engine.Engine
 	forwards  map[string]map[int]*ForwardEntry // sandboxID → containerPort → entry
 	usedPorts map[int]string                   // hostPort → sandboxID
 }
 
 // NewProxyManager creates a new ProxyManager.
-func NewProxyManager() *ProxyManager {
+func NewProxyManager(eng engine.Engine) *ProxyManager {
 	return &ProxyManager{
+		engine:    eng,
 		forwards:  make(map[string]map[int]*ForwardEntry),
 		usedPorts: make(map[int]string),
 	}
 }
 
 // Forward creates a TCP port forward from a random host port to containerPort
-// on the given sandbox IP. Returns the existing forward if already active.
-func (pm *ProxyManager) Forward(sandboxID, sandboxIP string, containerPort int) (*ForwardEntry, error) {
+// inside the sandbox, tunneled through Engine.Tunnel(). Returns the existing
+// forward if already active.
+func (pm *ProxyManager) Forward(sandboxID, engineID string, containerPort int) (*ForwardEntry, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	// Already forwarding this port for this sandbox?
 	if fwd, exists := pm.forwards[sandboxID][containerPort]; exists {
 		return fwd, nil
 	}
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
-		return nil, fmt.Errorf("listen: %w", err)
+		return nil, err
 	}
 
 	hostPort := ln.Addr().(*net.TCPAddr).Port
@@ -55,14 +60,14 @@ func (pm *ProxyManager) Forward(sandboxID, sandboxIP string, containerPort int) 
 
 	entry := &ForwardEntry{
 		SandboxID:     sandboxID,
-		SandboxIP:     sandboxIP,
+		EngineID:      engineID,
 		ContainerPort: containerPort,
 		HostPort:      hostPort,
 		listener:      ln,
 		cancel:        cancel,
 	}
 
-	go pm.relay(ctx, ln, sandboxIP, containerPort)
+	go pm.accept(ctx, ln, engineID, containerPort)
 
 	if pm.forwards[sandboxID] == nil {
 		pm.forwards[sandboxID] = make(map[int]*ForwardEntry)
@@ -70,6 +75,37 @@ func (pm *ProxyManager) Forward(sandboxID, sandboxIP string, containerPort int) 
 	pm.forwards[sandboxID][containerPort] = entry
 	pm.usedPorts[hostPort] = sandboxID
 	return entry, nil
+}
+
+// accept handles incoming connections on the host-side listener.
+// Each connection spawns a new Engine.Tunnel() into the sandbox.
+func (pm *ProxyManager) accept(ctx context.Context, ln net.Listener, engineID string, port int) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				continue
+			}
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			tunnel, err := pm.engine.Tunnel(context.Background(), engineID, port)
+			if err != nil {
+				return
+			}
+			defer tunnel.Close()
+			done := make(chan struct{})
+			go func() {
+				io.Copy(tunnel, c)
+				close(done)
+			}()
+			io.Copy(c, tunnel)
+			<-done
+		}(conn)
+	}
 }
 
 // StopForward stops a single port forward for a sandbox.
@@ -127,42 +163,4 @@ func (pm *ProxyManager) AllForwards() []ForwardEntry {
 		}
 	}
 	return out
-}
-
-// PortOwner returns the sandbox ID that owns a given host port, if any.
-func (pm *ProxyManager) PortOwner(hostPort int) (string, bool) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	id, ok := pm.usedPorts[hostPort]
-	return id, ok
-}
-
-func (pm *ProxyManager) relay(ctx context.Context, ln net.Listener, ip string, port int) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				continue
-			}
-		}
-		go func(c net.Conn) {
-			defer c.Close()
-			remote, err := net.DialTimeout("tcp",
-				fmt.Sprintf("%s:%d", ip, port), 3*time.Second)
-			if err != nil {
-				return
-			}
-			defer remote.Close()
-			done := make(chan struct{})
-			go func() {
-				io.Copy(remote, c)
-				close(done)
-			}()
-			io.Copy(c, remote)
-			<-done
-		}(conn)
-	}
 }

@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -213,7 +217,15 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 
 	// Sub-routes
 	if len(parts) == 2 {
-		switch parts[1] {
+		sub := parts[1]
+
+		// Handle proxy/:port/... — sub may be "proxy/4321" or "proxy/4321/some/path"
+		if strings.HasPrefix(sub, "proxy/") {
+			s.handleSandboxProxyRoute(w, r, id, strings.TrimPrefix(sub, "proxy/"))
+			return
+		}
+
+		switch sub {
 		case "stop":
 			s.handleSandboxStop(w, r, id)
 		case "start":
@@ -479,8 +491,8 @@ func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
 type portInfo struct {
 	SandboxID     string `json:"sandbox_id,omitempty"`
 	ContainerPort int    `json:"container_port"`
-	HostPort      int    `json:"host_port"`
-	URL           string `json:"url"`
+	ProxyURL      string `json:"proxy_url"`
+	HostPort      int    `json:"host_port,omitempty"` // raw TCP forward, if active
 }
 
 func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request, id string) {
@@ -488,14 +500,34 @@ func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request, id s
 		errResp(w, 405, "method not allowed")
 		return
 	}
+	sb, err := s.store.GetSandbox(id)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+
+	ports, err := s.engine.ListeningPorts(r.Context(), sb.EngineID)
+	if err != nil {
+		ports = []int{}
+	}
+
+	// Build active forward lookup
 	forwards := s.proxy.ActiveForwards(id)
-	out := make([]portInfo, 0, len(forwards))
+	fwdMap := map[int]int{} // containerPort → hostPort
 	for _, f := range forwards {
-		out = append(out, portInfo{
-			ContainerPort: f.ContainerPort,
-			HostPort:      f.HostPort,
-			URL:           fmt.Sprintf("http://localhost:%d", f.HostPort),
-		})
+		fwdMap[f.ContainerPort] = f.HostPort
+	}
+
+	out := make([]portInfo, 0, len(ports))
+	for _, p := range ports {
+		pi := portInfo{
+			ContainerPort: p,
+			ProxyURL:      fmt.Sprintf("/sandboxes/%s/proxy/%d/", id, p),
+		}
+		if hp, ok := fwdMap[p]; ok {
+			pi.HostPort = hp
+		}
+		out = append(out, pi)
 	}
 	writeJSON(w, 200, out)
 }
@@ -505,15 +537,31 @@ func (s *Server) handleAllPorts(w http.ResponseWriter, r *http.Request) {
 		errResp(w, 405, "method not allowed")
 		return
 	}
-	forwards := s.proxy.AllForwards()
-	out := make([]portInfo, 0, len(forwards))
-	for _, f := range forwards {
-		out = append(out, portInfo{
-			SandboxID:     f.SandboxID,
-			ContainerPort: f.ContainerPort,
-			HostPort:      f.HostPort,
-			URL:           fmt.Sprintf("http://localhost:%d", f.HostPort),
-		})
+	sandboxes, err := s.store.ListSandboxes()
+	if err != nil {
+		errResp(w, 500, err.Error())
+		return
+	}
+
+	var out []portInfo
+	for _, sb := range sandboxes {
+		if sb.Status != "running" {
+			continue
+		}
+		ports, err := s.engine.ListeningPorts(context.Background(), sb.EngineID)
+		if err != nil {
+			continue
+		}
+		for _, p := range ports {
+			out = append(out, portInfo{
+				SandboxID:     sb.ID,
+				ContainerPort: p,
+				ProxyURL:      fmt.Sprintf("/sandboxes/%s/proxy/%d/", sb.ID, p),
+			})
+		}
+	}
+	if out == nil {
+		out = []portInfo{}
 	}
 	writeJSON(w, 200, out)
 }
@@ -584,6 +632,134 @@ func (s *Server) handleVolume(w http.ResponseWriter, r *http.Request) {
 	default:
 		errResp(w, 405, "method not allowed")
 	}
+}
+
+// --- HTTP Reverse Proxy (tunneled through Engine) ---
+
+// handleSandboxProxyRoute parses the port from the path and delegates.
+// Path format: ":port" or ":port/rest/of/path"
+func (s *Server) handleSandboxProxyRoute(w http.ResponseWriter, r *http.Request, sandboxID, portPath string) {
+	// Split "4321/some/path" → port=4321, rest="/some/path"
+	portStr := portPath
+	rest := "/"
+	if idx := strings.IndexByte(portPath, '/'); idx >= 0 {
+		portStr = portPath[:idx]
+		rest = portPath[idx:]
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		errResp(w, 400, "invalid port")
+		return
+	}
+
+	sb, err := s.store.GetSandbox(sandboxID)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+
+	// WebSocket upgrade → tunnel raw bytes
+	if websocket.IsWebSocketUpgrade(r) {
+		s.handleProxyWS(w, r, sb.EngineID, port, rest)
+		return
+	}
+
+	// Regular HTTP → tunnel through exec
+	s.handleProxyHTTP(w, r, sb.EngineID, port, rest)
+}
+
+// handleProxyHTTP tunnels an HTTP request/response through Engine.Tunnel().
+func (s *Server) handleProxyHTTP(w http.ResponseWriter, r *http.Request, engineID string, port int, path string) {
+	tunnel, err := s.engine.Tunnel(r.Context(), engineID, port)
+	if err != nil {
+		errResp(w, 502, "tunnel failed: "+err.Error())
+		return
+	}
+	defer tunnel.Close()
+
+	// Rewrite the request to target localhost:port inside the sandbox
+	outReq := r.Clone(r.Context())
+	outReq.URL.Scheme = "http"
+	outReq.URL.Host = fmt.Sprintf("localhost:%d", port)
+	outReq.URL.Path = path
+	outReq.URL.RawQuery = r.URL.RawQuery
+	outReq.RequestURI = ""
+	outReq.Host = fmt.Sprintf("localhost:%d", port)
+
+	// Write the HTTP request into the tunnel
+	if err := outReq.Write(tunnel); err != nil {
+		errResp(w, 502, "failed to write request")
+		return
+	}
+
+	// Read the HTTP response from the tunnel
+	resp, err := http.ReadResponse(bufio.NewReader(tunnel), outReq)
+	if err != nil {
+		errResp(w, 502, "bad gateway: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// handleProxyWS tunnels a WebSocket connection through Engine.Tunnel().
+// The browser's WS connects to bhatti; bhatti opens a tunnel into the sandbox
+// and relays the raw HTTP upgrade + subsequent WS frames bidirectionally.
+func (s *Server) handleProxyWS(w http.ResponseWriter, r *http.Request, engineID string, port int, path string) {
+	tunnel, err := s.engine.Tunnel(r.Context(), engineID, port)
+	if err != nil {
+		errResp(w, 502, "tunnel failed: "+err.Error())
+		return
+	}
+	defer tunnel.Close()
+
+	// Hijack the browser connection to get the raw net.Conn
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		errResp(w, 500, "server doesn't support hijacking")
+		return
+	}
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		errResp(w, 500, "hijack failed")
+		return
+	}
+	defer clientConn.Close()
+
+	// Forward the original upgrade request into the tunnel
+	outReq := r.Clone(r.Context())
+	outReq.URL.Scheme = "http"
+	outReq.URL.Host = fmt.Sprintf("localhost:%d", port)
+	outReq.URL.Path = path
+	outReq.URL.RawQuery = r.URL.RawQuery
+	outReq.RequestURI = ""
+	outReq.Host = fmt.Sprintf("localhost:%d", port)
+	outReq.Write(tunnel)
+
+	// Read the upgrade response from the tunnel and forward to browser
+	resp, err := http.ReadResponse(bufio.NewReader(tunnel), outReq)
+	if err != nil {
+		return
+	}
+	resp.Write(clientBuf)
+	clientBuf.Flush()
+
+	// Bidirectional relay — both sides are now speaking WebSocket frames
+	done := make(chan struct{})
+	go func() {
+		io.Copy(tunnel, clientConn)
+		close(done)
+	}()
+	io.Copy(clientConn, tunnel)
+	<-done
 }
 
 func genID() string {

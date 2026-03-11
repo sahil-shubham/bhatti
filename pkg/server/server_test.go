@@ -86,6 +86,10 @@ func (m *mockEngine) ListeningPorts(_ context.Context, id string) ([]int, error)
 	return nil, nil // no ports in mock
 }
 
+func (m *mockEngine) Tunnel(_ context.Context, id string, port int) (io.ReadWriteCloser, error) {
+	return nil, io.EOF // not tested in unit tests
+}
+
 func setup(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()

@@ -69,3 +69,45 @@ func TestParseProcNetTCPEmpty(t *testing.T) {
 		t.Fatalf("expected 0 ports, got %d", len(ports))
 	}
 }
+
+func TestParseProcNetTCPv6(t *testing.T) {
+	// Combined /proc/net/tcp + /proc/net/tcp6 output (as produced by cat)
+	input := `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:10E1 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 3315777 1 000000009c504184 100 0 0 10 0
+   1: 00000000000000000000000000000000:961B 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 3315765 1 00000000b4288899 100 0 0 10 0`
+
+	ports := parseProcNetTCP(input)
+	sort.Ints(ports)
+
+	// 0x1F90 = 8080, 0x10E1 = 4321, 0x961B = 38427
+	if len(ports) != 3 {
+		t.Fatalf("expected 3 ports, got %d: %v", len(ports), ports)
+	}
+	expected := []int{4321, 8080, 38427}
+	for i, p := range ports {
+		if p != expected[i] {
+			t.Fatalf("expected %v, got %v", expected, ports)
+		}
+	}
+}
+
+func TestParseSSOutputIPv6(t *testing.T) {
+	input := `LISTEN  0       128          0.0.0.0:8080       0.0.0.0:*
+LISTEN  0       128             [::]:4321          [::]:*
+LISTEN  0       128                *:3000             *:*`
+
+	ports := parseSSOutput(input)
+	sort.Ints(ports)
+
+	if len(ports) != 3 {
+		t.Fatalf("expected 3 ports, got %d: %v", len(ports), ports)
+	}
+	expected := []int{3000, 4321, 8080}
+	for i, p := range ports {
+		if p != expected[i] {
+			t.Fatalf("expected %v, got %v", expected, ports)
+		}
+	}
+}

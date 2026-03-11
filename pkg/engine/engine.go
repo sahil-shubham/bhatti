@@ -58,4 +58,10 @@ type Engine interface {
 	Exec(ctx context.Context, id string, cmd []string) (ExecResult, error)
 	Shell(ctx context.Context, id string) (TerminalConn, error)
 	ListeningPorts(ctx context.Context, id string) ([]int, error)
+
+	// Tunnel opens a bidirectional byte stream to localhost:port inside the
+	// sandbox. The caller reads/writes raw TCP bytes. How the connection is
+	// established is engine-specific (Docker: exec socat, Firecracker: vsock
+	// to guest agent). The returned connection must be closed by the caller.
+	Tunnel(ctx context.Context, id string, port int) (io.ReadWriteCloser, error)
 }

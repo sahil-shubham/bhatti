@@ -352,6 +352,29 @@
   #detail-bar .detail-label { color: var(--fg-dim); }
   #detail-bar .detail-value { color: var(--fg-muted); font-family: var(--font-mono); font-size: 11px; }
 
+  /* Ports */
+  #detail-ports { display: flex; align-items: center; gap: 4px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+  .port-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 99px;
+    background: rgba(59,130,246,0.12);
+    color: var(--accent);
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid rgba(59,130,246,0.2);
+    transition: background 0.15s, border-color 0.15s;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .port-pill:hover { background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.4); }
+  .port-pill .port-icon { font-size: 10px; }
+  .no-ports { font-size: 11px; color: var(--fg-dim); }
+
   /* === Overlay === */
   #sidebar-overlay {
     display: none;
@@ -481,7 +504,8 @@
     /* On mobile, make actions always visible */
     .sandbox-item .actions { opacity: 1; }
 
-    #detail-bar { padding: 6px 12px; gap: 10px; }
+    #detail-bar { padding: 6px 12px; gap: 6px; }
+    #detail-ports { margin-left: 0; width: 100%; justify-content: flex-start; }
   }
 </style>
 </head>
@@ -540,6 +564,7 @@
     <div id="detail-bar">
       <div class="detail-item"><span class="detail-label">Template</span><span class="detail-value" id="detail-template">—</span></div>
       <div class="detail-item"><span class="detail-label">Created</span><span class="detail-value" id="detail-created">—</span></div>
+      <div id="detail-ports"></div>
     </div>
 
     <div id="placeholder">
@@ -942,6 +967,7 @@ async function resumeSandbox(id, name) {
       reconnectAttempts = 0;
       hidePlaceholder();
       initTerminal(id);
+      startPortPolling();
     }
     loadSandboxes();
   } else {
@@ -1009,6 +1035,7 @@ async function connectSandbox(id) {
   disconnectTerminal();
   reconnectAttempts = 0;
   initTerminal(id);
+  startPortPolling();
 }
 
 function showPlaceholder() {
@@ -1019,6 +1046,7 @@ function showPlaceholder() {
   document.getElementById('toolbar-pause').style.display = 'none';
   document.getElementById('toolbar-resume').style.display = 'none';
   document.getElementById('detail-bar').style.display = 'none';
+  stopPortPolling();
   setConnState('connected'); // hides indicator
 }
 
@@ -1137,6 +1165,47 @@ function connectWebSocket(sandboxId) {
       ws.send(JSON.stringify({ type: 'resize', rows, cols }));
     }
   });
+}
+
+// ============================================================
+// Port forwarding
+// ============================================================
+let portsTimer = null;
+
+function startPortPolling() {
+  stopPortPolling();
+  pollPorts();
+  portsTimer = setInterval(pollPorts, 3000);
+}
+
+function stopPortPolling() {
+  clearInterval(portsTimer);
+  portsTimer = null;
+  document.getElementById('detail-ports').innerHTML = '';
+}
+
+async function pollPorts() {
+  if (!currentSandbox || currentSandbox.status !== 'running') {
+    document.getElementById('detail-ports').innerHTML = '';
+    return;
+  }
+  const { status, data } = await api('GET', '/sandboxes/' + currentSandbox.id + '/ports');
+  if (status !== 200 || !currentSandbox) return;
+
+  const container = document.getElementById('detail-ports');
+  const ports = data || [];
+
+  if (ports.length === 0) {
+    container.innerHTML = '<span class="no-ports">No ports detected</span>';
+    return;
+  }
+
+  container.innerHTML = ports.map(p => {
+    const url = location.origin + p.proxy_url;
+    return `<a class="port-pill" href="${esc(url)}" target="_blank" rel="noopener" title="Port ${p.container_port} (proxied)">` +
+      `<span class="port-icon">↗</span>${p.container_port}` +
+      `</a>`;
+  }).join('');
 }
 
 // ============================================================
