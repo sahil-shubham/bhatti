@@ -41,6 +41,7 @@ func main() {
 
 	bringUpInterface("lo")
 	setupNetworking()
+	ensureResolvConf()
 	installSignalHandlers()
 
 	// Listen on vsock (works for cold boot, broken after snapshot/restore).
@@ -84,6 +85,15 @@ func mustMount(source, target, fstype string, flags uintptr, data string) {
 	os.MkdirAll(target, 0755)
 	if err := syscall.Mount(source, target, fstype, flags, data); err != nil {
 		fmt.Fprintf(os.Stderr, "bhatti-agent: mount %s on %s: %v\n", source, target, err)
+	}
+}
+
+func ensureResolvConf() {
+	const path = "/etc/resolv.conf"
+	// Remove any broken symlink (e.g. from systemd-resolved stub)
+	os.Remove(path)
+	if err := os.WriteFile(path, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "bhatti-agent: write resolv.conf: %v\n", err)
 	}
 }
 
