@@ -6,8 +6,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/sahilshubham/bhatti/pkg"
 	"github.com/sahilshubham/bhatti/pkg/engine"
@@ -83,6 +85,18 @@ func main() {
 		log.Printf("  → local:   http://localhost%s", port)
 		log.Printf("  → network: http://%s%s", lanIP, port)
 	}
+
+	// Graceful shutdown: clean up TAP devices on SIGTERM/SIGINT
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		<-sigCh
+		log.Println("shutting down...")
+		if shutdowner, ok := eng.(interface{ Shutdown() }); ok {
+			shutdowner.Shutdown()
+		}
+		os.Exit(0)
+	}()
 
 	if err := http.ListenAndServe(cfg.Listen, srv); err != nil {
 		log.Fatal(err)

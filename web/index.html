@@ -796,6 +796,15 @@ async function loadSandboxes() {
     return;
   }
 
+  // If the current sandbox's status changed externally, update the toolbar
+  if (currentSandbox) {
+    const updated = sandboxes.find(s => s.id === currentSandbox.id);
+    if (updated && updated.status !== currentSandbox.status) {
+      currentSandbox = updated;
+      updateToolbar(updated);
+    }
+  }
+
   list.innerHTML = '';
   sandboxes.forEach(sb => {
     const div = document.createElement('div');
@@ -962,10 +971,11 @@ async function resumeSandbox(id, name) {
     if (currentSandbox && currentSandbox.id === id) {
       currentSandbox = data;
       updateToolbar(data);
-      // Reconnect terminal now that it's running
+      // Reconnect terminal — small delay to let agent fully stabilize after resume
       disconnectTerminal();
       reconnectAttempts = 0;
       hidePlaceholder();
+      await new Promise(r => setTimeout(r, 500));
       initTerminal(id);
       startPortPolling();
     }

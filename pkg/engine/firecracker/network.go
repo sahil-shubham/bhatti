@@ -81,6 +81,50 @@ func detectDefaultInterface() string {
 	return "eth0"
 }
 
+// cleanupOrphanedTapDevices removes any TAP devices prefixed with "tap" that
+// don't belong to a known VM. Called on engine startup to recover from crashes.
+func cleanupOrphanedTapDevices(knownTaps map[string]bool) {
+	out, err := exec.Command("ip", "-o", "link", "show", "type", "tun").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// Format: "N: tapXXXXXXXX: <FLAGS>..."
+		name := strings.TrimSuffix(fields[1], ":")
+		if !strings.HasPrefix(name, "tap") {
+			continue
+		}
+		if knownTaps[name] {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "bhatti: cleaning orphaned TAP: %s\n", name)
+		run("ip", "link", "del", name)
+	}
+}
+
+// cleanupAllTapDevices removes all bhatti-created TAP devices.
+// Called on engine shutdown.
+func cleanupAllTapDevices() {
+	out, err := exec.Command("ip", "-o", "link", "show", "type", "tun").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimSuffix(fields[1], ":")
+		if strings.HasPrefix(name, "tap") {
+			run("ip", "link", "del", name)
+		}
+	}
+}
+
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Stderr = os.Stderr

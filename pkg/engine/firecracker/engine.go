@@ -76,11 +76,41 @@ func New(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("create sandbox dir: %w", err)
 	}
 
-	return &Engine{
+	eng := &Engine{
 		vms:     make(map[string]*VM),
 		cfg:     cfg,
 		nextCID: 3, // 0=hypervisor, 1=loopback, 2=host
-	}, nil
+	}
+
+	// Clean up orphaned TAP devices from previous crashes.
+	// At this point no VMs are loaded yet, so all TAPs are orphans.
+	cleanupOrphanedTapDevices(nil)
+
+	return eng, nil
+}
+
+// Shutdown stops all running VMs and cleans up all TAP devices.
+// Called on server shutdown (SIGTERM).
+func (e *Engine) Shutdown() {
+	e.mu.RLock()
+	ids := make([]string, 0, len(e.vms))
+	for id := range e.vms {
+		ids = append(ids, id)
+	}
+	e.mu.RUnlock()
+
+	for _, id := range ids {
+		vm, err := e.getVM(id)
+		if err != nil {
+			continue
+		}
+		if vm.Status == "running" && vm.cmd != nil {
+			vm.cmd.Process.Kill()
+			vm.cmd.Wait()
+		}
+	}
+
+	cleanupAllTapDevices()
 }
 
 func (e *Engine) getVM(id string) (*VM, error) {
@@ -368,10 +398,14 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 		return err
 	}
 
-	if vm.Status == "running" {
+	if vm.Status == "running" && vm.cmd != nil {
 		vm.cmd.Process.Kill()
 		vm.cmd.Wait()
 		vm.cancel()
+	}
+
+	// Always clean up TAP — whether running or stopped.
+	if vm.TapDevice != "" {
 		destroyTapDevice(vm.TapDevice, vm.CID)
 	}
 
