@@ -1,30 +1,77 @@
 #!/usr/bin/env bash
 #
-# Run bhatti agent tests on Pi via SSH.
+# Run bhatti tests on Pi via SSH.
 #
 # Usage:
-#   ./scripts/test-on-pi.sh                    # all tests
-#   ./scripts/test-on-pi.sh TestAgentTTY       # single test
-#   PI_HOST=user@10.0.0.5 ./scripts/test-on-pi.sh  # different Pi
+#   ./scripts/test-on-pi.sh                          # all agent + client tests
+#   ./scripts/test-on-pi.sh agent                     # Part 2: agent tests only
+#   ./scripts/test-on-pi.sh client                    # Part 3: client tests only
+#   ./scripts/test-on-pi.sh agent TestAgentTTY        # single test
+#   PI_HOST=user@10.0.0.5 ./scripts/test-on-pi.sh    # different Pi
 #
 set -euo pipefail
 
 PI_HOST="${PI_HOST:-user@192.168.1.201}"
-PI_TMP="/tmp/bhatti-agent-test"
-LOCAL_BIN="bin/bhatti-agent-test-linux-arm64"
+PI_DIR="/tmp/bhatti-test"
 
-TEST_RUN="${1:-}"
-EXTRA_ARGS=""
-if [[ -n "$TEST_RUN" ]]; then
-    EXTRA_ARGS="-test.run=$TEST_RUN"
-fi
+SUITE="${1:-all}"
+TEST_FILTER="${2:-}"
 
-echo "==> Cross-compiling test binary..."
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c \
-    -o "$LOCAL_BIN" ./cmd/bhatti-agent
+echo "==> Building agent binary..."
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+    -ldflags='-s -w' \
+    -o bin/bhatti-agent-linux-arm64 \
+    ./cmd/bhatti-agent
 
-echo "==> Uploading to $PI_HOST:$PI_TMP..."
-scp -q "$LOCAL_BIN" "$PI_HOST:$PI_TMP"
+run_agent_tests() {
+    echo "==> Compiling agent test binary..."
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c \
+        -o bin/bhatti-agent-test-linux-arm64 ./cmd/bhatti-agent
 
-echo "==> Running tests on Pi..."
-ssh "$PI_HOST" "chmod +x $PI_TMP && $PI_TMP -test.v -test.timeout=60s $EXTRA_ARGS"
+    echo "==> Uploading to $PI_HOST..."
+    ssh "$PI_HOST" "mkdir -p $PI_DIR"
+    scp -q bin/bhatti-agent-test-linux-arm64 "$PI_HOST:$PI_DIR/"
+
+    EXTRA=""
+    if [[ -n "$TEST_FILTER" ]]; then EXTRA="-test.run=$TEST_FILTER"; fi
+
+    echo "==> Running agent tests on Pi..."
+    ssh "$PI_HOST" "cd $PI_DIR && ./bhatti-agent-test-linux-arm64 -test.v -test.timeout=60s $EXTRA"
+}
+
+run_client_tests() {
+    echo "==> Compiling client test binary..."
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c \
+        -o bin/bhatti-client-test-linux-arm64 ./pkg/agent
+
+    echo "==> Uploading to $PI_HOST..."
+    ssh "$PI_HOST" "mkdir -p $PI_DIR"
+    scp -q bin/bhatti-agent-linux-arm64 bin/bhatti-client-test-linux-arm64 "$PI_HOST:$PI_DIR/"
+
+    EXTRA=""
+    if [[ -n "$TEST_FILTER" ]]; then EXTRA="-test.run=$TEST_FILTER"; fi
+
+    echo "==> Running client tests on Pi..."
+    ssh "$PI_HOST" "cd $PI_DIR && BHATTI_AGENT_BIN=$PI_DIR/bhatti-agent-linux-arm64 ./bhatti-client-test-linux-arm64 -test.v -test.timeout=60s $EXTRA"
+}
+
+case "$SUITE" in
+    agent)
+        run_agent_tests
+        ;;
+    client)
+        run_client_tests
+        ;;
+    all)
+        run_agent_tests
+        echo ""
+        echo "========================================="
+        echo ""
+        TEST_FILTER=""  # reset for client tests
+        run_client_tests
+        ;;
+    *)
+        echo "Usage: $0 [agent|client|all] [TestFilter]"
+        exit 1
+        ;;
+esac
