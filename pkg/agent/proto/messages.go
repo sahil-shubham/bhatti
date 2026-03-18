@@ -12,6 +12,13 @@ type ExecRequest struct {
 	MaxIdleSec *int              `json:"max_idle_sec,omitempty"`   // nil = default (0 = forever)
 }
 
+// ActivityInfo reports the agent's activity state.
+type ActivityInfo struct {
+	LastActivityUnix int64 `json:"last_activity_unix"`
+	ActiveSessions   int   `json:"active_sessions"`  // running processes
+	AttachedSessions int   `json:"attached_sessions"` // connected clients
+}
+
 // SessionInfo describes a running or completed session.
 type SessionInfo struct {
 	SessionID string `json:"session_id"`

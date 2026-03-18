@@ -325,6 +325,37 @@ func (c *AgentClient) SessionList(ctx context.Context) ([]proto.SessionInfo, err
 	return sessions, nil
 }
 
+// Activity queries the agent for activity info (last interaction, session counts).
+func (c *AgentClient) Activity(ctx context.Context) (*proto.ActivityInfo, error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return nil, fmt.Errorf("agent connect: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if err := proto.WriteFrame(conn, proto.ACTIVITY_REQ, nil); err != nil {
+		return nil, fmt.Errorf("agent send activity: %w", err)
+	}
+
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return nil, fmt.Errorf("agent read activity: %w", err)
+	}
+	if msgType != proto.ACTIVITY_RESP {
+		return nil, fmt.Errorf("expected ACTIVITY_RESP, got 0x%02x", msgType)
+	}
+
+	var info proto.ActivityInfo
+	if err := json.Unmarshal(payload, &info); err != nil {
+		return nil, fmt.Errorf("unmarshal activity: %w", err)
+	}
+	return &info, nil
+}
+
 // SessionKill sends SIGTERM to a session's process.
 func (c *AgentClient) SessionKill(ctx context.Context, sessionID string) error {
 	conn, err := c.dialControl()

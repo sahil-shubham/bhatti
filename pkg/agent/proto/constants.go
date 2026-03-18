@@ -35,6 +35,10 @@ const (
 	EXEC_LIST_RESP byte = 0x31 // guest → host: JSON []SessionInfo
 	EXEC_KILL      byte = 0x32 // host → guest: JSON {"session_id": "..."}
 	SESSION_INFO   byte = 0x33 // guest → host: JSON SessionInfo (sent on create/attach)
+
+	// Activity
+	ACTIVITY_REQ  byte = 0x40 // host → guest: empty payload
+	ACTIVITY_RESP byte = 0x41 // guest → host: JSON ActivityInfo
 )
 
 // Vsock ports

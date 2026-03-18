@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,6 +16,34 @@ import (
 
 // agentToken is set during boot from the config drive. Empty = no auth required.
 var agentToken string
+
+// lastActivity tracks the unix timestamp of the last client interaction.
+var lastActivity int64
+
+func updateActivity() {
+	atomic.StoreInt64(&lastActivity, time.Now().Unix())
+}
+
+func getActivity() proto.ActivityInfo {
+	registry.Lock()
+	active, attached := 0, 0
+	for _, s := range registry.sessions {
+		s.mu.Lock()
+		if s.ExitCode == nil {
+			active++
+		}
+		if s.Attached != nil {
+			attached++
+		}
+		s.mu.Unlock()
+	}
+	registry.Unlock()
+	return proto.ActivityInfo{
+		LastActivityUnix: atomic.LoadInt64(&lastActivity),
+		ActiveSessions:   active,
+		AttachedSessions: attached,
+	}
+}
 
 func handleControlConnection(conn net.Conn) {
 	defer conn.Close()
@@ -38,6 +67,7 @@ func handleControlConnection(conn net.Conn) {
 
 	switch msgType {
 	case proto.EXEC_REQ:
+		updateActivity()
 		var req proto.ExecRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("bad exec request: %v", err)))
@@ -59,6 +89,9 @@ func handleControlConnection(conn net.Conn) {
 	case proto.EXEC_LIST_REQ:
 		sessions := listSessions()
 		proto.SendJSON(conn, proto.EXEC_LIST_RESP, sessions)
+
+	case proto.ACTIVITY_REQ:
+		proto.SendJSON(conn, proto.ACTIVITY_RESP, getActivity())
 
 	case proto.EXEC_KILL:
 		var req struct {

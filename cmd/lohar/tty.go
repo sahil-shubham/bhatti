@@ -201,6 +201,7 @@ func readHostInput(conn net.Conn, sess *Session) {
 		}
 		switch msgType {
 		case proto.STDIN:
+			updateActivity()
 			if sess.Master != nil {
 				sess.Master.Write(payload)
 			}

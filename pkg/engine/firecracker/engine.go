@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/sahilshubham/bhatti/pkg/agent"
+	"github.com/sahilshubham/bhatti/pkg/agent/proto"
 	"github.com/sahilshubham/bhatti/pkg/engine"
 )
 
@@ -58,6 +59,7 @@ type VM struct {
 	Token       string // agent auth token
 	Agent       *agent.AgentClient
 	Status      string // "running", "stopped"
+	Thermal     string // "hot", "warm", "cold"
 	cancel      context.CancelFunc
 	cmd         *exec.Cmd
 }
@@ -353,7 +355,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		CID: cid, VcpuCount: vcpuCount, MemSizeMib: memMB,
 		TapDevice: tapName, GuestIP: guestIP, GuestMAC: mac,
 		Token: token, Agent: agentClient, Status: "running",
-		cancel: vmCancel, cmd: fcCmd,
+		Thermal: "hot", cancel: vmCancel, cmd: fcCmd,
 	}
 
 	e.mu.Lock()
@@ -405,10 +407,82 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 	// TAP is cleaned up in Destroy().
 
 	vm.Status = "stopped"
+	vm.Thermal = "cold"
 	return nil
 }
 
-// --- Start (Resume) ---
+// --- Pause (Hot → Warm) ---
+
+// Pause freezes vCPUs. FC process stays alive. Memory stays allocated. ~1ms.
+func (e *Engine) Pause(ctx context.Context, id string) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	if vm.Thermal != "hot" {
+		return fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	client := fcAPIClient(vm.SocketPath)
+	if err := fcPatch(client, "/vm", `{"state":"Paused"}`); err != nil {
+		return fmt.Errorf("pause: %w", err)
+	}
+	vm.Thermal = "warm"
+	return nil
+}
+
+// Resume unfreezes vCPUs. Warm → Hot. ~1ms.
+func (e *Engine) Resume(ctx context.Context, id string) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	if vm.Thermal != "warm" {
+		return fmt.Errorf("sandbox %q is not warm (thermal=%s)", id, vm.Thermal)
+	}
+	client := fcAPIClient(vm.SocketPath)
+	if err := fcPatch(client, "/vm", `{"state":"Resumed"}`); err != nil {
+		return fmt.Errorf("resume: %w", err)
+	}
+	vm.Thermal = "hot"
+	return nil
+}
+
+// ThermalState returns the current thermal state of a VM.
+func (e *Engine) ThermalState(id string) string {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return ""
+	}
+	return vm.Thermal
+}
+
+// Activity queries the guest agent for activity information.
+func (e *Engine) Activity(ctx context.Context, id string) (*proto.ActivityInfo, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, err
+	}
+	return vm.Agent.Activity(ctx)
+}
+
+// EnsureHot brings a VM to "hot" state from any thermal state.
+func (e *Engine) EnsureHot(ctx context.Context, id string) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	switch vm.Thermal {
+	case "hot":
+		return nil
+	case "warm":
+		return e.Resume(ctx, id)
+	case "cold":
+		return e.Start(ctx, id)
+	}
+	return nil
+}
+
+// --- Start (Resume from snapshot, Cold → Hot) ---
 
 func (e *Engine) Start(ctx context.Context, id string) error {
 	vm, err := e.getVM(id)
@@ -459,6 +533,7 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 	vm.cmd = fcCmd
 	vm.cancel = vmCancel
 	vm.Status = "running"
+	vm.Thermal = "hot"
 
 	// Use TCP client for post-resume — vsock is broken after snapshot/restore
 	// but virtio-net (TCP over TAP) survives.
