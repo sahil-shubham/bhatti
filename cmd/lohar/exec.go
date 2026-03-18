@@ -143,6 +143,11 @@ func buildEnv(env map[string]string) []string {
 		"HOME": "/root",
 		"LANG": "en_US.UTF-8",
 	}
+	// Merge config drive env vars (secrets, etc.)
+	for k, v := range configEnv {
+		defaults[k] = v
+	}
+	// Per-request env overrides everything
 	for k, v := range env {
 		defaults[k] = v
 	}

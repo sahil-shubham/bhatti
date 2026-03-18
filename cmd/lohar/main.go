@@ -3,14 +3,22 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/sahilshubham/bhatti/pkg/agent/proto"
 )
+
+// configEnv holds environment variables from the config drive, merged into
+// every exec request's environment.
+var configEnv map[string]string
 
 // TCP port constants reuse the vsock port numbers for simplicity.
 // The agent listens on both vsock AND TCP on the same port numbers.
@@ -23,8 +31,6 @@ func main() {
 
 	// --- PID 1 init ---
 
-	// Set PATH for the agent process itself. As PID 1, we inherit no
-	// environment. exec.Command uses LookPath which checks our PATH.
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	os.Setenv("HOME", "/root")
 
@@ -37,11 +43,31 @@ func main() {
 	mustMount("tmpfs", "/tmp", "tmpfs", 0, "")
 	mustMount("tmpfs", "/run", "tmpfs", 0, "")
 
-	syscall.Sethostname([]byte("bhatti"))
-
 	bringUpInterface("lo")
+
+	// Try to load config drive (/dev/vdb)
+	cfg := loadConfigDrive()
+	if cfg != nil {
+		if cfg.Hostname != "" {
+			syscall.Sethostname([]byte(cfg.Hostname))
+		} else {
+			syscall.Sethostname([]byte("bhatti"))
+		}
+		if len(cfg.DNS) > 0 {
+			applyDNS(cfg.DNS)
+		} else {
+			ensureResolvConf()
+		}
+		agentToken = cfg.Token
+		configEnv = cfg.Env
+		writeConfigFiles(cfg.Files)
+		mountVolumes(cfg.Volumes)
+	} else {
+		syscall.Sethostname([]byte("bhatti"))
+		ensureResolvConf()
+	}
+
 	setupNetworking()
-	ensureResolvConf()
 	installSignalHandlers()
 
 	// Listen on vsock (works for cold boot, broken after snapshot/restore).
@@ -104,6 +130,104 @@ func acceptLoop(ln net.Listener, handler func(net.Conn)) {
 			continue
 		}
 		go handler(conn)
+	}
+}
+
+// --- Config drive ---
+
+// SandboxConfig mirrors the config drive JSON structure.
+type SandboxConfig struct {
+	SandboxID string            `json:"sandbox_id"`
+	Hostname  string            `json:"hostname"`
+	Token     string            `json:"token"`
+	Env       map[string]string `json:"env"`
+	Files     map[string]struct {
+		Content string `json:"content"` // base64-encoded
+		Mode    string `json:"mode"`
+	} `json:"files"`
+	Volumes []struct {
+		Device string `json:"device"`
+		Mount  string `json:"mount"`
+		FS     string `json:"fs"`
+	} `json:"volumes"`
+	Init string   `json:"init,omitempty"`
+	DNS  []string `json:"dns"`
+	User string   `json:"user"`
+}
+
+// loadConfigDrive mounts /dev/vdb and reads config.json.
+// Returns nil if /dev/vdb doesn't exist (backward compatible).
+func loadConfigDrive() *SandboxConfig {
+	if _, err := os.Stat("/dev/vdb"); err != nil {
+		return nil
+	}
+	os.MkdirAll("/run/bhatti/config", 0755)
+	if err := syscall.Mount("/dev/vdb", "/run/bhatti/config", "ext4",
+		syscall.MS_RDONLY, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: mount config drive: %v\n", err)
+		return nil
+	}
+	data, err := os.ReadFile("/run/bhatti/config/config.json")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: read config.json: %v\n", err)
+		return nil
+	}
+	var cfg SandboxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: parse config.json: %v\n", err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "lohar: loaded config drive for %s\n", cfg.SandboxID)
+	return &cfg
+}
+
+func applyDNS(servers []string) {
+	os.Remove("/etc/resolv.conf")
+	var content string
+	for _, s := range servers {
+		content += "nameserver " + s + "\n"
+	}
+	os.WriteFile("/etc/resolv.conf", []byte(content), 0644)
+}
+
+func writeConfigFiles(files map[string]struct {
+	Content string `json:"content"`
+	Mode    string `json:"mode"`
+}) {
+	for path, cf := range files {
+		content, err := base64.StdEncoding.DecodeString(cf.Content)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "lohar: decode file %s: %v\n", path, err)
+			continue
+		}
+		os.MkdirAll(filepath.Dir(path), 0755)
+		mode, _ := strconv.ParseUint(cf.Mode, 8, 32)
+		if mode == 0 {
+			mode = 0644
+		}
+		if err := os.WriteFile(path, content, os.FileMode(mode)); err != nil {
+			fmt.Fprintf(os.Stderr, "lohar: write file %s: %v\n", path, err)
+			continue
+		}
+		// chown to lohar user (uid 1000)
+		os.Chown(path, 1000, 1000)
+		os.Chown(filepath.Dir(path), 1000, 1000)
+	}
+}
+
+func mountVolumes(volumes []struct {
+	Device string `json:"device"`
+	Mount  string `json:"mount"`
+	FS     string `json:"fs"`
+}) {
+	for _, v := range volumes {
+		os.MkdirAll(v.Mount, 0755)
+		if err := syscall.Mount(v.Device, v.Mount, v.FS, 0, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "lohar: mount %s → %s: %v\n", v.Device, v.Mount, err)
+			continue
+		}
+		os.Chown(v.Mount, 1000, 1000)
+		fmt.Fprintf(os.Stderr, "lohar: mounted %s → %s\n", v.Device, v.Mount)
 	}
 }
 

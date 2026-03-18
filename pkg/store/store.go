@@ -61,11 +61,12 @@ type Sandbox struct {
 	StoppedAt  *time.Time      `json:"stopped_at,omitempty"`
 }
 
-// SecretRecord tracks an encrypted secret file.
+// SecretRecord tracks an encrypted secret.
 type SecretRecord struct {
 	Name      string    `json:"name"`
-	Path      string    `json:"path"`
 	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	// Encrypted value is NOT included in JSON serialization
 }
 
 // Store wraps SQLite operations.
@@ -136,6 +137,8 @@ ALTER TABLE sandboxes ADD COLUMN vcpu_count REAL DEFAULT 1;
 ALTER TABLE sandboxes ADD COLUMN mem_size_mib INTEGER DEFAULT 512;
 ALTER TABLE sandboxes ADD COLUMN socket_path TEXT DEFAULT '';
 ALTER TABLE sandboxes ADD COLUMN vsock_path TEXT DEFAULT '';
+ALTER TABLE secrets ADD COLUMN value_encrypted BLOB DEFAULT NULL;
+ALTER TABLE secrets ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP;
 `
 
 // New opens (or creates) the SQLite database and runs migrations.
@@ -311,23 +314,30 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 
 // --- Secrets ---
 
-func (s *Store) CreateSecret(sr SecretRecord) error {
-	_, err := s.db.Exec(`INSERT INTO secrets (name, path, created_at) VALUES (?, ?, ?)`, sr.Name, sr.Path, sr.CreatedAt)
+// SetSecret creates or updates an encrypted secret.
+func (s *Store) SetSecret(name string, encrypted []byte) error {
+	now := time.Now()
+	_, err := s.db.Exec(
+		`INSERT INTO secrets (name, path, value_encrypted, created_at, updated_at)
+		 VALUES (?, '', ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET value_encrypted = excluded.value_encrypted, updated_at = excluded.updated_at`,
+		name, encrypted, now, now)
 	return err
 }
 
-func (s *Store) GetSecret(name string) (*SecretRecord, error) {
-	var sr SecretRecord
-	err := s.db.QueryRow(`SELECT name, path, created_at FROM secrets WHERE name = ?`, name).
-		Scan(&sr.Name, &sr.Path, &sr.CreatedAt)
+// GetSecretValue returns the encrypted bytes for a secret.
+func (s *Store) GetSecretValue(name string) ([]byte, error) {
+	var encrypted []byte
+	err := s.db.QueryRow(`SELECT value_encrypted FROM secrets WHERE name = ?`, name).Scan(&encrypted)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("secret %q not found", name)
 	}
-	return &sr, nil
+	return encrypted, nil
 }
 
+// ListSecrets returns metadata for all secrets (no values).
 func (s *Store) ListSecrets() ([]SecretRecord, error) {
-	rows, err := s.db.Query(`SELECT name, path, created_at FROM secrets ORDER BY name`)
+	rows, err := s.db.Query(`SELECT name, created_at, COALESCE(updated_at, created_at) FROM secrets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -335,12 +345,29 @@ func (s *Store) ListSecrets() ([]SecretRecord, error) {
 	var out []SecretRecord
 	for rows.Next() {
 		var sr SecretRecord
-		if err := rows.Scan(&sr.Name, &sr.Path, &sr.CreatedAt); err != nil {
+		var createdStr, updatedStr string
+		if err := rows.Scan(&sr.Name, &createdStr, &updatedStr); err != nil {
 			return nil, err
 		}
+		sr.CreatedAt, _ = time.Parse(time.DateTime, createdStr)
+		sr.UpdatedAt, _ = time.Parse(time.DateTime, updatedStr)
 		out = append(out, sr)
 	}
 	return out, rows.Err()
+}
+
+// GetSecret returns metadata for a secret (no value).
+func (s *Store) GetSecret(name string) (*SecretRecord, error) {
+	var sr SecretRecord
+	var createdStr, updatedStr string
+	err := s.db.QueryRow(`SELECT name, created_at, COALESCE(updated_at, created_at) FROM secrets WHERE name = ?`, name).
+		Scan(&sr.Name, &createdStr, &updatedStr)
+	if err != nil {
+		return nil, err
+	}
+	sr.CreatedAt, _ = time.Parse(time.DateTime, createdStr)
+	sr.UpdatedAt, _ = time.Parse(time.DateTime, updatedStr)
+	return &sr, nil
 }
 
 // --- Volumes ---

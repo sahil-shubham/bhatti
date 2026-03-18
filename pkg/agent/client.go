@@ -26,7 +26,8 @@ type AgentClient struct {
 	controlSock string // vsock UDS path or Unix socket path
 	forwardSock string
 	isVsock     bool
-	tcpAddr     string // guest IP for TCP mode (e.g. "172.16.0.2")
+	tcpAddr     string // guest IP for TCP mode (e.g. "192.168.137.2")
+	token       string // auth token, empty = no auth
 }
 
 // NewVsockClient creates a client that connects through a Firecracker vsock UDS.
@@ -47,6 +48,14 @@ func NewTCPClient(guestIP string) *AgentClient {
 	}
 }
 
+// NewTCPClientWithAuth creates a TCP client with an auth token.
+func NewTCPClientWithAuth(guestIP, token string) *AgentClient {
+	return &AgentClient{
+		tcpAddr: guestIP,
+		token:   token,
+	}
+}
+
 // NewTestClient creates a client that connects to the agent's test-mode
 // Unix sockets directly (no vsock handshake).
 func NewTestClient(controlSock, forwardSock string) *AgentClient {
@@ -58,24 +67,52 @@ func NewTestClient(controlSock, forwardSock string) *AgentClient {
 
 // dialControl opens a connection to the control channel (port 1024).
 func (c *AgentClient) dialControl() (net.Conn, error) {
+	var conn net.Conn
+	var err error
 	if c.tcpAddr != "" {
-		return net.Dial("tcp", net.JoinHostPort(c.tcpAddr, fmt.Sprint(proto.VsockPortControl)))
+		conn, err = net.Dial("tcp", net.JoinHostPort(c.tcpAddr, fmt.Sprint(proto.VsockPortControl)))
+	} else if c.isVsock {
+		conn, err = c.dialVsockPort(c.controlSock, proto.VsockPortControl)
+	} else {
+		conn, err = net.Dial("unix", c.controlSock)
 	}
-	if c.isVsock {
-		return c.dialVsockPort(c.controlSock, proto.VsockPortControl)
+	if err != nil {
+		return nil, err
 	}
-	return net.Dial("unix", c.controlSock)
+	if err := c.sendAuth(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 // dialForward opens a connection to the forward channel (port 1025).
 func (c *AgentClient) dialForward() (net.Conn, error) {
+	var conn net.Conn
+	var err error
 	if c.tcpAddr != "" {
-		return net.Dial("tcp", net.JoinHostPort(c.tcpAddr, fmt.Sprint(proto.VsockPortForward)))
+		conn, err = net.Dial("tcp", net.JoinHostPort(c.tcpAddr, fmt.Sprint(proto.VsockPortForward)))
+	} else if c.isVsock {
+		conn, err = c.dialVsockPort(c.forwardSock, proto.VsockPortForward)
+	} else {
+		conn, err = net.Dial("unix", c.forwardSock)
 	}
-	if c.isVsock {
-		return c.dialVsockPort(c.forwardSock, proto.VsockPortForward)
+	if err != nil {
+		return nil, err
 	}
-	return net.Dial("unix", c.forwardSock)
+	if err := c.sendAuth(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// sendAuth sends the AUTH frame if a token is set.
+func (c *AgentClient) sendAuth(conn net.Conn) error {
+	if c.token == "" {
+		return nil
+	}
+	return proto.WriteFrame(conn, proto.AUTH, []byte(c.token))
 }
 
 // dialVsockPort performs the Firecracker vsock CONNECT handshake.

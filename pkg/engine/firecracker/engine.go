@@ -42,23 +42,24 @@ type Engine struct {
 
 // VM holds per-sandbox state.
 type VM struct {
-	ID         string
-	Name       string
-	SocketPath string // Firecracker API socket
-	VsockPath  string // vsock UDS for host↔guest
-	RootfsPath string
+	ID          string
+	Name        string
+	SocketPath  string // Firecracker API socket
+	VsockPath   string // vsock UDS for host↔guest
+	RootfsPath  string
 	SnapMemPath string
 	SnapVMPath  string
-	CID        uint32
-	VcpuCount  int64
-	MemSizeMib int64
-	TapDevice  string
-	GuestIP    string
-	GuestMAC   string
-	Agent      *agent.AgentClient
-	Status     string // "running", "stopped"
-	cancel     context.CancelFunc
-	cmd        *exec.Cmd
+	CID         uint32
+	VcpuCount   int64
+	MemSizeMib  int64
+	TapDevice   string
+	GuestIP     string
+	GuestMAC    string
+	Token       string // agent auth token
+	Agent       *agent.AgentClient
+	Status      string // "running", "stopped"
+	cancel      context.CancelFunc
+	cmd         *exec.Cmd
 }
 
 // New validates config and returns a Firecracker engine.
@@ -172,6 +173,56 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 	}
 	mac := generateMAC()
 
+	// 4b. Generate auth token
+	tokenBytes := make([]byte, 16)
+	rand.Read(tokenBytes)
+	token := fmt.Sprintf("%x", tokenBytes)
+
+	// 4c. Build config drive
+	envMap := make(map[string]string)
+	for k, v := range spec.Env {
+		envMap[k] = v
+	}
+	filesMap := make(map[string]ConfigFile)
+
+	configDrivePath := filepath.Join(sandboxDir, "config.ext4")
+	var volumeMounts []VolumeMountConfig
+	driveIndex := byte('c') // vdb=config, vdc=first vol, vdd=second, ...
+	for _, vs := range spec.NewVolumes {
+		volPath := filepath.Join(sandboxDir, fmt.Sprintf("vol-%s.ext4", vs.Name))
+		if err := createVolume(volPath, vs.SizeMB); err != nil {
+			destroyTapDevice(tapName); e.pool.Release(guestIP)
+			os.RemoveAll(sandboxDir)
+			return engine.SandboxInfo{}, fmt.Errorf("create volume %s: %w", vs.Name, err)
+		}
+		device := fmt.Sprintf("/dev/vd%c", driveIndex)
+		volumeMounts = append(volumeMounts, VolumeMountConfig{
+			Device: device, Mount: vs.Mount, FS: "ext4",
+		})
+		driveIndex++
+	}
+
+	name := spec.Name
+	if name == "" {
+		name = id
+	}
+
+	if err := createConfigDrive(configDrivePath, SandboxConfig{
+		SandboxID: id,
+		Hostname:  name,
+		Token:     token,
+		Env:       envMap,
+		Files:     filesMap,
+		Volumes:   volumeMounts,
+		Init:      spec.Init,
+		DNS:       []string{"1.1.1.1", "8.8.8.8"},
+		User:      "lohar",
+	}); err != nil {
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
+		os.RemoveAll(sandboxDir)
+		return engine.SandboxInfo{}, fmt.Errorf("create config drive: %w", err)
+	}
+
 	// 5. Start Firecracker process
 	vmCtx, vmCancel := context.WithCancel(context.Background())
 	os.Remove(socketPath)
@@ -250,6 +301,32 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		return engine.SandboxInfo{}, fmt.Errorf("set network: %w", err)
 	}
 
+	// 6b. Attach config drive as /dev/vdb
+	if err := fcPut(client, "/drives/config", fmt.Sprintf(
+		`{"drive_id":"config","path_on_host":%q,"is_root_device":false,"is_read_only":true}`,
+		configDrivePath)); err != nil {
+		fcCmd.Process.Kill()
+		vmCancel()
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
+		os.RemoveAll(sandboxDir)
+		return engine.SandboxInfo{}, fmt.Errorf("set config drive: %w", err)
+	}
+
+	// 6c. Attach volume drives (/dev/vdc, /dev/vdd, ...)
+	for i, vs := range spec.NewVolumes {
+		volPath := filepath.Join(sandboxDir, fmt.Sprintf("vol-%s.ext4", vs.Name))
+		driveID := fmt.Sprintf("vol%d", i)
+		if err := fcPut(client, fmt.Sprintf("/drives/%s", driveID), fmt.Sprintf(
+			`{"drive_id":%q,"path_on_host":%q,"is_root_device":false,"is_read_only":false}`,
+			driveID, volPath)); err != nil {
+			fcCmd.Process.Kill()
+			vmCancel()
+			destroyTapDevice(tapName); e.pool.Release(guestIP)
+			os.RemoveAll(sandboxDir)
+			return engine.SandboxInfo{}, fmt.Errorf("set volume drive %d: %w", i, err)
+		}
+	}
+
 	// 7. Boot
 	if err := fcPut(client, "/actions", `{"action_type":"InstanceStart"}`); err != nil {
 		fcCmd.Process.Kill()
@@ -261,7 +338,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 
 	// 8. Wait for agent via TCP (kernel ip= already configured eth0).
 	// TCP is the primary channel — it survives snapshot/resume.
-	agentClient := agent.NewTCPClient(guestIP)
+	agentClient := agent.NewTCPClientWithAuth(guestIP, token)
 	if err := agentClient.WaitReady(ctx, 30*time.Second); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
@@ -270,17 +347,12 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		return engine.SandboxInfo{}, fmt.Errorf("agent not ready: %w", err)
 	}
 
-	name := spec.Name
-	if name == "" {
-		name = id
-	}
-
 	vm := &VM{
 		ID: id, Name: name, SocketPath: socketPath,
 		VsockPath: vsockPath, RootfsPath: rootfsPath,
 		CID: cid, VcpuCount: vcpuCount, MemSizeMib: memMB,
 		TapDevice: tapName, GuestIP: guestIP, GuestMAC: mac,
-		Agent: agentClient, Status: "running",
+		Token: token, Agent: agentClient, Status: "running",
 		cancel: vmCancel, cmd: fcCmd,
 	}
 
@@ -390,7 +462,7 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 
 	// Use TCP client for post-resume — vsock is broken after snapshot/restore
 	// but virtio-net (TCP over TAP) survives.
-	vm.Agent = agent.NewTCPClient(vm.GuestIP)
+	vm.Agent = agent.NewTCPClientWithAuth(vm.GuestIP, vm.Token)
 
 	// Wait for agent to be responsive after resume.
 	if err := vm.Agent.WaitReady(ctx, 30*time.Second); err != nil {

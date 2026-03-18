@@ -146,24 +146,41 @@ func TestSandboxesCRUD(t *testing.T) {
 func TestSecretsCRUD(t *testing.T) {
 	s := testStore(t)
 
-	sr := SecretRecord{
-		Name:      "api-key",
-		Path:      "/tmp/secrets/api-key.age",
-		CreatedAt: time.Now().Truncate(time.Second),
-	}
+	encrypted := []byte("fake-encrypted-data")
 
-	if err := s.CreateSecret(sr); err != nil {
+	if err := s.SetSecret("api-key", encrypted); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetSecret("api-key")
+	// Get value
+	got, err := s.GetSecretValue("api-key")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Path != sr.Path {
-		t.Fatalf("expected path %s, got %s", sr.Path, got.Path)
+	if string(got) != string(encrypted) {
+		t.Fatalf("expected %q, got %q", encrypted, got)
 	}
 
+	// Get metadata (no value)
+	meta, err := s.GetSecret("api-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Name != "api-key" {
+		t.Fatalf("expected name 'api-key', got %q", meta.Name)
+	}
+
+	// Update
+	updated := []byte("new-encrypted-data")
+	if err := s.SetSecret("api-key", updated); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetSecretValue("api-key")
+	if string(got) != string(updated) {
+		t.Fatalf("after update: expected %q, got %q", updated, got)
+	}
+
+	// List (no values)
 	list, err := s.ListSecrets()
 	if err != nil {
 		t.Fatal(err)

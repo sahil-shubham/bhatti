@@ -23,6 +23,9 @@ const (
 	// Exec
 	EXEC_REQ byte = 0x10 // host → guest: JSON-encoded ExecRequest
 
+	// Auth
+	AUTH byte = 0x11 // host → guest: token bytes (first frame after connect)
+
 	// Port forwarding
 	FWD_REQ  byte = 0x20 // host → guest: JSON-encoded ForwardRequest
 	FWD_RESP byte = 0x21 // guest → host: JSON-encoded ForwardResponse

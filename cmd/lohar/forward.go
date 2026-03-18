@@ -8,12 +8,24 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
 	"github.com/sahilshubham/bhatti/pkg/agent/proto"
 )
 
 func handleForwardConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Auth check
+	if agentToken != "" {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		msgType, payload, err := proto.ReadFrame(conn)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil || msgType != proto.AUTH || string(payload) != agentToken {
+			proto.WriteFrame(conn, proto.ERROR, []byte("auth required"))
+			return
+		}
+	}
 
 	msgType, payload, err := proto.ReadFrame(conn)
 	if err != nil {

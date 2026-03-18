@@ -513,16 +513,12 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 			errResp(w, 400, "name and value required")
 			return
 		}
-		// For now, store as plaintext metadata — age encryption in secrets package later
-		sr := store.SecretRecord{
-			Name:      req.Name,
-			Path:      fmt.Sprintf("secrets/%s.age", req.Name),
-			CreatedAt: time.Now(),
-		}
-		if err := s.store.CreateSecret(sr); err != nil {
+		// Store the value (will be encrypted by CLI before calling this)
+		if err := s.store.SetSecret(req.Name, []byte(req.Value)); err != nil {
 			errResp(w, 500, err.Error())
 			return
 		}
+		sr, _ := s.store.GetSecret(req.Name)
 		writeJSON(w, 201, sr)
 	default:
 		errResp(w, 405, "method not allowed")

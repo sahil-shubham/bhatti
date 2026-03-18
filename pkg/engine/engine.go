@@ -12,6 +12,20 @@ type VolumeMount struct {
 	ReadOnly bool   `json:"readonly,omitempty"`
 }
 
+// SecretRef references a secret to inject into the sandbox.
+type SecretRef struct {
+	Name string `json:"name"` // secret name in store
+	Path string `json:"path"` // file path inside guest OR env var name
+	Mode string `json:"mode"` // file mode (e.g. "0600"); empty = inject as env var
+}
+
+// VolumeSpec describes a volume to create and attach to the sandbox.
+type VolumeSpec struct {
+	Name   string `json:"name"`
+	SizeMB int    `json:"size_mb"`
+	Mount  string `json:"mount"`
+}
+
 // SandboxSpec describes what to create.
 type SandboxSpec struct {
 	Name       string            `json:"name"`
@@ -23,6 +37,9 @@ type SandboxSpec struct {
 	Labels     map[string]string `json:"labels"`
 	UserData   string            `json:"userdata"`
 	Volumes    []VolumeMount     `json:"volumes,omitempty"`
+	Secrets    []SecretRef       `json:"secrets,omitempty"`
+	NewVolumes []VolumeSpec      `json:"new_volumes,omitempty"`
+	Init       string            `json:"init,omitempty"`
 }
 
 // SandboxInfo is the runtime state of a sandbox.
