@@ -26,20 +26,27 @@ type VolumeSpec struct {
 	Mount  string `json:"mount"`
 }
 
+// FileSpec describes a file to inject into the sandbox.
+type FileSpec struct {
+	Content []byte `json:"content"` // raw content (will be base64-encoded in config drive)
+	Mode    string `json:"mode"`    // e.g. "0600"
+}
+
 // SandboxSpec describes what to create.
 type SandboxSpec struct {
-	Name       string            `json:"name"`
-	Image      string            `json:"image"`
-	CPUs       float64           `json:"cpus"`
-	MemoryMB   int               `json:"memory_mb"`
-	DiskSizeMB int               `json:"disk_size_mb"`
-	Env        map[string]string `json:"env"`
-	Labels     map[string]string `json:"labels"`
-	UserData   string            `json:"userdata"`
-	Volumes    []VolumeMount     `json:"volumes,omitempty"`
-	Secrets    []SecretRef       `json:"secrets,omitempty"`
-	NewVolumes []VolumeSpec      `json:"new_volumes,omitempty"`
-	Init       string            `json:"init,omitempty"`
+	Name       string               `json:"name"`
+	Image      string               `json:"image"`
+	CPUs       float64              `json:"cpus"`
+	MemoryMB   int                  `json:"memory_mb"`
+	DiskSizeMB int                  `json:"disk_size_mb"`
+	Env        map[string]string    `json:"env"`
+	Labels     map[string]string    `json:"labels"`
+	UserData   string               `json:"userdata"`
+	Volumes    []VolumeMount        `json:"volumes,omitempty"`
+	Secrets    []SecretRef          `json:"secrets,omitempty"`
+	Files      map[string]FileSpec  `json:"files,omitempty"` // path → content
+	NewVolumes []VolumeSpec         `json:"new_volumes,omitempty"`
+	Init       string               `json:"init,omitempty"`
 }
 
 // SandboxInfo is the runtime state of a sandbox.

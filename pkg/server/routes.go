@@ -160,9 +160,10 @@ func (s *Server) handleTemplate(w http.ResponseWriter, r *http.Request) {
 // --- Sandboxes ---
 
 type createSandboxReq struct {
-	Name       string              `json:"name"`
-	TemplateID string              `json:"template_id"`
+	Name       string               `json:"name"`
+	TemplateID string               `json:"template_id"`
 	Volumes    []engine.VolumeMount `json:"volumes,omitempty"`
+	Env        map[string]string    `json:"env,omitempty"`
 }
 
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -216,6 +217,29 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Resolve secrets from template
+		secretEnv := make(map[string]string)
+		secretFiles := make(map[string]engine.FileSpec)
+		for _, secretName := range tmpl.Secrets {
+			encrypted, err := s.store.GetSecretValue(secretName)
+			if err != nil {
+				errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
+				return
+			}
+			// Secrets are stored as plaintext bytes for now
+			// (age encryption is applied by the CLI before storing)
+			secretEnv[secretName] = string(encrypted)
+		}
+
+		// Merge request env overrides
+		env := make(map[string]string)
+		for k, v := range secretEnv {
+			env[k] = v
+		}
+		for k, v := range req.Env {
+			env[k] = v
+		}
+
 		spec := engine.SandboxSpec{
 			Name:     name,
 			Image:    tmpl.Image,
@@ -223,6 +247,8 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			MemoryMB: tmpl.MemoryMB,
 			Labels:   tmpl.Labels,
 			UserData: tmpl.UserData,
+			Env:      env,
+			Files:    secretFiles,
 			Volumes:  volumes,
 		}
 
@@ -408,6 +434,10 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		errResp(w, 400, "cmd required")
 		return
 	}
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		errResp(w, 500, "wake sandbox: "+err.Error())
+		return
+	}
 	result, err := s.engine.Exec(r.Context(), sb.EngineID, req.Cmd)
 	if err != nil {
 		errResp(w, 500, err.Error())
@@ -434,6 +464,10 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id stri
 	}
 	defer conn.Close()
 
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		conn.WriteMessage(websocket.TextMessage, []byte("wake sandbox: "+err.Error()))
+		return
+	}
 	term, err := s.engine.Shell(r.Context(), sb.EngineID)
 	if err != nil {
 		conn.WriteMessage(websocket.TextMessage, []byte("shell error: "+err.Error()))
@@ -563,6 +597,10 @@ func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		errResp(w, 500, "wake sandbox: "+err.Error())
+		return
+	}
 	ports, err := s.engine.ListeningPorts(r.Context(), sb.EngineID)
 	if err != nil {
 		ports = []int{}
@@ -712,6 +750,11 @@ func (s *Server) handleSandboxProxyRoute(w http.ResponseWriter, r *http.Request,
 	sb, err := s.store.GetSandbox(sandboxID)
 	if err != nil {
 		errResp(w, 404, "not found")
+		return
+	}
+
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		errResp(w, 500, "wake sandbox: "+err.Error())
 		return
 	}
 

@@ -70,6 +70,11 @@ func main() {
 	setupNetworking()
 	installSignalHandlers()
 
+	// Init script runs as a TTY session (can be attached to via session ID "init")
+	if cfg != nil && cfg.Init != "" {
+		go runInitSession(cfg.Init, cfg.User)
+	}
+
 	// Listen on vsock (works for cold boot, broken after snapshot/restore).
 	lnControl, err := listenVsock(proto.VsockPortControl)
 	if err != nil {

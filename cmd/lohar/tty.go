@@ -252,6 +252,90 @@ func openPTY() (master, slave *os.File, err error) {
 	return master, slave, nil
 }
 
+// runInitSession runs the init script as a TTY session with well-known ID "init".
+// The session can be attached to by the host via SessionAttach("init").
+func runInitSession(script, user string) {
+	sess := newSession([]string{"sh", "-c", script}, true, 0)
+	// Override the auto-generated ID with "init"
+	registry.Lock()
+	delete(registry.sessions, sess.ID)
+	sess.ID = "init"
+	registry.sessions["init"] = sess
+	registry.Unlock()
+
+	master, slave, err := openPTY()
+	if err != nil {
+		logf("init session PTY: %v", err)
+		removeSession("init")
+		return
+	}
+	sess.Master = master
+
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = buildEnv(nil)
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+
+	uid := uint32(1000)
+	gid := uint32(1000)
+	if user == "root" {
+		uid = 0
+		gid = 0
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+		Ctty:    0,
+		Credential: &syscall.Credential{
+			Uid: uid,
+			Gid: gid,
+		},
+	}
+	cmd.Dir = "/workspace"
+	if err := cmd.Start(); err != nil {
+		slave.Close()
+		master.Close()
+		logf("init session start: %v", err)
+		removeSession("init")
+		return
+	}
+	slave.Close()
+	sess.Cmd = cmd
+
+	logf("init session started (pid %d)", cmd.Process.Pid)
+
+	// Background reader: PTY master → scrollback (+ attached conn if any)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				sess.Scrollback.Write(buf[:n])
+				sess.mu.Lock()
+				if sess.Attached != nil {
+					proto.WriteFrame(sess.Attached, proto.STDOUT, buf[:n])
+				}
+				sess.mu.Unlock()
+			}
+			if err != nil {
+				exitCode := exitCodeFromErr(cmd.Wait())
+				sess.mu.Lock()
+				sess.ExitCode = &exitCode
+				if sess.Attached != nil {
+					exit := proto.ExitPayload(int32(exitCode))
+					proto.WriteFrame(sess.Attached, proto.EXIT, exit[:])
+				}
+				sess.mu.Unlock()
+				master.Close()
+				logf("init session exited (code %d)", exitCode)
+				return
+			}
+		}
+	}()
+}
+
 func setWinsize(f *os.File, rows, cols uint16) error {
 	ws := winsize{Rows: rows, Cols: cols}
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(),

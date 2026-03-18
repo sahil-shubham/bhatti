@@ -7,6 +7,7 @@ package firecracker
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -186,6 +187,12 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		envMap[k] = v
 	}
 	filesMap := make(map[string]ConfigFile)
+	for path, f := range spec.Files {
+		filesMap[path] = ConfigFile{
+			Content: base64.StdEncoding.EncodeToString(f.Content),
+			Mode:    f.Mode,
+		}
+	}
 
 	configDrivePath := filepath.Join(sandboxDir, "config.ext4")
 	var volumeMounts []VolumeMountConfig
