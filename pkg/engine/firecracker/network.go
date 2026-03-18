@@ -7,64 +7,114 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
-// IP allocation: each sandbox gets a /30 subnet from 172.16.0.0/16.
-//   CID 3 → 172.16.0.0/30:  host=172.16.0.1,  guest=172.16.0.2
-//   CID 4 → 172.16.0.4/30:  host=172.16.0.5,  guest=172.16.0.6
-//   CID N → base = (N-3)*4
+const (
+	bridgeName = "brbhatti0"
+	bridgeIP   = "192.168.137.1"
+	bridgeCIDR = "192.168.137.1/24"
+	subnetCIDR = "192.168.137.0/24"
+)
 
-type subnet struct {
-	HostIP  string
-	GuestIP string
+// ipPool manages IP allocation within the bridge subnet.
+// Usable range: .2 through .254 (253 addresses).
+// .0 = network, .1 = bridge, .255 = broadcast.
+type ipPool struct {
+	mu   sync.Mutex
+	used [256]bool
 }
 
-func subnetForCID(cid uint32) subnet {
-	offset := (cid - 3) * 4
-	b3 := byte(offset >> 8)
-	b4 := byte(offset & 0xFF)
-	return subnet{
-		HostIP:  fmt.Sprintf("172.16.%d.%d", b3, b4+1),
-		GuestIP: fmt.Sprintf("172.16.%d.%d", b3, b4+2),
+func newIPPool() *ipPool {
+	p := &ipPool{}
+	p.used[0] = true   // network
+	p.used[1] = true   // bridge
+	p.used[255] = true // broadcast
+	return p
+}
+
+// Allocate returns the next free IP in the 192.168.137.0/24 range.
+func (p *ipPool) Allocate() (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := 2; i < 255; i++ {
+		if !p.used[i] {
+			p.used[i] = true
+			return fmt.Sprintf("192.168.137.%d", i), nil
+		}
 	}
+	return "", fmt.Errorf("IP pool exhausted (253 sandboxes)")
 }
 
-func createTapDevice(sandboxID string, cid uint32) (tapName, guestIP string, err error) {
-	// Max 15 chars for Linux interface name: "tap" + 8 hex chars from ID
+// Release frees an IP back to the pool.
+func (p *ipPool) Release(ip string) {
+	var octet int
+	fmt.Sscanf(ip, "192.168.137.%d", &octet)
+	if octet < 2 || octet > 254 {
+		return
+	}
+	p.mu.Lock()
+	p.used[octet] = false
+	p.mu.Unlock()
+}
+
+// Mark reserves an IP (used during startup recovery).
+func (p *ipPool) Mark(ip string) {
+	var octet int
+	fmt.Sscanf(ip, "192.168.137.%d", &octet)
+	if octet < 2 || octet > 254 {
+		return
+	}
+	p.mu.Lock()
+	p.used[octet] = true
+	p.mu.Unlock()
+}
+
+// ensureBridge creates the bridge and masquerade rule if they don't exist.
+// Idempotent — safe to call on every engine startup.
+func ensureBridge() error {
+	// Create bridge (ignore error if exists)
+	runQuiet("ip", "link", "add", bridgeName, "type", "bridge")
+	// Add address (ignore error if already set)
+	runQuiet("ip", "addr", "add", bridgeCIDR, "dev", bridgeName)
+	if err := run("ip", "link", "set", bridgeName, "up"); err != nil {
+		return fmt.Errorf("bring up bridge: %w", err)
+	}
+
+	// Enable IP forwarding
+	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
+
+	// Add masquerade rule if not present
+	defaultIface := detectDefaultInterface()
+	if err := runQuiet("iptables", "-t", "nat", "-C", "POSTROUTING",
+		"-s", subnetCIDR, "-o", defaultIface, "-j", "MASQUERADE"); err != nil {
+		if err := run("iptables", "-t", "nat", "-A", "POSTROUTING",
+			"-s", subnetCIDR, "-o", defaultIface, "-j", "MASQUERADE"); err != nil {
+			return fmt.Errorf("add masquerade rule: %w", err)
+		}
+	}
+	return nil
+}
+
+func createTapDevice(sandboxID string) (tapName string, err error) {
 	tapName = "tap" + sandboxID[:8]
-	s := subnetForCID(cid)
 
 	if err := run("ip", "tuntap", "add", tapName, "mode", "tap"); err != nil {
-		return "", "", fmt.Errorf("create tap: %w", err)
+		return "", fmt.Errorf("create tap: %w", err)
 	}
-	if err := run("ip", "addr", "add", s.HostIP+"/30", "dev", tapName); err != nil {
+	if err := run("ip", "link", "set", tapName, "master", bridgeName); err != nil {
 		run("ip", "link", "del", tapName)
-		return "", "", fmt.Errorf("set tap ip: %w", err)
+		return "", fmt.Errorf("add to bridge: %w", err)
 	}
 	if err := run("ip", "link", "set", tapName, "up"); err != nil {
 		run("ip", "link", "del", tapName)
-		return "", "", fmt.Errorf("bring up tap: %w", err)
+		return "", fmt.Errorf("bring up tap: %w", err)
 	}
-
-	// NAT: masquerade guest traffic through the host's default interface.
-	defaultIface := detectDefaultInterface()
-	if err := run("iptables", "-t", "nat", "-A", "POSTROUTING",
-		"-s", s.GuestIP+"/32", "-o", defaultIface,
-		"-j", "MASQUERADE"); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: iptables NAT failed: %v\n", err)
-	}
-
-	return tapName, s.GuestIP, nil
+	return tapName, nil
 }
 
-func destroyTapDevice(tapName string, cid uint32) {
+func destroyTapDevice(tapName string) {
 	run("ip", "link", "del", tapName)
-
-	s := subnetForCID(cid)
-	defaultIface := detectDefaultInterface()
-	run("iptables", "-t", "nat", "-D", "POSTROUTING",
-		"-s", s.GuestIP+"/32", "-o", defaultIface,
-		"-j", "MASQUERADE")
 }
 
 func detectDefaultInterface() string {
@@ -93,7 +143,6 @@ func cleanupOrphanedTapDevices(knownTaps map[string]bool) {
 		if len(fields) < 2 {
 			continue
 		}
-		// Format: "N: tapXXXXXXXX: <FLAGS>..."
 		name := strings.TrimSuffix(fields[1], ":")
 		if !strings.HasPrefix(name, "tap") {
 			continue
@@ -107,7 +156,6 @@ func cleanupOrphanedTapDevices(knownTaps map[string]bool) {
 }
 
 // cleanupAllTapDevices removes all bhatti-created TAP devices.
-// Called on engine shutdown.
 func cleanupAllTapDevices() {
 	out, err := exec.Command("ip", "-o", "link", "show", "type", "tun").Output()
 	if err != nil {
@@ -129,4 +177,10 @@ func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// runQuiet runs a command suppressing stderr. Used for idempotent operations
+// where "already exists" errors are expected and not useful to log.
+func runQuiet(name string, args ...string) error {
+	return exec.Command(name, args...).Run()
 }

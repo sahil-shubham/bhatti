@@ -37,6 +37,7 @@ type Engine struct {
 	vms     map[string]*VM
 	cfg     Config
 	nextCID uint32
+	pool    *ipPool
 }
 
 // VM holds per-sandbox state.
@@ -80,6 +81,12 @@ func New(cfg Config) (*Engine, error) {
 		vms:     make(map[string]*VM),
 		cfg:     cfg,
 		nextCID: 3, // 0=hypervisor, 1=loopback, 2=host
+		pool:    newIPPool(),
+	}
+
+	// Set up bridge network
+	if err := ensureBridge(); err != nil {
+		return nil, fmt.Errorf("setup bridge: %w", err)
 	}
 
 	// Clean up orphaned TAP devices from previous crashes.
@@ -141,9 +148,15 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 	socketPath := filepath.Join(sandboxDir, "firecracker.sock")
 	vsockPath := filepath.Join(sandboxDir, "vsock.sock")
 
-	// 3. Create TAP device
-	tapName, guestIP, err := createTapDevice(id, cid)
+	// 3. Allocate IP and create TAP device
+	guestIP, err := e.pool.Allocate()
 	if err != nil {
+		os.RemoveAll(sandboxDir)
+		return engine.SandboxInfo{}, fmt.Errorf("allocate IP: %w", err)
+	}
+	tapName, err := createTapDevice(id)
+	if err != nil {
+		e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("create tap: %w", err)
 	}
@@ -158,7 +171,6 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		memMB = 512
 	}
 	mac := generateMAC()
-	s := subnetForCID(cid)
 
 	// 5. Start Firecracker process
 	vmCtx, vmCancel := context.WithCancel(context.Background())
@@ -167,7 +179,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 	fcCmd.Stderr = os.Stderr
 	if err := fcCmd.Start(); err != nil {
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("start firecracker: %w", err)
 	}
@@ -187,15 +199,15 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 	// Format: ip=<client-ip>::<gateway>:<netmask>::<device>:off:<dns1>:<dns2>:
 	// This configures eth0 before init runs, so the agent's TCP listener works immediately.
 	bootArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/bin/lohar quiet loglevel=0 ip=%s::%s:255.255.255.252::eth0:off:1.1.1.1:8.8.8.8:",
-		guestIP, s.HostIP)
+		"console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/bin/lohar quiet loglevel=0 ip=%s::%s:255.255.255.0::eth0:off:1.1.1.1:8.8.8.8:",
+		guestIP, bridgeIP)
 
 	if err := fcPut(client, "/boot-source", fmt.Sprintf(
 		`{"kernel_image_path":%q,"boot_args":%q}`,
 		e.cfg.KernelPath, bootArgs)); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("set boot-source: %w", err)
 	}
@@ -205,7 +217,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		rootfsPath)); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("set drive: %w", err)
 	}
@@ -214,7 +226,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		`{"vcpu_count":%d,"mem_size_mib":%d}`, vcpuCount, memMB)); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("set machine-config: %w", err)
 	}
@@ -223,7 +235,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		`{"guest_cid":%d,"uds_path":%q}`, cid, vsockPath)); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("set vsock: %w", err)
 	}
@@ -233,7 +245,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 		mac, tapName)); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("set network: %w", err)
 	}
@@ -242,7 +254,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 	if err := fcPut(client, "/actions", `{"action_type":"InstanceStart"}`); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("start instance: %w", err)
 	}
@@ -253,7 +265,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 	if err := agentClient.WaitReady(ctx, 30*time.Second); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
-		destroyTapDevice(tapName, cid)
+		destroyTapDevice(tapName); e.pool.Release(guestIP)
 		os.RemoveAll(sandboxDir)
 		return engine.SandboxInfo{}, fmt.Errorf("agent not ready: %w", err)
 	}
@@ -404,9 +416,12 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 		vm.cancel()
 	}
 
-	// Always clean up TAP — whether running or stopped.
+	// Always clean up TAP and release IP — whether running or stopped.
 	if vm.TapDevice != "" {
-		destroyTapDevice(vm.TapDevice, vm.CID)
+		destroyTapDevice(vm.TapDevice)
+	}
+	if vm.GuestIP != "" {
+		e.pool.Release(vm.GuestIP)
 	}
 
 	os.RemoveAll(filepath.Dir(vm.RootfsPath))
@@ -479,6 +494,9 @@ func (e *Engine) RestoreVM(id, name, status string, state map[string]interface{}
 	if status == "running" {
 		vm.Agent = agent.NewTCPClient(vm.GuestIP)
 	}
+
+	// Reserve the IP in the pool so it's not re-allocated
+	e.pool.Mark(vm.GuestIP)
 
 	e.mu.Lock()
 	e.vms[id] = vm

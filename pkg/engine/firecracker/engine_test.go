@@ -41,6 +41,15 @@ func testSpec(name string) engine.SandboxSpec {
 	return engine.SandboxSpec{Name: name, CPUs: 1, MemoryMB: 512}
 }
 
+// execWithTimeout wraps eng.Exec with a 15-second timeout to prevent tests
+// from hanging if a command blocks (e.g. ping after VM resume).
+func execWithTimeout(t *testing.T, eng *Engine, id string, cmd []string) (engine.ExecResult, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return eng.Exec(ctx, id, cmd)
+}
+
 func TestCreateExecDestroy(t *testing.T) {
 	eng := testEngine(t)
 	ctx := context.Background()
@@ -57,7 +66,7 @@ func TestCreateExecDestroy(t *testing.T) {
 	}
 
 	// uname
-	result, err := eng.Exec(ctx, info.ID, []string{"uname", "-a"})
+	result, err := execWithTimeout(t, eng, info.ID, []string{"uname", "-a"})
 	if err != nil {
 		t.Fatalf("Exec uname: %v", err)
 	}
@@ -67,7 +76,7 @@ func TestCreateExecDestroy(t *testing.T) {
 	t.Logf("uname: %s", strings.TrimSpace(result.Stdout))
 
 	// node
-	result, err = eng.Exec(ctx, info.ID, []string{"node", "--version"})
+	result, err = execWithTimeout(t, eng, info.ID, []string{"node", "--version"})
 	if err != nil {
 		t.Fatalf("Exec node: %v", err)
 	}
@@ -101,7 +110,7 @@ func TestSnapshotResume(t *testing.T) {
 	defer eng.Destroy(ctx, info.ID)
 
 	// 1. Write a file
-	r, _ := eng.Exec(ctx, info.ID, []string{"sh", "-c", "echo snap-data > /tmp/test && cat /tmp/test"})
+	r, _ := execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo snap-data > /tmp/test && cat /tmp/test"})
 	if r.ExitCode != 0 {
 		t.Fatalf("write file: exit=%d err=%q", r.ExitCode, r.Stderr)
 	}
@@ -109,7 +118,7 @@ func TestSnapshotResume(t *testing.T) {
 
 	// 2. Start a background process and record its PID
 	// Redirect stdin/stdout/stderr so the background process doesn't hold the pipe open.
-	r, _ = eng.Exec(ctx, info.ID, []string{"sh", "-c", "sleep 3600 </dev/null >/dev/null 2>&1 & echo $!"})
+	r, _ = execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "sleep 3600 </dev/null >/dev/null 2>&1 & echo $!"})
 	if r.ExitCode != 0 {
 		t.Fatalf("start background: exit=%d", r.ExitCode)
 	}
@@ -117,7 +126,7 @@ func TestSnapshotResume(t *testing.T) {
 	t.Logf("background sleep PID: %s", bgPID)
 
 	// 3. Set an env var in a file to verify later
-	eng.Exec(ctx, info.ID, []string{"sh", "-c", "echo MY_STATE=preserved > /tmp/env-test"})
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo MY_STATE=preserved > /tmp/env-test"})
 
 	// 4. Stop (snapshot)
 	if err := eng.Stop(ctx, info.ID); err != nil {
@@ -142,7 +151,7 @@ func TestSnapshotResume(t *testing.T) {
 	t.Log("resumed")
 
 	// 7. Verify file persists
-	r, err = eng.Exec(ctx, info.ID, []string{"cat", "/tmp/test"})
+	r, err = execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/test"})
 	if err != nil {
 		t.Fatalf("read file after resume: %v", err)
 	}
@@ -152,7 +161,7 @@ func TestSnapshotResume(t *testing.T) {
 	t.Log("✓ file persists")
 
 	// 8. Verify background process is still alive
-	r, err = eng.Exec(ctx, info.ID, []string{"kill", "-0", bgPID})
+	r, err = execWithTimeout(t, eng, info.ID, []string{"kill", "-0", bgPID})
 	if err != nil {
 		t.Fatalf("kill -0 after resume: %v", err)
 	}
@@ -163,7 +172,7 @@ func TestSnapshotResume(t *testing.T) {
 	}
 
 	// 9. Verify it shows in ps
-	r, _ = eng.Exec(ctx, info.ID, []string{"sh", "-c", "ps aux | grep 'sleep 3600' | grep -v grep"})
+	r, _ = execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "ps aux | grep 'sleep 3600' | grep -v grep"})
 	if !strings.Contains(r.Stdout, "sleep 3600") {
 		t.Errorf("ps: %q, want 'sleep 3600'", r.Stdout)
 	} else {
@@ -171,7 +180,7 @@ func TestSnapshotResume(t *testing.T) {
 	}
 
 	// 10. Verify env file persists
-	r, _ = eng.Exec(ctx, info.ID, []string{"cat", "/tmp/env-test"})
+	r, _ = execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/env-test"})
 	if !strings.Contains(r.Stdout, "MY_STATE=preserved") {
 		t.Errorf("env: %q", r.Stdout)
 	} else {
@@ -179,14 +188,14 @@ func TestSnapshotResume(t *testing.T) {
 	}
 
 	// 11. Second stop/start cycle — verify it works multiple times
-	eng.Exec(ctx, info.ID, []string{"sh", "-c", "echo cycle2 > /tmp/cycle2"})
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo cycle2 > /tmp/cycle2"})
 	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop (cycle 2): %v", err)
 	}
 	if err := eng.Start(ctx, info.ID); err != nil {
 		t.Fatalf("Start (cycle 2): %v", err)
 	}
-	r, _ = eng.Exec(ctx, info.ID, []string{"cat", "/tmp/cycle2"})
+	r, _ = execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/cycle2"})
 	if strings.TrimSpace(r.Stdout) != "cycle2" {
 		t.Errorf("cycle2 file: %q", r.Stdout)
 	} else {
@@ -205,12 +214,12 @@ func TestPortForwarding(t *testing.T) {
 	defer eng.Destroy(ctx, info.ID)
 
 	// Start python HTTP server in background (redirect fds to avoid pipe hold)
-	eng.Exec(ctx, info.ID, []string{"sh", "-c",
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
 		"cd /tmp && echo hello-from-vm > index.html && python3 -m http.server 9000 </dev/null >/dev/null 2>&1 &"})
 	time.Sleep(1 * time.Second)
 
 	// Verify it's listening
-	r, _ := eng.Exec(ctx, info.ID, []string{"ss", "-tln"})
+	r, _ := execWithTimeout(t, eng, info.ID, []string{"ss", "-tln"})
 	if !strings.Contains(r.Stdout, "9000") {
 		t.Fatalf("port 9000 not listening: %s", r.Stdout)
 	}
