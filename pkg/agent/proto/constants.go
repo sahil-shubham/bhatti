@@ -39,6 +39,16 @@ const (
 	// Activity
 	ACTIVITY_REQ  byte = 0x40 // host → guest: empty payload
 	ACTIVITY_RESP byte = 0x41 // guest → host: JSON ActivityInfo
+
+	// File operations
+	FILE_READ_REQ   byte = 0x50 // host → guest: JSON {"path": "..."}
+	FILE_READ_RESP  byte = 0x51 // guest → host: JSON {"size": N, "mode": "0644"} then STDOUT frames, then EXIT
+	FILE_WRITE_REQ  byte = 0x52 // host → guest: JSON {"path": "...", "mode": "0644", "size": N} then STDIN frames
+	FILE_WRITE_RESP byte = 0x53 // guest → host: JSON {"status": "ok"}
+	FILE_STAT_REQ   byte = 0x54 // host → guest: JSON {"path": "..."}
+	FILE_STAT_RESP  byte = 0x55 // guest → host: JSON FileInfo
+	FILE_LS_REQ     byte = 0x56 // host → guest: JSON {"path": "..."}
+	FILE_LS_RESP    byte = 0x57 // guest → host: JSON []FileInfo
 )
 
 // Vsock ports

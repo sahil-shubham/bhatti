@@ -725,6 +725,65 @@ func (e *Engine) Tunnel(ctx context.Context, id string, port int) (io.ReadWriteC
 	return vm.Agent.Forward(ctx, uint16(port))
 }
 
+// --- Session Operations ---
+
+func (e *Engine) SessionList(ctx context.Context, id string) ([]proto.SessionInfo, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, err
+	}
+	if vm.Thermal != "hot" {
+		return nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	return vm.Agent.SessionList(ctx)
+}
+
+// --- File Operations ---
+
+func (e *Engine) FileRead(ctx context.Context, id, path string, w io.Writer) (int64, string, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return 0, "", err
+	}
+	if vm.Thermal != "hot" {
+		return 0, "", fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	return vm.Agent.FileRead(ctx, path, w)
+}
+
+func (e *Engine) FileWrite(ctx context.Context, id, path, mode string, size int64, r io.Reader) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	if vm.Thermal != "hot" {
+		return fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	return vm.Agent.FileWrite(ctx, path, mode, size, r)
+}
+
+func (e *Engine) FileStat(ctx context.Context, id, path string) (*proto.FileInfo, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, err
+	}
+	if vm.Thermal != "hot" {
+		return nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	return vm.Agent.FileStat(ctx, path)
+}
+
+func (e *Engine) FileList(ctx context.Context, id, path string) ([]proto.FileInfo, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, err
+	}
+	if vm.Thermal != "hot" {
+		return nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	return vm.Agent.FileList(ctx, path)
+}
+
 // --- Helpers ---
 
 func generateID() string {

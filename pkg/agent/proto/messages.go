@@ -40,3 +40,12 @@ type ForwardResponse struct {
 	Status  string  `json:"status"`            // "ok" or "error"
 	Message *string `json:"message,omitempty"` // error detail when Status="error"
 }
+
+// FileInfo describes a file in the guest filesystem.
+type FileInfo struct {
+	Name  string `json:"name"`
+	Size  int64  `json:"size"`
+	Mode  string `json:"mode"`   // octal string, e.g. "0644"
+	IsDir bool   `json:"is_dir"`
+	Mtime int64  `json:"mtime"`  // unix timestamp
+}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/sahilshubham/bhatti/pkg/agent/proto"
 	"github.com/sahilshubham/bhatti/pkg/engine"
 	"github.com/sahilshubham/bhatti/pkg/store"
 )
@@ -321,6 +322,10 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			s.handleSandboxPorts(w, r, id)
 		case "ws":
 			s.handleSandboxWS(w, r, id)
+		case "files":
+			s.handleSandboxFiles(w, r, id)
+		case "sessions":
+			s.handleSandboxSessions(w, r, id)
 		default:
 			errResp(w, 404, "not found")
 		}
@@ -860,6 +865,129 @@ func (s *Server) handleProxyWS(w http.ResponseWriter, r *http.Request, engineID 
 	}()
 	io.Copy(clientConn, tunnel)
 	<-done
+}
+
+// --- File Operations ---
+
+// FileEngine is optionally implemented by engines that support direct file operations.
+type FileEngine interface {
+	FileRead(ctx context.Context, id, path string, w io.Writer) (int64, string, error)
+	FileWrite(ctx context.Context, id, path, mode string, size int64, r io.Reader) error
+	FileStat(ctx context.Context, id, path string) (*proto.FileInfo, error)
+	FileList(ctx context.Context, id, path string) ([]proto.FileInfo, error)
+}
+
+func (s *Server) handleSandboxFiles(w http.ResponseWriter, r *http.Request, id string) {
+	sb, err := s.store.GetSandbox(id)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		errResp(w, 500, "wake sandbox: "+err.Error())
+		return
+	}
+
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		errResp(w, 400, "path query parameter required")
+		return
+	}
+
+	fe, ok := s.engine.(FileEngine)
+	if !ok {
+		errResp(w, 501, "engine does not support file operations")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if r.URL.Query().Get("ls") == "true" {
+			files, err := fe.FileList(r.Context(), sb.EngineID, path)
+			if err != nil {
+				errResp(w, 500, err.Error())
+				return
+			}
+			writeJSON(w, 200, files)
+		} else {
+			// Bug #6: Stat first so we can set Content-Length and detect errors
+			// before writing any response body. Mid-stream errors will cause a
+			// short response that the client detects via Content-Length mismatch.
+			info, err := fe.FileStat(r.Context(), sb.EngineID, path)
+			if err != nil {
+				errResp(w, 500, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", fmt.Sprint(info.Size))
+			w.WriteHeader(200)
+			fe.FileRead(r.Context(), sb.EngineID, path, w)
+			// If FileRead fails mid-stream, the client sees a short body
+			// vs Content-Length — standard HTTP error detection.
+		}
+	case http.MethodPut:
+		size := r.ContentLength
+		// Bug #2: Reject unknown Content-Length (chunked/missing)
+		if size < 0 {
+			errResp(w, 400, "Content-Length header required for file upload")
+			return
+		}
+		mode := r.URL.Query().Get("mode")
+		if mode == "" {
+			mode = "0644"
+		}
+		if err := fe.FileWrite(r.Context(), sb.EngineID, path, mode, size, r.Body); err != nil {
+			errResp(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	case http.MethodHead:
+		info, err := fe.FileStat(r.Context(), sb.EngineID, path)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		w.Header().Set("X-File-Size", fmt.Sprint(info.Size))
+		w.Header().Set("X-File-Mode", info.Mode)
+		w.Header().Set("X-File-IsDir", fmt.Sprint(info.IsDir))
+		w.WriteHeader(200)
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+// --- Sessions ---
+
+func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	sb, err := s.store.GetSandbox(id)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		errResp(w, 500, "wake sandbox: "+err.Error())
+		return
+	}
+
+	// Use the engine to query sessions via the agent
+	type sessionLister interface {
+		SessionList(ctx context.Context, id string) ([]proto.SessionInfo, error)
+	}
+	if sl, ok := s.engine.(sessionLister); ok {
+		sessions, err := sl.SessionList(r.Context(), sb.EngineID)
+		if err != nil {
+			errResp(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, sessions)
+		return
+	}
+	errResp(w, 501, "engine does not support session listing")
 }
 
 func genID() string {

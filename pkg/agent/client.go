@@ -458,6 +458,164 @@ func (c *AgentClient) SessionAttach(ctx context.Context, sessionID string) (*pro
 	return &info, &agentTermConn{conn: conn}, nil
 }
 
+// FileRead reads a file from the guest and writes its contents to w.
+// Returns the file size and mode.
+func (c *AgentClient) FileRead(ctx context.Context, path string, w io.Writer) (size int64, mode string, err error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return 0, "", err
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if err := proto.SendJSON(conn, proto.FILE_READ_REQ, map[string]string{"path": path}); err != nil {
+		return 0, "", fmt.Errorf("send file read: %w", err)
+	}
+
+	// Read FILE_READ_RESP
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return 0, "", fmt.Errorf("read file resp: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return 0, "", fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.FILE_READ_RESP {
+		return 0, "", fmt.Errorf("expected FILE_READ_RESP, got 0x%02x", msgType)
+	}
+	var resp struct {
+		Size int64  `json:"size"`
+		Mode string `json:"mode"`
+	}
+	json.Unmarshal(payload, &resp)
+
+	// Read STDOUT frames until EXIT
+	var written int64
+	for {
+		msgType, payload, err = proto.ReadFrame(conn)
+		if err != nil {
+			return written, resp.Mode, err
+		}
+		switch msgType {
+		case proto.STDOUT:
+			n, _ := w.Write(payload)
+			written += int64(n)
+		case proto.EXIT:
+			return written, resp.Mode, nil
+		case proto.ERROR:
+			return written, resp.Mode, fmt.Errorf("agent: %s", payload)
+		}
+	}
+}
+
+// FileWrite writes content from r to a file in the guest.
+func (c *AgentClient) FileWrite(ctx context.Context, path, mode string, size int64, r io.Reader) error {
+	conn, err := c.dialControl()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if err := proto.SendJSON(conn, proto.FILE_WRITE_REQ, map[string]any{
+		"path": path, "mode": mode, "size": size,
+	}); err != nil {
+		return fmt.Errorf("send file write: %w", err)
+	}
+
+	// Send file content as STDIN frames
+	buf := make([]byte, 32768)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if werr := proto.WriteFrame(conn, proto.STDIN, buf[:n]); werr != nil {
+				return fmt.Errorf("write stdin frame: %w", werr)
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	// Read FILE_WRITE_RESP
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("read write resp: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return fmt.Errorf("agent: %s", payload)
+	}
+	return nil
+}
+
+// FileStat returns file info for a path in the guest.
+func (c *AgentClient) FileStat(ctx context.Context, path string) (*proto.FileInfo, error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if err := proto.SendJSON(conn, proto.FILE_STAT_REQ, map[string]string{"path": path}); err != nil {
+		return nil, fmt.Errorf("send file stat: %w", err)
+	}
+
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read stat resp: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return nil, fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.FILE_STAT_RESP {
+		return nil, fmt.Errorf("expected FILE_STAT_RESP, got 0x%02x", msgType)
+	}
+	var info proto.FileInfo
+	json.Unmarshal(payload, &info)
+	return &info, nil
+}
+
+// FileList returns directory contents for a path in the guest.
+func (c *AgentClient) FileList(ctx context.Context, path string) ([]proto.FileInfo, error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if err := proto.SendJSON(conn, proto.FILE_LS_REQ, map[string]string{"path": path}); err != nil {
+		return nil, fmt.Errorf("send file ls: %w", err)
+	}
+
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read ls resp: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return nil, fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.FILE_LS_RESP {
+		return nil, fmt.Errorf("expected FILE_LS_RESP, got 0x%02x", msgType)
+	}
+	var files []proto.FileInfo
+	json.Unmarshal(payload, &files)
+	return files, nil
+}
+
 // agentTermConn wraps the vsock connection as engine.TerminalConn.
 type agentTermConn struct {
 	conn    net.Conn

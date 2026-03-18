@@ -111,6 +111,17 @@ func handleControlConnection(conn net.Conn) {
 		exit := proto.ExitPayload(0)
 		proto.WriteFrame(conn, proto.EXIT, exit[:])
 
+	case proto.FILE_READ_REQ:
+		updateActivity()
+		handleFileRead(conn, payload)
+	case proto.FILE_WRITE_REQ:
+		updateActivity()
+		handleFileWrite(conn, payload)
+	case proto.FILE_STAT_REQ:
+		handleFileStat(conn, payload)
+	case proto.FILE_LS_REQ:
+		handleFileList(conn, payload)
+
 	default:
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("unexpected frame type 0x%02x", msgType)))
 	}
