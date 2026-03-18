@@ -15,7 +15,6 @@ set -euo pipefail
 
 FC_VERSION="1.6.0"
 FC_MAJOR_MINOR="1.6"
-GO_VERSION="1.24.1"
 DATA_DIR="/var/lib/bhatti"
 INSTALL_SYSTEMD=false
 
@@ -66,6 +65,8 @@ if [[ ! -f "$REPO_ROOT/go.mod" ]]; then
     echo "error: cannot find repo root (expected go.mod at $REPO_ROOT)" >&2
     exit 1
 fi
+
+GO_VERSION=$(grep '^go ' "$REPO_ROOT/go.mod" | awk '{print $2}')
 
 echo "==> Installing bhatti on $(hostname) ($HOST_ARCH)"
 echo "    repo: $REPO_ROOT"
