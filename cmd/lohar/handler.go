@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/sahilshubham/bhatti/pkg/agent/proto"
@@ -35,25 +36,49 @@ func handleControlConnection(conn net.Conn) {
 		return
 	}
 
-	if msgType != proto.EXEC_REQ {
-		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("expected EXEC_REQ, got 0x%02x", msgType)))
-		return
-	}
+	switch msgType {
+	case proto.EXEC_REQ:
+		var req proto.ExecRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("bad exec request: %v", err)))
+			return
+		}
+		if req.SessionID != nil {
+			// Attach to existing session
+			handleSessionAttach(conn, *req.SessionID)
+		} else if len(req.Argv) == 0 {
+			proto.WriteFrame(conn, proto.ERROR, []byte("empty argv"))
+		} else if req.TTY != nil && *req.TTY {
+			// Create new TTY session
+			handleTTYSession(conn, req)
+		} else {
+			// Non-TTY exec (one-shot, blocks until done)
+			handlePipedExec(conn, req)
+		}
 
-	var req proto.ExecRequest
-	if err := json.Unmarshal(payload, &req); err != nil {
-		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("bad exec request: %v", err)))
-		return
-	}
+	case proto.EXEC_LIST_REQ:
+		sessions := listSessions()
+		proto.SendJSON(conn, proto.EXEC_LIST_RESP, sessions)
 
-	if len(req.Argv) == 0 {
-		proto.WriteFrame(conn, proto.ERROR, []byte("empty argv"))
-		return
-	}
+	case proto.EXEC_KILL:
+		var req struct {
+			SessionID string `json:"session_id"`
+		}
+		json.Unmarshal(payload, &req)
+		s := getSession(req.SessionID)
+		if s == nil {
+			proto.WriteFrame(conn, proto.ERROR, []byte("session not found"))
+			return
+		}
+		s.mu.Lock()
+		if s.Cmd != nil && s.Cmd.Process != nil {
+			s.Cmd.Process.Signal(syscall.SIGTERM)
+		}
+		s.mu.Unlock()
+		exit := proto.ExitPayload(0)
+		proto.WriteFrame(conn, proto.EXIT, exit[:])
 
-	if req.TTY != nil && *req.TTY {
-		handleTTYExec(conn, req)
-	} else {
-		handlePipedExec(conn, req)
+	default:
+		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("unexpected frame type 0x%02x", msgType)))
 	}
 }

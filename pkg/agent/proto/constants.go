@@ -29,6 +29,12 @@ const (
 	// Port forwarding
 	FWD_REQ  byte = 0x20 // host → guest: JSON-encoded ForwardRequest
 	FWD_RESP byte = 0x21 // guest → host: JSON-encoded ForwardResponse
+
+	// Sessions
+	EXEC_LIST_REQ  byte = 0x30 // host → guest: empty payload
+	EXEC_LIST_RESP byte = 0x31 // guest → host: JSON []SessionInfo
+	EXEC_KILL      byte = 0x32 // host → guest: JSON {"session_id": "..."}
+	SESSION_INFO   byte = 0x33 // guest → host: JSON SessionInfo (sent on create/attach)
 )
 
 // Vsock ports

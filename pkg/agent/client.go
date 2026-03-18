@@ -210,6 +210,18 @@ func (c *AgentClient) Shell(ctx context.Context, argv []string, env map[string]s
 		return nil, fmt.Errorf("agent send shell: %w", err)
 	}
 
+	// Consume the SESSION_INFO frame that the agent sends before STDOUT
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("agent read session info: %w", err)
+	}
+	if msgType == proto.ERROR {
+		conn.Close()
+		return nil, fmt.Errorf("agent: %s", payload)
+	}
+	// SESSION_INFO consumed, ready for STDOUT/STDIN
+
 	return &agentTermConn{conn: conn}, nil
 }
 
@@ -280,6 +292,139 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// SessionList returns all active sessions inside the VM.
+func (c *AgentClient) SessionList(ctx context.Context) ([]proto.SessionInfo, error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return nil, fmt.Errorf("agent connect: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if err := proto.WriteFrame(conn, proto.EXEC_LIST_REQ, nil); err != nil {
+		return nil, fmt.Errorf("agent send list: %w", err)
+	}
+
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return nil, fmt.Errorf("agent read list: %w", err)
+	}
+	if msgType != proto.EXEC_LIST_RESP {
+		return nil, fmt.Errorf("expected EXEC_LIST_RESP, got 0x%02x", msgType)
+	}
+
+	var sessions []proto.SessionInfo
+	if err := json.Unmarshal(payload, &sessions); err != nil {
+		return nil, fmt.Errorf("unmarshal sessions: %w", err)
+	}
+	return sessions, nil
+}
+
+// SessionKill sends SIGTERM to a session's process.
+func (c *AgentClient) SessionKill(ctx context.Context, sessionID string) error {
+	conn, err := c.dialControl()
+	if err != nil {
+		return fmt.Errorf("agent connect: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	req := struct {
+		SessionID string `json:"session_id"`
+	}{SessionID: sessionID}
+	if err := proto.SendJSON(conn, proto.EXEC_KILL, req); err != nil {
+		return fmt.Errorf("agent send kill: %w", err)
+	}
+
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("agent read kill resp: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return fmt.Errorf("agent: %s", payload)
+	}
+	return nil
+}
+
+// ShellSession opens a TTY session and returns both the session info and the terminal connection.
+func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[string]string, rows, cols uint16) (*proto.SessionInfo, engine.TerminalConn, error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent connect: %w", err)
+	}
+
+	tty := true
+	req := proto.ExecRequest{
+		Argv: argv,
+		Env:  env,
+		TTY:  &tty,
+		Rows: &rows,
+		Cols: &cols,
+	}
+	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent send shell: %w", err)
+	}
+
+	// Read SESSION_INFO frame
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent read session info: %w", err)
+	}
+	if msgType == proto.ERROR {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.SESSION_INFO {
+		conn.Close()
+		return nil, nil, fmt.Errorf("expected SESSION_INFO, got 0x%02x", msgType)
+	}
+	var info proto.SessionInfo
+	json.Unmarshal(payload, &info)
+
+	return &info, &agentTermConn{conn: conn}, nil
+}
+
+// SessionAttach reconnects to an existing session and returns the session info and terminal.
+func (c *AgentClient) SessionAttach(ctx context.Context, sessionID string) (*proto.SessionInfo, engine.TerminalConn, error) {
+	conn, err := c.dialControl()
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent connect: %w", err)
+	}
+
+	req := proto.ExecRequest{SessionID: &sessionID}
+	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent send attach: %w", err)
+	}
+
+	// Read SESSION_INFO frame
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent read session info: %w", err)
+	}
+	if msgType == proto.ERROR {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.SESSION_INFO {
+		conn.Close()
+		return nil, nil, fmt.Errorf("expected SESSION_INFO, got 0x%02x", msgType)
+	}
+	var info proto.SessionInfo
+	json.Unmarshal(payload, &info)
+
+	return &info, &agentTermConn{conn: conn}, nil
 }
 
 // agentTermConn wraps the vsock connection as engine.TerminalConn.
