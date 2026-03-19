@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sahil-shubham/bhatti/pkg/agent"
 )
 
 func TestFileWriteRead(t *testing.T) {
@@ -511,6 +513,121 @@ func TestFileRapidWriteReadCycles(t *testing.T) {
 		}
 	}
 	t.Log("✓ 10 rapid write/read cycles, all correct")
+}
+
+// --- Server-side File Read Truncation on Real VMs ---
+
+func TestFileReadTruncatedLimit(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("trunc-limit"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Write a 100-line file via exec
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
+		"for i in $(seq 1 100); do echo \"line $i\"; done > /workspace/lines.txt"})
+
+	// Read with limit=10
+	var buf bytes.Buffer
+	_, _, err = eng.FileRead(ctx, info.ID, "/workspace/lines.txt", &buf,
+		agent.FileReadOpts{Limit: 10})
+	if err != nil {
+		t.Fatalf("FileRead: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 10 {
+		t.Fatalf("expected 10 lines, got %d", len(lines))
+	}
+	if lines[0] != "line 1" || lines[9] != "line 10" {
+		t.Errorf("content: first=%q last=%q", lines[0], lines[9])
+	}
+	t.Logf("✓ limit=10: got %d lines", len(lines))
+}
+
+func TestFileReadTruncatedOffset(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("trunc-off"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
+		"for i in $(seq 1 50); do echo \"line $i\"; done > /workspace/lines.txt"})
+
+	// Read with offset=40, limit=5 → lines 40-44
+	var buf bytes.Buffer
+	eng.FileRead(ctx, info.ID, "/workspace/lines.txt", &buf,
+		agent.FileReadOpts{Offset: 40, Limit: 5})
+
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("expected 5 lines, got %d: %q", len(lines), buf.String())
+	}
+	if lines[0] != "line 40" {
+		t.Errorf("first line: %q, want 'line 40'", lines[0])
+	}
+	if lines[4] != "line 44" {
+		t.Errorf("last line: %q, want 'line 44'", lines[4])
+	}
+	t.Logf("✓ offset=40,limit=5: lines 40-44")
+}
+
+func TestFileReadTruncatedMaxBytes(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("trunc-bytes"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
+		"for i in $(seq 1 1000); do echo \"line $i\"; done > /workspace/lines.txt"})
+
+	// Read with max_bytes=100
+	var buf bytes.Buffer
+	eng.FileRead(ctx, info.ID, "/workspace/lines.txt", &buf,
+		agent.FileReadOpts{MaxBytes: 100})
+
+	if buf.Len() > 100 {
+		t.Fatalf("expected <= 100 bytes, got %d", buf.Len())
+	}
+	if buf.Len() == 0 {
+		t.Fatal("expected some content")
+	}
+	t.Logf("✓ max_bytes=100: got %d bytes", buf.Len())
+}
+
+func TestFileReadFullBackwardCompat(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("trunc-compat"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
+		"for i in $(seq 1 50); do echo \"line $i\"; done > /workspace/lines.txt"})
+
+	// No opts → full file (backward compat)
+	var buf bytes.Buffer
+	eng.FileRead(ctx, info.ID, "/workspace/lines.txt", &buf)
+
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 50 {
+		t.Fatalf("expected 50 lines (full file), got %d", len(lines))
+	}
+	t.Log("✓ no opts: full file returned")
 }
 
 // Ensure unused import is satisfied

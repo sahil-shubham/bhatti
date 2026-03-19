@@ -380,3 +380,139 @@ func TestEnsureKeypair(t *testing.T) {
 	// Import from parent package — tested separately
 	_ = os.TempDir()
 }
+
+// --- Firecracker State Persistence ---
+
+func TestFirecrackerStateRoundTrip(t *testing.T) {
+	s := testStore(t)
+	defer s.Close()
+
+	// Create a sandbox first (SaveFirecrackerState updates by sandbox ID)
+	sb := Sandbox{
+		ID: "sb-fc-1", Name: "fc-test", EngineID: "eng-1",
+		Status: "running", EngineMeta: json.RawMessage("{}"),
+		CreatedAt: time.Now(),
+	}
+	if err := s.CreateSandbox(sb); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save FC state
+	state := FirecrackerState{
+		RootfsPath:  "/var/lib/bhatti/sandboxes/abc/rootfs.ext4",
+		SnapMemPath: "/var/lib/bhatti/sandboxes/abc/mem.snap",
+		SnapVMPath:  "/var/lib/bhatti/sandboxes/abc/vm.snap",
+		VsockCID:    42,
+		TapDevice:   "tap12345678",
+		GuestIP:     "192.168.137.5",
+		GuestMAC:    "02:ab:cd:ef:00:01",
+		VcpuCount:   2,
+		MemSizeMib:  1024,
+		SocketPath:  "/var/lib/bhatti/sandboxes/abc/firecracker.sock",
+		VsockPath:   "/var/lib/bhatti/sandboxes/abc/vsock.sock",
+	}
+	if err := s.SaveFirecrackerState("sb-fc-1", state); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load and verify
+	got, err := s.LoadFirecrackerState("sb-fc-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RootfsPath != state.RootfsPath {
+		t.Errorf("RootfsPath: %q, want %q", got.RootfsPath, state.RootfsPath)
+	}
+	if got.SnapMemPath != state.SnapMemPath {
+		t.Errorf("SnapMemPath: %q, want %q", got.SnapMemPath, state.SnapMemPath)
+	}
+	if got.SnapVMPath != state.SnapVMPath {
+		t.Errorf("SnapVMPath: %q, want %q", got.SnapVMPath, state.SnapVMPath)
+	}
+	if got.VsockCID != state.VsockCID {
+		t.Errorf("VsockCID: %d, want %d", got.VsockCID, state.VsockCID)
+	}
+	if got.TapDevice != state.TapDevice {
+		t.Errorf("TapDevice: %q, want %q", got.TapDevice, state.TapDevice)
+	}
+	if got.GuestIP != state.GuestIP {
+		t.Errorf("GuestIP: %q, want %q", got.GuestIP, state.GuestIP)
+	}
+	if got.GuestMAC != state.GuestMAC {
+		t.Errorf("GuestMAC: %q, want %q", got.GuestMAC, state.GuestMAC)
+	}
+	if got.VcpuCount != state.VcpuCount {
+		t.Errorf("VcpuCount: %v, want %v", got.VcpuCount, state.VcpuCount)
+	}
+	if got.MemSizeMib != state.MemSizeMib {
+		t.Errorf("MemSizeMib: %d, want %d", got.MemSizeMib, state.MemSizeMib)
+	}
+	if got.SocketPath != state.SocketPath {
+		t.Errorf("SocketPath: %q, want %q", got.SocketPath, state.SocketPath)
+	}
+	if got.VsockPath != state.VsockPath {
+		t.Errorf("VsockPath: %q, want %q", got.VsockPath, state.VsockPath)
+	}
+}
+
+func TestFirecrackerStateUpdate(t *testing.T) {
+	s := testStore(t)
+	defer s.Close()
+
+	sb := Sandbox{
+		ID: "sb-fc-2", Name: "fc-update", EngineID: "eng-2",
+		Status: "running", EngineMeta: json.RawMessage("{}"),
+		CreatedAt: time.Now(),
+	}
+	s.CreateSandbox(sb)
+
+	// Save initial state
+	s.SaveFirecrackerState("sb-fc-2", FirecrackerState{
+		RootfsPath: "/old/rootfs.ext4",
+		GuestIP:    "192.168.137.2",
+		VsockCID:   10,
+	})
+
+	// Update with new state
+	s.SaveFirecrackerState("sb-fc-2", FirecrackerState{
+		RootfsPath:  "/new/rootfs.ext4",
+		SnapMemPath: "/new/mem.snap",
+		GuestIP:     "192.168.137.3",
+		VsockCID:    20,
+	})
+
+	got, _ := s.LoadFirecrackerState("sb-fc-2")
+	if got.RootfsPath != "/new/rootfs.ext4" {
+		t.Errorf("RootfsPath not updated: %q", got.RootfsPath)
+	}
+	if got.SnapMemPath != "/new/mem.snap" {
+		t.Errorf("SnapMemPath not updated: %q", got.SnapMemPath)
+	}
+	if got.GuestIP != "192.168.137.3" {
+		t.Errorf("GuestIP not updated: %q", got.GuestIP)
+	}
+	if got.VsockCID != 20 {
+		t.Errorf("VsockCID not updated: %d", got.VsockCID)
+	}
+}
+
+func TestFirecrackerStateDefaults(t *testing.T) {
+	s := testStore(t)
+	defer s.Close()
+
+	// Non-FC sandbox should return zero-value state
+	sb := Sandbox{
+		ID: "sb-docker", Name: "docker-test", EngineID: "dock-1",
+		Status: "running", EngineMeta: json.RawMessage("{}"),
+		CreatedAt: time.Now(),
+	}
+	s.CreateSandbox(sb)
+
+	got, err := s.LoadFirecrackerState("sb-docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RootfsPath != "" || got.GuestIP != "" || got.VsockCID != 0 {
+		t.Errorf("expected zero values for non-FC sandbox, got: %+v", got)
+	}
+}
