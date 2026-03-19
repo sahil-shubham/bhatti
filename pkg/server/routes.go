@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -382,7 +382,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.engine.Destroy(r.Context(), sb.EngineID); err != nil {
-			log.Printf("engine destroy warning: %v", err)
+			slog.Warn("engine destroy failed", "sandbox", sb.ID, "error", err)
 		}
 		s.proxy.StopAll(id)
 		s.store.DetachVolumes(id)
@@ -492,7 +492,7 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id stri
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("ws upgrade error: %v", err)
+		slog.Error("websocket upgrade failed", "error", err)
 		return
 	}
 	defer conn.Close()
@@ -539,7 +539,7 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id stri
 			}
 			if json.Unmarshal(msg, &resize) == nil && resize.Type == "resize" {
 				if err := term.Resize(resize.Rows, resize.Cols); err != nil {
-					log.Printf("resize error: %v", err)
+					slog.Debug("terminal resize failed", "error", err)
 				}
 				continue
 			}

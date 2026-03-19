@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -29,25 +29,29 @@ func main() {
 func runDaemon() {
 	cfg, err := pkg.LoadConfig()
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("load config", "error", err)
+		os.Exit(1)
 	}
 
 	// Ensure data directory
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
-		log.Fatal(err)
+		slog.Error("create data dir", "error", err)
+		os.Exit(1)
 	}
 
 	// Generate SSH keypair
 	keyPath, err := pkg.EnsureKeypair(cfg.DataDir)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("ensure keypair", "error", err)
+		os.Exit(1)
 	}
-	log.Printf("SSH key: %s", keyPath)
+	slog.Info("SSH key ready", "path", keyPath)
 
 	// Open store
 	st, err := store.New(filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("open store", "error", err)
+		os.Exit(1)
 	}
 	defer st.Close()
 
@@ -59,10 +63,12 @@ func runDaemon() {
 	case "docker", "":
 		eng, err = docker.New()
 	default:
-		log.Fatalf("unknown engine: %s", cfg.Engine)
+		slog.Error("unknown engine", "engine", cfg.Engine)
+		os.Exit(1)
 	}
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("create engine", "error", err)
+		os.Exit(1)
 	}
 
 	// Recover Firecracker VMs from store if applicable
@@ -85,18 +91,20 @@ func runDaemon() {
 	// Resolve the port for display
 	port := cfg.Listen
 
-	log.Printf("bhatti listening on %s", cfg.Listen)
+	slog.Info("bhatti listening", "addr", cfg.Listen)
 	if lanIP := getLanIP(); lanIP != "" {
-		log.Printf("  → local:   http://localhost%s", port)
-		log.Printf("  → network: http://%s%s", lanIP, port)
+		slog.Info("endpoints",
+			"local", "http://localhost"+port,
+			"network", "http://"+lanIP+port,
+		)
 	}
 
 	// Graceful shutdown: clean up TAP devices on SIGTERM/SIGINT
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-		<-sigCh
-		log.Println("shutting down...")
+		sig := <-sigCh
+		slog.Info("shutting down", "signal", sig)
 		if shutdowner, ok := eng.(interface{ Shutdown() }); ok {
 			shutdowner.Shutdown()
 		}
@@ -104,7 +112,8 @@ func runDaemon() {
 	}()
 
 	if err := http.ListenAndServe(cfg.Listen, srv); err != nil {
-		log.Fatal(err)
+		slog.Error("server failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -112,7 +121,7 @@ func runDaemon() {
 func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
 	sandboxes, err := st.ListSandboxes()
 	if err != nil {
-		log.Printf("warning: recovery list: %v", err)
+		slog.Warn("recovery: list sandboxes", "error", err)
 		return
 	}
 
@@ -145,26 +154,26 @@ func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
 			if _, err := os.Stat(fcState.SnapMemPath); err == nil {
 				provider.RestoreVM(sb.EngineID, sb.Name, "stopped", state)
 				recovered++
-				log.Printf("recovered stopped sandbox %s (%s)", sb.Name, sb.ID)
+				slog.Info("recovered sandbox", "name", sb.Name, "id", sb.ID, "status", "stopped")
 			} else {
 				st.UpdateSandboxStatus(sb.ID, "unknown")
-				log.Printf("sandbox %s snapshot missing, marked unknown", sb.Name)
+				slog.Warn("snapshot missing", "name", sb.Name, "id", sb.ID)
 			}
 		} else if sb.Status == "running" {
 			if fcState.SnapMemPath != "" {
 				st.UpdateSandboxStatus(sb.ID, "stopped")
 				provider.RestoreVM(sb.EngineID, sb.Name, "stopped", state)
 				recovered++
-				log.Printf("sandbox %s was running, marked stopped (resumable)", sb.Name)
+				slog.Info("recovered sandbox", "name", sb.Name, "id", sb.ID, "status", "stopped (was running)")
 			} else {
 				st.UpdateSandboxStatus(sb.ID, "unknown")
-				log.Printf("sandbox %s was running with no snapshot, marked unknown", sb.Name)
+				slog.Warn("sandbox was running with no snapshot", "name", sb.Name, "id", sb.ID)
 			}
 		}
 	}
 
 	if recovered > 0 {
-		log.Printf("recovered %d sandbox(es) from store", recovered)
+		slog.Info("recovery complete", "count", recovered)
 	}
 }
 

@@ -4,6 +4,7 @@ package firecracker
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -167,7 +168,7 @@ func cleanupOrphanedTapDevices(knownTaps map[string]bool) {
 		if knownTaps[name] {
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "bhatti: cleaning orphaned TAP: %s\n", name)
+		slog.Info("cleaning orphaned TAP", "device", name)
 		run("ip", "link", "del", name)
 	}
 }

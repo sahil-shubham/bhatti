@@ -159,6 +159,10 @@ func buildEnv(env map[string]string) []string {
 }
 
 // logf logs to stderr with a prefix.
+// Lohar runs as PID 1 inside the guest VM — its stderr goes to Firecracker's
+// stderr on the host. We use simple fmt-based logging here rather than
+// log/slog because lohar's output is only visible in debug mode and the
+// "lohar: " prefix pattern is already consistent.
 func logf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "lohar: "+format+"\n", args...)
 }

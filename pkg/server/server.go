@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -123,19 +123,19 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 
 		if thermal == "hot" && idle > cfg.WarmTimeout && activity.AttachedSessions == 0 {
 			if err := te.Pause(context.Background(), sb.EngineID); err != nil {
-				log.Printf("thermal: pause %s: %v", sb.Name, err)
+				slog.Warn("thermal pause failed", "sandbox", sb.Name, "error", err)
 				continue
 			}
-			log.Printf("thermal: %s → warm (idle %v)", sb.Name, idle.Round(time.Second))
+			slog.Info("thermal transition", "sandbox", sb.Name, "from", "hot", "to", "warm", "idle", idle.Round(time.Second))
 		}
 
 		if thermal == "warm" && idle > cfg.ColdTimeout {
 			if err := s.engine.Stop(context.Background(), sb.EngineID); err != nil {
-				log.Printf("thermal: snapshot %s: %v", sb.Name, err)
+				slog.Warn("thermal snapshot failed", "sandbox", sb.Name, "error", err)
 				continue
 			}
 			s.saveVMState(sb.ID, sb.EngineID)
-			log.Printf("thermal: %s → cold (idle %v)", sb.Name, idle.Round(time.Second))
+			slog.Info("thermal transition", "sandbox", sb.Name, "from", "warm", "to", "cold", "idle", idle.Round(time.Second))
 		}
 	}
 }
@@ -242,7 +242,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("json encode error: %v", err)
+		slog.Error("json encode failed", "error", err)
 	}
 }
 
