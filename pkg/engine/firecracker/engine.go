@@ -266,8 +266,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 
 	// 5. Start Firecracker process
-	var vmCtx context.Context
-	vmCtx, vmCancel = context.WithCancel(context.Background())
+	vmCtx, cancel := context.WithCancel(context.Background())
+	vmCancel = cancel // assign to outer var so defer can clean up
 	os.Remove(socketPath)
 	fcCmd = exec.CommandContext(vmCtx, e.cfg.FCBinary, "--api-sock", socketPath)
 	fcCmd.Stderr = os.Stderr
