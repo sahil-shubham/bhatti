@@ -218,14 +218,12 @@ func (s *Server) scanPorts() {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Skip auth for static files and WebSocket upgrades
 	if s.authToken != "" && !isStaticPath(r.URL.Path) {
-		// Allow WS auth via query param
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token == "" {
 			token = r.URL.Query().Get("token")
 		}
-		if token != s.authToken && !strings.HasSuffix(r.URL.Path, "/ws") {
+		if token != s.authToken {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}

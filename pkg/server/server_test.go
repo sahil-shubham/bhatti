@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	dockerengine "github.com/sahil-shubham/bhatti/pkg/engine/docker"
 	"github.com/sahil-shubham/bhatti/pkg/store"
@@ -839,5 +841,74 @@ func TestSecretValidation(t *testing.T) {
 	})
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+// --- Part 21: WebSocket Auth Tests ---
+
+func TestWSAuthRequired(t *testing.T) {
+	_, ts := setup(t)
+
+	// Create sandbox to have a valid ID
+	name := uniqueName(t, "wsauth")
+	_, sb := createTemplateAndSandbox(t, ts, name, nil)
+
+	// Connect to WS without any token — should get 401, not upgrade
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/sandboxes/" + sb.ID + "/ws"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("expected WS dial to fail without auth, but it succeeded")
+	}
+	if resp != nil && resp.StatusCode != 401 {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestWSAuthQueryParam(t *testing.T) {
+	_, ts := setup(t)
+
+	name := uniqueName(t, "wsqp")
+	_, sb := createTemplateAndSandbox(t, ts, name, nil)
+
+	// Connect with correct token in query param
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/sandboxes/" + sb.ID + "/ws?token=test-token"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("expected WS dial with query param token to succeed: %v", err)
+	}
+	ws.Close()
+}
+
+func TestWSAuthBearerHeader(t *testing.T) {
+	_, ts := setup(t)
+
+	name := uniqueName(t, "wshdr")
+	_, sb := createTemplateAndSandbox(t, ts, name, nil)
+
+	// Connect with correct token in Authorization header
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/sandboxes/" + sb.ID + "/ws"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("expected WS dial with bearer header to succeed: %v", err)
+	}
+	ws.Close()
+}
+
+func TestWSAuthWrongToken(t *testing.T) {
+	_, ts := setup(t)
+
+	name := uniqueName(t, "wsbad")
+	_, sb := createTemplateAndSandbox(t, ts, name, nil)
+
+	// Connect with wrong token
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/sandboxes/" + sb.ID + "/ws?token=wrong-token"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("expected WS dial with wrong token to fail")
+	}
+	if resp != nil && resp.StatusCode != 401 {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
 	}
 }
