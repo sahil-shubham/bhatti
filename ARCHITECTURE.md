@@ -94,17 +94,27 @@ Hot ◄──~400µs──► Warm ◄──~50ms──► Cold
 | State | FC process | vCPUs | Host RAM | Resume | When |
 |---|---|---|---|---|---|
 | Hot | alive | running | allocated | — | active use |
-| Warm | alive | paused | allocated | ~400µs | idle <30min |
+| Warm | alive | paused | allocated | ~400µs | idle <30s |
 | Cold | dead | — | freed | ~50ms | idle >30min |
 
 Transitions:
 - **Hot → Warm**: no attached sessions + idle N seconds. `PATCH /vm {"state":"Paused"}`
 - **Warm → Hot**: any operation. `PATCH /vm {"state":"Resumed"}`
-- **Warm → Cold**: paused too long. Snapshot to disk, kill FC process.
+- **Warm → Cold**: paused too long. Snapshot to disk (diff if base exists), kill FC process.
 - **Cold → Hot**: any operation. New FC process, load snapshot.
 
-`ensureHot()` is called before every operation that needs the VM.
-Metadata queries (status, list) don't wake the VM.
+`ensureHot()` is called before every operation that needs the VM. It also
+updates the host-side activity cache so the thermal manager knows this
+sandbox was recently accessed without querying the guest agent.
+
+Metadata queries (status, list, health) don't wake the VM.
+
+### Thermal manager optimization
+
+The thermal cycle runs every 10 seconds. For each sandbox, it checks
+a host-side `sync.Map` of last API activity timestamps. If the sandbox
+had activity within the warm timeout, the guest agent query is skipped
+entirely. This avoids opening a TCP connection per sandbox per cycle.
 
 ---
 
@@ -125,31 +135,50 @@ type Engine interface {
     ListeningPorts(ctx, id)     → []int, error
     Tunnel(ctx, id, port)       → ReadWriteCloser, error
 }
+
+// Optional: streaming exec for NDJSON endpoint
+type StreamExecEngine interface {
+    ExecStream(ctx, id, cmd, onEvent) → error
+}
 ```
 
 The Firecracker engine additionally implements:
 
 ```go
-// Thermal management (used by server.ThermalEngine interface)
+// Thermal management
 Pause(ctx, id)               → error           // hot → warm
 Resume(ctx, id)              → error           // warm → hot
 EnsureHot(ctx, id)           → error           // any → hot
 ThermalState(id)             → string
 Activity(ctx, id)            → ActivityInfo, error
 
-// File operations (used by server.FileEngine interface)
-FileRead(ctx, id, path, w)   → int64, string, error
+// File operations (with server-side truncation)
+FileRead(ctx, id, path, w, opts...)  → int64, string, error
 FileWrite(ctx, id, path, mode, size, r) → error
 FileStat(ctx, id, path)      → FileInfo, error
 FileList(ctx, id, path)      → []FileInfo, error
 
-// Session listing
+// Streaming exec
+ExecStream(ctx, id, cmd, onEvent) → error
+
+// Sessions
 SessionList(ctx, id)         → []SessionInfo, error
 
 // State persistence
 VMState(id)                  → map[string]interface{}
 RestoreVM(id, name, status, state)
 ```
+
+### Concurrency model
+
+Each VM has a `stateMu sync.Mutex` that protects all mutable fields. The
+engine-level `sync.RWMutex` protects only the VM map — not individual state.
+
+- **Short operations** (Exec, FileRead, Pause, etc.): capture the Agent
+  reference under lock, release, then call the agent.
+- **Long-lived operations** (Shell, Tunnel): same capture-and-release
+  pattern. The Agent pointer is safe after release because it's only
+  replaced during `Start()`, which holds the lock.
 
 ---
 
@@ -191,11 +220,16 @@ Connection model:
   Exception: attached TTY sessions keep the connection open.
 - Forward: one connection per tunnel. FWD_REQ → FWD_RESP, then unframed
   bidirectional TCP relay.
+- All dials are context-aware with timeouts (5s dial, 10s FC API).
 
 ### File operation protocol
 
 **Read**: `FILE_READ_REQ` → `FILE_READ_RESP` (size, mode) → `STDOUT` frames → `EXIT`.
-Rejects directories and non-regular files (prevents infinite reads on `/dev/urandom`).
+Supports server-side truncation via `offset` (1-indexed line), `limit` (max lines),
+and `max_bytes` (byte budget) — whichever limit hits first stops the read.
+Without these parameters, streams the full file (backward compatible).
+Rejects directories and non-regular files. Cancellable via context (closes
+connection, lohar gets broken pipe).
 
 **Write**: `FILE_WRITE_REQ` (path, mode, size) → `STDIN` frames → `FILE_WRITE_RESP`.
 Atomic: writes to temp file, then renames. Readers never see partial content.
@@ -206,24 +240,65 @@ Rejects negative sizes (prevents silent data loss from missing Content-Length).
 **List**: `FILE_LS_REQ` → `FILE_LS_RESP` (JSON array of FileInfo).
 Capped at 10,000 entries. Validates target is a directory.
 
+### Kill semantics
+
+Kill behavior depends on session type:
+- **Piped exec** (non-TTY): `SIGKILL` to process group. Immediate, reliable.
+  Uses `Setpgid: true` so child processes are in the same group.
+- **TTY sessions**: `SIGTERM` to process group. Allows graceful shutdown,
+  preserves the session model (sessions survive disconnects).
+- **EXEC_KILL API**: `SIGKILL` to process group. Explicit force-kill.
+- **Idle timer**: `SIGKILL` to process group. Session is abandoned.
+
+---
+
+## Snapshots
+
+### Full vs Diff
+
+The first `Stop()` creates a **Full** snapshot (all memory pages). Subsequent
+`Stop()` calls create **Diff** snapshots (only dirty pages since the last
+snapshot). This requires `track_dirty_pages: true` in the FC machine config
+and `enable_diff_snapshots: true` on snapshot load.
+
+On Pi 5 with NVMe: full snapshot = ~4.4s (512MB), diff = ~52ms.
+
+If the base snapshot file is missing (deleted, corrupted), Stop() falls
+back to a Full snapshot automatically with a warning log.
+
+### Daemon recovery
+
+On startup, `recoverVMs()` reads all sandboxes from SQLite and restores
+Firecracker VMs to the engine's in-memory map:
+
+- **Stopped + snapshot exists**: restored as "stopped" (resumable)
+- **Stopped + snapshot missing**: marked "unknown"
+- **Running + snapshot exists**: marked "stopped" (FC process is dead)
+- **Running + no snapshot**: marked "unknown" (unrecoverable)
+- **Destroyed / Docker**: skipped
+
+State extraction uses type-safe helpers (`stateStr`, `stateInt64`,
+`stateUint32`, `stateBool`) that handle both JSON `float64` and SQLite
+`int` values without panicking.
+
 ---
 
 ## API Surface
 
-Implemented routes:
-
 ```
+GET    /health                                 health check (no auth)
+
 POST   /sandboxes                              create (template or direct)
 GET    /sandboxes                              list
 GET    /sandboxes/:id                          get
 DELETE /sandboxes/:id                          destroy
 POST   /sandboxes/:id/stop                     snapshot to disk
 POST   /sandboxes/:id/start                    resume from snapshot
-POST   /sandboxes/:id/exec                     non-TTY exec
+POST   /sandboxes/:id/exec                     exec (buffered JSON or streaming NDJSON)
 GET    /sandboxes/:id/ws                       WebSocket shell
 GET    /sandboxes/:id/sessions                 list sessions
 GET    /sandboxes/:id/ports                    listening ports
-GET    /sandboxes/:id/files?path=...           read file
+GET    /sandboxes/:id/files?path=...           read file (&offset=&limit=&max_bytes=)
 GET    /sandboxes/:id/files?path=...&ls=true   list directory
 PUT    /sandboxes/:id/files?path=...           write file (Content-Length required)
 HEAD   /sandboxes/:id/files?path=...           stat file
@@ -246,14 +321,21 @@ DELETE /volumes/:name                          delete volume
 GET    /ports                                  all listening ports across sandboxes
 ```
 
-Create sandbox — template or direct:
-```json
-// Direct (no template needed):
-{"name": "dev", "cpus": 2, "memory_mb": 1024, "env": {"K": "V"}, "init": "npm i"}
+### Streaming exec
 
-// Template-based:
-{"template_id": "abc123", "name": "dev"}
+`POST /sandboxes/:id/exec` with `Accept: application/x-ndjson` streams
+output as newline-delimited JSON. Each event is flushed immediately:
+
+```json
+{"type":"stdout","data":"output...\n"}
+{"type":"stderr","data":"warning...\n"}
+{"type":"exit","exit_code":0}
 ```
+
+Without the `Accept` header, the existing buffered JSON response is returned.
+The Firecracker engine implements `StreamExecEngine` natively (forwards
+agent frames as events). The Docker engine falls back to buffering then
+emitting as NDJSON events.
 
 ---
 
@@ -268,7 +350,7 @@ bhatti create [--name N] [--cpus C] [--memory M] [--env K=V,K=V] [--init CMD]
 bhatti list | ls                    list sandboxes
 bhatti destroy | rm <id|name>       destroy sandbox
 
-bhatti exec <id|name> -- CMD...     run command (exit code forwarded)
+bhatti exec <id|name> -- CMD...     run command (streaming output)
 bhatti shell | sh <id|name>         interactive shell (Ctrl+\ to detach)
 bhatti ps <id|name>                 list sessions
 
@@ -297,7 +379,7 @@ Config: `BHATTI_URL`, `BHATTI_TOKEN` env vars, or `~/.bhatti/config.yaml`.
 ├── lohar                         guest agent binary
 ├── images/
 │   ├── vmlinux-arm64             kernel (or vmlinux-amd64)
-│   └── rootfs-base-arm64.ext4   base rootfs (or -amd64)
+│   └── rootfs-base-arm64.ext4   base rootfs (Ubuntu 24.04 + Node + rg + fd)
 └── sandboxes/
     └── <id>/
         ├── rootfs.ext4           CoW copy of base rootfs
@@ -311,31 +393,6 @@ Config: `BHATTI_URL`, `BHATTI_TOKEN` env vars, or `~/.bhatti/config.yaml`.
 
 ---
 
-## Deployment
-
-```bash
-# From source (recommended):
-git clone https://github.com/sahil-shubham/bhatti.git
-cd bhatti
-sudo ./scripts/install.sh
-
-# What install.sh does:
-#   1. Detects architecture (aarch64/x86_64)
-#   2. Installs Go if missing
-#   3. Installs Firecracker if missing
-#   4. Builds bhatti + lohar from source
-#   5. Downloads kernel
-#   6. Builds rootfs (Ubuntu 24.04 + Node.js + tools) — ~10min first time
-#   7. Generates config.yaml with auth token
-#   8. Installs systemd service (deploy/bhatti.service)
-#   9. Starts daemon, waits for health check
-```
-
-Subsequent installs skip existing components (kernel, rootfs, config)
-and update the binaries + lohar agent inside the rootfs.
-
----
-
 ## Key Design Decisions
 
 **TCP over TAP for post-snapshot.** Vsock is broken after Firecracker
@@ -343,7 +400,8 @@ snapshot/restore. TCP over virtio-net works. Lohar listens on both;
 after resume, the TCP client is used.
 
 **No FC Go SDK.** Direct HTTP to FC's Unix socket API. ~20 lines of
-helpers replace thousands of SDK lines.
+helpers replace thousands of SDK lines. `DisableKeepAlives: true` prevents
+connection pile-up on the Unix socket under rapid pause/resume cycles.
 
 **No systemd in guest.** Lohar IS init. Mounts, networking, PTYs,
 processes — all deterministic. Boot to ready in ~3.5s.
@@ -356,10 +414,41 @@ processes — all deterministic. Boot to ready in ~3.5s.
 TTY execs survive disconnect. Scrollback on reattach.
 
 **Three-tier thermals.** Hot (running), Warm (paused, ~400µs resume),
-Cold (snapshotted, ~50ms resume). Consumer never sees this.
+Cold (snapshotted, ~50ms resume). Consumer never sees this. Host-side
+activity cache avoids per-sandbox TCP queries on every thermal cycle.
+
+**Diff snapshots.** First snapshot is Full, subsequent are Diff (dirty
+pages only). Reduces snapshot time from ~4.4s to ~52ms. Falls back to
+Full if base snapshot is missing.
 
 **Atomic file writes.** Write to temp file, fsync, rename. Concurrent
 readers always see complete content (old or new, never partial).
+
+**Server-side file truncation.** Agents always truncate (2000 lines / 50KB).
+Doing it guest-side via `offset`/`limit`/`max_bytes` avoids transferring
+megabytes through the wire protocol. 4.5x speedup on 10K-line files.
+
+**Content-negotiated streaming.** `Accept: application/x-ndjson` on the
+exec endpoint streams output as it arrives. No WebSocket required for the
+95% case (fire a command, stream output, get exit code). Falls back to
+buffered JSON without the header.
+
+**Process group kill.** Piped exec uses `Setpgid: true` + `SIGKILL` to
+the process group. TTY sessions use `SIGTERM` (graceful). This matches
+how coding agents abort commands (`kill(-pid, SIGKILL)`) while preserving
+the session model for interactive use.
+
+**Per-VM mutex.** Each VM has a `stateMu` that protects mutable fields.
+The engine-level lock protects only the VM map. Short ops capture the
+Agent reference under lock, release, then call. Long ops (Shell, Tunnel)
+use the same capture-and-release pattern.
+
+**Context-aware connections.** All agent dials accept `context.Context`.
+Firecracker API client has 10s timeout with `DisableKeepAlives`. Thermal
+manager wraps each agent query in a 5s per-sandbox timeout.
+
+**Structured logging.** `log/slog` (stdlib). Text for development, JSON
+for production. Zero external dependencies.
 
 **Secrets via age + config drive.** Encrypted at rest, decrypted at
 sandbox creation, injected as files or env vars.
@@ -367,6 +456,5 @@ sandbox creation, injected as files or env vars.
 **Single binary.** `bhatti serve` = daemon, `bhatti create` = CLI.
 No separate CLI tool to install or version.
 
-**Build from source install.** No pre-built binary downloads from
-GitHub (repo is private). Clone + `install.sh` builds everything.
-CI creates releases for when the repo goes public.
+**Graceful shutdown.** `http.Server.Shutdown()` drains connections on
+SIGTERM/SIGINT, then stops background goroutines and cleans up VMs/TAPs.
