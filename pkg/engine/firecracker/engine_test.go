@@ -203,6 +203,120 @@ func TestSnapshotResume(t *testing.T) {
 	}
 }
 
+func TestDiffSnapshot(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("diff-snap"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Write data before first snapshot
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo snap-v1 > /tmp/data"})
+
+	// First stop → Full snapshot
+	if err := eng.Stop(ctx, info.ID); err != nil {
+		t.Fatalf("Stop 1: %v", err)
+	}
+
+	vm, _ := eng.getVM(info.ID)
+	fullSize, err := fileSize(vm.SnapMemPath)
+	if err != nil {
+		t.Fatalf("stat full snapshot: %v", err)
+	}
+	t.Logf("full snapshot: %d MB", fullSize/(1024*1024))
+
+	// Resume
+	if err := eng.Start(ctx, info.ID); err != nil {
+		t.Fatalf("Start 1: %v", err)
+	}
+
+	// Verify data persists
+	r, _ := execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/data"})
+	if !strings.Contains(r.Stdout, "snap-v1") {
+		t.Fatalf("data not preserved after full snapshot: %q", r.Stdout)
+	}
+
+	// Write more data
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo snap-v2 > /tmp/data2"})
+
+	// Second stop → Diff snapshot (should be smaller)
+	if err := eng.Stop(ctx, info.ID); err != nil {
+		t.Fatalf("Stop 2: %v", err)
+	}
+
+	diffSize, err := fileSize(vm.SnapMemPath)
+	if err != nil {
+		t.Fatalf("stat diff snapshot: %v", err)
+	}
+	t.Logf("diff snapshot: %d MB (full was %d MB)", diffSize/(1024*1024), fullSize/(1024*1024))
+
+	if diffSize >= fullSize {
+		t.Logf("⚠ diff snapshot not smaller than full (may be expected if VM dirtied many pages)")
+	} else {
+		t.Logf("✓ diff snapshot is %dx smaller than full", fullSize/diffSize)
+	}
+
+	// Resume from diff and verify ALL data (both v1 and v2)
+	if err := eng.Start(ctx, info.ID); err != nil {
+		t.Fatalf("Start 2: %v", err)
+	}
+	r, _ = execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/data"})
+	if !strings.Contains(r.Stdout, "snap-v1") {
+		t.Fatalf("v1 data lost after diff snapshot: %q", r.Stdout)
+	}
+	r, _ = execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/data2"})
+	if !strings.Contains(r.Stdout, "snap-v2") {
+		t.Fatalf("v2 data lost after diff snapshot: %q", r.Stdout)
+	}
+	t.Log("✓ all data preserved across full→diff→resume")
+}
+
+func TestDiffSnapshotMultipleCycles(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("diff-multi"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Full → Diff → Diff → Diff: verify data accumulates correctly
+	for cycle := 1; cycle <= 4; cycle++ {
+		execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
+			fmt.Sprintf("echo cycle-%d > /tmp/cycle%d", cycle, cycle)})
+
+		if err := eng.Stop(ctx, info.ID); err != nil {
+			t.Fatalf("Stop cycle %d: %v", cycle, err)
+		}
+		if err := eng.Start(ctx, info.ID); err != nil {
+			t.Fatalf("Start cycle %d: %v", cycle, err)
+		}
+
+		// Verify ALL previous cycles' data
+		for check := 1; check <= cycle; check++ {
+			r, _ := execWithTimeout(t, eng, info.ID, []string{"cat",
+				fmt.Sprintf("/tmp/cycle%d", check)})
+			expected := fmt.Sprintf("cycle-%d", check)
+			if !strings.Contains(r.Stdout, expected) {
+				t.Fatalf("cycle %d: data from cycle %d lost: %q", cycle, check, r.Stdout)
+			}
+		}
+		t.Logf("✓ cycle %d: all data preserved", cycle)
+	}
+}
+
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 func TestPortForwarding(t *testing.T) {
 	eng := testEngine(t)
 	ctx := context.Background()

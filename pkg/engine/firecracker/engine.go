@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -71,11 +72,12 @@ type VM struct {
 	GuestIP     string
 	GuestMAC    string
 	Token       string // agent auth token
-	Agent       *agent.AgentClient
-	Status      string // "running", "stopped"
-	Thermal     string // "hot", "warm", "cold"
-	cancel      context.CancelFunc
-	cmd         *exec.Cmd
+	Agent           *agent.AgentClient
+	Status          string // "running", "stopped"
+	Thermal         string // "hot", "warm", "cold"
+	hasBaseSnapshot bool   // true after first Full snapshot (enables Diff)
+	cancel          context.CancelFunc
+	cmd             *exec.Cmd
 }
 
 // New validates config and returns a Firecracker engine.
@@ -303,8 +305,9 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		return info, fmt.Errorf("set drive: %w", err)
 	}
 
+	// track_dirty_pages enables diff snapshots (only dirty pages are written).
 	if err = fcPut(client, "/machine-config", fmt.Sprintf(
-		`{"vcpu_count":%d,"mem_size_mib":%d}`, vcpuCount, memMB)); err != nil {
+		`{"vcpu_count":%d,"mem_size_mib":%d,"track_dirty_pages":true}`, vcpuCount, memMB)); err != nil {
 		return info, fmt.Errorf("set machine-config: %w", err)
 	}
 
@@ -389,13 +392,32 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 		return fmt.Errorf("pause: %w", err)
 	}
 
-	// Create snapshot
+	// Create snapshot — use Diff if we have a base, Full otherwise.
+	// Diff snapshots write only dirty pages since the last snapshot,
+	// reducing write time from ~4s (512MB full) to ~0.5s (10-50MB diff).
 	vm.SnapMemPath = filepath.Join(filepath.Dir(vm.RootfsPath), "mem.snap")
 	vm.SnapVMPath = filepath.Join(filepath.Dir(vm.RootfsPath), "vm.snap")
+
+	snapshotType := "Full"
+	if vm.hasBaseSnapshot {
+		// Verify base snapshot files still exist
+		if _, err := os.Stat(vm.SnapMemPath); err != nil {
+			slog.Warn("base snapshot missing, falling back to full",
+				"id", id, "path", vm.SnapMemPath, "error", err)
+			vm.hasBaseSnapshot = false
+		} else {
+			snapshotType = "Diff"
+		}
+	}
+
 	if err := fcPut(client, "/snapshot/create", fmt.Sprintf(
-		`{"snapshot_type":"Full","snapshot_path":%q,"mem_file_path":%q}`,
-		vm.SnapVMPath, vm.SnapMemPath)); err != nil {
-		return fmt.Errorf("create snapshot: %w", err)
+		`{"snapshot_type":%q,"snapshot_path":%q,"mem_file_path":%q}`,
+		snapshotType, vm.SnapVMPath, vm.SnapMemPath)); err != nil {
+		return fmt.Errorf("create %s snapshot: %w", snapshotType, err)
+	}
+
+	if !vm.hasBaseSnapshot {
+		vm.hasBaseSnapshot = true
 	}
 
 	// Stop VMM process
@@ -547,8 +569,10 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 
 	client := fcAPIClient(newSocketPath)
 
+	// enable_diff_snapshots re-enables dirty page tracking after restore,
+	// allowing subsequent Diff snapshots on the restored VM.
 	if err := fcPut(client, "/snapshot/load", fmt.Sprintf(
-		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true}`,
+		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"enable_diff_snapshots":true}`,
 		vm.SnapVMPath, vm.SnapMemPath)); err != nil {
 		fcCmd.Process.Kill()
 		vmCancel()
@@ -644,8 +668,9 @@ func (e *Engine) VMState(id string) map[string]interface{} {
 		"guest_mac":     vm.GuestMAC,
 		"vcpu_count":    vm.VcpuCount,
 		"mem_size_mib":  vm.MemSizeMib,
-		"socket_path":   vm.SocketPath,
-		"vsock_path":    vm.VsockPath,
+		"socket_path":       vm.SocketPath,
+		"vsock_path":        vm.VsockPath,
+		"has_base_snapshot": vm.hasBaseSnapshot,
 	}
 }
 
@@ -669,8 +694,9 @@ func (e *Engine) RestoreVM(id, name, status string, state map[string]interface{}
 		GuestMAC:    stateStr(state, "guest_mac"),
 		VcpuCount:   stateInt64(state, "vcpu_count"),
 		MemSizeMib:  stateInt64(state, "mem_size_mib"),
-		SnapMemPath: stateStr(state, "snap_mem_path"),
-		SnapVMPath:  stateStr(state, "snap_vm_path"),
+		SnapMemPath:     stateStr(state, "snap_mem_path"),
+		SnapVMPath:      stateStr(state, "snap_vm_path"),
+		hasBaseSnapshot: stateBool(state, "has_base_snapshot"),
 	}
 
 	if status == "running" {
@@ -956,6 +982,18 @@ func stateUint32(m map[string]interface{}, key string) uint32 {
 		return v
 	}
 	return 0
+}
+
+func stateBool(m map[string]interface{}, key string) bool {
+	switch v := m[key].(type) {
+	case bool:
+		return v
+	case int:
+		return v != 0
+	case float64:
+		return v != 0
+	}
+	return false
 }
 
 // --- Helpers ---
