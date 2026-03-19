@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
@@ -29,14 +30,22 @@ type ThermalConfig struct {
 
 // Server is the HTTP API server.
 type Server struct {
-	engine      engine.Engine
-	store       *store.Store
-	authToken   string
-	mux         *http.ServeMux
-	proxy       *ProxyManager
-	stopScan    context.CancelFunc
-	stopThermal context.CancelFunc
-	startTime   time.Time
+	engine       engine.Engine
+	store        *store.Store
+	authToken    string
+	mux          *http.ServeMux
+	proxy        *ProxyManager
+	stopScan     context.CancelFunc
+	stopThermal  context.CancelFunc
+	startTime    time.Time
+	lastActivity sync.Map // engineID → time.Time — host-side activity cache
+}
+
+// touchActivity records that a sandbox was accessed via the API.
+// The thermal manager checks this before querying the guest agent,
+// avoiding a TCP connection per sandbox per thermal cycle.
+func (s *Server) touchActivity(engineID string) {
+	s.lastActivity.Store(engineID, time.Now())
 }
 
 // New creates a new API server. If webDir is non-empty, serves the web UI at /.
@@ -113,7 +122,16 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			continue
 		}
 
-		// Per-sandbox timeout prevents one hung VM from blocking the cycle
+		// Fast path: check host-side activity cache. If the sandbox had
+		// API activity within warmTimeout, skip the agent query entirely.
+		// This avoids opening a TCP connection per sandbox per cycle.
+		if ts, ok := s.lastActivity.Load(sb.EngineID); ok {
+			if time.Since(ts.(time.Time)) < cfg.WarmTimeout {
+				continue // definitely active, skip agent query
+			}
+		}
+
+		// Slow path: ask the agent for authoritative activity info.
 		actCtx, actCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		activity, err := te.Activity(actCtx, sb.EngineID)
 		actCancel()
@@ -143,8 +161,11 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 }
 
 // ensureHot transparently wakes a sandbox from warm or cold state.
+// Also touches the host-side activity cache so the thermal manager
+// knows this sandbox was recently accessed without querying the agent.
 // Returns nil if the engine doesn't support thermal management.
 func (s *Server) ensureHot(ctx context.Context, engineID string) error {
+	s.touchActivity(engineID)
 	te, ok := s.engine.(ThermalEngine)
 	if !ok {
 		return nil
