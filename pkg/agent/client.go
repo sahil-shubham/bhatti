@@ -484,6 +484,22 @@ func (c *AgentClient) FileRead(ctx context.Context, path string, w io.Writer, op
 	}
 	defer conn.Close()
 
+	// Close connection on context cancellation — this makes lohar's
+	// WriteFrame fail with broken pipe, stopping the transfer immediately.
+	// Without this, a cancelled FileRead of a 100MB file would run to
+	// completion on the guest side.
+	if ctx.Done() != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+			case <-done:
+			}
+		}()
+	}
+
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	}

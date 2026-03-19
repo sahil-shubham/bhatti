@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
 
@@ -1920,6 +1922,65 @@ func TestAgentKillTTYSessionGraceful(t *testing.T) {
 	} else {
 		// Connection closed without EXIT — also acceptable (process died)
 		t.Log("✓ TTY session connection closed after KILL")
+	}
+}
+
+func TestAgentFileReadAbort(t *testing.T) {
+	ctrl, _, cleanup := startTestAgent(t)
+	defer cleanup()
+
+	// Write a large file directly (10MB)
+	path := filepath.Join(t.TempDir(), "large.bin")
+	f, _ := os.Create(path)
+	data := make([]byte, 10*1024*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	f.Write(data)
+	f.Close()
+
+	// Test 1: pre-cancelled context returns immediately
+	client := agent.NewTestClient(ctrl, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before read
+
+	start := time.Now()
+	_, _, err := client.FileRead(ctx, path, io.Discard)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Error("expected error from pre-cancelled context")
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("pre-cancelled FileRead took %v, want <1s", elapsed)
+	}
+	t.Logf("✓ pre-cancelled FileRead returned in %v: %v", elapsed.Round(time.Millisecond), err)
+
+	// Test 2: cancel mid-transfer returns quickly
+	ctx2, cancel2 := context.WithCancel(context.Background())
+
+	start = time.Now()
+	done := make(chan struct{})
+	var readErr error
+	var bytesRead int64
+	go func() {
+		bytesRead, _, readErr = client.FileRead(ctx2, path, io.Discard)
+		close(done)
+	}()
+
+	// Cancel after 10ms
+	time.Sleep(10 * time.Millisecond)
+	cancel2()
+
+	select {
+	case <-done:
+		elapsed = time.Since(start)
+		t.Logf("✓ mid-transfer cancel returned in %v (read %d bytes, err=%v)",
+			elapsed.Round(time.Millisecond), bytesRead, readErr)
+		if elapsed > 2*time.Second {
+			t.Errorf("mid-transfer cancel took too long: %v", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("FileRead did not return after context cancellation (5s timeout)")
 	}
 }
 
