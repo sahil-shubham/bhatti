@@ -318,4 +318,4 @@ Tested on:
 
 ## License
 
-Private project.
+[AGPL-3.0](LICENSE)

@@ -112,9 +112,13 @@ useradd -m -s /bin/zsh -G sudo lohar
 echo "lohar ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # Node.js
-ARCH=$(dpkg --print-architecture)
 NODE_VERSION=22.16.0
-curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz" \
+case $(dpkg --print-architecture) in
+    amd64) NODE_ARCH=x64 ;;
+    arm64) NODE_ARCH=arm64 ;;
+    *) echo "unsupported arch"; exit 1 ;;
+esac
+curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
     | tar -xJ --strip-components=1 -C /usr/local
 
 # Claude Code
