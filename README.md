@@ -106,4 +106,4 @@ sudo bhatti user create --name alice --max-sandboxes 5
 
 ## License
 
-[AGPL-3.0](LICENSE). If your use case requires a commercial license, [get in touch](mailto:sahil@bhatti.sh).
+[AGPL-3.0](LICENSE). If your use case requires a commercial license, [get in touch](mailto:hello@sahil-shubham.in).
