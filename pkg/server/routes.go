@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -83,6 +84,7 @@ func floatOrZero(m map[string]interface{}, k string) float64 {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/metrics", s.handleMetrics)
 	s.mux.HandleFunc("/templates", s.handleTemplates)
 	s.mux.HandleFunc("/templates/", s.handleTemplate)
 	s.mux.HandleFunc("/sandboxes", s.handleSandboxes)
@@ -92,6 +94,89 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/volumes", s.handleVolumes)
 	s.mux.HandleFunc("/volumes/", s.handleVolume)
 	s.mux.HandleFunc("/ports", s.handleAllPorts)
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	sandboxes, _ := s.store.ListAllSandboxes()
+	users, _ := s.store.ListUsers()
+
+	// Count thermal states
+	var hot, warm, cold int
+	if te, ok := s.engine.(ThermalEngine); ok {
+		for _, sb := range sandboxes {
+			if sb.Status != "running" {
+				cold++
+				continue
+			}
+			switch te.ThermalState(sb.EngineID) {
+			case "hot":
+				hot++
+			case "warm":
+				warm++
+			default:
+				cold++
+			}
+		}
+	} else {
+		for _, sb := range sandboxes {
+			if sb.Status == "running" {
+				hot++
+			} else {
+				cold++
+			}
+		}
+	}
+
+	// Count active users (users with at least one non-destroyed sandbox)
+	activeUsers := 0
+	userHasSandbox := make(map[string]bool)
+	for _, sb := range sandboxes {
+		userHasSandbox[sb.CreatedBy] = true
+	}
+	activeUsers = len(userHasSandbox)
+
+	// Host stats (best effort — works on Linux, graceful on others)
+	host := map[string]any{}
+	if data, err := os.ReadFile("/proc/loadavg"); err == nil {
+		var load1 float64
+		fmt.Sscanf(string(data), "%f", &load1)
+		host["load_1m"] = load1
+	}
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				var kb int64
+				fmt.Sscanf(line, "MemTotal: %d kB", &kb)
+				host["memory_total_mb"] = kb / 1024
+			}
+			if strings.HasPrefix(line, "MemAvailable:") {
+				var kb int64
+				fmt.Sscanf(line, "MemAvailable: %d kB", &kb)
+				host["memory_available_mb"] = kb / 1024
+			}
+		}
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"uptime": time.Since(s.startTime).Round(time.Second).String(),
+		"sandboxes": map[string]any{
+			"total": len(sandboxes),
+			"hot":   hot,
+			"warm":  warm,
+			"cold":  cold,
+		},
+		"users": map[string]any{
+			"total":  len(users),
+			"active": activeUsers,
+		},
+		"host": host,
+		"requests": map[string]any{
+			"total":         s.requestTotal.Load(),
+			"errors_5xx":    s.requestErrors.Load(),
+			"auth_failures": s.authFailures.Load(),
+		},
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -345,7 +430,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 		info, err := s.engine.Create(r.Context(), spec)
 		if err != nil {
-			errResp(w, 500, "create failed: "+err.Error())
+			errRespInternal(w, r, "sandbox create failed", err)
 			return
 		}
 
@@ -363,7 +448,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.store.CreateSandbox(sb); err != nil {
 			s.engine.Destroy(r.Context(), info.EngineID)
-			errResp(w, 500, "store failed: "+err.Error())
+			errRespInternal(w, r, "store sandbox failed", err)
 			return
 		}
 
@@ -375,6 +460,9 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// Persist Firecracker VM state
 		s.saveVMState(sbID, info.EngineID)
 
+		slog.Info("sandbox.created",
+			"sandbox_id", sb.ID, "name", sb.Name, "user", user.Name,
+			"cpus", spec.CPUs, "memory_mb", spec.MemoryMB)
 		writeJSON(w, 201, sb)
 	default:
 		errResp(w, 405, "method not allowed")
@@ -450,9 +538,10 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		s.store.DetachVolumes(id)
 		if err := s.store.DeleteSandbox(user.ID, id); err != nil {
-			errResp(w, 500, err.Error())
+			errRespInternal(w, r, "delete sandbox failed", err)
 			return
 		}
+		slog.Info("sandbox.destroyed", "sandbox_id", sb.ID, "name", sb.Name, "user", user.Name)
 		writeJSON(w, 200, map[string]string{"status": "destroyed"})
 	default:
 		errResp(w, 405, "method not allowed")
@@ -505,7 +594,8 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 }
 
 type execReq struct {
-	Cmd []string `json:"cmd"`
+	Cmd        []string `json:"cmd"`
+	TimeoutSec int      `json:"timeout_sec,omitempty"` // default 300, max 3600
 }
 
 func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id string) {
@@ -531,14 +621,22 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
+	// Apply exec timeout (default 300s, max 3600s)
+	timeout := 300 * time.Second
+	if req.TimeoutSec > 0 && req.TimeoutSec <= 3600 {
+		timeout = time.Duration(req.TimeoutSec) * time.Second
+	}
+	execCtx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
 	// Streaming NDJSON when requested via Accept header
 	if r.Header.Get("Accept") == "application/x-ndjson" {
-		s.handleSandboxExecStream(w, r, sb, req)
+		s.handleSandboxExecStream(w, r.WithContext(execCtx), sb, req)
 		return
 	}
 
 	// Buffered JSON (existing behavior)
-	result, err := s.engine.Exec(r.Context(), sb.EngineID, req.Cmd)
+	result, err := s.engine.Exec(execCtx, sb.EngineID, req.Cmd)
 	if err != nil {
 		errResp(w, 500, err.Error())
 		return
@@ -1137,6 +1235,17 @@ func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 	errResp(w, 501, "engine does not support session listing")
+}
+
+// errRespInternal logs the real error and returns a generic message with request ID.
+// Used for 500 errors to avoid leaking internal paths, IPs, or system details.
+func errRespInternal(w http.ResponseWriter, r *http.Request, logMsg string, err error) {
+	reqID := RequestIDFromContext(r.Context())
+	slog.Error(logMsg, "request_id", reqID, "error", err)
+	writeJSON(w, 500, map[string]string{
+		"error":      "internal error",
+		"request_id": reqID,
+	})
 }
 
 // encryptSecret encrypts a plaintext secret using the age key in dataDir.

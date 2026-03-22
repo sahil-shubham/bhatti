@@ -168,7 +168,10 @@ func (c *AgentClient) Exec(ctx context.Context, argv []string, env map[string]st
 		return engine.ExecResult{}, fmt.Errorf("agent send exec: %w", err)
 	}
 
+	const maxBufferedOutput = 10 << 20 // 10 MB
+
 	var stdout, stderr bytes.Buffer
+	var totalBytes int
 	for {
 		msgType, payload, err := proto.ReadFrame(conn)
 		if err != nil {
@@ -176,16 +179,26 @@ func (c *AgentClient) Exec(ctx context.Context, argv []string, env map[string]st
 		}
 		switch msgType {
 		case proto.STDOUT:
-			stdout.Write(payload)
+			if totalBytes+len(payload) <= maxBufferedOutput {
+				stdout.Write(payload)
+				totalBytes += len(payload)
+			}
 		case proto.STDERR:
-			stderr.Write(payload)
+			if totalBytes+len(payload) <= maxBufferedOutput {
+				stderr.Write(payload)
+				totalBytes += len(payload)
+			}
 		case proto.EXIT:
 			exitCode, _ := proto.ParseExitCode(payload)
-			return engine.ExecResult{
+			result := engine.ExecResult{
 				ExitCode: int(exitCode),
 				Stdout:   stdout.String(),
 				Stderr:   stderr.String(),
-			}, nil
+			}
+			if totalBytes >= maxBufferedOutput {
+				result.Stderr += "\n[output truncated at 10MB]"
+			}
+			return result, nil
 		case proto.ERROR:
 			return engine.ExecResult{}, fmt.Errorf("agent error: %s", payload)
 		default:

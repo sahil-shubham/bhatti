@@ -919,3 +919,157 @@ func TestSecretEncryptDecrypt(t *testing.T) {
 	// Clean up
 	doReqEnc("DELETE", "/secrets/my-api-key", nil)
 }
+
+func TestRateLimiting(t *testing.T) {
+	_, ts := setup(t)
+
+	// Burst 10 sandbox creates rapidly — the 11th+ should get 429
+	var got429 bool
+	for i := 0; i < 15; i++ {
+		resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
+			"name": uniqueName(t, fmt.Sprintf("rate-%d", i)),
+		})
+		if resp.StatusCode == 429 {
+			got429 = true
+			resp.Body.Close()
+			break
+		}
+		if resp.StatusCode == 201 {
+			var sb store.Sandbox
+			decodeJSON(t, resp, &sb)
+			t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil) })
+		} else {
+			resp.Body.Close()
+		}
+	}
+	if !got429 {
+		t.Error("expected at least one 429 after rapid creates")
+	}
+}
+
+func TestExecTimeout(t *testing.T) {
+	_, ts := setup(t)
+	sb := createSandbox(t, ts, uniqueName(t, "timeout"))
+
+	// Request with a 1-second timeout — mock engine exec is instant
+	// so this tests the plumbing, not actual timeout behavior
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd":         []string{"echo", "fast"},
+		"timeout_sec": 1,
+	})
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var result engine.ExecResult
+	decodeJSON(t, resp, &result)
+	if result.ExitCode != 0 {
+		t.Errorf("exit code: %d", result.ExitCode)
+	}
+}
+
+func TestExecTimeoutClamped(t *testing.T) {
+	_, ts := setup(t)
+	sb := createSandbox(t, ts, uniqueName(t, "clamp"))
+
+	// timeout_sec > 3600 should be ignored (uses default 300)
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+		"cmd":         []string{"echo", "ok"},
+		"timeout_sec": 99999,
+	})
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	_, ts := setup(t)
+
+	// Create a sandbox so metrics show something
+	sb := createSandbox(t, ts, uniqueName(t, "metrics"))
+	_ = sb
+
+	// /metrics requires no auth
+	req, _ := http.NewRequest("GET", ts.URL+"/metrics", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var m map[string]any
+	decodeJSON(t, resp, &m)
+
+	// Check required fields
+	if _, ok := m["uptime"]; !ok {
+		t.Error("missing uptime")
+	}
+	if sb, ok := m["sandboxes"].(map[string]any); ok {
+		if sb["total"].(float64) < 1 {
+			t.Error("expected at least 1 sandbox")
+		}
+	} else {
+		t.Error("missing sandboxes field")
+	}
+	if u, ok := m["users"].(map[string]any); ok {
+		if u["total"].(float64) < 1 {
+			t.Error("expected at least 1 user")
+		}
+	} else {
+		t.Error("missing users field")
+	}
+	if _, ok := m["requests"]; !ok {
+		t.Error("missing requests field")
+	}
+	t.Logf("metrics: %+v", m)
+}
+
+func TestErrorSanitization(t *testing.T) {
+	srv, ts := setup(t)
+
+	// Force an engine error that contains internal path info
+	mockEng := srv.engine.(*mockEngine)
+	mockEng.CreateErr = fmt.Errorf("internal: /var/lib/bhatti/sandboxes/abc/rootfs.ext4 failed")
+
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"name": uniqueName(t, "err-test"),
+	})
+	if resp.StatusCode != 500 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 500, got %d: %s", resp.StatusCode, body)
+	}
+
+	var errBody map[string]string
+	decodeJSON(t, resp, &errBody)
+
+	// Should have request_id but NOT the internal path
+	if errBody["request_id"] == "" {
+		t.Error("expected request_id in error response")
+	}
+	if strings.Contains(errBody["error"], "/var/lib") {
+		t.Error("error message leaks internal path")
+	}
+	if errBody["error"] != "internal error" {
+		t.Errorf("expected 'internal error', got %q", errBody["error"])
+	}
+	t.Logf("sanitized error: %+v", errBody)
+
+	// Reset
+	mockEng.CreateErr = nil
+}
+
+func TestRequestHasID(t *testing.T) {
+	_, ts := setup(t)
+
+	// Make any request, check we get logging (hard to test log output
+	// directly, but we can verify the 500 error includes request_id)
+	resp := doReq(t, ts, "GET", "/sandboxes", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}

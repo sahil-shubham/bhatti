@@ -28,6 +28,12 @@ func main() {
 }
 
 func runDaemon() {
+	// Structured JSON logging for production
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	cfg, err := pkg.LoadConfig()
 	if err != nil {
 		slog.Error("load config", "error", err)

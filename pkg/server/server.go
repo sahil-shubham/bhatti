@@ -1,15 +1,20 @@
 package server
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
@@ -20,6 +25,7 @@ import (
 type contextKey string
 
 const userContextKey contextKey = "user"
+const requestIDKey contextKey = "request_id"
 
 // ThermalEngine is optionally implemented by engines that support thermal management.
 type ThermalEngine interface {
@@ -41,9 +47,15 @@ type Server struct {
 	store        *store.Store
 	dataDir      string // path to data directory (for age.key)
 	mux          *http.ServeMux
+	limiter      *rateLimiter
 	stopThermal  context.CancelFunc
 	startTime    time.Time
 	lastActivity sync.Map // engineID → time.Time — host-side activity cache
+
+	// Request counters for /metrics
+	requestTotal  atomic.Int64
+	requestErrors atomic.Int64
+	authFailures  atomic.Int64
 }
 
 // touchActivity records that a sandbox was accessed via the API.
@@ -65,6 +77,7 @@ func New(eng engine.Engine, st *store.Store, dataDir ...string) *Server {
 		store:     st,
 		dataDir:   dir,
 		mux:       http.NewServeMux(),
+		limiter:   newRateLimiter(),
 		startTime: time.Now(),
 	}
 	s.routes()
@@ -182,7 +195,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean(r.URL.Path)
 
 	// Unauthenticated endpoints (exact match only)
-	if cleanPath == "/health" {
+	if cleanPath == "/health" || cleanPath == "/metrics" {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -200,13 +213,79 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hash := sha256Hex(token)
 	user, err := s.store.GetUserByKeyHash(hash)
 	if err != nil {
+		s.authFailures.Add(1)
+		slog.Warn("auth.failed", "ip", r.RemoteAddr)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
 		return
 	}
 
-	// Attach user to request context
-	ctx := context.WithValue(r.Context(), userContextKey, user)
-	s.mux.ServeHTTP(w, r.WithContext(ctx))
+	// Rate limiting per user
+	if !s.limiter.Allow(user.ID, r) {
+		errResp(w, 429, "rate limit exceeded")
+		return
+	}
+
+	// Generate request ID and attach user + request ID to context
+	reqID := generateRequestID()
+	ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+	ctx = context.WithValue(ctx, userContextKey, user)
+
+	// Request logging
+	start := time.Now()
+	wrapped := &statusWriter{ResponseWriter: w, status: 200}
+	s.mux.ServeHTTP(wrapped, r.WithContext(ctx))
+
+	s.requestTotal.Add(1)
+	if wrapped.status >= 500 {
+		s.requestErrors.Add(1)
+	}
+
+	slog.Info("request",
+		"request_id", reqID,
+		"method", r.Method,
+		"path", cleanPath,
+		"status", wrapped.status,
+		"duration_ms", time.Since(start).Milliseconds(),
+		"user", user.Name,
+		"user_id", user.ID,
+	)
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code.
+// It preserves Flusher and Hijacker interfaces for streaming and WebSocket.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijack not supported")
+}
+
+func generateRequestID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return "req_" + hex.EncodeToString(b)
+}
+
+// RequestIDFromContext extracts the request ID from context.
+func RequestIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey).(string)
+	return id
 }
 
 func sha256Hex(s string) string {
