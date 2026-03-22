@@ -10,23 +10,23 @@ import (
 	"filippo.io/age"
 )
 
-// EnsureKey loads an age identity from path, or generates one if it doesn't exist.
-// Returns the identity (for decryption) and recipient (for encryption).
+// EnsureKey loads an age identity from path, or generates one if it doesn't exist
+// or is empty. Returns the identity (for decryption) and recipient (for encryption).
 func EnsureKey(path string) (*age.X25519Identity, *age.X25519Recipient, error) {
 	data, err := os.ReadFile(path)
-	if err == nil {
-		// Key exists — parse it
+	if err == nil && len(bytes.TrimSpace(data)) > 0 {
+		// Key exists and is non-empty — parse it
 		id, err := age.ParseX25519Identity(string(bytes.TrimSpace(data)))
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse age key %s: %w", path, err)
 		}
 		return id, id.Recipient(), nil
 	}
-	if !os.IsNotExist(err) {
+	if err != nil && !os.IsNotExist(err) {
 		return nil, nil, fmt.Errorf("read age key %s: %w", path, err)
 	}
 
-	// Generate new key
+	// Generate new key (file missing or empty)
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate age key: %w", err)
