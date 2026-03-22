@@ -1,38 +1,93 @@
 # Quickstart
 
-Get Bhatti running on a Linux host with KVM in under 10 minutes.
+There are two ways to use Bhatti: **install the CLI** to use someone else's server, or **run the full server** on your own hardware.
 
-## Install
+---
+
+## Option A: Use the CLI (remote user)
+
+If someone gave you an API key, you just need the CLI binary. No KVM, no root, no Go — works on macOS and Linux.
+
+### Install
 
 ```bash
-# On a Linux host with KVM (Raspberry Pi 5, AWS Graviton, Hetzner bare metal)
+curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install-cli.sh | bash
+```
+
+This downloads a ~11MB binary for your OS and architecture and puts it in `/usr/local/bin`.
+
+### Configure
+
+```bash
+bhatti setup
+```
+
+```
+API endpoint [http://localhost:8080]: https://api.bhatti.sh
+API key: ****
+Saved to ~/.bhatti/config.yaml
+Testing connection... ✓ connected (sandboxes: 0, uptime: 4h23m)
+```
+
+Or set environment variables directly:
+
+```bash
+export BHATTI_URL=https://api.bhatti.sh
+export BHATTI_TOKEN=bht_your_api_key_here
+```
+
+### Use
+
+```bash
+bhatti create --name dev
+bhatti exec dev -- uname -a               # Linux VM, full isolation
+bhatti exec dev -- node --version          # Node 22 pre-installed
+bhatti shell dev                           # interactive shell (Ctrl+\ to detach)
+echo 'console.log("hi")' | bhatti file write dev /workspace/app.js
+bhatti file read dev /workspace/app.js
+bhatti destroy dev
+```
+
+That's it. Each sandbox is a real Firecracker microVM with its own kernel, filesystem, and network. Idle sandboxes pause automatically and resume transparently on the next command.
+
+---
+
+## Option B: Run the Server (self-hosted)
+
+Run Bhatti on your own Linux box with KVM — Raspberry Pi 5, AWS Graviton, Hetzner bare metal, or any x86_64/arm64 machine with `/dev/kvm`.
+
+### Install
+
+```bash
 git clone https://github.com/sahil-shubham/bhatti.git
 cd bhatti
 sudo ./scripts/install.sh
 ```
 
-The install script builds everything from source — Go, Firecracker, the host daemon, the guest agent, and a base Ubuntu rootfs:
+This builds everything from source (~10 min on first run):
+- Installs Go and Firecracker if not present
+- Builds the host daemon (`bhatti`) and guest agent (`lohar`)
+- Downloads a Linux kernel and builds an Ubuntu 24.04 rootfs
+- Creates an admin user and saves the API key to `~/.bhatti/config.yaml`
 
 ```
 ==> Installing bhatti on myhost (aarch64)
-==> Installing Go 1.25.6...
-==> Installing Firecracker 1.6.0...
 ==> Building bhatti and lohar from source...
 ==> Downloading kernel...
 ==> Building rootfs (this takes ~10 minutes on first install)...
-==> Generating config...
+==> Creating admin user...
 
 ============================================
   bhatti installed on myhost (aarch64)
 
+  Admin API key: bht_abc123...
+  (saved to ~/.bhatti/config.yaml)
+
   To start the daemon:
     cd /var/lib/bhatti && sudo bhatti serve
 
-  Then in another terminal:
-    bhatti create --name hello
-    bhatti exec hello -- echo 'it works'
-    bhatti shell hello
-    bhatti destroy hello
+  ⚠  BACK UP: /var/lib/bhatti/age.key
+     If lost, all encrypted secrets become unrecoverable.
 ============================================
 ```
 
@@ -42,51 +97,45 @@ For a systemd service that starts on boot:
 sudo ./scripts/install.sh --systemd
 ```
 
-## Create a Sandbox
+### Start the daemon
 
 ```bash
-bhatti create --name dev --cpus 2 --memory 1024
-# → a1b2c3d4e5f6  dev  192.168.137.2
+cd /var/lib/bhatti && sudo bhatti serve
 ```
 
-This boots a Firecracker microVM with 2 vCPUs, 1GB RAM, and a full Ubuntu 24.04 userland. The VM is ready when the command returns (~3.5 seconds).
+### Create users
 
-## Run Commands
+Each user gets their own API key, sandbox limit, resource caps, and isolated network:
 
 ```bash
-bhatti exec dev -- uname -a
-# → Linux dev 6.1.90 ... aarch64 GNU/Linux
+sudo bhatti user create --name alice --max-sandboxes 5
+# → API key: bht_...  (shown once, save it now)
 
-bhatti exec dev -- node --version
-# → v22.16.0
+sudo bhatti user create --name bob --max-sandboxes 10 --max-cpus 4 --max-memory 4096
 
-bhatti exec dev -- which rg fd
-# → /usr/bin/rg
-# → /usr/bin/fd
+sudo bhatti user list
+# ID           NAME                 SANDBOXES  CPUS   MEM    SUBNET
+# usr_admin    admin                0/50       4      4096   1
+# usr_a1b2     alice                0/5        4      4096   2
+# usr_c3d4     bob                  0/10       4      4096   3
 ```
 
-## Interactive Shell
+Users are isolated at every layer:
+- **API**: each user sees only their own sandboxes and secrets
+- **Network**: each user gets a dedicated bridge and `/24` subnet — VMs from different users cannot communicate
+- **Resources**: per-user sandbox count limits and CPU/memory caps
+- **Rate limits**: per-user token buckets (10 creates/min, 120 execs/min)
+
+Give alice her API key. She installs the CLI ([Option A](#option-a-use-the-cli-remote-user)), runs `bhatti setup`, and she's in.
+
+### Key rotation
 
 ```bash
-bhatti shell dev
+sudo bhatti user rotate-key alice
+# → New key: bht_...  (old key immediately invalidated)
 ```
 
-You're now inside the VM. Full zsh with syntax highlighting, autosuggestions, and starship prompt. Press `Ctrl+\` to detach — the shell keeps running inside the VM.
-
-## File Operations
-
-```bash
-# Write a file into the VM
-echo 'console.log("hello from bhatti")' | bhatti file write dev /workspace/app.js
-
-# Read it back
-bhatti file read dev /workspace/app.js
-
-# List a directory
-bhatti file ls dev /workspace/
-```
-
-## Secrets
+### Secrets
 
 ```bash
 bhatti secret set API_KEY sk-abc123
@@ -94,34 +143,21 @@ bhatti secret list
 bhatti secret delete API_KEY
 ```
 
-## Destroy
+Secrets are encrypted at rest with [age](https://age-encryption.org/) and scoped per user.
 
-```bash
-bhatti destroy dev
-```
-
-VM is gone. TAP device cleaned up, IP returned to the pool, rootfs deleted.
+---
 
 ## What Just Happened
 
-Behind the scenes:
+When you ran `bhatti create --name dev`:
 
-1. `create` copied the base rootfs (CoW clone if filesystem supports it), created a config drive with hostname/DNS/auth token, allocated a TAP device and IP on the bridge network, started a Firecracker process, configured it over the Unix socket API, booted the kernel, and waited for lohar (the guest agent) to respond on TCP port 1024.
+1. The server authenticated your API key (SHA-256 hash lookup), checked your sandbox limit, and validated the name
+2. It copied the base rootfs (CoW clone if filesystem supports it), created a config drive with hostname/DNS/auth token, allocated a TAP device on your user's bridge network, started a Firecracker process, configured it over the Unix socket API, booted the kernel, and waited for lohar (the guest agent) to respond
+3. The sandbox is now running with its own kernel, its own filesystem, and its own network — isolated from other users' sandboxes by separate L2 bridge segments and iptables rules
 
-2. `exec` connected to lohar over TCP, sent an `EXEC_REQ` frame with the command, streamed `STDOUT`/`STDERR` frames back, and read the `EXIT` frame with the exit code.
+When you left the sandbox idle for 30 seconds, it automatically transitioned to *warm* (vCPUs paused, ~400µs resume). After 30 minutes idle, it would be snapshotted to disk (*cold*, ~50ms resume). The next `exec` transparently restores it. See [Thermal Management](thermal-management.md).
 
-3. `shell` opened a WebSocket to the daemon, which connected to lohar and allocated a PTY inside the VM. Terminal I/O was relayed bidirectionally via `STDIN`/`STDOUT` frames.
-
-4. `destroy` killed the Firecracker process, removed the TAP device, released the IP, and deleted the sandbox directory.
-
-If you'd left the sandbox idle for 30 seconds, it would have automatically transitioned to *warm* (vCPUs paused, ~400µs resume). After 30 minutes idle, it would have been snapshotted to disk and the Firecracker process killed (*cold*, ~50ms resume). The next `exec` would have transparently restored it. See [Thermal Management](thermal-management.md) for details.
-
-## Environment Variables
-
-```bash
-export BHATTI_URL=http://localhost:8080   # API endpoint (default)
-export BHATTI_TOKEN=your-auth-token       # Auth token (or from ~/.bhatti/config.yaml)
-```
+---
 
 ## Next Steps
 

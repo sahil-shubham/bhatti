@@ -1,6 +1,6 @@
 # ⚒ Bhatti
 
-Firecracker microVM orchestrator. Each sandbox is a real Linux VM with its own kernel, filesystem, and process isolation — created in seconds, paused for free, resumed in microseconds.
+Open-source Firecracker microVM orchestrator. Each sandbox is a real Linux VM with its own kernel, filesystem, and process isolation — created in seconds, paused for free, resumed in microseconds.
 
 Built for running AI coding agents in isolated environments. A paused sandbox resumes and executes a command in **under 3ms**.
 
@@ -10,6 +10,17 @@ bhatti exec dev -- npm install
 bhatti shell dev                          # Ctrl+\ to detach
 bhatti destroy dev
 ```
+
+## Install the CLI
+
+No KVM, root, or Go needed — just a ~11MB binary. Works on macOS and Linux.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install-cli.sh | bash
+bhatti setup     # enter API endpoint + key
+```
+
+Self-hosting? See [server installation](docs/quickstart.md#option-b-run-the-server-self-hosted).
 
 ## Performance
 
@@ -32,58 +43,66 @@ Pause/Resume:                   ~400µs
 ```
 bhatti (host daemon)                        lohar (guest agent, PID 1 in each VM)
   ├─ REST/WS API (:8080)                     ├─ TCP :1024 (exec, files, sessions)
-  ├─ Firecracker engine                       ├─ TCP :1025 (port forwarding)
-  │  (create, exec, snapshot, diff snap)      ├─ PTY allocation + session registry
-  ├─ Thermal manager                          ├─ Atomic file writes
-  │  (hot → warm → cold, auto)               ├─ Process group kill
-  ├─ Bridge networking (253 VMs)              ├─ 64KB scrollback per session
-  ├─ SQLite store + age encryption            └─ Config drive (env, secrets, volumes)
+  ├─ Per-user auth (API keys, SHA-256)        ├─ TCP :1025 (port forwarding)
+  ├─ Firecracker engine                       ├─ PTY sessions + 64KB scrollback
+  │  (create, exec, snapshot, diff snap)      ├─ Atomic file writes
+  ├─ Thermal manager                          ├─ Process group kill
+  │  (hot → warm → cold, auto)               ├─ Exec as uid 1000 (not root)
+  ├─ Per-user bridge networks (isolated)      └─ Config drive (env, secrets)
+  ├─ SQLite store + age encryption
+  ├─ Rate limiting + exec timeouts
   └─ Reverse proxy (HTTP + WebSocket)
 ```
 
-Idle sandbox → **warm** after 30s (vCPUs paused, ~400µs resume) → **cold** after 30min (snapshotted to disk, memory freed, ~50ms resume). Any API request transparently wakes it. The consumer never sees thermal states.
+Idle sandbox → **warm** after 30s (vCPUs paused, ~400µs resume) → **cold** after 30min (snapshotted to disk, memory freed, ~50ms resume). Any API request transparently wakes it.
+
+## Multi-Tenant Isolation
+
+Each user gets their own API key, sandbox limits, and network:
+
+```bash
+sudo bhatti user create --name alice --max-sandboxes 5
+# → API key: bht_...  (shown once)
+```
+
+- **API scoping** — users see only their own sandboxes and secrets
+- **Network isolation** — per-user bridge + /24 subnet, cross-user traffic blocked at L2
+- **Resource caps** — per-user limits on sandbox count, CPUs, and memory
+- **Rate limiting** — per-user token buckets (10 creates/min, 120 execs/min)
+- **Secrets** — encrypted at rest (age), scoped per user
 
 ## Documentation
 
 | | |
 |---|---|
-| **[Quickstart](docs/quickstart.md)** | Install, create, exec, shell, destroy |
+| **[Quickstart](docs/quickstart.md)** | CLI install + server install, user management |
 | **[Architecture](docs/architecture.md)** | System design, data flow, concurrency model |
 | **[Wire Protocol](docs/wire-protocol.md)** | Binary framing, connection lifecycle, auth |
 | **[Guest Agent](docs/guest-agent.md)** | PID 1 init, PTY, sessions, process management |
 | **[Thermal Management](docs/thermal-management.md)** | Hot/warm/cold, diff snapshots, activity caching |
-| **[Networking](docs/networking.md)** | Bridge, TAP, IP pool, kernel ip=, post-snapshot TCP |
+| **[Networking](docs/networking.md)** | Per-user bridges, iptables isolation, kernel ip= |
 | **[API Reference](docs/api-reference.md)** | REST/WebSocket endpoints |
-| **[CLI Reference](docs/cli-reference.md)** | All commands with examples |
+| **[CLI Reference](docs/cli-reference.md)** | All commands — create, exec, shell, user, setup |
 | **[Testing](docs/testing.md)** | 11K lines of tests, zero mocks for VM tests |
-| **[Design Decisions](docs/decisions.md)** | Why TCP over vsock post-snapshot, why no FC SDK, why PID 1, ... |
-
-## Quick Start
-
-```bash
-# On a Linux host with KVM
-git clone https://github.com/sahil-shubham/bhatti.git && cd bhatti
-sudo ./scripts/install.sh
-# starts daemon, creates rootfs, configures everything
-```
-
-See [docs/quickstart.md](docs/quickstart.md) for the full walkthrough.
+| **[Design Decisions](docs/decisions.md)** | Why TCP over vsock, why no FC SDK, why PID 1, ... |
 
 ## Key Features
 
-- **No templates required** — create sandboxes with CPUs, memory, env vars, init scripts directly
+- **Multi-tenant** — per-user API keys, sandbox scoping, network isolation, rate limiting
 - **Streaming exec** — real-time NDJSON output via `Accept: application/x-ndjson`
-- **Server-side file truncation** — `offset`/`limit`/`max_bytes` on file reads (agents truncate to 2000 lines / 50KB — doing it guest-side avoids transferring megabytes)
-- **Diff snapshots** — after the first full snapshot, subsequent snapshots write only dirty pages (~52ms vs ~4.4s)
+- **Server-side file truncation** — `offset`/`limit`/`max_bytes` on file reads
+- **Diff snapshots** — only dirty pages after the first snapshot (~52ms vs ~4.4s)
 - **Session-aware exec** — TTY sessions survive disconnects, scrollback replayed on reattach
 - **Atomic file writes** — temp + fsync + rename, concurrent readers never see partial content
 - **Process group kill** — `SIGKILL` to pgid for piped exec, `SIGTERM` for TTY sessions
-- **Single binary** — `bhatti serve` = daemon, `bhatti create` = CLI
+- **Guest hardening** — exec as uid 1000, config drive unmounted after boot, connection/session limits
+- **Single binary** — `bhatti serve` = daemon, `bhatti create` = CLI, `bhatti user` = admin
 
 ## Requirements
 
-- Linux (aarch64 or x86_64) with KVM (`/dev/kvm`)
-- Root access
+**Server:** Linux (aarch64 or x86_64) with KVM (`/dev/kvm`) and root access.
+
+**CLI:** macOS or Linux. No special requirements.
 
 ## License
 

@@ -2,39 +2,71 @@
 
 `bhatti` is a single binary — `bhatti serve` starts the daemon, everything else is a CLI command that talks to the daemon's HTTP API.
 
-All commands accept sandbox name or ID interchangeably.
+All sandbox commands accept sandbox name or ID interchangeably.
+
+## Installation
+
+**Remote users** (macOS or Linux, no root needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install-cli.sh | bash
+```
+
+**Server operators** — the CLI is included in the full install (`scripts/install.sh`).
+
+Pin a specific version:
+
+```bash
+BHATTI_VERSION=v0.1.0 curl -fsSL .../install-cli.sh | bash
+```
 
 ## Configuration
 
+### Interactive setup
+
 ```bash
-export BHATTI_URL=http://localhost:8080   # API endpoint
-export BHATTI_TOKEN=your-auth-token       # auth token
+bhatti setup
 ```
 
-Or configure via `~/.bhatti/config.yaml`:
+Prompts for API endpoint and API key, saves to `~/.bhatti/config.yaml`, tests the connection.
+
+### Environment variables
+
+```bash
+export BHATTI_URL=https://api.bhatti.sh    # API endpoint
+export BHATTI_TOKEN=bht_your_key_here      # API key
+```
+
+### Config file
+
+`~/.bhatti/config.yaml`:
 
 ```yaml
-auth_token: your-auth-token
+auth_token: bht_your_key_here
 listen: :8080
 ```
 
-The install script creates this file automatically.
+Priority: environment variables > config file.
 
 ## Commands
 
+### version
+
+```bash
+bhatti version
+# → bhatti v0.1.0
+# → api: https://api.bhatti.sh
+```
+
 ### serve
 
-Start the daemon.
+Start the daemon. Requires root, KVM, and a config at `/var/lib/bhatti/config.yaml`.
 
 ```bash
 sudo bhatti serve
 ```
 
-Reads config from (first match): `$BHATTI_CONFIG`, `./config.yaml`, `~/.bhatti/config.yaml`.
-
 ### create
-
-Create a new sandbox.
 
 ```bash
 bhatti create --name dev --cpus 2 --memory 1024
@@ -44,13 +76,11 @@ bhatti create --name builder --init "npm install && npm run build"
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--name` | auto-generated | Sandbox name |
-| `--cpus` | 1 | Number of vCPUs |
-| `--memory` | 512 | Memory in MB |
+| `--name` | auto-generated | Sandbox name (must match `[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}`) |
+| `--cpus` | 1 | Number of vCPUs (capped by user's per-sandbox limit) |
+| `--memory` | 512 | Memory in MB (capped by user's per-sandbox limit) |
 | `--env` | — | Comma-separated KEY=VALUE pairs |
-| `--init` | — | Init script (runs as TTY session "init") |
-
-Output: `ID  NAME  IP`
+| `--init` | — | Init script (runs as attachable TTY session "init") |
 
 ### list / ls
 
@@ -58,17 +88,12 @@ Output: `ID  NAME  IP`
 bhatti list
 ```
 
-```
-ID                   NAME                 STATUS     IP
-a1b2c3d4e5f6         dev                  running    192.168.137.2
-f7e8d9c0b1a2         worker               stopped    192.168.137.3
-```
+Shows only your sandboxes (scoped to your API key).
 
 ### destroy / rm
 
 ```bash
 bhatti destroy dev
-bhatti rm a1b2c3d4e5f6
 ```
 
 ### exec
@@ -76,16 +101,16 @@ bhatti rm a1b2c3d4e5f6
 ```bash
 bhatti exec dev -- echo hello
 bhatti exec dev -- npm install
-bhatti exec worker -- sh -c 'echo $API_KEY'
+bhatti exec dev -- sh -c 'echo $API_KEY'
 ```
 
-Everything after `--` is the command. Exit code is forwarded — `bhatti exec dev -- false` exits with code 1.
-
-Stdout goes to stdout, stderr goes to stderr. Suitable for piping:
+Everything after `--` is the command. Exit code is forwarded. Stdout goes to stdout, stderr goes to stderr:
 
 ```bash
 bhatti exec dev -- cat /workspace/data.json | jq .name
 ```
+
+Commands run as user `lohar` (uid 1000), not root. Use `sudo` inside the sandbox for root access.
 
 ### shell / sh
 
@@ -93,11 +118,7 @@ bhatti exec dev -- cat /workspace/data.json | jq .name
 bhatti shell dev
 ```
 
-Opens an interactive terminal inside the sandbox. Full zsh with syntax highlighting and starship prompt.
-
-- Terminal size is synced automatically (SIGWINCH → resize)
-- `Ctrl+\` to detach (shell keeps running inside the VM)
-- The shell session survives network disconnects
+Interactive terminal inside the sandbox. `Ctrl+\` to detach — the shell keeps running, scrollback is preserved. Reconnect with `bhatti shell dev` again.
 
 ### ps
 
@@ -105,31 +126,15 @@ Opens an interactive terminal inside the sandbox. Full zsh with syntax highlight
 bhatti ps dev
 ```
 
-```
-ID         COMMAND                                  RUNNING  ATTACHED
-init       npm install                              true     false
-s1         /bin/zsh -li                             true     true
-```
-
 ### file
 
 ```bash
-# Read a file to stdout
 bhatti file read dev /workspace/app.js
-
-# Write a file from stdin
 echo 'console.log("hello")' | bhatti file write dev /workspace/app.js
-cat local-file.tar.gz | bhatti file write dev /workspace/archive.tar.gz
-
-# List a directory
 bhatti file ls dev /workspace/
 ```
 
-```
-d0755     4096 node_modules
--0644     1234 app.js
--0644      567 package.json
-```
+File writes are capped at 100MB per operation. Writes are atomic (concurrent readers never see partial content).
 
 ### secret
 
@@ -139,4 +144,38 @@ bhatti secret list
 bhatti secret delete API_KEY
 ```
 
-Secrets are encrypted at rest with age. They're injected into sandboxes via the config drive.
+Secrets are encrypted at rest (age) and scoped to your user.
+
+### user (server operator only)
+
+User management operates directly on the local SQLite database. Requires access to the data directory.
+
+```bash
+# Create a user
+sudo bhatti user create --name alice --max-sandboxes 5 --max-cpus 4 --max-memory 4096
+# → API key: bht_...  (shown once)
+
+# List users
+sudo bhatti user list
+
+# Rotate API key (old key immediately invalidated)
+sudo bhatti user rotate-key alice
+
+# Delete user (fails if user has active sandboxes)
+sudo bhatti user delete alice
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name` | required | User name (must be unique) |
+| `--max-sandboxes` | 5 | Maximum concurrent sandboxes |
+| `--max-cpus` | 4 | Maximum vCPUs per sandbox |
+| `--max-memory` | 4096 | Maximum memory (MB) per sandbox |
+
+### setup
+
+```bash
+bhatti setup
+```
+
+Interactive configuration for remote CLI users. Prompts for endpoint and API key, saves config, tests the connection.
