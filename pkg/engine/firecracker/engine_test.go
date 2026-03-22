@@ -25,10 +25,17 @@ func skipIfNotRoot(t *testing.T) {
 func testEngine(t *testing.T) *Engine {
 	t.Helper()
 	skipIfNotRoot(t)
+
+	// Auto-detect architecture for image paths
+	arch := "arm64"
+	if out, _ := os.ReadFile("/proc/cpuinfo"); strings.Contains(string(out), "GenuineIntel") || strings.Contains(string(out), "AuthenticAMD") {
+		arch = "amd64"
+	}
+
 	eng, err := New(Config{
 		DataDir:    "/var/lib/bhatti",
-		KernelPath: "/var/lib/bhatti/images/vmlinux-arm64",
-		BaseRootfs: "/var/lib/bhatti/images/rootfs-base-arm64.ext4",
+		KernelPath: fmt.Sprintf("/var/lib/bhatti/images/vmlinux-%s", arch),
+		BaseRootfs: fmt.Sprintf("/var/lib/bhatti/images/rootfs-base-%s.ext4", arch),
 		FCBinary:   "/usr/local/bin/firecracker",
 	})
 	if err != nil {
@@ -38,7 +45,10 @@ func testEngine(t *testing.T) *Engine {
 }
 
 func testSpec(name string) engine.SandboxSpec {
-	return engine.SandboxSpec{Name: name, CPUs: 1, MemoryMB: 512}
+	return engine.SandboxSpec{
+		Name: name, CPUs: 1, MemoryMB: 512,
+		UserID: "usr_test", SubnetIndex: 99, // test user on isolated subnet
+	}
 }
 
 // execWithTimeout wraps eng.Exec with a 15-second timeout to prevent tests
