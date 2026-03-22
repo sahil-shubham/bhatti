@@ -10,7 +10,9 @@ is either done before launch or explicitly deferred with a documented reason.
 ### Dependency graph
 
 ```
-Part 1 (auth)      — per-user API keys, store scoping
+Part 1 (auth)      — per-user API keys, store scoping  ✅
+     ↓
+Part 1b (test infra) — remove Docker engine, mock engine for server tests, fix Part 1 bugs
      ↓
 Part 2 (network)   — per-user bridge networks, iptables isolation
      ↓
@@ -310,6 +312,168 @@ func (s *Store) RotateUserKey(id, newKeyHash string) error {
 - `TestAuthMiddleware` — no token → 401, invalid token → 401, valid token → 200
 - `TestSandboxLimit` — create up to max_sandboxes, next one returns 429
 - `TestResourceCaps` — request CPUs > max → 400
+
+---
+
+## Part 1b — Remove Docker Engine, Mock Engine, Fix Bugs
+
+The Docker engine served two purposes: macOS dev fallback and server
+integration tests. Both are now obstacles. The Docker engine doesn't
+support any Firecracker-specific features (thermal management, snapshots,
+config drives, bridge networks). Server tests that use Docker are slow,
+flaky, and test the wrong engine. Four of the server test "failures" from
+Part 1 are Docker-specific limitations, not auth bugs.
+
+The test architecture splits into two layers:
+
+| Layer | What it tests | Engine | Runs on |
+|-------|--------------|--------|---------|
+| `pkg/engine/firecracker/` | VM lifecycle, exec, snapshot, files, thermal, network | Real Firecracker | agni-01 |
+| `pkg/server/` | HTTP routing, auth, scoping, validation, error codes | Mock | Anywhere |
+
+The Go compiler enforces the mock ↔ interface contract: if `engine.Engine`
+changes a method signature, the mock won't compile. The mock is kept
+minimal — a map of sandboxes with status tracking, canned exec results —
+so there's nothing to go stale behaviorally.
+
+### 1b.1 Delete Docker Engine
+
+**Delete entirely:**
+- `pkg/engine/docker/docker.go`
+- `pkg/engine/docker/docker_test.go`
+- `pkg/engine/docker/parse_test.go`
+
+**Update:**
+- `cmd/bhatti/main.go` — remove `docker.New()` case, remove import
+- `cmd/bhatti/engine_other.go` — return clear error:
+  `"bhatti requires Linux with KVM (firecracker engine only)"`
+- `pkg/config.go` — change default engine from `"docker"` to `"firecracker"`
+- `go.mod` — `go mod tidy` to remove `github.com/docker/docker` and its
+  transitive dependencies
+- `Dockerfile.sandbox` — move to `docs/archive/` (Docker sandbox image is
+  replaced by rootfs built via `build-rootfs.sh`)
+- `Makefile` — remove `sandbox` target
+
+### 1b.2 Mock Engine for Server Tests
+
+**File:** `pkg/server/mock_engine_test.go`
+
+A minimal `engine.Engine` implementation for server tests. Not a
+sophisticated fake — just enough to let the HTTP layer exercise its logic.
+
+```go
+type mockEngine struct {
+    mu         sync.Mutex
+    sandboxes  map[string]*engine.SandboxInfo
+    execResult engine.ExecResult  // configurable per-test
+}
+
+func newMockEngine() *mockEngine {
+    return &mockEngine{
+        sandboxes:  make(map[string]*engine.SandboxInfo),
+        execResult: engine.ExecResult{ExitCode: 0, Stdout: "mock\n"},
+    }
+}
+```
+
+Key behaviors:
+- `Create` — stores sandbox in map, returns SandboxInfo with status "running"
+- `Exec` — returns `m.execResult` (configurable per test)
+- `Shell` — returns a `net.Pipe()` wrapped as TerminalConn
+- `Destroy` — removes from map
+- `Stop/Start` — toggles status
+- `Status` — returns from map, error if not found
+- `List` — returns all sandboxes
+- `ListeningPorts` — returns empty slice
+- `Tunnel` — returns a `net.Pipe()`
+
+The mock does NOT implement `ThermalEngine`, `FileEngine`,
+`StreamExecEngine`, or `VMStateProvider`. Server tests that need those
+interfaces test against real Firecracker on agni-01.
+
+### 1b.3 Update Server Test Setup
+
+Replace `dockerengine.New()` with `newMockEngine()` in `setup()` and
+`setupTwoUsers()`. Remove `skipIfNoDocker()`, `ensureAlpinePulled()`,
+and all Docker cleanup helpers. Server tests become:
+- Fast (~milliseconds per test, not seconds)
+- Deterministic (no container startup races)
+- Runnable anywhere (CI, Mac, Linux, no Docker needed)
+
+### 1b.4 Fix Bug: Secrets Table Primary Key
+
+The `secrets` table has `name TEXT PRIMARY KEY`. Two users can't have a
+secret with the same name. `SetSecret` silently loses data when names
+collide across users.
+
+**Fix:** Recreate the table with composite primary key `(user_id, name)`:
+
+```sql
+-- In store.New(), after running migrations:
+CREATE TABLE IF NOT EXISTS secrets_v2 (
+    user_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    path TEXT NOT NULL DEFAULT '',
+    value_encrypted BLOB DEFAULT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, name)
+);
+INSERT OR IGNORE INTO secrets_v2 (user_id, name, path, value_encrypted, created_at, updated_at)
+    SELECT COALESCE(user_id, ''), name, path, value_encrypted,
+           created_at, COALESCE(updated_at, created_at) FROM secrets;
+DROP TABLE IF EXISTS secrets;
+ALTER TABLE secrets_v2 RENAME TO secrets;
+```
+
+Update `SetSecret` upsert to conflict on `(user_id, name)`:
+
+```go
+INSERT INTO secrets (user_id, name, path, value_encrypted, created_at, updated_at)
+VALUES (?, ?, '', ?, ?, ?)
+ON CONFLICT(user_id, name) DO UPDATE SET
+    value_encrypted = excluded.value_encrypted,
+    updated_at = excluded.updated_at
+```
+
+### 1b.5 Fix Bug: Sandbox Name Collision Wastes VM Boot
+
+Check for name conflicts BEFORE calling `engine.Create()`. Return 409
+with a clean message instead of booting a VM and then destroying it.
+
+```go
+// In handleSandboxes POST, after name validation, before engine.Create():
+if spec.Name != "" {
+    existing, _ := s.store.ListSandboxes(user.ID)
+    for _, sb := range existing {
+        if sb.Name == spec.Name && sb.Status != "destroyed" {
+            errResp(w, 409, fmt.Sprintf("sandbox %q already exists", spec.Name))
+            return
+        }
+    }
+}
+```
+
+### 1b.6 Testing
+
+All existing Part 1 tests must pass plus:
+
+Store:
+- `TestTwoUsersCreateSameSecretName` — Alice and Bob both create "API_KEY",
+  each sees their own value (was failing, now passes)
+- `TestDeleteSandboxByID` — unscoped delete works
+- `TestUserDuplicateNameRejected` — UNIQUE constraint on name
+- `TestUserDuplicateKeyHashRejected` — UNIQUE constraint on hash
+
+Server (all using mock engine, no Docker):
+- `TestCrossUserSandboxIsolation` — user B gets 404 on user A's sandbox
+- `TestCrossUserExecIsolation` — user B gets 404 on exec/stop
+- `TestSandboxResourceCaps` — CPU/memory over limit → 400
+- `TestSandboxCountLimit` — create up to max, next → 429
+- `TestSandboxNameValidationHTTP` — invalid names → 400
+- `TestDuplicateSandboxNameHTTP` — same name twice → 409 (not 500)
+- `TestPathCleanAuthBypass` — path tricks don't bypass auth
+- `TestCrossUserSecretIsolationHTTP` — user B can't see/delete user A's secrets
 
 ---
 
