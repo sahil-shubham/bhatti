@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./pkg/store/ ./pkg/server/ ./pkg/ ./pkg/agent/proto/ ./pkg/secrets/ ./cmd/bhatti/ -count=1 -timeout=120s
+
+      - name: Vet
+        run: go vet ./...
