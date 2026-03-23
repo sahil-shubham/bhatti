@@ -187,33 +187,52 @@ func (t *requestTiming) finish() {
 	t.mu.Unlock()
 }
 
+// fmtDuration formats a duration with appropriate precision:
+//
+//	< 1ms   → microseconds  (342µs)
+//	< 1s    → milliseconds  (12.3ms)
+//	≥ 1s    → seconds       (2.38s)
+func fmtDuration(d time.Duration) string {
+	switch {
+	case d < time.Millisecond:
+		return fmt.Sprintf("%dµs", d.Microseconds())
+	case d < time.Second:
+		ms := float64(d.Microseconds()) / 1000.0
+		if ms < 10 {
+			return fmt.Sprintf("%.2fms", ms)
+		}
+		return fmt.Sprintf("%.1fms", ms)
+	default:
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	}
+}
+
 func (t *requestTiming) print() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	fmt.Fprintf(os.Stderr, "---\n")
 	if !t.dnsStart.IsZero() && !t.dnsDone.IsZero() {
-		fmt.Fprintf(os.Stderr, "dns:       %s\n", t.dnsDone.Sub(t.dnsStart).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "dns:       %s\n", fmtDuration(t.dnsDone.Sub(t.dnsStart)))
 	}
 	if !t.connectStart.IsZero() && !t.connectDone.IsZero() {
-		fmt.Fprintf(os.Stderr, "connect:   %s\n", t.connectDone.Sub(t.connectStart).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "connect:   %s\n", fmtDuration(t.connectDone.Sub(t.connectStart)))
 	}
 	if !t.tlsStart.IsZero() && !t.tlsDone.IsZero() {
-		fmt.Fprintf(os.Stderr, "tls:       %s\n", t.tlsDone.Sub(t.tlsStart).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "tls:       %s\n", fmtDuration(t.tlsDone.Sub(t.tlsStart)))
 	}
-	// server = time from TLS done (or connect done) to first response byte
 	serverStart := t.tlsDone
 	if serverStart.IsZero() {
 		serverStart = t.connectDone
 	}
 	if !serverStart.IsZero() && !t.firstByte.IsZero() {
-		fmt.Fprintf(os.Stderr, "server:    %s\n", t.firstByte.Sub(serverStart).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "server:    %s\n", fmtDuration(t.firstByte.Sub(serverStart)))
 	}
 	if !t.firstByte.IsZero() && !t.end.IsZero() {
-		fmt.Fprintf(os.Stderr, "transfer:  %s\n", t.end.Sub(t.firstByte).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "transfer:  %s\n", fmtDuration(t.end.Sub(t.firstByte)))
 	}
 	if !t.start.IsZero() && !t.end.IsZero() {
-		fmt.Fprintf(os.Stderr, "total:     %s\n", t.end.Sub(t.start).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "total:     %s\n", fmtDuration(t.end.Sub(t.start)))
 	}
 }
 
