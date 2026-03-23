@@ -63,6 +63,12 @@ Scoping: admin images are global (no user prefix). User-saved images
 are private (stored under `usr_{id}/`). Users see both admin and their
 own images. They cannot see other users' images.
 
+**Name validation**: image, volume, and snapshot names are used to
+construct file paths. All names must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`
+(same regex as sandbox names). Names containing `/`, `..`, or null bytes
+are rejected. This prevents path traversal attacks like
+`name: "../../sandboxes/victim/rootfs"`.
+
 ### Volumes
 
 A volume is a mutable ext4 file owned by a user. Stored outside the
@@ -90,6 +96,14 @@ Concurrency: a volume can be attached to **one sandbox for writing** at
 a time. ext4 does not support concurrent writers — attaching the same
 volume to two running sandboxes would corrupt the filesystem. Read-only
 attachment to multiple sandboxes simultaneously is safe and supported.
+
+Read-only mounts require changes at three layers:
+1. **Firecracker**: `/drives/{id}` with `is_read_only: true`
+2. **Config drive**: `VolumeMountConfig` gains a `ReadOnly bool` field
+3. **Guest agent**: lohar's `mountVolumes` uses `syscall.MS_RDONLY`
+
+Without all three, the volume is mounted read-write inside the VM
+regardless of what the API says, allowing corruption of shared data.
 
 ### Snapshots
 
@@ -684,32 +698,79 @@ to anything else since the snapshot was taken.
 produces the exact state that was checkpointed. But copying a 20GB
 volume on every checkpoint is expensive.
 
-**Resolution**: copy the rootfs (it's ephemeral and specific to this
-snapshot). Reference volumes by name but record a "generation" counter.
-The volume tracks how many times it's been attached/detached. On resume,
-if the generation has changed (volume was used by another sandbox since
-checkpoint), warn or fail. If the generation is the same, the volume
-content is unchanged and safe to resume with.
+**Resolution**: copy everything. Rootfs, config drive, and all attached
+volumes are copied into the snapshot directory. Snapshots are fully
+self-contained and always safe to resume regardless of what happened
+to the original volumes.
 
-For v0.2: just copy everything. Snapshots are complete, self-contained,
-and always safe. Optimize with generation tracking in v0.3.
+The cost: for a sandbox with 2GB rootfs, 1GB mem, and 5GB volume, a
+checkpoint writes 8GB. At NVMe speeds (2GB/s), that's 4 seconds of
+VM pause. This is acceptable for explicit user-initiated checkpoints.
+It is NOT acceptable for automatic thermal snapshots — those continue
+to use the existing ephemeral snapshot path which doesn't copy volumes.
+
+A future optimization (volume deduplication or reference counting) is
+a significant redesign of the consistency model and is deferred
+indefinitely. Copy-everything is the correct starting point.
 
 ### Resuming from a named snapshot
 
+**Critical implementation detail**: Firecracker's `vm.snap` records the
+original `path_on_host` for every block device. On snapshot load,
+Firecracker opens those exact paths. If the rootfs was at
+`/var/lib/bhatti/sandboxes/abc/rootfs.ext4` when checkpointed, `vm.snap`
+contains that path — NOT the copied snapshot path.
+
+The resume procedure must reconfigure drives BEFORE loading the snapshot:
+
 ```
 POST /snapshots/dev-ready/resume {"name": "new-sandbox"}
-→ read manifest
+→ read manifest (VM config, drive map, agent token)
 → create new sandbox directory
-→ copy rootfs and config from snapshot dir
-→ attach volume files (from volumes dir, not snapshot dir)
-→ start Firecracker with snapshot load (mem.snap + vm.snap)
-→ VM resumes exactly where it was checkpointed
+→ copy rootfs and config from snapshot dir to new sandbox dir
+→ start new Firecracker process
+→ PUT /drives/rootfs   {"path_on_host": NEW rootfs path}     ← REQUIRED
+→ PUT /drives/config   {"path_on_host": NEW config path}     ← REQUIRED
+→ for each volume:
+    PUT /drives/volN    {"path_on_host": volume file path}   ← REQUIRED
+→ PUT /machine-config  {same vcpu/memory as manifest}
+→ PUT /network-interfaces/eth0 {same MAC, new TAP}
+→ PUT /vsock           {same CID, new UDS path}
+→ PUT /snapshot/load   {snapshot_path, mem_backend, resume_vm: true}
+→ reconnect agent with token from manifest
+```
+
+All drive PUTs must happen BEFORE `/snapshot/load`. Firecracker
+supports this pre-load drive patching — it's the official way to
+relocate snapshot files. Without it, Firecracker opens the old paths
+and the resume fails or reads stale/deleted data.
+
+The manifest must record:
+```json
+{
+    "vm_config": {"vcpu_count": 2, "mem_size_mib": 1024},
+    "drives": [
+        {"drive_id": "rootfs", "role": "rootfs"},
+        {"drive_id": "config", "role": "config"},
+        {"drive_id": "vol0", "role": "volume", "name": "workspace", "user_id": "usr_alice"}
+    ],
+    "network": {"guest_mac": "02:ab:cd:...", "guest_ip": "10.0.1.2"},
+    "agent_token": "abc123...",
+    "vsock_cid": 42
+}
 ```
 
 **Firecracker constraint**: the resume must use the exact same VM
 configuration (vCPUs, memory, drive count and order). The manifest
 records this. If the user requests different resources, we reject
 with a clear error explaining why.
+
+**Snapshot rootfs copies are NOT standalone images.** The copied rootfs
+may have dirty pages that only exist in `mem.snap` (kernel page cache).
+On resume, the kernel flushes these from restored memory to the rootfs —
+this is correct. But booting the rootfs independently (without mem.snap)
+would give an inconsistent filesystem. Do not use snapshot rootfs copies
+as images.
 
 **What the user experiences**: a sandbox that boots in ~50ms with all
 their processes running, files open, dev server responding. Not a fresh
@@ -798,11 +859,25 @@ CREATE TABLE volumes_v2 (
     name TEXT NOT NULL,
     size_mb INTEGER NOT NULL,
     file_path TEXT NOT NULL,              -- /var/lib/bhatti/volumes/{user_id}/{name}.ext4
-    attached_to TEXT NOT NULL DEFAULT '', -- sandbox ID or empty
-    attached_mount TEXT NOT NULL DEFAULT '', -- mount point when attached
-    read_only INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, name)
+);
+
+-- Storage quotas added to users table (v0.1 already has max_sandboxes, max_cpus, max_memory)
+-- ALTER TABLE users ADD COLUMN max_volume_storage_mb INTEGER NOT NULL DEFAULT 20480;   -- 20GB default
+-- ALTER TABLE users ADD COLUMN max_images INTEGER NOT NULL DEFAULT 10;
+-- ALTER TABLE users ADD COLUMN max_snapshots INTEGER NOT NULL DEFAULT 5;
+
+-- Junction table for volume attachments. Supports multiple read-only
+-- attachments to the same volume simultaneously. A volume can have
+-- at most one read-write attachment OR multiple read-only attachments.
+CREATE TABLE volume_attachments (
+    volume_id TEXT NOT NULL,
+    sandbox_id TEXT NOT NULL,
+    mount TEXT NOT NULL,
+    read_only INTEGER NOT NULL DEFAULT 0,
+    attached_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (volume_id, sandbox_id)
 );
 -- migrate old volumes table data if any, then drop + rename
 ```
@@ -812,49 +887,77 @@ New store methods:
 ```go
 // Volume entity
 type Volume struct {
-    ID           string    `json:"id"`
-    UserID       string    `json:"user_id"`
-    Name         string    `json:"name"`
-    SizeMB       int       `json:"size_mb"`
-    FilePath     string    `json:"-"`             // not exposed via API
-    AttachedTo   string    `json:"attached_to"`   // sandbox ID or ""
-    AttachedMount string   `json:"attached_mount"`
-    ReadOnly     bool      `json:"read_only"`
-    CreatedAt    time.Time `json:"created_at"`
+    ID          string             `json:"id"`
+    UserID      string             `json:"user_id"`
+    Name        string             `json:"name"`
+    SizeMB      int                `json:"size_mb"`
+    FilePath    string             `json:"-"`
+    Attachments []VolumeAttachment `json:"attachments"`
+    CreatedAt   time.Time          `json:"created_at"`
+}
+
+type VolumeAttachment struct {
+    SandboxID string `json:"sandbox_id"`
+    Mount     string `json:"mount"`
+    ReadOnly  bool   `json:"read_only"`
 }
 
 func (s *Store) CreateVolume(v Volume) error
-func (s *Store) GetVolume(userID, name string) (*Volume, error)
+func (s *Store) GetVolume(userID, name string) (*Volume, error)    // includes attachments
 func (s *Store) ListUserVolumes(userID string) ([]Volume, error)
-func (s *Store) DeleteVolume(userID, name string) error           // fails if attached
-func (s *Store) AttachVolume(userID, name, sandboxID, mount string, readOnly bool) error  // tx: check not attached
-func (s *Store) DetachVolume(userID, name string) error
-func (s *Store) DetachAllVolumes(sandboxID string) error          // called on sandbox destroy
+func (s *Store) DeleteVolume(userID, name string) error            // fails if any attachments
+func (s *Store) AttachVolume(userID, name, sandboxID, mount string, readOnly bool) error
+func (s *Store) DetachVolume(userID, name, sandboxID string) error
+func (s *Store) DetachAllForSandbox(sandboxID string) error        // called on sandbox destroy
+func (s *Store) DetachOrphanedVolumes() error                      // startup recovery
 func (s *Store) UpdateVolumeSize(userID, name string, sizeMB int) error
 ```
 
-`AttachVolume` runs inside a transaction:
+`AttachVolume` runs inside a transaction with the junction table:
 ```go
 func (s *Store) AttachVolume(userID, name, sandboxID, mount string, readOnly bool) error {
     tx, _ := s.db.Begin()
     defer tx.Rollback()
 
-    var currentAttach string
-    var currentRO int
-    tx.QueryRow("SELECT attached_to, read_only FROM volumes_v2 WHERE user_id=? AND name=?",
-        userID, name).Scan(&currentAttach, &currentRO)
-
-    if currentAttach != "" && !readOnly {
-        return fmt.Errorf("volume %q already attached to sandbox %s", name, currentAttach)
-    }
-    // read-only attachment to already-attached volume is OK only if both are read-only
-    if currentAttach != "" && readOnly && currentRO == 0 {
-        return fmt.Errorf("volume %q attached read-write to %s, cannot attach read-only simultaneously", name, currentAttach)
+    // Get volume ID
+    var volID string
+    tx.QueryRow("SELECT id FROM volumes_v2 WHERE user_id=? AND name=?",
+        userID, name).Scan(&volID)
+    if volID == "" {
+        return fmt.Errorf("volume %q not found", name)
     }
 
-    tx.Exec("UPDATE volumes_v2 SET attached_to=?, attached_mount=?, read_only=? WHERE user_id=? AND name=?",
-        sandboxID, mount, boolToInt(readOnly), userID, name)
+    // Check existing attachments
+    var rwCount, roCount int
+    tx.QueryRow("SELECT COUNT(*) FROM volume_attachments WHERE volume_id=? AND read_only=0",
+        volID).Scan(&rwCount)
+    tx.QueryRow("SELECT COUNT(*) FROM volume_attachments WHERE volume_id=? AND read_only=1",
+        volID).Scan(&roCount)
+
+    if !readOnly {
+        // Requesting read-write: must have zero existing attachments
+        if rwCount > 0 || roCount > 0 {
+            return fmt.Errorf("volume %q already attached (rw=%d, ro=%d)", name, rwCount, roCount)
+        }
+    } else {
+        // Requesting read-only: must have no read-write attachments
+        if rwCount > 0 {
+            return fmt.Errorf("volume %q has a read-write attachment, cannot attach read-only", name)
+        }
+    }
+
+    tx.Exec("INSERT INTO volume_attachments (volume_id, sandbox_id, mount, read_only) VALUES (?,?,?,?)",
+        volID, sandboxID, mount, boolToInt(readOnly))
     return tx.Commit()
+}
+```
+
+Orphan cleanup on startup (fixes crash between Destroy and DetachAll):
+```go
+func (s *Store) DetachOrphanedVolumes() error {
+    _, err := s.db.Exec(`DELETE FROM volume_attachments
+        WHERE sandbox_id NOT IN (SELECT id FROM sandboxes WHERE status != 'destroyed')`)
+    return err
 }
 ```
 
@@ -1011,6 +1114,37 @@ The `--volume` flag format: `name:mount[:ro]`
 - `TestVolumeSurvivesSnapshot` — stop + start sandbox with volume, data intact
 - `TestEphemeralVolumesStillWork` — legacy NewVolumes path still functions
 
+**Crash recovery tests (integration, agni-01):**
+- `TestCrashBetweenDestroyAndDetach` — create sandbox with volume, kill
+  daemon between engine.Destroy and store.DetachAllForSandbox, restart,
+  verify volume is auto-detached by DetachOrphanedVolumes on startup
+- `TestCrashDuringVolumeCreate` — kill daemon during mkfs.ext4, restart,
+  verify partial ext4 file is cleaned up or ignored
+- `TestOrphanedVolumeFile` — delete store record but leave ext4 file,
+  verify no crash and file is reportable via admin tooling
+
+**Concurrency tests:**
+- `TestConcurrentAttachSameVolume` — two goroutines attach same volume
+  read-write simultaneously → exactly one succeeds, one gets error
+- `TestAutoCreateRace` — two sandbox creates with same auto_create volume
+  → only one volume file created, no data loss from mkfs overwrite
+- `TestConcurrentAttachReadOnly` — three goroutines attach same volume
+  read-only simultaneously → all three succeed
+
+**Schema migration test:**
+- `TestMigrateV02ToV03` — create a v0.2 database (old volumes table),
+  run New() which applies migrations, verify data preserved in volumes_v2
+  and volume_attachments tables
+
+**Guest-side edge cases (integration, agni-01):**
+- `TestMountCorruptVolume` — attach a volume with invalid ext4 (zeroed
+  file), verify lohar logs error and continues (doesn't crash)
+- `TestMountMissingDevice` — config drive references /dev/vde but only
+  3 drives attached, verify lohar logs error and continues
+- `TestMountPointConflict` — volume mount at /workspace which already
+  has files in rootfs, verify mount overlays correctly (existing files
+  hidden, volume content visible)
+
 
 ### Phase 2: Custom Images + OCI Pull
 
@@ -1088,10 +1222,20 @@ type Config struct {
 
 type Option func(*pullOptions)
 func WithAuth(user, password string) Option
-func WithPlatform(os, arch string) Option
+func WithPlatform(os, arch string) Option  // MUST default to runtime.GOARCH
 ```
 
 **File:** `pkg/oci/pull.go`
+
+**Platform resolution**: Docker Hub serves multi-platform manifests.
+`crane.Pull("python:3.12")` defaults to the build host's architecture.
+If bhatti is compiled for amd64, it pulls amd64 images. But if someone
+runs the CLI on an arm64 Mac (for `bhatti image pull`), crane pulls
+arm64 — which won't run on an amd64 Firecracker host. The default
+platform must be the TARGET host architecture (the Firecracker VM arch),
+not the build/CLI architecture. For `bhatti image pull` run remotely
+via API, the server knows its own `runtime.GOARCH`. For CLI-initiated
+pulls, the pull should happen server-side, not client-side.
 
 ```go
 func PullAndConvert(ctx context.Context, ref, outputPath, loharPath string, opts ...Option) (*Config, error) {
@@ -1139,38 +1283,76 @@ func PullAndConvert(ctx context.Context, ref, outputPath, loharPath string, opts
 
 ```go
 // extractLayer extracts a single OCI layer tar into the target directory.
-// Handles whiteouts (per-file and opaque), permissions, symlinks, hard links.
+// Uses a two-pass approach because the OCI spec does NOT guarantee ordering
+// within a layer tar. An opaque whiteout (.wh..wh..opq) can appear AFTER
+// regular files in the same directory within the same tar. A single-pass
+// approach would extract files then delete them when the whiteout is hit.
+//
+// Pass 1: scan the tar for all whiteout entries, record them.
+// Pass 2: apply whiteouts (delete from previous layers), then extract files.
 func extractLayer(layer v1.Layer, targetDir string) error {
-    reader, _ := layer.Uncompressed()
-    tr := tar.NewReader(reader)
+    // Pass 1: collect whiteouts
+    reader1, _ := layer.Uncompressed()
+    tr1 := tar.NewReader(reader1)
+
+    type whiteout struct {
+        path   string
+        opaque bool // true = .wh..wh..opq (clear entire directory)
+    }
+    var whiteouts []whiteout
 
     for {
-        header, err := tr.Next()
+        header, err := tr1.Next()
         if err == io.EOF { break }
+        if err != nil { return err }
+
+        base := filepath.Base(header.Name)
+        if base == ".wh..wh..opq" {
+            dir := filepath.Dir(filepath.Join(targetDir, header.Name))
+            whiteouts = append(whiteouts, whiteout{path: dir, opaque: true})
+        } else if strings.HasPrefix(base, ".wh.") {
+            target := filepath.Join(targetDir, filepath.Dir(header.Name),
+                strings.TrimPrefix(base, ".wh."))
+            whiteouts = append(whiteouts, whiteout{path: target, opaque: false})
+        }
+    }
+
+    // Apply whiteouts (delete from previous layers)
+    for _, wo := range whiteouts {
+        if wo.opaque {
+            removeDirectoryContents(wo.path)
+        } else {
+            os.RemoveAll(wo.path)
+        }
+    }
+
+    // Pass 2: extract files (re-read layer since tar is streaming)
+    reader2, _ := layer.Uncompressed()
+    tr2 := tar.NewReader(reader2)
+
+    for {
+        header, err := tr2.Next()
+        if err == io.EOF { break }
+        if err != nil { return err }
+
+        // Skip whiteout entries (already processed)
+        base := filepath.Base(header.Name)
+        if base == ".wh..wh..opq" || strings.HasPrefix(base, ".wh.") {
+            continue
+        }
 
         path := filepath.Join(targetDir, header.Name)
 
-        // Handle whiteouts
-        base := filepath.Base(header.Name)
-        dir := filepath.Dir(path)
-        if base == ".wh..wh..opq" {
-            // Opaque whiteout: remove all existing entries in this directory
-            removeDirectoryContents(dir)
-            continue
-        }
-        if strings.HasPrefix(base, ".wh.") {
-            // Per-file whiteout: delete the named file
-            target := filepath.Join(dir, strings.TrimPrefix(base, ".wh."))
-            os.RemoveAll(target)
-            continue
+        // Path traversal protection
+        if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(targetDir)) {
+            continue // skip entries that escape the target dir
         }
 
-        // Extract based on type
         switch header.Typeflag {
         case tar.TypeDir:
             os.MkdirAll(path, os.FileMode(header.Mode))
         case tar.TypeReg:
-            writeFile(path, tr, os.FileMode(header.Mode))
+            writeFile(path, tr2, os.FileMode(header.Mode))
         case tar.TypeSymlink:
             os.Symlink(header.Linkname, path)
         case tar.TypeLink:
@@ -1227,8 +1409,9 @@ func ensureUser1000(rootDir string) error {
         return nil // no passwd file, skip
     }
     for _, line := range strings.Split(string(data), "\n") {
-        if strings.Contains(line, ":1000:") {
-            return nil // uid 1000 exists
+        fields := strings.Split(line, ":")
+        if len(fields) >= 3 && fields[2] == "1000" {
+            return nil // uid 1000 exists (field index 2 is uid)
         }
     }
     // Append lohar user
@@ -1297,6 +1480,9 @@ func validateImage(rootDir string) []string {
 
 ```go
 // createExt4FromDir creates an ext4 image from a directory tree.
+// Uses mke2fs -d to populate the filesystem without mounting, avoiding
+// leaked loop devices on crash and reducing syscall overhead for
+// directories with many small files (node_modules).
 func createExt4FromDir(srcDir, outputPath string) error {
     // 1. Calculate required size
     totalSize, fileCount, err := dirStats(srcDir)
@@ -1315,26 +1501,32 @@ func createExt4FromDir(srcDir, outputPath string) error {
     f.Truncate(int64(sizeMB) << 20)
     f.Close()
 
-    // 3. Format with enough inodes
-    //    Default ext4 creates 1 inode per 16KB. Images with many small
-    //    files (node_modules) can exhaust inodes. Allocate 1 inode per
-    //    4KB or at least fileCount * 1.5.
+    // 3. Format and populate in one step using mke2fs -d.
+    //    This avoids the mount/umount dance entirely — no loop device,
+    //    no risk of leaked mounts on crash, faster for many small files.
+    //
+    //    -N: inode count (1 per 4KB or fileCount*1.5, whichever is more)
+    //    -d: populate from directory
     inodes := max(fileCount * 3 / 2, totalSize / 4096)
-    exec.Command("mkfs.ext4", "-F", "-q", "-N", fmt.Sprint(inodes), outputPath).Run()
-
-    // 4. Mount and copy
-    mountDir, _ := os.MkdirTemp("", "bhatti-ext4-*")
-    defer os.RemoveAll(mountDir)
-
-    exec.Command("mount", "-o", "loop", outputPath, mountDir).Run()
-    defer exec.Command("umount", mountDir).Run()
-
-    // cp -a preserves permissions, symlinks, hard links, timestamps
-    exec.Command("cp", "-a", srcDir+"/.", mountDir+"/").Run()
+    cmd := exec.Command("mke2fs",
+        "-t", "ext4",
+        "-d", srcDir,           // populate from directory
+        "-N", fmt.Sprint(inodes),
+        "-F", "-q",
+        outputPath)
+    if out, err := cmd.CombinedOutput(); err != nil {
+        return fmt.Errorf("mke2fs: %s: %w", out, err)
+    }
 
     return nil
 }
 ```
+
+Note: `mke2fs -d` requires e2fsprogs >= 1.43 (Ubuntu 18.04+). It
+handles permissions, symlinks, hard links, and timestamps. It does NOT
+require root — no mount/umount. This also fixes the existing bug in
+`createConfigDrive` which uses mount/umount and can leak loop devices
+on crash. Migrate `createConfigDrive` to use `mke2fs -d` as well.
 
 #### 2.3 Engine Changes
 
@@ -1361,8 +1553,23 @@ if err = copyRootfs(baseImage, rootfsPath); err != nil {
     return info, fmt.Errorf("copy rootfs: %w", err)
 }
 
+// Note: copyRootfs should use `cp --reflink=auto --sparse=always` on the
+// fallback path (when reflink fails). Without --sparse=always, a 10GB
+// rootfs that's 90% empty materializes as 10GB on disk instead of ~1GB.
+// This matters especially for named snapshots that copy rootfs + mem.snap.
+
+// Re-inject lohar into the rootfs to ensure the current version is used.
+// Saved images and OCI images may contain an older lohar binary. Without
+// this, a bhatti upgrade would leave VMs running old agent code, causing
+// protocol mismatches between host and guest.
+if err = injectLoharIntoRootfs(rootfsPath, e.cfg.DataDir); err != nil {
+    slog.Warn("lohar injection failed, using image's lohar", "error", err)
+}
+
 // Resize if requested
 if spec.DiskSizeMB > 0 {
+    // e2fsck before resize2fs — resize on a dirty filesystem amplifies corruption
+    exec.Command("e2fsck", "-f", "-y", rootfsPath).Run() // best effort
     if err = exec.Command("truncate", "-s", fmt.Sprintf("%dM", spec.DiskSizeMB), rootfsPath).Run(); err != nil {
         return info, fmt.Errorf("resize rootfs: %w", err)
     }
@@ -1380,25 +1587,37 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
     if err != nil {
         return err
     }
-    vm.stateMu.Lock()
-    defer vm.stateMu.Unlock()
 
-    // Pause VM for filesystem consistency
+    // Hold stateMu only for the pause — not for the entire copy.
+    // The copy can take 1-10 seconds for a 1-4GB rootfs. Holding
+    // stateMu for that duration blocks ALL operations on this sandbox
+    // (exec, file read, etc.) and makes it unresponsive to API calls.
+    //
+    // Instead: pause under lock, release lock, copy (VM is paused so
+    // rootfs is consistent), re-acquire lock, resume.
+    vm.stateMu.Lock()
     wasPaused := vm.Thermal == "warm"
     if vm.Thermal == "hot" {
         client := fcAPIClient(vm.SocketPath)
         fcPatch(client, "/vm", `{"state":"Paused"}`)
+        vm.Thermal = "warm"
     }
+    rootfsPath := vm.RootfsPath
+    socketPath := vm.SocketPath
+    vm.stateMu.Unlock()
 
-    // Copy rootfs
-    if err := copyRootfs(vm.RootfsPath, destPath); err != nil {
+    // Copy rootfs (VM is paused, filesystem is consistent, lock is released)
+    if err := copyRootfs(rootfsPath, destPath); err != nil {
         return fmt.Errorf("copy rootfs: %w", err)
     }
 
-    // Resume if it was hot
+    // Resume
     if !wasPaused {
-        client := fcAPIClient(vm.SocketPath)
+        vm.stateMu.Lock()
+        client := fcAPIClient(socketPath)
         fcPatch(client, "/vm", `{"state":"Resumed"}`)
+        vm.Thermal = "hot"
+        vm.stateMu.Unlock()
     }
 
     return nil
@@ -1519,7 +1738,7 @@ CREATE TABLE snapshots (
 ```
 # Images
 GET    /images                         list (admin + user's own)
-POST   /images/pull                    pull from OCI registry
+POST   /images/pull                    pull from OCI registry (async — returns task ID)
 POST   /sandboxes/:id/save-image       save sandbox rootfs as image
 DELETE /images/:name                   delete image
 
