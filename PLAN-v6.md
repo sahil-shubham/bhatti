@@ -761,55 +761,718 @@ uses the template but with more CPUs.
 
 ### Phase 1: Persistent Volumes
 
-**What ships**: volumes survive sandbox destroy. Users create named
-volumes, attach them to sandboxes, detach on destroy, reattach to new
-sandboxes. Data persists.
+#### 1.1 Store Schema
 
-**What changes**:
-- Store: `volumes` table gets `user_id`, `size_mb`, `attached_to`, `mount`
-- Engine: resolve volume name → file path, create if auto_create
-- Engine: on destroy, release volume attachment but don't delete files
-- Engine: attachment concurrency check
-- API: `POST /volumes` (create with size), `DELETE /volumes/:name`,
-  `POST /volumes/:name/resize`
-- CLI: `bhatti volume create/list/delete/resize`
-- Sandbox creation: `--volume workspace:/workspace` flag
+Replace the existing `volumes` table (which only tracked Docker named
+volumes by name):
 
-**What doesn't change**: images (still only base), snapshots (still
-ephemeral), templates (deferred).
+```sql
+CREATE TABLE volumes_v2 (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size_mb INTEGER NOT NULL,
+    file_path TEXT NOT NULL,              -- /var/lib/bhatti/volumes/{user_id}/{name}.ext4
+    attached_to TEXT NOT NULL DEFAULT '', -- sandbox ID or empty
+    attached_mount TEXT NOT NULL DEFAULT '', -- mount point when attached
+    read_only INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, name)
+);
+-- migrate old volumes table data if any, then drop + rename
+```
+
+New store methods:
+
+```go
+// Volume entity
+type Volume struct {
+    ID           string    `json:"id"`
+    UserID       string    `json:"user_id"`
+    Name         string    `json:"name"`
+    SizeMB       int       `json:"size_mb"`
+    FilePath     string    `json:"-"`             // not exposed via API
+    AttachedTo   string    `json:"attached_to"`   // sandbox ID or ""
+    AttachedMount string   `json:"attached_mount"`
+    ReadOnly     bool      `json:"read_only"`
+    CreatedAt    time.Time `json:"created_at"`
+}
+
+func (s *Store) CreateVolume(v Volume) error
+func (s *Store) GetVolume(userID, name string) (*Volume, error)
+func (s *Store) ListUserVolumes(userID string) ([]Volume, error)
+func (s *Store) DeleteVolume(userID, name string) error           // fails if attached
+func (s *Store) AttachVolume(userID, name, sandboxID, mount string, readOnly bool) error  // tx: check not attached
+func (s *Store) DetachVolume(userID, name string) error
+func (s *Store) DetachAllVolumes(sandboxID string) error          // called on sandbox destroy
+func (s *Store) UpdateVolumeSize(userID, name string, sizeMB int) error
+```
+
+`AttachVolume` runs inside a transaction:
+```go
+func (s *Store) AttachVolume(userID, name, sandboxID, mount string, readOnly bool) error {
+    tx, _ := s.db.Begin()
+    defer tx.Rollback()
+
+    var currentAttach string
+    var currentRO int
+    tx.QueryRow("SELECT attached_to, read_only FROM volumes_v2 WHERE user_id=? AND name=?",
+        userID, name).Scan(&currentAttach, &currentRO)
+
+    if currentAttach != "" && !readOnly {
+        return fmt.Errorf("volume %q already attached to sandbox %s", name, currentAttach)
+    }
+    // read-only attachment to already-attached volume is OK only if both are read-only
+    if currentAttach != "" && readOnly && currentRO == 0 {
+        return fmt.Errorf("volume %q attached read-write to %s, cannot attach read-only simultaneously", name, currentAttach)
+    }
+
+    tx.Exec("UPDATE volumes_v2 SET attached_to=?, attached_mount=?, read_only=? WHERE user_id=? AND name=?",
+        sandboxID, mount, boolToInt(readOnly), userID, name)
+    return tx.Commit()
+}
+```
+
+#### 1.2 Engine Changes
+
+**File:** `pkg/engine/engine.go`
+
+Replace the existing `VolumeMount` and `NewVolumes` fields on
+`SandboxSpec` with a unified volume attachment:
+
+```go
+// PersistentVolume describes a named volume to attach to a sandbox.
+type PersistentVolume struct {
+    Name       string `json:"name"`        // volume name (scoped to user)
+    Mount      string `json:"mount"`       // mount point inside VM
+    SizeMB     int    `json:"size_mb"`     // used only if AutoCreate
+    AutoCreate bool   `json:"auto_create"` // create if doesn't exist
+    ReadOnly   bool   `json:"read_only"`
+}
+```
+
+`SandboxSpec` changes:
+```go
+type SandboxSpec struct {
+    // ... existing fields ...
+    Volumes    []PersistentVolume `json:"volumes,omitempty"`  // replaces both VolumeMount and NewVolumes
+
+    // Deprecated — kept for backward compat with v0.1 API, ignored if Volumes is set
+    NewVolumes []VolumeSpec       `json:"new_volumes,omitempty"`
+}
+```
+
+**File:** `pkg/engine/firecracker/engine.go`
+
+In `Create()`, after rootfs copy and before Firecracker configuration:
+
+```go
+// 4d. Resolve and attach persistent volumes
+var volumeMounts []VolumeMountConfig
+driveIndex := byte('c') // vdb=config, vdc=first vol, ...
+
+for _, vol := range spec.Volumes {
+    volDir := filepath.Join(e.cfg.DataDir, "volumes", spec.UserID)
+    volPath := filepath.Join(volDir, vol.Name+".ext4")
+
+    if _, statErr := os.Stat(volPath); os.IsNotExist(statErr) {
+        if !vol.AutoCreate || vol.SizeMB <= 0 {
+            return info, fmt.Errorf("volume %q not found", vol.Name)
+        }
+        os.MkdirAll(volDir, 0700)
+        if err = createVolume(volPath, vol.SizeMB); err != nil {
+            return info, fmt.Errorf("create volume %q: %w", vol.Name, err)
+        }
+    }
+
+    device := fmt.Sprintf("/dev/vd%c", driveIndex)
+    volumeMounts = append(volumeMounts, VolumeMountConfig{
+        Device: device, Mount: vol.Mount, FS: "ext4",
+    })
+    driveIndex++
+}
+
+// Also handle legacy NewVolumes for backward compat
+for _, vs := range spec.NewVolumes {
+    volPath := filepath.Join(sandboxDir, fmt.Sprintf("vol-%s.ext4", vs.Name))
+    // ... existing code (creates ephemeral volume in sandbox dir) ...
+}
+```
+
+Key difference: persistent volumes use `e.cfg.DataDir/volumes/{user_id}/`
+while legacy NewVolumes use `sandboxDir/`. The sandbox dir is deleted on
+destroy; the volumes dir is not.
+
+In `Destroy()`:
+```go
+// Release volume attachments (but don't delete volume files)
+// The server layer calls store.DetachAllVolumes(sandboxID)
+// Volume files in /var/lib/bhatti/volumes/ are untouched
+```
+
+No change to `Destroy()` itself — `os.RemoveAll(sandboxDir)` only
+removes the sandbox directory. Persistent volumes are outside it.
+
+#### 1.3 Server / Routes Changes
+
+**File:** `pkg/server/routes.go`
+
+Update `handleSandboxes POST` to handle persistent volumes:
+- Before `engine.Create()`: for each volume in request, call
+  `store.AttachVolume()` to check/reserve the attachment
+- If any attachment fails: return 409 ("volume already attached")
+- After sandbox destroy: `store.DetachAllVolumes(sandboxID)` to release
+  all volume attachments
+
+New volume endpoints:
+```go
+POST   /volumes          → handleVolumeCreate (user_id, name, size_mb)
+GET    /volumes          → handleVolumeList (user-scoped)
+GET    /volumes/:name    → handleVolumeGet
+DELETE /volumes/:name    → handleVolumeDelete (must be detached)
+POST   /volumes/:name/resize → handleVolumeResize (must be detached)
+```
+
+**Important:** `handleVolumeDelete` must check `attached_to == ""` before
+deleting both the store record and the ext4 file on disk. If the file
+is deleted while attached to a running VM, the VM's block device becomes
+invalid and the VM crashes.
+
+#### 1.4 CLI Changes
+
+```
+bhatti volume create --name workspace --size 5120
+bhatti volume list
+bhatti volume delete workspace
+bhatti volume resize workspace --size 10240
+
+bhatti create --name dev --volume workspace:/workspace
+bhatti create --name dev --volume datasets:/data:ro   # read-only
+```
+
+The `--volume` flag format: `name:mount[:ro]`
+
+#### 1.5 Tests
+
+**Store tests (pkg/store/):**
+- `TestVolumeCreateAndGet` — create volume, verify fields
+- `TestVolumeUserScoped` — user A can't see/delete user B's volumes
+- `TestVolumeAttachDetach` — attach to sandbox, verify attached_to, detach
+- `TestVolumeDoubleAttachRejected` — attach to sb1, try attach to sb2 → error
+- `TestVolumeReadOnlyMultiAttach` — attach RO to sb1 and sb2 → both succeed
+- `TestVolumeDeleteWhileAttached` — fails with error
+- `TestVolumeDeleteAfterDetach` — succeeds
+- `TestDetachAllVolumes` — multiple volumes detached on sandbox destroy
+- `TestVolumeResize` — update size_mb, verify
+
+**Server tests (pkg/server/, mock engine):**
+- `TestVolumeCreateHTTP` — POST /volumes with size, verify 201
+- `TestVolumeListHTTP` — user-scoped listing
+- `TestVolumeScopingHTTP` — user A can't access user B's volumes
+- `TestSandboxWithVolume` — create sandbox with --volume, verify sandbox created
+- `TestSandboxVolumeConflict` — two sandboxes same volume → 409 on second
+- `TestSandboxDestroyReleasesVolume` — destroy sandbox, volume is detached
+- `TestVolumeDeleteWhileAttachedHTTP` — 409
+- `TestVolumeResizeWhileAttachedHTTP` — 409
+- `TestVolumeResizeHTTP` — resize detached volume, verify new size
+
+**Integration tests (pkg/engine/firecracker/, agni-01):**
+- `TestPersistentVolumeData` — create volume, write data in sb1, destroy sb1,
+  create sb2 with same volume, read data → data persists
+- `TestVolumeOwnership` — files in volume owned by uid 1000
+- `TestVolumeReadOnlyMount` — write to RO volume → fails inside VM
+- `TestVolumeMultiplePerSandbox` — sandbox with 2 volumes, verify both mounted
+- `TestVolumeAutoCreate` — sandbox with auto_create volume, volume created on first use
+- `TestVolumeSurvivesSnapshot` — stop + start sandbox with volume, data intact
+- `TestEphemeralVolumesStillWork` — legacy NewVolumes path still functions
+
 
 ### Phase 2: Custom Images + OCI Pull
 
-**What ships**: multiple rootfs images. Admin-built, user-saved, and
-pulled from Docker registries. Sandbox creation specifies image by name.
+#### 2.1 Image Store Schema
 
-**What changes**:
-- New dependency: `github.com/google/go-containerregistry` (crane)
-- Conversion pipeline: pull → flatten → ext4 → inject lohar
-- Image metadata stored in `images` table
-- Engine: resolve image name → file path for rootfs copy
-- Engine: rootfs resize via `truncate` + `resize2fs`
-- API: `GET /images`, `POST /images/pull`, `POST /sandboxes/:id/save-image`,
-  `DELETE /images/:name`
-- CLI: `bhatti image pull/list/save/delete`
-- Sandbox creation: `--image python-3.12` flag
+```sql
+CREATE TABLE images (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT '',     -- '' = admin/global image
+    name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',      -- 'admin', 'oci:docker.io/library/python:3.12', 'saved:sandbox-abc'
+    file_path TEXT NOT NULL,             -- /var/lib/bhatti/images/{name}.ext4 or usr_{id}/{name}.ext4
+    size_mb INTEGER NOT NULL DEFAULT 0,
+    oci_config_json TEXT NOT NULL DEFAULT '{}',  -- extracted OCI config (env, workdir, cmd, etc.)
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, name)
+);
+```
 
-**What doesn't change**: snapshots (still ephemeral), templates (deferred).
+Store methods:
+```go
+type Image struct {
+    ID        string            `json:"id"`
+    UserID    string            `json:"user_id"`
+    Name      string            `json:"name"`
+    Source    string             `json:"source"`
+    FilePath  string            `json:"-"`
+    SizeMB    int               `json:"size_mb"`
+    OCIConfig ImageConfig       `json:"oci_config"`
+    CreatedAt time.Time         `json:"created_at"`
+}
+
+type ImageConfig struct {
+    Env        map[string]string `json:"env,omitempty"`
+    WorkingDir string            `json:"working_dir,omitempty"`
+    Cmd        []string          `json:"cmd,omitempty"`
+    User       string            `json:"user,omitempty"`
+}
+
+func (s *Store) CreateImage(img Image) error
+func (s *Store) GetImage(userID, name string) (*Image, error)       // checks user + admin
+func (s *Store) GetAdminImage(name string) (*Image, error)          // admin only
+func (s *Store) ListImages(userID string) ([]Image, error)          // user's + admin
+func (s *Store) DeleteImage(userID, name string) error
+```
+
+`GetImage` first checks `user_id = ?`, then falls back to `user_id = ''`
+(admin images). This gives user images priority — a user can shadow an
+admin image with their own version.
+
+#### 2.2 OCI Conversion Package
+
+**New package:** `pkg/oci/`
+
+```go
+package oci
+
+// PullAndConvert pulls an OCI image from a registry, flattens it to
+// an ext4 rootfs image, injects the lohar agent, and returns the
+// path to the created ext4 file.
+//
+// The loharPath is the path to the lohar binary on the host.
+// The outputPath is where the ext4 file will be written.
+// Returns the extracted OCI config for storage.
+func PullAndConvert(ctx context.Context, ref, outputPath, loharPath string, opts ...Option) (*Config, error)
+
+type Config struct {
+    Env          map[string]string
+    WorkingDir   string
+    Cmd          []string
+    User         string
+    ExposedPorts []int
+    TotalSize    int64    // flattened size in bytes
+}
+
+type Option func(*pullOptions)
+func WithAuth(user, password string) Option
+func WithPlatform(os, arch string) Option
+```
+
+**File:** `pkg/oci/pull.go`
+
+```go
+func PullAndConvert(ctx context.Context, ref, outputPath, loharPath string, opts ...Option) (*Config, error) {
+    // 1. Pull image
+    img, err := crane.Pull(ref, craneOpts...)
+
+    // 2. Read config
+    cfgFile, _ := img.ConfigFile()
+    config := extractConfig(cfgFile)
+
+    // 3. Create temp dir for flattening
+    tmpDir, _ := os.MkdirTemp("", "bhatti-oci-*")
+    defer os.RemoveAll(tmpDir)
+
+    // 4. Flatten layers
+    layers, _ := img.Layers()
+    for _, layer := range layers {
+        if err := extractLayer(layer, tmpDir); err != nil {
+            return nil, fmt.Errorf("extract layer: %w", err)
+        }
+    }
+
+    // 5. Inject bhatti components
+    if err := injectLohar(tmpDir, loharPath); err != nil {
+        return nil, fmt.Errorf("inject lohar: %w", err)
+    }
+
+    // 6. Validate compatibility
+    if warnings := validateImage(tmpDir); len(warnings) > 0 {
+        for _, w := range warnings {
+            slog.Warn("oci image warning", "ref", ref, "issue", w)
+        }
+    }
+
+    // 7. Create ext4
+    if err := createExt4FromDir(tmpDir, outputPath); err != nil {
+        return nil, fmt.Errorf("create ext4: %w", err)
+    }
+
+    return config, nil
+}
+```
+
+**File:** `pkg/oci/flatten.go`
+
+```go
+// extractLayer extracts a single OCI layer tar into the target directory.
+// Handles whiteouts (per-file and opaque), permissions, symlinks, hard links.
+func extractLayer(layer v1.Layer, targetDir string) error {
+    reader, _ := layer.Uncompressed()
+    tr := tar.NewReader(reader)
+
+    for {
+        header, err := tr.Next()
+        if err == io.EOF { break }
+
+        path := filepath.Join(targetDir, header.Name)
+
+        // Handle whiteouts
+        base := filepath.Base(header.Name)
+        dir := filepath.Dir(path)
+        if base == ".wh..wh..opq" {
+            // Opaque whiteout: remove all existing entries in this directory
+            removeDirectoryContents(dir)
+            continue
+        }
+        if strings.HasPrefix(base, ".wh.") {
+            // Per-file whiteout: delete the named file
+            target := filepath.Join(dir, strings.TrimPrefix(base, ".wh."))
+            os.RemoveAll(target)
+            continue
+        }
+
+        // Extract based on type
+        switch header.Typeflag {
+        case tar.TypeDir:
+            os.MkdirAll(path, os.FileMode(header.Mode))
+        case tar.TypeReg:
+            writeFile(path, tr, os.FileMode(header.Mode))
+        case tar.TypeSymlink:
+            os.Symlink(header.Linkname, path)
+        case tar.TypeLink:
+            os.Link(filepath.Join(targetDir, header.Linkname), path)
+        case tar.TypeBlock, tar.TypeChar:
+            // Skip device nodes — lohar creates /dev at boot
+            continue
+        }
+
+        // Preserve ownership
+        os.Lchown(path, header.Uid, header.Gid)
+    }
+}
+```
+
+**File:** `pkg/oci/inject.go`
+
+```go
+// injectLohar copies the lohar binary and ensures boot directories exist.
+func injectLohar(rootDir, loharPath string) error {
+    // Copy lohar
+    dst := filepath.Join(rootDir, "usr/local/bin/lohar")
+    os.MkdirAll(filepath.Dir(dst), 0755)
+    copyFile(loharPath, dst)
+    os.Chmod(dst, 0755)
+
+    // Ensure boot directories
+    for _, dir := range []string{
+        "proc", "sys", "dev", "dev/pts", "tmp", "run", "workspace",
+    } {
+        os.MkdirAll(filepath.Join(rootDir, dir), 0755)
+    }
+
+    // Fix resolv.conf (may be a broken symlink from systemd-resolved)
+    resolvPath := filepath.Join(rootDir, "etc/resolv.conf")
+    os.Remove(resolvPath) // remove symlink if exists
+    os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
+
+    // Ensure uid 1000 user exists
+    if err := ensureUser1000(rootDir); err != nil {
+        return fmt.Errorf("ensure user: %w", err)
+    }
+
+    return nil
+}
+
+// ensureUser1000 checks if uid 1000 exists in /etc/passwd.
+// If not, creates a 'lohar' user with uid 1000.
+// If uid 1000 exists (e.g., 'node' in node images), leaves it as-is.
+func ensureUser1000(rootDir string) error {
+    passwdPath := filepath.Join(rootDir, "etc/passwd")
+    data, err := os.ReadFile(passwdPath)
+    if err != nil {
+        return nil // no passwd file, skip
+    }
+    for _, line := range strings.Split(string(data), "\n") {
+        if strings.Contains(line, ":1000:") {
+            return nil // uid 1000 exists
+        }
+    }
+    // Append lohar user
+    f, _ := os.OpenFile(passwdPath, os.O_APPEND|os.O_WRONLY, 0644)
+    defer f.Close()
+    f.WriteString("lohar:x:1000:1000::/home/lohar:/bin/sh\n")
+
+    groupPath := filepath.Join(rootDir, "etc/group")
+    g, _ := os.OpenFile(groupPath, os.O_APPEND|os.O_WRONLY, 0644)
+    defer g.Close()
+    g.WriteString("lohar:x:1000:\n")
+
+    os.MkdirAll(filepath.Join(rootDir, "home/lohar"), 0755)
+    os.Chown(filepath.Join(rootDir, "home/lohar"), 1000, 1000)
+    return nil
+}
+```
+
+**File:** `pkg/oci/validate.go`
+
+```go
+// validateImage checks for known incompatibilities and returns warnings.
+func validateImage(rootDir string) []string {
+    var warnings []string
+
+    // Check for systemd (won't work — lohar is PID 1)
+    if exists(rootDir, "lib/systemd/systemd") || exists(rootDir, "usr/lib/systemd/systemd") {
+        warnings = append(warnings, "image contains systemd — it will NOT run as PID 1, lohar replaces it")
+    }
+
+    // Check for Docker-in-Docker
+    if exists(rootDir, "usr/bin/dockerd") {
+        warnings = append(warnings, "image contains dockerd — Docker-in-Docker is not supported in Firecracker VMs")
+    }
+
+    // Check for NVIDIA/GPU libraries
+    if globExists(rootDir, "usr/lib/*/libcuda.*") || exists(rootDir, "usr/local/cuda") {
+        warnings = append(warnings, "image contains CUDA libraries — GPU passthrough is not supported in Firecracker")
+    }
+
+    // Check for missing shell
+    hasShell := exists(rootDir, "bin/sh") || exists(rootDir, "usr/bin/sh") ||
+                exists(rootDir, "bin/bash") || exists(rootDir, "usr/bin/bash")
+    if !hasShell {
+        warnings = append(warnings, "image has no /bin/sh — exec commands will fail. "+
+            "This image may be a 'scratch' or 'distroless' image which is not compatible with bhatti")
+    }
+
+    // Check for FUSE
+    if exists(rootDir, "usr/bin/fusermount") || exists(rootDir, "usr/bin/fusermount3") {
+        warnings = append(warnings, "image contains FUSE tools — FUSE is not supported in the Firecracker guest kernel")
+    }
+
+    return warnings
+}
+```
+
+**File:** `pkg/oci/ext4.go`
+
+```go
+// createExt4FromDir creates an ext4 image from a directory tree.
+func createExt4FromDir(srcDir, outputPath string) error {
+    // 1. Calculate required size
+    totalSize, fileCount, err := dirStats(srcDir)
+    if err != nil {
+        return err
+    }
+
+    // Add 20% headroom + 256MB minimum free
+    sizeMB := int(totalSize/1024/1024) * 120 / 100
+    if sizeMB < 512 {
+        sizeMB = 512
+    }
+
+    // 2. Create sparse file
+    f, _ := os.Create(outputPath)
+    f.Truncate(int64(sizeMB) << 20)
+    f.Close()
+
+    // 3. Format with enough inodes
+    //    Default ext4 creates 1 inode per 16KB. Images with many small
+    //    files (node_modules) can exhaust inodes. Allocate 1 inode per
+    //    4KB or at least fileCount * 1.5.
+    inodes := max(fileCount * 3 / 2, totalSize / 4096)
+    exec.Command("mkfs.ext4", "-F", "-q", "-N", fmt.Sprint(inodes), outputPath).Run()
+
+    // 4. Mount and copy
+    mountDir, _ := os.MkdirTemp("", "bhatti-ext4-*")
+    defer os.RemoveAll(mountDir)
+
+    exec.Command("mount", "-o", "loop", outputPath, mountDir).Run()
+    defer exec.Command("umount", mountDir).Run()
+
+    // cp -a preserves permissions, symlinks, hard links, timestamps
+    exec.Command("cp", "-a", srcDir+"/.", mountDir+"/").Run()
+
+    return nil
+}
+```
+
+#### 2.3 Engine Changes
+
+In `Create()`, resolve image name to file path:
+
+```go
+// 1. Resolve image
+baseImage := e.cfg.BaseRootfs // default
+if spec.Image != "" {
+    // Check user images first, then admin images
+    imgPath := filepath.Join(e.cfg.DataDir, "images", spec.UserID, spec.Image+".ext4")
+    if _, err := os.Stat(imgPath); os.IsNotExist(err) {
+        // Try admin image
+        imgPath = filepath.Join(e.cfg.DataDir, "images", spec.Image+".ext4")
+        if _, err := os.Stat(imgPath); os.IsNotExist(err) {
+            return info, fmt.Errorf("image %q not found", spec.Image)
+        }
+    }
+    baseImage = imgPath
+}
+
+rootfsPath := filepath.Join(sandboxDir, "rootfs.ext4")
+if err = copyRootfs(baseImage, rootfsPath); err != nil {
+    return info, fmt.Errorf("copy rootfs: %w", err)
+}
+
+// Resize if requested
+if spec.DiskSizeMB > 0 {
+    if err = exec.Command("truncate", "-s", fmt.Sprintf("%dM", spec.DiskSizeMB), rootfsPath).Run(); err != nil {
+        return info, fmt.Errorf("resize rootfs: %w", err)
+    }
+    if err = exec.Command("resize2fs", rootfsPath).Run(); err != nil {
+        return info, fmt.Errorf("resize2fs: %w", err)
+    }
+}
+```
+
+Save-as-image in the engine:
+
+```go
+func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) error {
+    vm, err := e.getVM(sandboxID)
+    if err != nil {
+        return err
+    }
+    vm.stateMu.Lock()
+    defer vm.stateMu.Unlock()
+
+    // Pause VM for filesystem consistency
+    wasPaused := vm.Thermal == "warm"
+    if vm.Thermal == "hot" {
+        client := fcAPIClient(vm.SocketPath)
+        fcPatch(client, "/vm", `{"state":"Paused"}`)
+    }
+
+    // Copy rootfs
+    if err := copyRootfs(vm.RootfsPath, destPath); err != nil {
+        return fmt.Errorf("copy rootfs: %w", err)
+    }
+
+    // Resume if it was hot
+    if !wasPaused {
+        client := fcAPIClient(vm.SocketPath)
+        fcPatch(client, "/vm", `{"state":"Resumed"}`)
+    }
+
+    return nil
+}
+```
+
+#### 2.4 Tests
+
+**OCI package unit tests (pkg/oci/, run anywhere):**
+- `TestExtractLayerBasic` — single layer with files, verify extracted
+- `TestExtractLayerWhiteoutFile` — `.wh.config.json` deletes file from lower layer
+- `TestExtractLayerWhiteoutOpaque` — `.wh..wh..opq` clears directory
+- `TestExtractLayerSymlinks` — symlinks preserved
+- `TestExtractLayerHardLinks` — hard links preserved (same inode)
+- `TestExtractLayerPermissions` — file modes preserved
+- `TestExtractLayerDeviceNodesSkipped` — block/char devices ignored
+- `TestInjectLohar` — lohar binary present, boot dirs exist
+- `TestInjectLoharResolvConf` — broken symlink replaced with file
+- `TestEnsureUser1000Exists` — uid 1000 already in passwd → no change
+- `TestEnsureUser1000Missing` — uid 1000 not in passwd → lohar user added
+- `TestEnsureUser1000NoPasswd` — no /etc/passwd file → skip gracefully
+- `TestValidateImageClean` — normal image, no warnings
+- `TestValidateImageSystemd` — detects systemd
+- `TestValidateImageDockerInDocker` — detects dockerd
+- `TestValidateImageCuda` — detects CUDA
+- `TestValidateImageNoShell` — detects missing /bin/sh
+- `TestValidateImageFuse` — detects FUSE tools
+- `TestCreateExt4FromDir` — verify ext4 image is mountable
+- `TestCreateExt4InodeCount` — directory with 50000 small files, verify no inode exhaustion
+- `TestCreateExt4Size` — verify image size has headroom
+
+These tests use crafted tar layers and temp directories, not real
+Docker images. They run on any Linux system without network access.
+
+**OCI integration tests (pkg/oci/, needs network + root):**
+- `TestPullAndConvertAlpine` — pull alpine:latest (5MB), convert, verify
+  ext4 mountable, /bin/sh exists, lohar exists
+- `TestPullAndConvertPython` — pull python:3.12-slim (~150MB), convert,
+  verify python3 binary exists
+- `TestPullAndConvertNode` — pull node:22-slim, convert, verify node
+  binary exists, verify uid 1000 = `node` (not overwritten)
+- `TestPullAndConvertDistroless` — pull gcr.io/distroless/static,
+  convert, verify warning about missing shell
+- `TestPullAndConvertUbuntu` — pull ubuntu:24.04, verify resolv.conf
+  is a regular file (not systemd symlink)
+- `TestPullPrivateImageAuth` — pull from private registry with auth
+  (needs test registry or skip)
+
+**Engine integration tests (agni-01, real Firecracker):**
+- `TestBootFromOCIImage` — pull alpine, convert, boot sandbox with
+  `image: alpine`, exec `cat /etc/alpine-release` → success
+- `TestBootFromPythonImage` — pull python:3.12-slim, boot, exec
+  `python3 -c "print('hello')"` → "hello"
+- `TestBootFromNodeImage` — pull node:22-slim, boot, exec
+  `node -e "console.log('ok')"` → "ok"
+- `TestImageEnvMerge` — OCI image has `PYTHON_VERSION=3.12`, sandbox
+  adds `MY_VAR=test`, exec `env` shows both
+- `TestSaveAndBootImage` — create sandbox, install package, save as
+  image, boot new sandbox from saved image, verify package exists
+- `TestImageResizeDisk` — create sandbox with `disk_size_mb: 4096`,
+  verify `df` shows ~4GB filesystem
+- `TestImageNotFound` — create sandbox with nonexistent image → error
+- `TestUserImageShadowsAdmin` — admin image "base" exists, user saves
+  their own "base", user's sandbox uses user's version
+
 
 ### Phase 3: Named Snapshots + Templates
 
-**What ships**: full VM checkpoint/resume as named entities. Templates
-as named presets.
+#### 3.1 Snapshot Store Schema
 
-**What changes**:
-- Snapshot storage outside sandbox dir
-- Manifest tracking (VM config, block device references)
-- Resume from named snapshot with new sandbox ID
-- Templates table redesigned for Firecracker
-- Template resolution in server layer
-- API: `POST /sandboxes/:id/checkpoint`,
-  `POST /snapshots/:name/resume`, `GET /snapshots`
-- CLI: `bhatti checkpoint/resume`
+```sql
+CREATE TABLE snapshots (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    source_sandbox TEXT NOT NULL,       -- sandbox ID it was created from
+    mem_path TEXT NOT NULL,             -- /var/lib/bhatti/snapshots/{user_id}/{name}/mem.snap
+    vm_path TEXT NOT NULL,
+    rootfs_path TEXT NOT NULL,          -- copied rootfs at snapshot time
+    config_path TEXT NOT NULL,          -- copied config drive
+    manifest_json TEXT NOT NULL,        -- VM config + volume refs
+    size_mb INTEGER NOT NULL DEFAULT 0, -- total snapshot size
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, name)
+);
+```
+
+#### 3.2 Tests
+
+**Store tests:**
+- `TestSnapshotCreateAndGet`
+- `TestSnapshotUserScoped`
+- `TestSnapshotDelete`
+
+**Engine integration tests (agni-01):**
+- `TestCheckpointAndResume` — create sandbox, run background process,
+  checkpoint as "dev-ready", resume into new sandbox, verify process
+  is running
+- `TestCheckpointWithVolume` — sandbox has volume, checkpoint, resume,
+  verify volume data accessible
+- `TestCheckpointVMConfig` — resume must use same vcpu/memory as
+  checkpoint
+- `TestCheckpointDifferentConfig` — try resume with different config →
+  clear error explaining constraint
+- `TestCheckpointResumeTiming` — resume from checkpoint in <100ms
+  (existing stop/start perf test, extended for named snapshots)
 
 ---
 
