@@ -1,9 +1,10 @@
-# Bhatti v0.2 — Images, Volumes, and Snapshots
+# Bhatti v0.3 — Images, Volumes, and Snapshots
 
 v0.1 shipped multi-tenant security: per-user auth, network isolation,
 guest hardening, encrypted secrets, rate limiting, and observability.
+v0.2 shipped CLI improvements (cobra migration, --timing, --json, --timeout).
 
-v0.2 adds the storage and state primitives that make bhatti useful for
+v0.3 adds the storage and state primitives that make bhatti useful for
 real workloads: persistent data, custom environments, and checkpoint/resume.
 
 ---
@@ -27,7 +28,7 @@ for each drive. The guest agent reads the config drive and mounts them.
 directory and destroyed with the sandbox. The rootfs is always a copy of
 one hardcoded base image. Volumes are ephemeral.
 
-**The v0.2 model:** block devices have their own lifecycle, independent
+**The v0.3 model:** block devices have their own lifecycle, independent
 of sandboxes. A sandbox is a transient compute context that *references*
 durable block devices, not *owns* them. This is the same relationship
 as EC2 instances to EBS volumes, or Kubernetes pods to PersistentVolumes.
@@ -115,9 +116,18 @@ type VolumeMountConfig struct {
 }
 ```
 
+**MUST: update `cmd/lohar/main.go`**: the existing `SandboxConfig.Volumes`
+uses an anonymous struct `[]struct{Device, Mount, FS string}` that does
+NOT have a `ReadOnly` field. It must be changed to use `VolumeMountConfig`
+(the named type above). Without this, Go's JSON unmarshaler silently
+ignores the `read_only` key and every "read-only" volume is mounted
+read-write — a data corruption path, not a cosmetic bug. The type name
+`VolumeMountConfig` is used on both engine and guest sides; the JSON
+serialization on the config drive is the contract between them.
+
 And the updated lohar mount code:
 ```go
-func mountVolumes(volumes []VolumeMount) {
+func mountVolumes(volumes []VolumeMountConfig) {
     for _, v := range volumes {
         os.MkdirAll(v.Mount, 0755)
         var flags uintptr
@@ -385,7 +395,7 @@ ensureUser(mountpoint, "lohar", 1000)
   b) Always create the `lohar` user, overwriting any existing uid 1000
   c) Use whatever uid the image specifies in its `User` config field
 
-  For v0.2: option (a) — reuse the existing uid 1000 user. If no uid 1000
+  For v0.3: option (a) — reuse the existing uid 1000 user. If no uid 1000
   exists, create `lohar`. This handles Node images (uid 1000 = `node`) and
   Python images (uid 1000 = `appuser`) without conflict.
 
@@ -451,7 +461,7 @@ single-node.
 If layer sharing becomes critical later (hundreds of images, frequent
 updates), the path is: mount an overlayfs inside the guest VM with
 layers as separate read-only block devices. But this adds complexity to
-lohar and limits layers per image. Not worth it for v0.2.
+lohar and limits layers per image. Not worth it for v0.3.
 
 **Incremental updates.** Pulling `python:3.12.4` after having `3.12.3`
 in Docker only downloads the changed layers. In bhatti, it re-downloads
@@ -532,7 +542,7 @@ bhatti image pull 123456.dkr.ecr.us-east-1.amazonaws.com/my-image:latest
 # (uses AWS credential chain automatically if aws-cli is configured)
 ```
 
-For v0.2: support `--auth user:token` flag and `~/.docker/config.json`.
+For v0.3: support `--auth user:token` flag and `~/.docker/config.json`.
 Don't implement the full Docker credential helper ecosystem — it's a
 rabbit hole. Users who need ECR/GCR auth can `docker pull` + `docker save`
 + `bhatti image import` as a workaround.
@@ -571,6 +581,7 @@ CREATE TABLE tasks (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at DATETIME
 );
+CREATE INDEX idx_tasks_created_at ON tasks(created_at);  -- cleanup query scans by created_at
 ```
 
 **Task lifecycle:**
@@ -741,7 +752,7 @@ POST /volumes/workspace/resize {"size_mb": 10240}
 Cannot resize while attached — the guest kernel has the filesystem
 mounted and would be confused by the underlying block device changing
 size. (Live resize IS possible with virtio-blk resize events, but adds
-significant complexity. Defer to v0.3.)
+significant complexity. Defer to v0.4.)
 
 **Shrink is explicitly rejected.** `truncate` to a smaller size silently
 chops the file. `resize2fs` would then fail or corrupt the filesystem.
@@ -861,9 +872,44 @@ These must also be persisted in `VMState()` / `RestoreVM()` so they
 survive daemon restarts (stored as JSON in the sandboxes table's
 `engine_meta_json` column).
 
+**Concrete `VMState()` / `RestoreVM()` changes** — without these, a
+daemon restart followed by a checkpoint produces a snapshot manifest
+with zero volume entries, silently losing all volume references:
+
+```go
+// In VMState() — add to the returned map:
+func (e *Engine) VMState(id string) map[string]interface{} {
+    // ... existing fields ...
+    m["volumes"] = vm.Volumes // []VolumeAttachmentInfo, marshaled by json.Marshal
+    return m
+}
+
+// In RestoreVM() — deserialize volumes from persisted state:
+func (e *Engine) RestoreVM(id, name, status string, state map[string]interface{}) {
+    // ... existing field extraction ...
+
+    // Restore volume attachments (JSON round-trip through interface{})
+    if raw, ok := state["volumes"]; ok {
+        b, _ := json.Marshal(raw) // re-marshal the []interface{} back to JSON
+        json.Unmarshal(b, &vm.Volumes)
+    }
+
+    // ... rest of RestoreVM ...
+}
+```
+
+The `engine_meta_json` column in the sandboxes table already stores
+arbitrary JSON. The server layer's existing `SaveFirecrackerState` /
+`LoadFirecrackerState` must be updated to round-trip this field. The
+simplest path: stop using per-column storage for engine state and
+switch entirely to the `engine_meta_json` blob (which already exists
+but is underused). This avoids adding more ALTER TABLE migrations.
+
 **Creating a named snapshot:**
 ```
 POST /sandboxes/abc123/checkpoint {"name": "dev-ready"}
+→ CHECK if snapshots/usr_alice/dev-ready/ already exists → 409 "delete first"
+    (fail BEFORE pausing the VM — don't waste 10s of copying only to fail at rename)
 → acquire vm.stateMu (hold for entire operation — see below)
 → pause VM
 → create temp directory: snapshots/usr_alice/.dev-ready.tmp/
@@ -881,23 +927,18 @@ POST /sandboxes/abc123/checkpoint {"name": "dev-ready"}
 Uses `--sparse=always` for all copies (volumes may be large and sparse).
 
 **Parallel copies**: rootfs, config, and volume files are independent.
-Copy them concurrently using a `sync.WaitGroup`:
+Copy them concurrently using `errgroup` (NOT `atomic.Value` — that
+only stores the last error, losing all but one if multiple copies fail):
 ```go
-var wg sync.WaitGroup
-var copyErr atomic.Value
+g, _ := errgroup.WithContext(ctx)
 for _, src := range filesToCopy {
-    wg.Add(1)
-    go func(s, d string) {
-        defer wg.Done()
-        if err := copyFile(s, d); err != nil {
-            copyErr.Store(err)
-        }
-    }(src.path, dst.path)
+    g.Go(func() error {
+        return copyFile(src.path, dst.path)
+    })
 }
-wg.Wait()
-if e := copyErr.Load(); e != nil {
+if err := g.Wait(); err != nil {
     os.RemoveAll(tmpDir) // clean up partial snapshot
-    return e.(error)
+    return err           // first error (usually the root cause, e.g. "disk full")
 }
 ```
 
@@ -1072,6 +1113,22 @@ this is correct. But booting the rootfs independently (without mem.snap)
 would give an inconsistent filesystem. Do not use snapshot rootfs copies
 as images.
 
+**Resumed sandbox volumes are ephemeral copies.** On resume, volume
+files are copied from the snapshot directory into the new sandbox
+directory. These copies are destroyed when the resumed sandbox is
+destroyed — they are NOT attached to the original persistent volume.
+The `volume_attachments` table has NO rows for the resumed sandbox's
+volumes. This means:
+- `GET /volumes/:name` shows 0 attachments even though the resumed
+  sandbox has a copy of that volume's data at snapshot time.
+- Writes to `/workspace` in the resumed sandbox do NOT affect the
+  original persistent volume.
+- The original volume can be independently attached to other sandboxes.
+This is correct and intentional — the snapshot is a frozen point-in-time.
+Modifying the original volume after checkpoint would violate snapshot
+isolation. Document this clearly in the API docs so users understand
+"resume gives you a copy, not a reference."
+
 **What the user experiences**: a sandbox that boots in ~50ms with all
 their processes running, files open, dev server responding. Not a fresh
 boot — a continuation.
@@ -1202,7 +1259,7 @@ type VolumeAttachment struct {
     ReadOnly  bool   `json:"read_only"`
 }
 
-func (s *Store) CreateVolume(v Volume) error
+func (s *Store) CreateVolume(v Volume) error                       // plain INSERT (not OR IGNORE) — must return error on UNIQUE violation for race coordination
 func (s *Store) GetVolume(userID, name string) (*Volume, error)    // includes attachments
 func (s *Store) ListUserVolumes(userID string) ([]Volume, error)
 func (s *Store) DeleteVolume(userID, name string) error            // fails if any attachments
@@ -1272,7 +1329,45 @@ func (s *Store) DetachOrphanedVolumes() (int64, error) {
 }
 ```
 
-#### 1.2 Engine Changes
+#### 1.2 Startup Initialization
+
+**File:** `pkg/engine/firecracker/engine.go` — `New()`
+
+The existing `New()` creates only `DataDir/sandboxes/`. The new
+entity directories must also be created at startup, otherwise the
+first image pull / volume create / checkpoint fails with ENOENT:
+
+```go
+for _, sub := range []string{"sandboxes", "images", "volumes", "snapshots"} {
+    if err := os.MkdirAll(filepath.Join(cfg.DataDir, sub), 0700); err != nil {
+        return nil, fmt.Errorf("create %s dir: %w", sub, err)
+    }
+}
+```
+
+**Stale snapshot temp directory cleanup**: if the daemon was killed
+during a checkpoint, a `.tmp` directory with gigabytes of partial
+data may survive in the snapshots tree. Clean these on startup:
+
+```go
+// Clean stale checkpoint temp dirs left by crashed checkpoints
+filepath.WalkDir(filepath.Join(cfg.DataDir, "snapshots"), func(path string, d fs.DirEntry, err error) error {
+    if err != nil {
+        return nil
+    }
+    if d.IsDir() && strings.HasSuffix(d.Name(), ".tmp") {
+        slog.Info("removing stale snapshot temp dir", "path", path)
+        os.RemoveAll(path)
+        return filepath.SkipDir
+    }
+    return nil
+})
+```
+
+This runs BEFORE any user requests are accepted, alongside the
+existing orphaned TAP device cleanup and volume orphan reconciliation.
+
+#### 1.3 Engine Changes
 
 **File:** `pkg/engine/engine.go`
 
@@ -1298,6 +1393,10 @@ type SandboxSpec struct {
 
     // Deprecated — kept for backward compat with v0.1 API, ignored if Volumes is set
     NewVolumes []VolumeSpec       `json:"new_volumes,omitempty"`
+
+    // Set by server layer (not by API clients):
+    BaseImage       string           `json:"-"` // resolved image file path (from store.GetImage)
+    ResolvedVolumes []ResolvedVolume `json:"-"` // resolved volume file paths (from store + attach)
 }
 ```
 
@@ -1318,31 +1417,37 @@ var engineVolumes []engine.ResolvedVolume
 for _, vol := range req.Volumes {
     existing, err := store.GetVolume(userID, vol.Name)
     if err != nil && vol.AutoCreate && vol.SizeMB > 0 {
-        // Auto-create: use O_EXCL to prevent race with concurrent creates
+        // Auto-create: use the store's UNIQUE(user_id, name) constraint
+        // as the coordination primitive, NOT filesystem O_EXCL.
+        //
+        // Why: O_EXCL wins the file race, but the loser then calls
+        // store.GetVolume() which may return "not found" because the
+        // winner is still running mkfs.ext4 (~200ms) and hasn't
+        // committed store.CreateVolume yet. The loser gets a 500.
+        //
+        // Correct approach: insert the store record FIRST (name reservation),
+        // then create the file. The store's unique constraint serializes
+        // concurrent creates. Losers see "duplicate" and re-fetch.
         volDir := filepath.Join(dataDir, "volumes", userID)
         os.MkdirAll(volDir, 0700)
         volPath := filepath.Join(volDir, vol.Name+".ext4")
 
-        // O_EXCL: fail if file already exists (another goroutine won the race)
-        f, createErr := os.OpenFile(volPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+        storeVol := store.Volume{ID: generateID(), UserID: userID,
+            Name: vol.Name, SizeMB: vol.SizeMB, FilePath: volPath}
+        createErr := store.CreateVolume(storeVol)
         if createErr != nil {
-            // File exists — another concurrent request created it. Re-fetch from store.
+            // UNIQUE constraint violation — another request won the race.
+            // The winner has committed the store record, so GetVolume
+            // will always succeed (no timing window).
             existing, err = store.GetVolume(userID, vol.Name)
             if err != nil {
                 return fmt.Errorf("volume %q: race recovery failed: %w", vol.Name, err)
             }
         } else {
-            f.Close()
+            // We won the race. Create the file.
             if err := createVolume(volPath, vol.SizeMB); err != nil {
-                os.Remove(volPath) // clean up on format failure
+                store.DeleteVolume(userID, vol.Name) // remove store record
                 return fmt.Errorf("create volume %q: %w", vol.Name, err)
-            }
-            // Create store record AFTER file exists — if store fails, remove file
-            storeVol := store.Volume{ID: generateID(), UserID: userID,
-                Name: vol.Name, SizeMB: vol.SizeMB, FilePath: volPath}
-            if err := store.CreateVolume(storeVol); err != nil {
-                os.Remove(volPath) // orphan prevention
-                return fmt.Errorf("store volume %q: %w", vol.Name, err)
             }
             existing = &storeVol
         }
@@ -1431,16 +1536,30 @@ In `Destroy()`:
 No change to `Destroy()` itself — `os.RemoveAll(sandboxDir)` only
 removes the sandbox directory. Persistent volumes are outside it.
 
-#### 1.3 Server / Routes Changes
+#### 1.4 Server / Routes Changes
 
 **File:** `pkg/server/routes.go`
 
+**Regression warning**: the store volume API changes signature entirely
+(e.g., `CreateVolume(name string)` → `CreateVolume(v Volume)`,
+`AttachVolume(sandboxID, volumeName, target, readonly)` →
+`AttachVolume(userID, name, sandboxID, mount, readOnly)`). There are
+9 call sites in `routes.go` plus 1 in `server_test.go`. All must be
+updated atomically — a partial migration that compiles (e.g., wrong
+arg order with matching types) produces silent wrong behavior. Compile
+won't catch `AttachVolume(sbID, vol.Name, ...)` vs
+`AttachVolume(userID, vol.Name, ...)` since both are strings.
+
 Update `handleSandboxes POST` to handle persistent volumes:
-- Before `engine.Create()`: for each volume in request, call
-  `store.AttachVolume()` to check/reserve the attachment
+- **Move volume resolution BEFORE `engine.Create()`** (currently it's after).
+  Volumes must be reserved in the store before the VM boots, so a second
+  concurrent request for the same volume gets a 409 instead of two VMs
+  fighting over the same ext4 file.
 - If any attachment fails: return 409 ("volume already attached")
-- After sandbox destroy: `store.DetachAllVolumes(sandboxID)` to release
-  all volume attachments
+- On `engine.Create()` failure: `store.DetachAllForSandbox(sandboxID)` to
+  undo the pre-reservations (new rollback path — v0.1 had no equivalent)
+- After sandbox destroy: `store.DetachAllForSandbox(sandboxID)` to release
+  all volume attachments (replaces v0.1's `DetachVolumes`)
 
 New volume endpoints:
 ```go
@@ -1517,7 +1636,7 @@ func reconcileOrphanedVolumeFiles(dataDir string, store *Store) {
 }
 ```
 
-#### 1.4 CLI Changes
+#### 1.5 CLI Changes
 
 ```
 bhatti volume create --name workspace --size 5120
@@ -1531,7 +1650,7 @@ bhatti create --name dev --volume datasets:/data:ro   # read-only
 
 The `--volume` flag format: `name:mount[:ro]`
 
-#### 1.5 Tests
+#### 1.6 Tests
 
 **Store tests (pkg/store/):**
 - `TestVolumeCreateAndGet` — create volume, verify fields
@@ -1565,6 +1684,11 @@ The `--volume` flag format: `name:mount[:ro]`
 - `TestVolumeResizeShrinkHTTP` — resize to smaller size → 400
 - `TestSandboxCreateFailRollbacksVolumes` — engine.Create fails, verify
   all volumes that were attached during the request are detached
+- `TestSandboxCreateNoVolumesRegression` — create sandbox with zero
+  volumes (the v0.1 path), verify it still works end-to-end. This is
+  the #1 regression test — the volume resolution loop now runs before
+  engine.Create(), and an off-by-one or nil-slice bug here breaks ALL
+  sandbox creation, not just the volume path.
 - `TestVolumeDeleteOrdering` — delete volume, verify store record gone
   before file (mock filesystem to verify call order)
 
@@ -1614,7 +1738,7 @@ The `--volume` flag format: `name:mount[:ro]`
   exec blocks until checkpoint completes, then returns normally
 
 **Schema migration test:**
-- `TestMigrateV01ToV02` — create a v0.1 database (old volumes table with
+- `TestMigrateV02ToV03` — create a v0.2 database (old volumes table with
   just name + created_at), run New() which applies migrations, verify:
   - old volume records accessible (or gracefully absent — v0.1 volumes
     were Docker-only, Firecracker volumes are new)
@@ -1864,8 +1988,12 @@ func extractLayer(layer v1.Layer, targetDir string) error {
         }
     }
 
-    // Merge staged files into target (this layer's files overwrite previous)
-    exec.Command("cp", "-a", stageDir+"/.", targetDir+"/").Run()
+    // Merge staged files into target (this layer's files overwrite previous).
+    // Use filepath.Walk + os.Rename instead of `cp -a` subprocess.
+    // Rename is O(1) on the same filesystem (stageDir and targetDir are
+    // both under the same MkdirTemp parent). For a 12-layer image this
+    // eliminates 12 cp processes and avoids re-reading every file.
+    mergeDir(stageDir, targetDir) // Walk stageDir, Rename files into targetDir
 
     return nil
 }
@@ -1937,7 +2065,13 @@ func ensureUser1000(rootDir string) error {
     if _, err := os.Stat(useraddPath); err == nil {
         cmd := exec.Command("chroot", rootDir,
             "useradd", "-m", "-u", "1000", "-s", "/bin/sh", "lohar")
-        cmd.Run() // best effort — may fail if chroot isn't available
+        if err := cmd.Run(); err != nil {
+            // May fail for cross-arch images (arm64 image on amd64 host
+            // gives "exec format error") or if chroot is unavailable.
+            // Fall through to manual passwd editing below.
+            slog.Debug("chroot useradd failed, falling back to manual",
+                "rootDir", rootDir, "error", err)
+        }
         // Verify it worked
         data2, _ := os.ReadFile(passwdPath)
         if strings.Contains(string(data2), ":1000:") {
@@ -2042,8 +2176,13 @@ func createExt4FromDir(srcDir, outputPath string) error {
         return err
     }
 
-    // Add 20% headroom + 256MB minimum free
-    sizeMB := int(totalSize/1024/1024) * 120 / 100
+    // Add 30% headroom for ext4 metadata (journal, inode table, block group
+    // descriptors, superblock copies). 20% is too tight for images with many
+    // small files where inode overhead alone exceeds 5%. mke2fs does NOT
+    // auto-expand — if this estimate is even one block group short, mke2fs
+    // fails with "Not enough space" and leaves a partial image.
+    // Minimum 512MB to avoid micro-images with no free space.
+    sizeMB := int(totalSize/1024/1024) * 130 / 100
     if sizeMB < 512 {
         sizeMB = 512
     }
@@ -2067,6 +2206,7 @@ func createExt4FromDir(srcDir, outputPath string) error {
         "-F", "-q",
         outputPath)
     if out, err := cmd.CombinedOutput(); err != nil {
+        os.Remove(outputPath) // clean up truncated/partial file on failure
         return fmt.Errorf("mke2fs: %s: %w", out, err)
     }
 
@@ -2079,6 +2219,15 @@ handles permissions, symlinks, and timestamps. It does NOT require
 root — no mount/umount. This also fixes the existing bug in
 `createConfigDrive` which uses mount/umount and can leak loop devices
 on crash. Migrate `createConfigDrive` to use `mke2fs -d` as well.
+
+**Config drive sizing**: the existing `createConfigDrive` hardcodes a
+1MB ext4 image. With ext4 overhead on 1MB, only ~500KB is usable. A
+sandbox with 20 volume mounts, 50 env vars, 10 injected files, and a
+long init script can exceed this. Bump to 4MB (still trivial for disk
+usage, eliminates the silent failure where `write config.json` returns
+ENOSPC and the sandbox boots with no config). When migrating to
+`mke2fs -d`, calculate size from the serialized JSON + 50% headroom
+with a 1MB floor.
 
 **Known `mke2fs -d` limitations:**
 - **Hard links**: preserved only in e2fsprogs >= 1.45. Ubuntu 18.04
@@ -2107,18 +2256,24 @@ In `Create()`, resolve image name to file path:
 
 ```go
 // 1. Resolve image
+// Image resolution happens in the SERVER LAYER (like volumes), not the
+// engine. The engine receives a resolved file path in spec.BaseImage.
+// This ensures all image access goes through store.GetImage() — so a
+// deleted image whose orphaned file wasn't cleaned up yet can't be
+// used, and a missing file gives a clear "image not found" error
+// instead of a confusing "copy rootfs" failure.
+//
+// Server layer (before engine.Create):
+//   if req.Image != "" {
+//       img, err := store.GetImage(userID, req.Image) // checks user, then admin
+//       if err != nil { return 404 }
+//       spec.BaseImage = img.FilePath
+//   }
+//
+// Engine layer:
 baseImage := e.cfg.BaseRootfs // default
-if spec.Image != "" {
-    // Check user images first, then admin images
-    imgPath := filepath.Join(e.cfg.DataDir, "images", spec.UserID, spec.Image+".ext4")
-    if _, err := os.Stat(imgPath); os.IsNotExist(err) {
-        // Try admin image
-        imgPath = filepath.Join(e.cfg.DataDir, "images", spec.Image+".ext4")
-        if _, err := os.Stat(imgPath); os.IsNotExist(err) {
-            return info, fmt.Errorf("image %q not found", spec.Image)
-        }
-    }
-    baseImage = imgPath
+if spec.BaseImage != "" {
+    baseImage = spec.BaseImage
 }
 
 rootfsPath := filepath.Join(sandboxDir, "rootfs.ext4")
@@ -2168,6 +2323,19 @@ if spec.DiskSizeMB > 0 {
 ```
 
 Save-as-image in the engine:
+
+New methods `SaveImage` and `Checkpoint`/`ResumeSnapshot` are NOT added
+to the `engine.Engine` interface — they're Firecracker-specific. The
+server layer uses a type assertion:
+```go
+if imgEngine, ok := s.engine.(interface {
+    SaveImage(ctx context.Context, sandboxID, destPath string) error
+}); ok {
+    imgEngine.SaveImage(ctx, sandboxID, destPath)
+}
+```
+This avoids breaking the Docker engine (if it still exists) or any
+future engine implementations that don't support snapshots.
 
 ```go
 func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) error {
@@ -2459,7 +2627,7 @@ pre-load drive configuration.
 - `TestResumeAfterBridgeDestroyed` — checkpoint, destroy all sandboxes
   (bridge gets cleaned up), resume → bridge recreated, VM works
 - `TestConfigDriveBackwardCompat` — v0.1 config drive (no ReadOnly field)
-  loaded by v0.2 lohar → mounts work (Go JSON defaults missing bool to false)
+  loaded by v0.3 lohar → mounts work (Go JSON defaults missing bool to false)
 - `TestVolumeAttachedToCrashedSandbox` — FC process killed (not daemon),
   sandbox status still "running" in DB, volume still "attached" → verify
   startup recovery updates sandbox status AND detaches volumes
@@ -2470,9 +2638,42 @@ pre-load drive configuration.
   dir, try to boot from it without mem.snap → either fails or produces
   inconsistent state (documents the constraint)
 
+**Resumed sandbox volume behavior (agni-01):**
+- `TestResumedSandboxVolumeIsEphemeral` — checkpoint sandbox A with
+  volume "ws", resume as sandbox B, write file in B's /workspace,
+  destroy B, attach "ws" to sandbox C → file from B is NOT in C
+  (B had a snapshot copy, not the live volume)
+- `TestResumedSandboxVolumeNoAttachmentRecord` — resume from snapshot,
+  GET /volumes/ws → 0 attachments (resumed sandbox uses ephemeral copy)
+- `TestResumedSandboxVolumeReadable` — resume, exec `cat /workspace/file`
+  → returns data from snapshot time (copy is functional)
+
+**Save-as-image page cache flush verification (agni-01):**
+- `TestSaveImageLargeWriteFlush` — write 10MB file via `dd` (large
+  enough to stay in page cache), immediately save-as-image, boot from
+  saved image, verify full 10MB file is present and intact (catches
+  missing `sync` — a 1-byte file would pass even without sync)
+
+**Startup reconciliation (integration):**
+- `TestStartupCleansStaleSnapshotTmpDirs` — create a
+  `snapshots/usr_alice/.test.tmp/` dir with files, restart daemon,
+  verify the .tmp dir was removed
+- `TestStartupCreatesEntityDirectories` — delete images/ dir, restart
+  daemon, verify images/ dir recreated
+
+**Task table index (store):**
+- `TestTaskCleanupPerformance` — insert 1000 tasks, run cleanup,
+  verify it completes in <100ms (catches missing index on created_at)
+
+**Crashed sandbox volume detachment (integration):**
+- `TestCrashedFCProcessReleasesVolumes` — create sandbox with volume,
+  kill Firecracker process (not daemon), restart daemon, verify startup
+  recovery detects dead sandbox, updates status to 'destroyed', AND
+  detaches the volume so it can be reused
+
 ---
 
-## API Surface (v0.2 complete)
+## API Surface (v0.3 complete)
 
 ```
 # Images
