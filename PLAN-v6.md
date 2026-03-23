@@ -310,6 +310,31 @@ ensureUser(mountpoint, "lohar", 1000)
   exists, create `lohar`. This handles Node images (uid 1000 = `node`) and
   Python images (uid 1000 = `appuser`) without conflict.
 
+  **Why this works**: lohar's exec uses `Credential{Uid: 1000}` which is
+  a kernel-level operation — it doesn't consult /etc/passwd. The passwd
+  entry only affects `whoami`, `~` expansion, and programs that call
+  `getpwuid(1000)`. By reusing the image's existing uid 1000 user, we
+  preserve the image's expected home directory, shell, and npm/pip configs.
+
+- **Images that expect root**: some images have `User: ""` (default) or
+  `User: "root"` in their OCI config, meaning the container was designed
+  to run everything as root. In bhatti, exec runs as uid 1000. If the
+  image writes to `/usr/local/lib`, `/etc`, or other root-owned paths,
+  it will get permission denied.
+
+  Mitigation: sudo. Our base rootfs has sudo + NOPASSWD configured. But
+  pulled Docker images may not have sudo installed. During conversion,
+  we should:
+  a) Check if sudo exists in the image
+  b) If not, install it (copy a static sudo binary, or add to sudoers
+     if sudo is present but not configured for uid 1000)
+  c) If we can't install sudo, warn: "image expects root but has no
+     sudo — permission errors may occur for system-level operations"
+
+  This is the biggest compatibility gap between Docker (runs as root by
+  default) and bhatti (runs as uid 1000 by default). It's solvable but
+  must be handled during conversion, not at runtime.
+
 **5. Extract and store OCI config metadata.**
 The image's config contains runtime hints that should be preserved:
 
@@ -1257,6 +1282,13 @@ func validateImage(rootDir string) []string {
         warnings = append(warnings, "image contains FUSE tools — FUSE is not supported in the Firecracker guest kernel")
     }
 
+    // Check sudo availability (bhatti runs exec as uid 1000, not root)
+    hasSudo := exists(rootDir, "usr/bin/sudo") || exists(rootDir, "bin/sudo")
+    if !hasSudo {
+        warnings = append(warnings, "image does not have sudo — commands that need root will fail. "+
+            "Install sudo in the image or use 'bhatti image save' from a sandbox with sudo configured")
+    }
+
     return warnings
 }
 ```
@@ -1394,6 +1426,8 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 - `TestValidateImageCuda` — detects CUDA
 - `TestValidateImageNoShell` — detects missing /bin/sh
 - `TestValidateImageFuse` — detects FUSE tools
+- `TestValidateImageNoSudo` — detects missing sudo
+- `TestValidateImageWithSudo` — sudo present, no warning
 - `TestCreateExt4FromDir` — verify ext4 image is mountable
 - `TestCreateExt4InodeCount` — directory with 50000 small files, verify no inode exhaustion
 - `TestCreateExt4Size` — verify image size has headroom
@@ -1431,6 +1465,10 @@ Docker images. They run on any Linux system without network access.
 - `TestImageNotFound` — create sandbox with nonexistent image → error
 - `TestUserImageShadowsAdmin` — admin image "base" exists, user saves
   their own "base", user's sandbox uses user's version
+- `TestOCIImageExecAsUid1000` — pull node:22-slim, boot, exec `whoami`
+  → returns `node` (the image's uid 1000 user, not `lohar`)
+- `TestOCIImageSudoWorks` — boot from image with sudo, exec
+  `sudo whoami` → `root`
 
 
 ### Phase 3: Named Snapshots + Templates
