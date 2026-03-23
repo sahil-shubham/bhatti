@@ -26,6 +26,27 @@ type VolumeSpec struct {
 	Mount  string `json:"mount"`
 }
 
+// PersistentVolume describes a named volume to attach to a sandbox.
+// Used in the API request → server layer volume resolution.
+type PersistentVolume struct {
+	Name       string `json:"name"`        // volume name (scoped to user)
+	Mount      string `json:"mount"`       // mount point inside VM
+	SizeMB     int    `json:"size_mb"`     // used only if AutoCreate
+	AutoCreate bool   `json:"auto_create"` // create if doesn't exist
+	ReadOnly   bool   `json:"read_only"`
+}
+
+// ResolvedVolume is a fully resolved volume reference with host file path.
+// The server layer handles name resolution, auto-create, and attachment.
+// The engine layer receives only these resolved volumes.
+type ResolvedVolume struct {
+	FilePath string `json:"file_path"` // host path to ext4 file
+	DriveID  string `json:"drive_id"`  // Firecracker drive ID ("vol0")
+	Name     string `json:"name"`      // volume name
+	Mount    string `json:"mount"`     // guest mount point
+	ReadOnly bool   `json:"read_only"`
+}
+
 // FileSpec describes a file to inject into the sandbox.
 type FileSpec struct {
 	Content []byte `json:"content"` // raw content (will be base64-encoded in config drive)
@@ -48,9 +69,14 @@ type SandboxSpec struct {
 	NewVolumes []VolumeSpec         `json:"new_volumes,omitempty"`
 	Init       string               `json:"init,omitempty"`
 
+	// v0.3: Persistent volume references (replaces VolumeMount for persistent vols)
+	PersistentVolumes []PersistentVolume `json:"persistent_volumes,omitempty"`
+
 	// Set by server layer, not by API clients
-	UserID      string `json:"-"` // owner's user ID
-	SubnetIndex int    `json:"-"` // owner's subnet index for network isolation
+	UserID          string           `json:"-"` // owner's user ID
+	SubnetIndex     int              `json:"-"` // owner's subnet index for network isolation
+	BaseImage       string           `json:"-"` // resolved image file path
+	ResolvedVolumes []ResolvedVolume `json:"-"` // resolved volume file paths
 }
 
 // SandboxInfo is the runtime state of a sandbox.

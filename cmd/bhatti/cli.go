@@ -59,6 +59,9 @@ func init() {
 	rootCmd.AddCommand(psCmd)
 	rootCmd.AddCommand(fileCmd)
 	rootCmd.AddCommand(secretCmd)
+	rootCmd.AddCommand(volumeCmd)
+	rootCmd.AddCommand(imageCmd)
+	rootCmd.AddCommand(snapshotCmd)
 	rootCmd.AddCommand(userCmd)
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(versionCmd)
@@ -376,20 +379,51 @@ var createCmd = &cobra.Command{
 		defer printTiming()
 
 		name, _ := cmd.Flags().GetString("name")
+		image, _ := cmd.Flags().GetString("image")
 		cpus, _ := cmd.Flags().GetFloat64("cpus")
 		memory, _ := cmd.Flags().GetInt("memory")
+		diskSize, _ := cmd.Flags().GetInt("disk-size")
 		env, _ := cmd.Flags().GetString("env")
 		initScript, _ := cmd.Flags().GetString("init")
+		volFlags, _ := cmd.Flags().GetStringSlice("volume")
 
 		envMap := parseEnvFlag(env)
 		req := map[string]any{
 			"name": name, "cpus": cpus, "memory_mb": memory,
+		}
+		if image != "" {
+			req["image"] = image
+		}
+		if diskSize > 0 {
+			req["disk_size_mb"] = diskSize
 		}
 		if len(envMap) > 0 {
 			req["env"] = envMap
 		}
 		if initScript != "" {
 			req["init"] = initScript
+		}
+
+		// Parse --volume flags: name:mount[:ro]
+		if len(volFlags) > 0 {
+			var pvols []map[string]any
+			for _, vf := range volFlags {
+				parts := strings.SplitN(vf, ":", 3)
+				if len(parts) < 2 {
+					return fmt.Errorf("invalid --volume format %q (expected name:mount[:ro])", vf)
+				}
+				pv := map[string]any{
+					"name":        parts[0],
+					"mount":       parts[1],
+					"auto_create": false,
+					"read_only":   false,
+				}
+				if len(parts) == 3 && parts[2] == "ro" {
+					pv["read_only"] = true
+				}
+				pvols = append(pvols, pv)
+			}
+			req["persistent_volumes"] = pvols
 		}
 
 		var sb struct {
@@ -411,10 +445,13 @@ var createCmd = &cobra.Command{
 
 func init() {
 	createCmd.Flags().String("name", "", "Sandbox name")
+	createCmd.Flags().String("image", "", "Rootfs image name")
 	createCmd.Flags().Float64("cpus", 1, "Number of vCPUs")
 	createCmd.Flags().Int("memory", 512, "Memory in MB")
+	createCmd.Flags().Int("disk-size", 0, "Rootfs disk size in MB (0 = use image size)")
 	createCmd.Flags().String("env", "", "Environment variables (K=V,K=V)")
 	createCmd.Flags().String("init", "", "Init script")
+	createCmd.Flags().StringSlice("volume", nil, "Persistent volume (name:mount[:ro])")
 }
 
 // --- list ---
@@ -1109,6 +1146,426 @@ var setupCmd = &cobra.Command{
 			health["sandboxes"], health["uptime"])
 		return nil
 	},
+}
+
+// --- volume ---
+
+var volumeCmd = &cobra.Command{
+	Use:   "volume <create|list|delete|resize>",
+	Short: "Manage persistent volumes",
+}
+
+var volumeCreateCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create a persistent volume",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		name, _ := cmd.Flags().GetString("name")
+		sizeMB, _ := cmd.Flags().GetInt("size")
+		if name == "" || sizeMB <= 0 {
+			return fmt.Errorf("--name and --size (> 0) required")
+		}
+
+		var vol struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			SizeMB int    `json:"size_mb"`
+			Status string `json:"status"`
+		}
+		if err := apiJSON("POST", "/volumes", map[string]any{
+			"name": name, "size_mb": sizeMB,
+		}, &vol); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(vol)
+		} else {
+			fmt.Printf("%s\t%s\t%dMB\t%s\n", vol.ID, vol.Name, vol.SizeMB, vol.Status)
+		}
+		return nil
+	},
+}
+
+var volumeListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List persistent volumes",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		var volumes []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			SizeMB int    `json:"size_mb"`
+			Status string `json:"status"`
+		}
+		if err := apiJSON("GET", "/volumes", nil, &volumes); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(volumes)
+		} else {
+			fmt.Printf("%-20s %-20s %-10s %-10s\n", "ID", "NAME", "SIZE", "STATUS")
+			for _, v := range volumes {
+				fmt.Printf("%-20s %-20s %dMB\t%-10s\n", v.ID, v.Name, v.SizeMB, v.Status)
+			}
+		}
+		return nil
+	},
+}
+
+var volumeDeleteCmd = &cobra.Command{
+	Use:   "delete <name>",
+	Short: "Delete a persistent volume",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		if err := apiJSON("DELETE", "/volumes/"+args[0], nil, nil); err != nil {
+			return err
+		}
+		fmt.Println("deleted")
+		return nil
+	},
+}
+
+var volumeResizeCmd = &cobra.Command{
+	Use:   "resize <name>",
+	Short: "Resize a persistent volume (grow only)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		sizeMB, _ := cmd.Flags().GetInt("size")
+		if sizeMB <= 0 {
+			return fmt.Errorf("--size (> 0) required")
+		}
+
+		if err := apiJSON("POST", "/volumes/"+args[0]+"/resize", map[string]any{
+			"size_mb": sizeMB,
+		}, nil); err != nil {
+			return err
+		}
+		fmt.Printf("resized to %dMB\n", sizeMB)
+		return nil
+	},
+}
+
+func init() {
+	volumeCreateCmd.Flags().String("name", "", "Volume name (required)")
+	volumeCreateCmd.Flags().Int("size", 0, "Size in MB (required)")
+	volumeResizeCmd.Flags().Int("size", 0, "New size in MB (must be larger)")
+
+	volumeCmd.AddCommand(volumeCreateCmd)
+	volumeCmd.AddCommand(volumeListCmd)
+	volumeCmd.AddCommand(volumeDeleteCmd)
+	volumeCmd.AddCommand(volumeResizeCmd)
+}
+
+// --- image ---
+
+var imageCmd = &cobra.Command{
+	Use:   "image <list|delete>",
+	Short: "Manage rootfs images",
+}
+
+var imageListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List available images",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		var images []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Source string `json:"source"`
+			SizeMB int    `json:"size_mb"`
+			UserID string `json:"user_id"`
+		}
+		if err := apiJSON("GET", "/images", nil, &images); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(images)
+		} else {
+			fmt.Printf("%-20s %-20s %-30s %-10s %-10s\n", "ID", "NAME", "SOURCE", "SIZE", "SCOPE")
+			for _, img := range images {
+				scope := "admin"
+				if img.UserID != "" {
+					scope = "user"
+				}
+				fmt.Printf("%-20s %-20s %-30s %dMB\t%-10s\n",
+					img.ID, img.Name, img.Source, img.SizeMB, scope)
+			}
+		}
+		return nil
+	},
+}
+
+var imageDeleteCmd = &cobra.Command{
+	Use:   "delete <name>",
+	Short: "Delete an image",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		if err := apiJSON("DELETE", "/images/"+args[0], nil, nil); err != nil {
+			return err
+		}
+		fmt.Println("deleted")
+		return nil
+	},
+}
+
+var imagePullCmd = &cobra.Command{
+	Use:   "pull <ref>",
+	Short: "Pull an OCI/Docker image (async)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		ref := args[0]
+		name, _ := cmd.Flags().GetString("name")
+		auth, _ := cmd.Flags().GetString("auth")
+		if name == "" {
+			// Derive name from ref: "python:3.12" → "python-3.12"
+			name = strings.NewReplacer("/", "-", ":", "-", ".", "-").Replace(ref)
+			// Remove registry prefix for common cases
+			if idx := strings.LastIndex(name, "-"); idx > 0 {
+				parts := strings.Split(ref, "/")
+				if len(parts) > 1 {
+					name = strings.NewReplacer("/", "-", ":", "-").Replace(
+						strings.Join(parts[len(parts)-1:], "-"))
+				}
+			}
+		}
+
+		body := map[string]any{"ref": ref, "name": name}
+		if auth != "" {
+			body["auth"] = auth
+		}
+
+		var result struct {
+			TaskID string `json:"task_id"`
+			Status string `json:"status"`
+		}
+		if err := apiJSON("POST", "/images/pull", body, &result); err != nil {
+			return err
+		}
+
+		if isJSON(cmd) {
+			outputJSON(result)
+			return nil
+		}
+
+		fmt.Printf("pulling %s as %q (task: %s)\n", ref, name, result.TaskID)
+
+		// Poll for completion
+		for {
+			time.Sleep(2 * time.Second)
+			var task struct {
+				Status   string `json:"status"`
+				Progress string `json:"progress"`
+				Error    string `json:"error"`
+			}
+			if err := apiJSON("GET", "/tasks/"+result.TaskID, nil, &task); err != nil {
+				return err
+			}
+			switch task.Status {
+			case "completed":
+				fmt.Println("done")
+				return nil
+			case "failed":
+				return fmt.Errorf("pull failed: %s", task.Error)
+			default:
+				if task.Progress != "" {
+					fmt.Printf("\r  %s", task.Progress)
+				}
+			}
+		}
+	},
+}
+
+var imageSaveCmd = &cobra.Command{
+	Use:               "save <sandbox-id|name>",
+	Short:             "Save a sandbox's rootfs as an image",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		name, _ := cmd.Flags().GetString("name")
+		if name == "" {
+			return fmt.Errorf("--name is required")
+		}
+
+		var img struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			SizeMB int    `json:"size_mb"`
+		}
+		if err := apiJSON("POST", "/sandboxes/"+id+"/save-image",
+			map[string]any{"name": name}, &img); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(img)
+		} else {
+			fmt.Printf("saved %q (%dMB)\n", img.Name, img.SizeMB)
+		}
+		return nil
+	},
+}
+
+func init() {
+	imagePullCmd.Flags().String("name", "", "Image name (default: derived from ref)")
+	imagePullCmd.Flags().String("auth", "", "Registry auth (user:token)")
+	imageSaveCmd.Flags().String("name", "", "Image name (required)")
+
+	imageCmd.AddCommand(imageListCmd)
+	imageCmd.AddCommand(imageDeleteCmd)
+	imageCmd.AddCommand(imagePullCmd)
+	imageCmd.AddCommand(imageSaveCmd)
+}
+
+// --- snapshot ---
+
+var snapshotCmd = &cobra.Command{
+	Use:   "snapshot <create|list|resume|delete>",
+	Short: "Manage named VM snapshots",
+}
+
+var snapshotCreateCmd = &cobra.Command{
+	Use:               "create <sandbox-id|name>",
+	Short:             "Checkpoint a running sandbox",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		name, _ := cmd.Flags().GetString("name")
+		if name == "" {
+			return fmt.Errorf("--name is required")
+		}
+
+		var snap struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			SizeMB int    `json:"size_mb"`
+		}
+		if err := apiJSON("POST", "/sandboxes/"+id+"/checkpoint",
+			map[string]any{"name": name}, &snap); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(snap)
+		} else {
+			fmt.Printf("checkpoint %q created (%dMB)\n", snap.Name, snap.SizeMB)
+		}
+		return nil
+	},
+}
+
+var snapshotListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List snapshots",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		var snaps []struct {
+			ID            string `json:"id"`
+			Name          string `json:"name"`
+			SourceSandbox string `json:"source_sandbox"`
+			SizeMB        int    `json:"size_mb"`
+		}
+		if err := apiJSON("GET", "/snapshots", nil, &snaps); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(snaps)
+		} else {
+			fmt.Printf("%-20s %-20s %-20s %-10s\n", "ID", "NAME", "SOURCE", "SIZE")
+			for _, s := range snaps {
+				fmt.Printf("%-20s %-20s %-20s %dMB\n", s.ID, s.Name, s.SourceSandbox, s.SizeMB)
+			}
+		}
+		return nil
+	},
+}
+
+var snapshotResumeCmd = &cobra.Command{
+	Use:   "resume <snapshot-name>",
+	Short: "Resume a sandbox from a snapshot",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		name, _ := cmd.Flags().GetString("name")
+
+		var sb struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			IP   string `json:"ip"`
+		}
+		body := map[string]any{}
+		if name != "" {
+			body["name"] = name
+		}
+		if err := apiJSON("POST", "/snapshots/"+args[0]+"/resume", body, &sb); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(sb)
+		} else {
+			fmt.Printf("%s\t%s\t%s\n", sb.ID, sb.Name, sb.IP)
+		}
+		return nil
+	},
+}
+
+var snapshotDeleteCmd = &cobra.Command{
+	Use:   "delete <snapshot-name>",
+	Short: "Delete a snapshot",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		if err := apiJSON("DELETE", "/snapshots/"+args[0], nil, nil); err != nil {
+			return err
+		}
+		fmt.Println("deleted")
+		return nil
+	},
+}
+
+func init() {
+	snapshotCreateCmd.Flags().String("name", "", "Snapshot name (required)")
+	snapshotResumeCmd.Flags().String("name", "", "New sandbox name")
+
+	snapshotCmd.AddCommand(snapshotCreateCmd)
+	snapshotCmd.AddCommand(snapshotListCmd)
+	snapshotCmd.AddCommand(snapshotResumeCmd)
+	snapshotCmd.AddCommand(snapshotDeleteCmd)
 }
 
 // --- version ---

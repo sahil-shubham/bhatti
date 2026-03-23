@@ -34,18 +34,78 @@ type Template struct {
 	CreatedAt  time.Time           `json:"created_at"`
 }
 
-// Volume is a named Docker volume tracked by bhatti.
+// Volume is a named Docker volume tracked by bhatti (legacy v0.1/v0.2).
 type Volume struct {
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// SandboxVolume records a volume mounted to a sandbox.
+// SandboxVolume records a volume mounted to a sandbox (legacy v0.1/v0.2).
 type SandboxVolume struct {
 	SandboxID  string `json:"sandbox_id"`
 	VolumeName string `json:"volume_name"`
 	Target     string `json:"target"`
 	ReadOnly   bool   `json:"readonly"`
+}
+
+// PersistentVolume is a v0.3 persistent ext4 volume with its own lifecycle.
+type PersistentVolume struct {
+	ID          string             `json:"id"`
+	UserID      string             `json:"user_id"`
+	Name        string             `json:"name"`
+	SizeMB      int                `json:"size_mb"`
+	Status      string             `json:"status"` // "creating" or "ready"
+	FilePath    string             `json:"-"`
+	Attachments []VolumeAttachment `json:"attachments"`
+	CreatedAt   time.Time          `json:"created_at"`
+}
+
+// VolumeAttachment records a volume attached to a sandbox.
+type VolumeAttachment struct {
+	SandboxID string `json:"sandbox_id"`
+	Mount     string `json:"mount"`
+	ReadOnly  bool   `json:"read_only"`
+}
+
+// ImageRecord is a v0.3 rootfs image (admin or user-scoped).
+type ImageRecord struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"user_id"` // "" = admin/global
+	Name          string    `json:"name"`
+	Source        string    `json:"source"`
+	FilePath      string    `json:"-"`
+	SizeMB        int       `json:"size_mb"`
+	OCIDigest     string    `json:"oci_digest,omitempty"`
+	OCIConfigJSON string    `json:"-"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// SnapshotRecord is a v0.3 named VM snapshot.
+type SnapshotRecord struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"user_id"`
+	Name          string    `json:"name"`
+	SourceSandbox string    `json:"source_sandbox"`
+	MemPath       string    `json:"-"`
+	VMPath        string    `json:"-"`
+	RootfsPath    string    `json:"-"`
+	ConfigPath    string    `json:"-"`
+	ManifestJSON  string    `json:"-"`
+	SizeMB        int       `json:"size_mb"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// TaskRecord tracks an async operation (e.g., image pull).
+type TaskRecord struct {
+	ID          string    `json:"id"`
+	UserID      string    `json:"user_id"`
+	Type        string    `json:"type"`
+	Status      string    `json:"status"` // "running", "completed", "failed"
+	Progress    string    `json:"progress"`
+	ResultJSON  string    `json:"result,omitempty"`
+	Error       string    `json:"error,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 }
 
 // Sandbox is a running or stopped sandbox instance.
@@ -79,6 +139,9 @@ type User struct {
 	MaxCPUsPerSandbox     int       `json:"max_cpus_per_sandbox"`
 	MaxMemoryMBPerSandbox int       `json:"max_memory_mb_per_sandbox"`
 	SubnetIndex           int       `json:"subnet_index"`
+	MaxVolumeStorageMB    int       `json:"max_volume_storage_mb"`
+	MaxImages             int       `json:"max_images"`
+	MaxSnapshots          int       `json:"max_snapshots"`
 	CreatedAt             time.Time `json:"created_at"`
 }
 
@@ -167,6 +230,9 @@ ALTER TABLE sandboxes ADD COLUMN created_by TEXT NOT NULL DEFAULT '';
 ALTER TABLE secrets ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE sandboxes ADD COLUMN agent_token TEXT DEFAULT '';
 ALTER TABLE sandboxes ADD COLUMN has_base_snapshot INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN max_volume_storage_mb INTEGER NOT NULL DEFAULT 20480;
+ALTER TABLE users ADD COLUMN max_images INTEGER NOT NULL DEFAULT 10;
+ALTER TABLE users ADD COLUMN max_snapshots INTEGER NOT NULL DEFAULT 5;
 `
 
 // New opens (or creates) the SQLite database and runs migrations.
@@ -186,6 +252,64 @@ func New(dbPath string) (*Store, error) {
 		}
 		db.Exec(stmt) // ignore errors (column already exists)
 	}
+
+	// v0.3 tables: persistent volumes, images, snapshots, tasks
+	db.Exec(`CREATE TABLE IF NOT EXISTS volumes_v2 (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		size_mb INTEGER NOT NULL,
+		file_path TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'ready',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(user_id, name)
+	)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS volume_attachments (
+		volume_id TEXT NOT NULL,
+		sandbox_id TEXT NOT NULL,
+		mount TEXT NOT NULL,
+		read_only INTEGER NOT NULL DEFAULT 0,
+		attached_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (volume_id, sandbox_id)
+	)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS images (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL DEFAULT '',
+		name TEXT NOT NULL,
+		source TEXT NOT NULL DEFAULT '',
+		file_path TEXT NOT NULL,
+		size_mb INTEGER NOT NULL DEFAULT 0,
+		oci_digest TEXT NOT NULL DEFAULT '',
+		oci_config_json TEXT NOT NULL DEFAULT '{}',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(user_id, name)
+	)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS snapshots (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		source_sandbox TEXT NOT NULL,
+		mem_path TEXT NOT NULL,
+		vm_path TEXT NOT NULL,
+		rootfs_path TEXT NOT NULL,
+		config_path TEXT NOT NULL,
+		manifest_json TEXT NOT NULL,
+		size_mb INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(user_id, name)
+	)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		type TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'running',
+		progress TEXT NOT NULL DEFAULT '',
+		result_json TEXT NOT NULL DEFAULT '{}',
+		error TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		completed_at DATETIME
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)`)
 
 	// Create unique index on (created_by, name) for non-destroyed sandboxes.
 	// Prevents a user from having two sandboxes with the same name.
@@ -230,50 +354,45 @@ func (s *Store) CreateUser(u User) error {
 	return err
 }
 
-// GetUserByKeyHash looks up a user by the SHA-256 hash of their API key.
-func (s *Store) GetUserByKeyHash(hash string) (*User, error) {
+const userSelectCols = `id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, COALESCE(max_volume_storage_mb, 20480), COALESCE(max_images, 10), COALESCE(max_snapshots, 5), created_at`
+
+func scanUser(s scanner) (*User, error) {
 	var u User
-	err := s.db.QueryRow(
-		`SELECT id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, created_at
-		 FROM users WHERE api_key_hash = ?`, hash).Scan(
-		&u.ID, &u.Name, &u.APIKeyHash, &u.MaxSandboxes, &u.MaxCPUsPerSandbox, &u.MaxMemoryMBPerSandbox, &u.SubnetIndex, &u.CreatedAt,
-	)
+	err := s.Scan(&u.ID, &u.Name, &u.APIKeyHash, &u.MaxSandboxes, &u.MaxCPUsPerSandbox,
+		&u.MaxMemoryMBPerSandbox, &u.SubnetIndex, &u.MaxVolumeStorageMB, &u.MaxImages,
+		&u.MaxSnapshots, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &u, nil
+}
+
+// GetUserByKeyHash looks up a user by the SHA-256 hash of their API key.
+func (s *Store) GetUserByKeyHash(hash string) (*User, error) {
+	row := s.db.QueryRow(`SELECT `+userSelectCols+` FROM users WHERE api_key_hash = ?`, hash)
+	return scanUser(row)
 }
 
 // GetUser looks up a user by ID.
 func (s *Store) GetUser(id string) (*User, error) {
-	var u User
-	err := s.db.QueryRow(
-		`SELECT id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, created_at
-		 FROM users WHERE id = ?`, id).Scan(
-		&u.ID, &u.Name, &u.APIKeyHash, &u.MaxSandboxes, &u.MaxCPUsPerSandbox, &u.MaxMemoryMBPerSandbox, &u.SubnetIndex, &u.CreatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &u, nil
+	row := s.db.QueryRow(`SELECT `+userSelectCols+` FROM users WHERE id = ?`, id)
+	return scanUser(row)
 }
 
 // ListUsers returns all users.
 func (s *Store) ListUsers() ([]User, error) {
-	rows, err := s.db.Query(
-		`SELECT id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, created_at
-		 FROM users ORDER BY created_at`)
+	rows, err := s.db.Query(`SELECT ` + userSelectCols + ` FROM users ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []User
 	for rows.Next() {
-		var u User
-		if err := rows.Scan(&u.ID, &u.Name, &u.APIKeyHash, &u.MaxSandboxes, &u.MaxCPUsPerSandbox, &u.MaxMemoryMBPerSandbox, &u.SubnetIndex, &u.CreatedAt); err != nil {
+		u, err := scanUser(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, u)
+		out = append(out, *u)
 	}
 	return out, rows.Err()
 }
@@ -769,4 +888,418 @@ func (s *Store) LoadFirecrackerState(id string) (*FirecrackerState, error) {
 	}
 	st.HasBaseSnapshot = hasSnap != 0
 	return &st, nil
+}
+
+// ==========================================================================
+// v0.3 Persistent Volumes
+// ==========================================================================
+
+// CreatePersistentVolume inserts a new persistent volume record.
+// Returns error on UNIQUE violation (not idempotent — for race coordination).
+func (s *Store) CreatePersistentVolume(v PersistentVolume) error {
+	_, err := s.db.Exec(
+		`INSERT INTO volumes_v2 (id, user_id, name, size_mb, file_path, status, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		v.ID, v.UserID, v.Name, v.SizeMB, v.FilePath, v.Status, v.CreatedAt,
+	)
+	return err
+}
+
+// GetPersistentVolume retrieves a persistent volume by user and name, including attachments.
+func (s *Store) GetPersistentVolume(userID, name string) (*PersistentVolume, error) {
+	var v PersistentVolume
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, size_mb, file_path, status, created_at
+		 FROM volumes_v2 WHERE user_id = ? AND name = ?`, userID, name).Scan(
+		&v.ID, &v.UserID, &v.Name, &v.SizeMB, &v.FilePath, &v.Status, &v.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// Load attachments
+	rows, err := s.db.Query(
+		`SELECT sandbox_id, mount, read_only FROM volume_attachments WHERE volume_id = ?`, v.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var a VolumeAttachment
+			var ro int
+			if err := rows.Scan(&a.SandboxID, &a.Mount, &ro); err == nil {
+				a.ReadOnly = ro != 0
+				v.Attachments = append(v.Attachments, a)
+			}
+		}
+	}
+	return &v, nil
+}
+
+// ListPersistentVolumes returns all persistent volumes for a user.
+func (s *Store) ListPersistentVolumes(userID string) ([]PersistentVolume, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, size_mb, file_path, status, created_at
+		 FROM volumes_v2 WHERE user_id = ? ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PersistentVolume
+	for rows.Next() {
+		var v PersistentVolume
+		if err := rows.Scan(&v.ID, &v.UserID, &v.Name, &v.SizeMB, &v.FilePath, &v.Status, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// DeletePersistentVolume removes a persistent volume record. Fails if any attachments exist.
+func (s *Store) DeletePersistentVolume(userID, name string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var volID string
+	err = tx.QueryRow(`SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
+		userID, name).Scan(&volID)
+	if err != nil {
+		return fmt.Errorf("volume %q not found", name)
+	}
+
+	var count int
+	tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ?`, volID).Scan(&count)
+	if count > 0 {
+		return fmt.Errorf("volume %q has %d active attachment(s)", name, count)
+	}
+
+	tx.Exec(`DELETE FROM volumes_v2 WHERE id = ?`, volID)
+	return tx.Commit()
+}
+
+// AttachPersistentVolume attaches a persistent volume to a sandbox with concurrency checks.
+func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, readOnly bool) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var volID, status string
+	err = tx.QueryRow(`SELECT id, status FROM volumes_v2 WHERE user_id = ? AND name = ?`,
+		userID, name).Scan(&volID, &status)
+	if err != nil {
+		return fmt.Errorf("volume %q not found", name)
+	}
+	if status == "creating" {
+		return fmt.Errorf("volume %q is being created, retry shortly", name)
+	}
+
+	var rwCount, roCount int
+	tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 0`,
+		volID).Scan(&rwCount)
+	tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 1`,
+		volID).Scan(&roCount)
+
+	if !readOnly {
+		if rwCount > 0 || roCount > 0 {
+			return fmt.Errorf("volume %q already attached (rw=%d, ro=%d)", name, rwCount, roCount)
+		}
+	} else {
+		if rwCount > 0 {
+			return fmt.Errorf("volume %q has a read-write attachment, cannot attach read-only", name)
+		}
+	}
+
+	ro := 0
+	if readOnly {
+		ro = 1
+	}
+	_, err = tx.Exec(
+		`INSERT INTO volume_attachments (volume_id, sandbox_id, mount, read_only) VALUES (?, ?, ?, ?)`,
+		volID, sandboxID, mount, ro)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DetachPersistentVolume removes a specific volume attachment.
+func (s *Store) DetachPersistentVolume(userID, name, sandboxID string) error {
+	var volID string
+	err := s.db.QueryRow(`SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
+		userID, name).Scan(&volID)
+	if err != nil {
+		return fmt.Errorf("volume %q not found", name)
+	}
+	_, err = s.db.Exec(
+		`DELETE FROM volume_attachments WHERE volume_id = ? AND sandbox_id = ?`,
+		volID, sandboxID)
+	return err
+}
+
+// DetachAllPersistentVolumesForSandbox removes all persistent volume attachments for a sandbox.
+func (s *Store) DetachAllPersistentVolumesForSandbox(sandboxID string) error {
+	_, err := s.db.Exec(`DELETE FROM volume_attachments WHERE sandbox_id = ?`, sandboxID)
+	return err
+}
+
+// DetachOrphanedPersistentVolumes removes attachments for destroyed/missing sandboxes.
+// Must be called AFTER recoverVMs updates sandbox statuses.
+func (s *Store) DetachOrphanedPersistentVolumes() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM volume_attachments
+		WHERE sandbox_id IN (
+			SELECT va.sandbox_id FROM volume_attachments va
+			LEFT JOIN sandboxes s ON va.sandbox_id = s.id
+			WHERE s.id IS NULL
+			   OR s.status IN ('destroyed', 'unknown')
+		)`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// UpdatePersistentVolumeSize updates the size_mb field after a resize.
+func (s *Store) UpdatePersistentVolumeSize(userID, name string, sizeMB int) error {
+	res, err := s.db.Exec(`UPDATE volumes_v2 SET size_mb = ? WHERE user_id = ? AND name = ?`,
+		sizeMB, userID, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("volume %q not found", name)
+	}
+	return nil
+}
+
+// UpdatePersistentVolumeStatus updates the status field (e.g., "creating" → "ready").
+func (s *Store) UpdatePersistentVolumeStatus(userID, name, status string) error {
+	_, err := s.db.Exec(`UPDATE volumes_v2 SET status = ? WHERE user_id = ? AND name = ?`,
+		status, userID, name)
+	return err
+}
+
+// UserVolumeStorageUsed returns the total size_mb of all persistent volumes for a user.
+func (s *Store) UserVolumeStorageUsed(userID string) (int, error) {
+	var total sql.NullInt64
+	s.db.QueryRow(`SELECT SUM(size_mb) FROM volumes_v2 WHERE user_id = ?`, userID).Scan(&total)
+	if !total.Valid {
+		return 0, nil
+	}
+	return int(total.Int64), nil
+}
+
+// ==========================================================================
+// v0.3 Images
+// ==========================================================================
+
+// CreateImage inserts a new image record.
+func (s *Store) CreateImage(img ImageRecord) error {
+	_, err := s.db.Exec(
+		`INSERT INTO images (id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		img.ID, img.UserID, img.Name, img.Source, img.FilePath,
+		img.SizeMB, img.OCIDigest, img.OCIConfigJSON, img.CreatedAt,
+	)
+	return err
+}
+
+// GetImage retrieves an image by user and name. Falls back to admin images (user_id='').
+func (s *Store) GetImage(userID, name string) (*ImageRecord, error) {
+	var img ImageRecord
+	// Try user-scoped first
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
+		 FROM images WHERE user_id = ? AND name = ?`, userID, name).Scan(
+		&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
+		&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt,
+	)
+	if err == nil {
+		return &img, nil
+	}
+	// Fall back to admin image
+	err = s.db.QueryRow(
+		`SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
+		 FROM images WHERE user_id = '' AND name = ?`, name).Scan(
+		&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
+		&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("image %q not found", name)
+	}
+	return &img, nil
+}
+
+// ListImages returns all images visible to a user (their own + admin).
+func (s *Store) ListImages(userID string) ([]ImageRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
+		 FROM images WHERE user_id = ? OR user_id = '' ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ImageRecord
+	for rows.Next() {
+		var img ImageRecord
+		if err := rows.Scan(&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
+			&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, img)
+	}
+	return out, rows.Err()
+}
+
+// DeleteImage removes an image record.
+func (s *Store) DeleteImage(userID, name string) error {
+	res, err := s.db.Exec(`DELETE FROM images WHERE user_id = ? AND name = ?`, userID, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("image %q not found", name)
+	}
+	return nil
+}
+
+// ==========================================================================
+// v0.3 Snapshots
+// ==========================================================================
+
+// CreateSnapshot inserts a new snapshot record.
+func (s *Store) CreateSnapshot(snap SnapshotRecord) error {
+	_, err := s.db.Exec(
+		`INSERT INTO snapshots (id, user_id, name, source_sandbox, mem_path, vm_path,
+		 rootfs_path, config_path, manifest_json, size_mb, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		snap.ID, snap.UserID, snap.Name, snap.SourceSandbox,
+		snap.MemPath, snap.VMPath, snap.RootfsPath, snap.ConfigPath,
+		snap.ManifestJSON, snap.SizeMB, snap.CreatedAt,
+	)
+	return err
+}
+
+// GetSnapshot retrieves a snapshot by user and name.
+func (s *Store) GetSnapshot(userID, name string) (*SnapshotRecord, error) {
+	var snap SnapshotRecord
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, source_sandbox, mem_path, vm_path,
+		 rootfs_path, config_path, manifest_json, size_mb, created_at
+		 FROM snapshots WHERE user_id = ? AND name = ?`, userID, name).Scan(
+		&snap.ID, &snap.UserID, &snap.Name, &snap.SourceSandbox,
+		&snap.MemPath, &snap.VMPath, &snap.RootfsPath, &snap.ConfigPath,
+		&snap.ManifestJSON, &snap.SizeMB, &snap.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %q not found", name)
+	}
+	return &snap, nil
+}
+
+// ListSnapshots returns all snapshots for a user.
+func (s *Store) ListSnapshots(userID string) ([]SnapshotRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, source_sandbox, mem_path, vm_path,
+		 rootfs_path, config_path, manifest_json, size_mb, created_at
+		 FROM snapshots WHERE user_id = ? ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotRecord
+	for rows.Next() {
+		var snap SnapshotRecord
+		if err := rows.Scan(&snap.ID, &snap.UserID, &snap.Name, &snap.SourceSandbox,
+			&snap.MemPath, &snap.VMPath, &snap.RootfsPath, &snap.ConfigPath,
+			&snap.ManifestJSON, &snap.SizeMB, &snap.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, snap)
+	}
+	return out, rows.Err()
+}
+
+// DeleteSnapshot removes a snapshot record.
+func (s *Store) DeleteSnapshot(userID, name string) error {
+	res, err := s.db.Exec(`DELETE FROM snapshots WHERE user_id = ? AND name = ?`, userID, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("snapshot %q not found", name)
+	}
+	return nil
+}
+
+// ==========================================================================
+// v0.3 Tasks (async operations)
+// ==========================================================================
+
+// CreateTask inserts a new task record.
+func (s *Store) CreateTask(t TaskRecord) error {
+	_, err := s.db.Exec(
+		`INSERT INTO tasks (id, user_id, type, status, progress, result_json, error, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.UserID, t.Type, t.Status, t.Progress, t.ResultJSON, t.Error, t.CreatedAt,
+	)
+	return err
+}
+
+// GetTask retrieves a task by ID.
+func (s *Store) GetTask(id string) (*TaskRecord, error) {
+	var t TaskRecord
+	var completedAt sql.NullTime
+	err := s.db.QueryRow(
+		`SELECT id, user_id, type, status, progress, result_json, error, created_at, completed_at
+		 FROM tasks WHERE id = ?`, id).Scan(
+		&t.ID, &t.UserID, &t.Type, &t.Status, &t.Progress,
+		&t.ResultJSON, &t.Error, &t.CreatedAt, &completedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("task %q not found", id)
+	}
+	if completedAt.Valid {
+		t.CompletedAt = &completedAt.Time
+	}
+	return &t, nil
+}
+
+// UpdateTaskProgress updates the progress string on a running task.
+func (s *Store) UpdateTaskProgress(id, progress string) error {
+	_, err := s.db.Exec(`UPDATE tasks SET progress = ? WHERE id = ?`, progress, id)
+	return err
+}
+
+// CompleteTask marks a task as completed with a result.
+func (s *Store) CompleteTask(id, resultJSON string) error {
+	now := time.Now()
+	_, err := s.db.Exec(`UPDATE tasks SET status = 'completed', result_json = ?, completed_at = ? WHERE id = ?`,
+		resultJSON, now, id)
+	return err
+}
+
+// FailTask marks a task as failed with an error.
+func (s *Store) FailTask(id, errMsg string) error {
+	now := time.Now()
+	_, err := s.db.Exec(`UPDATE tasks SET status = 'failed', error = ?, completed_at = ? WHERE id = ?`,
+		errMsg, now, id)
+	return err
+}
+
+// CleanupOldTasks removes completed/failed tasks older than the given duration.
+func (s *Store) CleanupOldTasks(maxAge time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-maxAge)
+	res, err := s.db.Exec(`DELETE FROM tasks WHERE created_at < ? AND status IN ('completed', 'failed')`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/oci"
 	"github.com/sahil-shubham/bhatti/pkg/secrets"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
@@ -105,8 +107,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/sandboxes/", s.handleSandbox)
 	s.mux.HandleFunc("/secrets", s.handleSecrets)
 	s.mux.HandleFunc("/secrets/", s.handleSecret)
-	s.mux.HandleFunc("/volumes", s.handleVolumes)
-	s.mux.HandleFunc("/volumes/", s.handleVolume)
+	s.mux.HandleFunc("/volumes", s.handlePersistentVolumes)
+	s.mux.HandleFunc("/volumes/", s.handlePersistentVolume)
+	s.mux.HandleFunc("/images", s.handleImages)
+	s.mux.HandleFunc("/images/", s.handleImage)
+	s.mux.HandleFunc("/snapshots", s.handleSnapshots)
+	s.mux.HandleFunc("/snapshots/", s.handleSnapshot)
+	s.mux.HandleFunc("/tasks/", s.handleTask)
 	s.mux.HandleFunc("/ports", s.handleAllPorts)
 }
 
@@ -276,12 +283,17 @@ func (s *Server) handleTemplate(w http.ResponseWriter, r *http.Request) {
 type createSandboxReq struct {
 	Name       string               `json:"name"`
 	TemplateID string               `json:"template_id,omitempty"`
+	Image      string               `json:"image,omitempty"`      // v0.3: image name
 	CPUs       float64              `json:"cpus,omitempty"`
 	MemoryMB   int                  `json:"memory_mb,omitempty"`
+	DiskSizeMB int                  `json:"disk_size_mb,omitempty"` // v0.3: resize rootfs
 	Env        map[string]string    `json:"env,omitempty"`
 	Init       string               `json:"init,omitempty"`
 	NewVolumes []engine.VolumeSpec  `json:"new_volumes,omitempty"`
 	Volumes    []engine.VolumeMount `json:"volumes,omitempty"`
+
+	// v0.3: persistent volumes
+	PersistentVolumes []engine.PersistentVolume `json:"persistent_volumes,omitempty"`
 }
 
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -389,27 +401,46 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				env[k] = v
 			}
 
+			// Apply request overrides on template defaults
+			cpus := tmpl.CPUs
+			if req.CPUs > 0 {
+				cpus = req.CPUs
+			}
+			memMB := tmpl.MemoryMB
+			if req.MemoryMB > 0 {
+				memMB = req.MemoryMB
+			}
+
 			spec = engine.SandboxSpec{
-				Name:     name,
-				Image:    tmpl.Image,
-				CPUs:     tmpl.CPUs,
-				MemoryMB: tmpl.MemoryMB,
-				Labels:   tmpl.Labels,
-				UserData: tmpl.UserData,
-				Env:      env,
-				Files:    secretFiles,
-				Volumes:  volumes,
+				Name:              name,
+				Image:             tmpl.Image,
+				CPUs:              cpus,
+				MemoryMB:          memMB,
+				DiskSizeMB:        req.DiskSizeMB,
+				Labels:            tmpl.Labels,
+				UserData:          tmpl.UserData,
+				Env:               env,
+				Init:              req.Init,
+				Files:             secretFiles,
+				Volumes:           volumes,
+				PersistentVolumes: req.PersistentVolumes,
+			}
+			// Request image overrides template image
+			if req.Image != "" {
+				spec.Image = req.Image
 			}
 		} else {
 			// --- Direct creation (no template) ---
 			spec = engine.SandboxSpec{
-				Name:       req.Name,
-				CPUs:       req.CPUs,
-				MemoryMB:   req.MemoryMB,
-				Env:        req.Env,
-				Init:       req.Init,
-				NewVolumes: req.NewVolumes,
-				Volumes:    req.Volumes,
+				Name:              req.Name,
+				CPUs:              req.CPUs,
+				MemoryMB:          req.MemoryMB,
+				DiskSizeMB:        req.DiskSizeMB,
+				Env:               req.Env,
+				Init:              req.Init,
+				NewVolumes:        req.NewVolumes,
+				Volumes:           req.Volumes,
+				PersistentVolumes: req.PersistentVolumes,
 			}
 			volumes = req.Volumes
 
@@ -442,13 +473,131 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		spec.UserID = user.ID
 		spec.SubnetIndex = user.SubnetIndex
 
+		// v0.3: Resolve image name to file path
+		if req.Image != "" {
+			img, err := s.store.GetImage(user.ID, req.Image)
+			if err != nil {
+				errResp(w, 404, fmt.Sprintf("image %q not found", req.Image))
+				return
+			}
+			spec.BaseImage = img.FilePath
+		}
+
+		// Generate a sandbox ID for volume attachment tracking (before engine.Create)
+		sbID := genID()
+
+		// v0.3: Resolve persistent volumes — reserve in store before VM boots
+		var resolvedVolumes []engine.ResolvedVolume
+		if len(spec.PersistentVolumes) > 0 {
+			for _, vol := range spec.PersistentVolumes {
+				if !isValidName(vol.Name) {
+					errResp(w, 400, fmt.Sprintf("invalid volume name %q", vol.Name))
+					return
+				}
+				if !isValidMountPath(vol.Mount) {
+					errResp(w, 400, fmt.Sprintf("invalid mount path %q: must be absolute, no '..' components, not a system path", vol.Mount))
+					return
+				}
+
+				existing, err := s.store.GetPersistentVolume(user.ID, vol.Name)
+				if err != nil && vol.AutoCreate && vol.SizeMB > 0 {
+					// Auto-create: insert store record first with status='creating'
+					volDir := filepath.Join(s.dataDir, "volumes", user.ID)
+					os.MkdirAll(volDir, 0700)
+					volPath := filepath.Join(volDir, vol.Name+".ext4")
+
+					storeVol := store.PersistentVolume{
+						ID: genID(), UserID: user.ID,
+						Name: vol.Name, SizeMB: vol.SizeMB, FilePath: volPath,
+						Status: "creating", CreatedAt: time.Now(),
+					}
+					createErr := s.store.CreatePersistentVolume(storeVol)
+					if createErr != nil {
+						// UNIQUE violation — another request won the race
+						time.Sleep(500 * time.Millisecond)
+						existing, err = s.store.GetPersistentVolume(user.ID, vol.Name)
+						if err != nil {
+							errResp(w, 500, fmt.Sprintf("volume %q: race recovery failed", vol.Name))
+							return
+						}
+						if existing.Status == "creating" {
+							errResp(w, 409, fmt.Sprintf("volume %q is being created by another request, retry", vol.Name))
+							return
+						}
+					} else {
+						// We won the race. Create the ext4 file.
+						if err := createVolumeFile(volPath, vol.SizeMB); err != nil {
+							s.store.DeletePersistentVolume(user.ID, vol.Name)
+							errRespInternal(w, r, "create volume failed", err)
+							return
+						}
+						s.store.UpdatePersistentVolumeStatus(user.ID, vol.Name, "ready")
+						storeVol.Status = "ready"
+						existing = &storeVol
+					}
+				} else if err != nil {
+					errResp(w, 404, fmt.Sprintf("volume %q not found", vol.Name))
+					return
+				}
+
+				// For read-only attach: ensure the ext4 journal is clean BEFORE
+				// calling AttachPersistentVolume. But we must verify the volume
+				// isn't RW-attached first (e2fsck on a live RW filesystem = corruption).
+				// The store's AttachPersistentVolume checks this atomically, but we need
+				// the e2fsck to happen between "it's safe" and "we've committed the attach".
+				//
+				// Strategy: check attachments first (read-only query), e2fsck if safe,
+				// then do the transactional attach (which re-checks under lock).
+				if vol.ReadOnly && existing.FilePath != "" && len(existing.Attachments) == 0 {
+					// No current attachments — safe to e2fsck.
+					// This handles the common case: volume was RW-attached, VM was destroyed
+					// (unclean unmount → dirty journal), now attaching RO.
+					if !volumeIsClean(existing.FilePath) {
+						slog.Info("cleaning dirty journal before ro attach", "volume", vol.Name)
+						if out, err := exec.Command("e2fsck", "-f", "-y", existing.FilePath).CombinedOutput(); err != nil {
+							slog.Warn("e2fsck before ro attach failed", "volume", vol.Name, "output", string(out), "error", err)
+						}
+					}
+				} else if vol.ReadOnly && existing.FilePath != "" && len(existing.Attachments) > 0 {
+					// Has existing RO attachments. The journal must already be clean
+					// (first RO mount cleaned it). If somehow dirty, reject rather than
+					// risk concurrent e2fsck.
+					if !volumeIsClean(existing.FilePath) {
+						s.store.DetachAllPersistentVolumesForSandbox(sbID)
+						errResp(w, 409, fmt.Sprintf("volume %q has a dirty journal and existing attachments — detach all and retry", vol.Name))
+						return
+					}
+				}
+
+				// Attach (store transaction handles concurrency — re-checks under lock)
+				if err := s.store.AttachPersistentVolume(user.ID, vol.Name, sbID, vol.Mount, vol.ReadOnly); err != nil {
+					// Rollback previously attached volumes
+					s.store.DetachAllPersistentVolumesForSandbox(sbID)
+					errResp(w, 409, err.Error())
+					return
+				}
+
+				resolvedVolumes = append(resolvedVolumes, engine.ResolvedVolume{
+					FilePath: existing.FilePath,
+					DriveID:  fmt.Sprintf("vol%d", len(resolvedVolumes)),
+					Name:     vol.Name,
+					Mount:    vol.Mount,
+					ReadOnly: vol.ReadOnly,
+				})
+			}
+			spec.ResolvedVolumes = resolvedVolumes
+		}
+
 		info, err := s.engine.Create(r.Context(), spec)
 		if err != nil {
+			// Rollback persistent volume attachments on engine failure
+			if len(resolvedVolumes) > 0 {
+				s.store.DetachAllPersistentVolumesForSandbox(sbID)
+			}
 			errRespInternal(w, r, "sandbox create failed", err)
 			return
 		}
 
-		sbID := genID()
 		sb := store.Sandbox{
 			ID:         sbID,
 			Name:       spec.Name,
@@ -518,6 +667,10 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			s.handleSandboxFiles(w, r, id)
 		case "sessions":
 			s.handleSandboxSessions(w, r, id)
+		case "save-image":
+			s.handleSandboxSaveImage(w, r, id)
+		case "checkpoint":
+			s.handleSandboxCheckpoint(w, r, id)
 		default:
 			errResp(w, 404, "not found")
 		}
@@ -551,6 +704,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("engine destroy failed", "sandbox", sb.ID, "error", err)
 		}
 		s.store.DetachVolumes(id)
+		s.store.DetachAllPersistentVolumesForSandbox(id) // v0.3 persistent volumes
 		if err := s.store.DeleteSandbox(user.ID, id); err != nil {
 			errRespInternal(w, r, "delete sandbox failed", err)
 			return
@@ -912,60 +1066,130 @@ func (s *Server) handleAllPorts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// --- Volumes ---
+// --- Persistent Volumes (v0.3) ---
 
-func (s *Server) handleVolumes(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListVolumes()
+		list, err := s.store.ListPersistentVolumes(user.ID)
 		if err != nil {
 			errRespInternal(w, r, "list volumes failed", err)
 			return
 		}
 		if list == nil {
-			list = []store.Volume{}
+			list = []store.PersistentVolume{}
 		}
 		writeJSON(w, 200, list)
 	case http.MethodPost:
 		var req struct {
-			Name string `json:"name"`
+			Name   string `json:"name"`
+			SizeMB int    `json:"size_mb"`
 		}
 		if err := readJSON(r, &req); err != nil {
 			errResp(w, 400, "invalid json: "+err.Error())
 			return
 		}
-		if req.Name == "" {
-			errResp(w, 400, "name required")
+		if req.Name == "" || req.SizeMB <= 0 {
+			errResp(w, 400, "name and size_mb (> 0) required")
 			return
 		}
-		if err := s.store.CreateVolume(req.Name); err != nil {
-			errRespInternal(w, r, "create volume failed", err)
+		if !isValidName(req.Name) {
+			errResp(w, 400, "invalid volume name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
 			return
 		}
-		vol, _ := s.store.GetVolume(req.Name)
+
+		// Check quota
+		used, _ := s.store.UserVolumeStorageUsed(user.ID)
+		userObj, _ := s.store.GetUser(user.ID)
+		maxStorage := 20480 // default 20GB
+		if userObj != nil {
+			maxStorage = userObj.MaxVolumeStorageMB
+		}
+		if used+req.SizeMB > maxStorage {
+			errResp(w, 429, fmt.Sprintf("volume storage quota exceeded (%dMB used, %dMB max)", used, maxStorage))
+			return
+		}
+
+		volDir := filepath.Join(s.dataDir, "volumes", user.ID)
+		os.MkdirAll(volDir, 0700)
+		volPath := filepath.Join(volDir, req.Name+".ext4")
+
+		vol := store.PersistentVolume{
+			ID: genID(), UserID: user.ID, Name: req.Name,
+			SizeMB: req.SizeMB, FilePath: volPath,
+			Status: "creating", CreatedAt: time.Now(),
+		}
+		if err := s.store.CreatePersistentVolume(vol); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") {
+				errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
+			} else {
+				errRespInternal(w, r, "create volume failed", err)
+			}
+			return
+		}
+
+		if err := createVolumeFile(volPath, req.SizeMB); err != nil {
+			s.store.DeletePersistentVolume(user.ID, req.Name)
+			errRespInternal(w, r, "create volume file failed", err)
+			return
+		}
+		s.store.UpdatePersistentVolumeStatus(user.ID, req.Name, "ready")
+		vol.Status = "ready"
+
+		slog.Info("volume.created", "name", req.Name, "user", user.Name, "size_mb", req.SizeMB)
 		writeJSON(w, 201, vol)
 	default:
 		errResp(w, 405, "method not allowed")
 	}
 }
 
-func (s *Server) handleVolume(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimPrefix(r.URL.Path, "/volumes/")
+func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	urlPath := strings.TrimPrefix(r.URL.Path, "/volumes/")
+	parts := strings.SplitN(urlPath, "/", 2)
+	name := parts[0]
+
 	if name == "" {
 		errResp(w, 400, "missing volume name")
 		return
 	}
+	if !isValidName(name) {
+		errResp(w, 400, "invalid volume name")
+		return
+	}
+
+	// Sub-routes
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "resize":
+			s.handleVolumeResize(w, r, user, name)
+		case "snapshot":
+			s.handleVolumeSnapshot(w, r, user, name)
+		default:
+			errResp(w, 404, "not found")
+		}
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		vol, err := s.store.GetVolume(name)
+		vol, err := s.store.GetPersistentVolume(user.ID, name)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
 		}
 		writeJSON(w, 200, vol)
 	case http.MethodDelete:
-		if err := s.store.DeleteVolume(name); err != nil {
-			if strings.Contains(err.Error(), "in use") {
+		// Check for file path before deleting from store
+		vol, err := s.store.GetPersistentVolume(user.ID, name)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		if err := s.store.DeletePersistentVolume(user.ID, name); err != nil {
+			if strings.Contains(err.Error(), "attachment") {
 				errResp(w, 409, err.Error())
 			} else if strings.Contains(err.Error(), "not found") {
 				errResp(w, 404, err.Error())
@@ -974,7 +1198,320 @@ func (s *Server) handleVolume(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		// Delete file (orphan cleanup on startup handles failures)
+		if vol.FilePath != "" {
+			os.Remove(vol.FilePath)
+		}
+		slog.Info("volume.deleted", "name", name, "user", user.Name)
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user *store.User, name string) {
+	if r.Method != http.MethodPost {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	if !isValidName(name) {
+		errResp(w, 400, "invalid volume name")
+		return
+	}
+	var req struct {
+		SizeMB int `json:"size_mb"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+
+	vol, err := s.store.GetPersistentVolume(user.ID, name)
+	if err != nil {
+		errResp(w, 404, "volume not found")
+		return
+	}
+	if len(vol.Attachments) > 0 {
+		errResp(w, 409, "volume is attached — detach before resizing")
+		return
+	}
+	if req.SizeMB <= vol.SizeMB {
+		errResp(w, 400, fmt.Sprintf("new size (%dMB) must be larger than current size (%dMB)", req.SizeMB, vol.SizeMB))
+		return
+	}
+
+	// e2fsck + truncate + resize2fs
+	if out, err := exec.Command("e2fsck", "-f", "-y", vol.FilePath).CombinedOutput(); err != nil {
+		slog.Warn("e2fsck before resize", "output", string(out), "error", err)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dM", req.SizeMB), vol.FilePath).Run(); err != nil {
+		errRespInternal(w, r, "truncate volume failed", err)
+		return
+	}
+	if err := exec.Command("resize2fs", vol.FilePath).Run(); err != nil {
+		errRespInternal(w, r, "resize2fs failed", err)
+		return
+	}
+
+	s.store.UpdatePersistentVolumeSize(user.ID, name, req.SizeMB)
+	slog.Info("volume.resized", "name", name, "user", user.Name, "new_size_mb", req.SizeMB)
+	writeJSON(w, 200, map[string]any{"status": "resized", "size_mb": req.SizeMB})
+}
+
+// handleVolumeSnapshot creates an independent copy of a volume.
+func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, user *store.User, srcName string) {
+	if r.Method != http.MethodPost {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Name == "" || !isValidName(req.Name) {
+		errResp(w, 400, "valid name required")
+		return
+	}
+
+	src, err := s.store.GetPersistentVolume(user.ID, srcName)
+	if err != nil {
+		errResp(w, 404, "source volume not found")
+		return
+	}
+	if len(src.Attachments) > 0 {
+		errResp(w, 409, "source volume is attached — detach before snapshotting")
+		return
+	}
+
+	dstDir := filepath.Join(s.dataDir, "volumes", user.ID)
+	os.MkdirAll(dstDir, 0700)
+	dstPath := filepath.Join(dstDir, req.Name+".ext4")
+
+	vol := store.PersistentVolume{
+		ID: genID(), UserID: user.ID, Name: req.Name,
+		SizeMB: src.SizeMB, FilePath: dstPath,
+		Status: "creating", CreatedAt: time.Now(),
+	}
+	if err := s.store.CreatePersistentVolume(vol); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
+		} else {
+			errRespInternal(w, r, "create volume snapshot record failed", err)
+		}
+		return
+	}
+
+	if err := exec.Command("cp", "--sparse=always", src.FilePath, dstPath).Run(); err != nil {
+		s.store.DeletePersistentVolume(user.ID, req.Name)
+		errRespInternal(w, r, "copy volume file failed", err)
+		return
+	}
+
+	s.store.UpdatePersistentVolumeStatus(user.ID, req.Name, "ready")
+	vol.Status = "ready"
+
+	slog.Info("volume.snapshot", "src", srcName, "dst", req.Name, "user", user.Name, "size_mb", src.SizeMB)
+	writeJSON(w, 201, vol)
+}
+
+// volumeIsClean checks if an ext4 volume has a clean journal.
+// Returns false if the journal is dirty (needs e2fsck before RO mount).
+func volumeIsClean(path string) bool {
+	out, err := exec.Command("tune2fs", "-l", path).Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "Filesystem state:            clean")
+}
+
+// createVolumeFile creates an ext4 image of the specified size in MB.
+func createVolumeFile(path string, sizeMB int) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(int64(sizeMB) << 20); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+	// mkfs.ext4 may not be available on non-Linux platforms (tests)
+	if err := exec.Command("mkfs.ext4", "-F", "-q", path).Run(); err != nil {
+		// File exists as a sparse file — usable for store tests, not for real VMs
+		slog.Warn("mkfs.ext4 failed (expected on non-Linux)", "path", path, "error", err)
+	}
+	return nil
+}
+
+// --- Images (v0.3) ---
+
+func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.ListImages(user.ID)
+		if err != nil {
+			errRespInternal(w, r, "list images failed", err)
+			return
+		}
+		if list == nil {
+			list = []store.ImageRecord{}
+		}
+		writeJSON(w, 200, list)
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	path := strings.TrimPrefix(r.URL.Path, "/images/")
+	if path == "" {
+		errResp(w, 400, "missing image name")
+		return
+	}
+
+	// Sub-route: POST /images/pull
+	if path == "pull" {
+		s.handleImagePull(w, r, user)
+		return
+	}
+
+	name := path
+
+	switch r.Method {
+	case http.MethodGet:
+		img, err := s.store.GetImage(user.ID, name)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		writeJSON(w, 200, img)
+	case http.MethodDelete:
+		img, err := s.store.GetImage(user.ID, name)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		if err := s.store.DeleteImage(user.ID, name); err != nil {
+			errRespInternal(w, r, "delete image failed", err)
+			return
+		}
+		if img.FilePath != "" {
+			os.Remove(img.FilePath)
+		}
+		slog.Info("image.deleted", "name", name, "user", user.Name)
+		writeJSON(w, 200, map[string]string{"status": "deleted"})
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+// --- Snapshots (v0.3) ---
+
+func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.ListSnapshots(user.ID)
+		if err != nil {
+			errRespInternal(w, r, "list snapshots failed", err)
+			return
+		}
+		if list == nil {
+			list = []store.SnapshotRecord{}
+		}
+		writeJSON(w, 200, list)
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	urlPath := strings.TrimPrefix(r.URL.Path, "/snapshots/")
+	parts := strings.SplitN(urlPath, "/", 2)
+	name := parts[0]
+
+	if name == "" {
+		errResp(w, 400, "missing snapshot name")
+		return
+	}
+
+	// Sub-route: POST /snapshots/:name/resume
+	if len(parts) == 2 && parts[1] == "resume" {
+		s.handleSnapshotResume(w, r, user, name)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		snap, err := s.store.GetSnapshot(user.ID, name)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		writeJSON(w, 200, snap)
+	case http.MethodDelete:
+		snap, err := s.store.GetSnapshot(user.ID, name)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		if err := s.store.DeleteSnapshot(user.ID, name); err != nil {
+			errRespInternal(w, r, "delete snapshot failed", err)
+			return
+		}
+		// Delete snapshot directory
+		snapDir := filepath.Dir(snap.MemPath)
+		os.RemoveAll(snapDir)
+		slog.Info("snapshot.deleted", "name", name, "user", user.Name)
+		writeJSON(w, 200, map[string]string{"status": "deleted"})
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+// --- Tasks (v0.3) ---
+
+func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/tasks/")
+	if id == "" {
+		errResp(w, 400, "missing task id")
+		return
+	}
+	user := UserFromContext(r.Context())
+
+	switch r.Method {
+	case http.MethodGet:
+		task, err := s.store.GetTask(id)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		if task.UserID != user.ID {
+			errResp(w, 404, "not found")
+			return
+		}
+		writeJSON(w, 200, task)
+	case http.MethodDelete:
+		task, err := s.store.GetTask(id)
+		if err != nil {
+			errResp(w, 404, err.Error())
+			return
+		}
+		if task.UserID != user.ID {
+			errResp(w, 404, "not found")
+			return
+		}
+		// TODO: cancel running task via context cancellation
+		s.store.FailTask(id, "cancelled by user")
+		writeJSON(w, 200, map[string]string{"status": "cancelled"})
 	default:
 		errResp(w, 405, "method not allowed")
 	}
@@ -1251,6 +1788,375 @@ func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request, i
 	errResp(w, 501, "engine does not support session listing")
 }
 
+// --- Checkpoint (named snapshot) ---
+
+func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	user := UserFromContext(r.Context())
+	sb := s.getUserSandbox(w, r, id)
+	if sb == nil {
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Name == "" || !isValidName(req.Name) {
+		errResp(w, 400, "valid name required")
+		return
+	}
+
+	// Check quota
+	existing, _ := s.store.ListSnapshots(user.ID)
+	userObj, _ := s.store.GetUser(user.ID)
+	maxSnaps := 5
+	if userObj != nil && userObj.MaxSnapshots > 0 {
+		maxSnaps = userObj.MaxSnapshots
+	}
+	if len(existing) >= maxSnaps {
+		errResp(w, 429, fmt.Sprintf("snapshot limit reached (%d/%d)", len(existing), maxSnaps))
+		return
+	}
+
+	type checkpointer interface {
+		Checkpoint(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir string) (any, error)
+	}
+	cp, ok := s.engine.(checkpointer)
+	if !ok {
+		errResp(w, 501, "engine does not support checkpoint")
+		return
+	}
+
+	snapDir := filepath.Join(s.dataDir, "snapshots", user.ID)
+	os.MkdirAll(snapDir, 0700)
+
+	manifestIface, err := cp.Checkpoint(r.Context(), sb.EngineID, user.ID, user.SubnetIndex, req.Name, snapDir)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			errResp(w, 409, err.Error())
+		} else {
+			errRespInternal(w, r, "checkpoint failed", err)
+		}
+		return
+	}
+
+	// Calculate total snapshot size
+	finalDir := filepath.Join(snapDir, req.Name)
+	var totalSize int64
+	filepath.Walk(finalDir, func(_ string, fi os.FileInfo, _ error) error {
+		if fi != nil && !fi.IsDir() {
+			totalSize += fi.Size()
+		}
+		return nil
+	})
+	sizeMB := int(totalSize / 1024 / 1024)
+
+	manifestJSON, _ := json.Marshal(manifestIface)
+	snap := store.SnapshotRecord{
+		ID: genID(), UserID: user.ID, Name: req.Name,
+		SourceSandbox: sb.ID,
+		MemPath:       filepath.Join(finalDir, "mem.snap"),
+		VMPath:        filepath.Join(finalDir, "vm.snap"),
+		RootfsPath:    filepath.Join(finalDir, "rootfs.ext4"),
+		ConfigPath:    filepath.Join(finalDir, "config.ext4"),
+		ManifestJSON:  string(manifestJSON),
+		SizeMB:        sizeMB,
+		CreatedAt:     time.Now(),
+	}
+	if err := s.store.CreateSnapshot(snap); err != nil {
+		errRespInternal(w, r, "store snapshot record failed", err)
+		return
+	}
+
+	s.saveVMState(sb.ID, sb.EngineID) // persist updated state
+	slog.Info("snapshot.created", "name", req.Name, "sandbox", sb.ID,
+		"user", user.Name, "size_mb", sizeMB)
+	writeJSON(w, 201, snap)
+}
+
+// --- Snapshot Resume ---
+
+func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, user *store.User, snapName string) {
+	if r.Method != http.MethodPost {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"` // new sandbox name
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Name != "" && !isValidName(req.Name) {
+		errResp(w, 400, "invalid sandbox name")
+		return
+	}
+
+	// Load snapshot from store
+	snap, err := s.store.GetSnapshot(user.ID, snapName)
+	if err != nil {
+		errResp(w, 404, err.Error())
+		return
+	}
+
+	// Parse manifest
+	type manifest struct {
+		Name        string `json:"name"`
+		CreatedFrom string `json:"created_from"`
+		UserID      string `json:"user_id"`
+		SubnetIndex int    `json:"subnet_index"`
+		VMConfig    struct {
+			VcpuCount  int64 `json:"vcpu_count"`
+			MemSizeMib int64 `json:"mem_size_mib"`
+		} `json:"vm_config"`
+		Drives []struct {
+			DriveID      string `json:"drive_id"`
+			Role         string `json:"role"`
+			SnapshotFile string `json:"snapshot_file"`
+			Name         string `json:"name"`
+			ReadOnly     bool   `json:"read_only"`
+		} `json:"drives"`
+		Network struct {
+			GuestMAC string `json:"guest_mac"`
+			GuestIP  string `json:"guest_ip"`
+		} `json:"network"`
+		AgentToken string `json:"agent_token"`
+	}
+	var m manifest
+	if err := json.Unmarshal([]byte(snap.ManifestJSON), &m); err != nil {
+		errRespInternal(w, r, "parse snapshot manifest failed", err)
+		return
+	}
+
+	// Enforce sandbox count limit
+	count, _ := s.store.CountUserSandboxes(user.ID)
+	if count >= user.MaxSandboxes {
+		errResp(w, 429, fmt.Sprintf("sandbox limit reached (%d/%d)", count, user.MaxSandboxes))
+		return
+	}
+
+	type snapshotResumer interface {
+		ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName string) (engine.SandboxInfo, error)
+	}
+
+	sr, ok := s.engine.(snapshotResumer)
+	if !ok {
+		errResp(w, 501, "engine does not support snapshot resume")
+		return
+	}
+
+	snapDir := filepath.Dir(snap.MemPath) // e.g. /var/lib/bhatti/snapshots/usr_alice/dev-ready
+
+	sandboxName := req.Name
+	if sandboxName == "" {
+		sandboxName = snapName + "-" + genID()[:6]
+	}
+
+	info, err := sr.ResumeFromManifestJSON(r.Context(), snapDir, []byte(snap.ManifestJSON), sandboxName)
+	if err != nil {
+		if strings.Contains(err.Error(), "in use") {
+			errResp(w, 409, err.Error())
+		} else {
+			errRespInternal(w, r, "resume snapshot failed", err)
+		}
+		return
+	}
+
+	sbID := genID()
+	sb := store.Sandbox{
+		ID: sbID, Name: sandboxName, EngineID: info.EngineID,
+		Status: info.Status, IP: info.IP,
+		EngineMeta: json.RawMessage("{}"),
+		CreatedBy:  user.ID, CreatedAt: time.Now(),
+	}
+	if err := s.store.CreateSandbox(sb); err != nil {
+		s.engine.Destroy(r.Context(), info.EngineID)
+		errRespInternal(w, r, "store sandbox failed", err)
+		return
+	}
+
+	s.saveVMState(sbID, info.EngineID)
+	slog.Info("snapshot.resumed", "snapshot", snapName, "sandbox_id", sbID,
+		"name", sandboxName, "user", user.Name)
+	writeJSON(w, 201, sb)
+}
+
+// --- Image Pull (async) ---
+
+func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *store.User) {
+	if r.Method != http.MethodPost {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Ref  string `json:"ref"`            // e.g. "python:3.12"
+		Name string `json:"name"`           // e.g. "python-3.12"
+		Auth string `json:"auth,omitempty"` // "user:token"
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Ref == "" || req.Name == "" {
+		errResp(w, 400, "ref and name required")
+		return
+	}
+	if !isValidName(req.Name) {
+		errResp(w, 400, "invalid image name")
+		return
+	}
+
+	// Check if already pulling same ref for same user (duplicate prevention)
+	// Simple: check for a running task with same type and ref
+	// For now, create the task and proceed.
+
+	taskID := genID()
+	task := store.TaskRecord{
+		ID: taskID, UserID: user.ID, Type: "image_pull",
+		Status: "running", CreatedAt: time.Now(),
+	}
+	s.store.CreateTask(task)
+
+	loharPath := filepath.Join(s.dataDir, "lohar")
+	outputDir := filepath.Join(s.dataDir, "images", user.ID)
+	os.MkdirAll(outputDir, 0700)
+	outputPath := filepath.Join(outputDir, req.Name+".ext4")
+
+	// Run in background goroutine
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		var ociOpts []oci.Option
+		ociOpts = append(ociOpts, oci.WithProgress(func(msg string) {
+			s.store.UpdateTaskProgress(taskID, msg)
+		}))
+		if req.Auth != "" {
+			parts := strings.SplitN(req.Auth, ":", 2)
+			if len(parts) == 2 {
+				ociOpts = append(ociOpts, oci.WithAuth(parts[0], parts[1]))
+			}
+		}
+
+		config, err := oci.PullAndConvert(ctx, req.Ref, outputPath, loharPath, ociOpts...)
+		if err != nil {
+			os.Remove(outputPath)
+			s.store.FailTask(taskID, err.Error())
+			slog.Error("image pull failed", "ref", req.Ref, "user", user.ID, "error", err)
+			return
+		}
+
+		configJSON, _ := json.Marshal(config)
+		sizeMB := int(config.TotalSize / 1024 / 1024)
+
+		img := store.ImageRecord{
+			ID: genID(), UserID: user.ID, Name: req.Name,
+			Source:        "oci:" + req.Ref,
+			FilePath:      outputPath,
+			SizeMB:        sizeMB,
+			OCIConfigJSON: string(configJSON),
+			CreatedAt:     time.Now(),
+		}
+		if err := s.store.CreateImage(img); err != nil {
+			os.Remove(outputPath)
+			s.store.FailTask(taskID, "store image: "+err.Error())
+			return
+		}
+
+		resultJSON, _ := json.Marshal(map[string]any{
+			"image": req.Name, "size_mb": sizeMB, "source": req.Ref,
+		})
+		s.store.CompleteTask(taskID, string(resultJSON))
+		slog.Info("image.pulled", "ref", req.Ref, "name", req.Name,
+			"user", user.Name, "size_mb", sizeMB)
+	}()
+
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"task_id": taskID, "status": "running"})
+}
+
+// --- Save Image (sandbox rootfs → image) ---
+
+func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		errResp(w, 405, "method not allowed")
+		return
+	}
+	user := UserFromContext(r.Context())
+	sb := s.getUserSandbox(w, r, id)
+	if sb == nil {
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Name == "" || !isValidName(req.Name) {
+		errResp(w, 400, "valid name required")
+		return
+	}
+
+	// Check if image already exists
+	if _, err := s.store.GetImage(user.ID, req.Name); err == nil {
+		errResp(w, 409, fmt.Sprintf("image %q already exists — delete first", req.Name))
+		return
+	}
+
+	// Type assertion for SaveImage capability
+	type imageSaver interface {
+		SaveImage(ctx context.Context, sandboxID, destPath string) error
+	}
+	saver, ok := s.engine.(imageSaver)
+	if !ok {
+		errResp(w, 501, "engine does not support save-image")
+		return
+	}
+
+	outputDir := filepath.Join(s.dataDir, "images", user.ID)
+	os.MkdirAll(outputDir, 0700)
+	outputPath := filepath.Join(outputDir, req.Name+".ext4")
+
+	if err := saver.SaveImage(r.Context(), sb.EngineID, outputPath); err != nil {
+		os.Remove(outputPath)
+		errRespInternal(w, r, "save image failed", err)
+		return
+	}
+
+	var sizeMB int
+	if fi, err := os.Stat(outputPath); err == nil {
+		sizeMB = int(fi.Size() / 1024 / 1024)
+	}
+
+	img := store.ImageRecord{
+		ID: genID(), UserID: user.ID, Name: req.Name,
+		Source:   "saved:" + sb.ID,
+		FilePath: outputPath, SizeMB: sizeMB,
+		CreatedAt: time.Now(),
+	}
+	if err := s.store.CreateImage(img); err != nil {
+		os.Remove(outputPath)
+		errRespInternal(w, r, "store image record failed", err)
+		return
+	}
+
+	slog.Info("image.saved", "name", req.Name, "source_sandbox", sb.ID,
+		"user", user.Name, "size_mb", sizeMB)
+	writeJSON(w, 201, img)
+}
+
 // errRespInternal logs the real error and returns a generic message with request ID.
 // Used for 500 errors to avoid leaking internal paths, IPs, or system details.
 func errRespInternal(w http.ResponseWriter, r *http.Request, logMsg string, err error) {
@@ -1300,6 +2206,28 @@ var validNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
 
 func isValidName(name string) bool {
 	return validNameRe.MatchString(name)
+}
+
+// isValidMountPath validates that a volume mount path is safe.
+// Rejects system paths that would overlay critical guest filesystems.
+func isValidMountPath(mount string) bool {
+	if mount == "" || mount[0] != '/' {
+		return false // must be absolute
+	}
+	clean := filepath.Clean(mount)
+	if strings.Contains(clean, "..") {
+		return false
+	}
+	// Reject system mount points that lohar or the kernel use
+	forbidden := []string{"/", "/proc", "/sys", "/dev", "/dev/pts",
+		"/run", "/tmp", "/etc", "/bin", "/sbin", "/lib", "/lib64",
+		"/usr", "/usr/local/bin", "/boot", "/root"}
+	for _, f := range forbidden {
+		if clean == f {
+			return false
+		}
+	}
+	return true
 }
 
 // getUserSandbox is a helper that retrieves a sandbox scoped to the authenticated user.

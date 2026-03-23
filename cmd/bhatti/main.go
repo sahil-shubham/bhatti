@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -89,6 +90,38 @@ func runDaemon() {
 	// Recover Firecracker VMs from store if applicable
 	if provider, ok := eng.(engine.VMStateProvider); ok {
 		recoverVMs(st, provider)
+	}
+
+	// v0.3: Detach volumes orphaned by crashed sandboxes.
+	// MUST run after recoverVMs (which marks dead-process sandboxes as stopped/unknown).
+	if n, err := st.DetachOrphanedPersistentVolumes(); err != nil {
+		slog.Warn("orphan volume detach failed", "error", err)
+	} else if n > 0 {
+		slog.Info("detached orphaned volume attachments", "count", n)
+	}
+
+	// v0.3: Reconcile orphaned volume files on disk.
+	// If daemon crashed between store.DeletePersistentVolume (removes DB row)
+	// and os.Remove (removes .ext4 file), the file lingers with no store record.
+	reconcileOrphanedVolumeFiles(cfg.DataDir, st)
+
+	// v0.3: Clean stale checkpoint temp dirs left by crashed checkpoints
+	snapshotDir := filepath.Join(cfg.DataDir, "snapshots")
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, userDir := range entries {
+			if !userDir.IsDir() {
+				continue
+			}
+			userPath := filepath.Join(snapshotDir, userDir.Name())
+			subEntries, _ := os.ReadDir(userPath)
+			for _, entry := range subEntries {
+				if entry.IsDir() && strings.HasSuffix(entry.Name(), ".tmp") {
+					tmpPath := filepath.Join(userPath, entry.Name())
+					slog.Info("removing stale snapshot temp dir", "path", tmpPath)
+					os.RemoveAll(tmpPath)
+				}
+			}
+		}
 	}
 
 	// Start server
@@ -207,6 +240,39 @@ func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
 
 	if recovered > 0 {
 		slog.Info("recovery complete", "count", recovered)
+	}
+}
+
+// reconcileOrphanedVolumeFiles walks the volumes directory and removes
+// .ext4 files that have no matching store record. This handles the crash
+// window between store.DeletePersistentVolume and os.Remove.
+func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
+	volRoot := filepath.Join(dataDir, "volumes")
+	userDirs, err := os.ReadDir(volRoot)
+	if err != nil {
+		return // volumes dir may not exist yet
+	}
+	for _, userDir := range userDirs {
+		if !userDir.IsDir() {
+			continue
+		}
+		userID := userDir.Name()
+		userPath := filepath.Join(volRoot, userID)
+		files, err := os.ReadDir(userPath)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".ext4") {
+				continue
+			}
+			volName := strings.TrimSuffix(f.Name(), ".ext4")
+			if _, err := st.GetPersistentVolume(userID, volName); err != nil {
+				orphanPath := filepath.Join(userPath, f.Name())
+				slog.Info("removing orphaned volume file", "path", orphanPath)
+				os.Remove(orphanPath)
+			}
+		}
 	}
 }
 

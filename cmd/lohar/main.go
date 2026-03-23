@@ -145,6 +145,16 @@ func acceptLoop(ln net.Listener, handler func(net.Conn)) {
 
 // --- Config drive ---
 
+// VolumeMountConfig maps a block device to a mount point inside the guest.
+// This type mirrors the engine-side VolumeMountConfig — the config drive
+// JSON is the contract between them. The ReadOnly field controls MS_RDONLY.
+type VolumeMountConfig struct {
+	Device   string `json:"device"`    // e.g. "/dev/vdc"
+	Mount    string `json:"mount"`     // e.g. "/workspace"
+	FS       string `json:"fs"`        // e.g. "ext4"
+	ReadOnly bool   `json:"read_only"` // mount with MS_RDONLY
+}
+
 // SandboxConfig mirrors the config drive JSON structure.
 type SandboxConfig struct {
 	SandboxID string            `json:"sandbox_id"`
@@ -155,14 +165,10 @@ type SandboxConfig struct {
 		Content string `json:"content"` // base64-encoded
 		Mode    string `json:"mode"`
 	} `json:"files"`
-	Volumes []struct {
-		Device string `json:"device"`
-		Mount  string `json:"mount"`
-		FS     string `json:"fs"`
-	} `json:"volumes"`
-	Init string   `json:"init,omitempty"`
-	DNS  []string `json:"dns"`
-	User string   `json:"user"`
+	Volumes []VolumeMountConfig `json:"volumes"`
+	Init    string              `json:"init,omitempty"`
+	DNS     []string            `json:"dns"`
+	User    string              `json:"user"`
 }
 
 // loadConfigDrive mounts /dev/vdb and reads config.json.
@@ -225,19 +231,21 @@ func writeConfigFiles(files map[string]struct {
 	}
 }
 
-func mountVolumes(volumes []struct {
-	Device string `json:"device"`
-	Mount  string `json:"mount"`
-	FS     string `json:"fs"`
-}) {
+func mountVolumes(volumes []VolumeMountConfig) {
 	for _, v := range volumes {
 		os.MkdirAll(v.Mount, 0755)
-		if err := syscall.Mount(v.Device, v.Mount, v.FS, 0, ""); err != nil {
+		var flags uintptr
+		if v.ReadOnly {
+			flags |= syscall.MS_RDONLY
+		}
+		if err := syscall.Mount(v.Device, v.Mount, v.FS, flags, ""); err != nil {
 			fmt.Fprintf(os.Stderr, "lohar: mount %s → %s: %v\n", v.Device, v.Mount, err)
 			continue
 		}
-		os.Chown(v.Mount, 1000, 1000)
-		fmt.Fprintf(os.Stderr, "lohar: mounted %s → %s\n", v.Device, v.Mount)
+		if !v.ReadOnly {
+			os.Chown(v.Mount, 1000, 1000)
+		}
+		fmt.Fprintf(os.Stderr, "lohar: mounted %s → %s (ro=%v)\n", v.Device, v.Mount, v.ReadOnly)
 	}
 }
 

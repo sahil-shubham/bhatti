@@ -99,6 +99,23 @@ func (p *ipPool) Release(ip string) {
 	p.mu.Unlock()
 }
 
+// TryAllocate attempts to allocate a specific IP. Returns error if taken.
+// Used by snapshot resume which must get the exact IP from the manifest.
+func (p *ipPool) TryAllocate(ip string) error {
+	var octet int
+	fmt.Sscanf(ip, p.prefix+"%d", &octet)
+	if octet < 2 || octet > 254 {
+		return fmt.Errorf("IP %s out of range", ip)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.used[octet] {
+		return fmt.Errorf("IP %s is in use by another sandbox", ip)
+	}
+	p.used[octet] = true
+	return nil
+}
+
 // Mark reserves an IP (used during startup recovery).
 func (p *ipPool) Mark(ip string) {
 	var octet int

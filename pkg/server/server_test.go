@@ -48,7 +48,7 @@ func setup(t *testing.T) (*Server, *httptest.Server) {
 	})
 
 	eng := newMockEngine()
-	srv := New(eng, st)
+	srv := New(eng, st, dir)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() { srv.Close(); ts.Close(); st.Close() })
 	return srv, ts
@@ -346,24 +346,37 @@ func TestSecretValidation(t *testing.T) {
 	resp.Body.Close()
 }
 
-// --- Volumes ---
+// --- Persistent Volumes (v0.3) ---
 
 func TestVolumeCRUD(t *testing.T) {
 	_, ts := setup(t)
 	volName := uniqueName(t, "crud")
 
-	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName})
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName, "size_mb": 64})
 	if resp.StatusCode != 201 {
-		t.Fatalf("expected 201, got %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, body)
 	}
 	resp.Body.Close()
 
 	resp = doReq(t, ts, "GET", "/volumes", nil)
-	var list []store.Volume
+	var list []store.PersistentVolume
 	decodeJSON(t, resp, &list)
 	if len(list) != 1 {
 		t.Fatalf("expected 1, got %d", len(list))
 	}
+	if list[0].Name != volName {
+		t.Fatalf("expected name %q, got %q", volName, list[0].Name)
+	}
+	if list[0].SizeMB != 64 {
+		t.Fatalf("expected 64MB, got %d", list[0].SizeMB)
+	}
+
+	resp = doReq(t, ts, "GET", "/volumes/"+volName, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
 
 	resp = doReq(t, ts, "DELETE", "/volumes/"+volName, nil)
 	if resp.StatusCode != 200 {
@@ -378,11 +391,132 @@ func TestVolumeCRUD(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestVolumeDuplicateNameRejected(t *testing.T) {
+	_, ts := setup(t)
+	volName := uniqueName(t, "dup")
+
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName, "size_mb": 64})
+	if resp.StatusCode != 201 {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName, "size_mb": 64})
+	if resp.StatusCode != 409 {
+		t.Fatalf("expected 409 conflict, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestVolumeValidation(t *testing.T) {
 	_, ts := setup(t)
-	resp := doReq(t, ts, "POST", "/volumes", map[string]any{})
+	// Missing size
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": "test"})
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// Missing name
+	resp = doReq(t, ts, "POST", "/volumes", map[string]any{"size_mb": 64})
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestVolumeDeleteWhileAttachedHTTP(t *testing.T) {
+	_, ts := setup(t)
+	volName := uniqueName(t, "attached")
+
+	// Create volume
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName, "size_mb": 64})
+	if resp.StatusCode != 201 {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Create sandbox with that volume
+	resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"name": uniqueName(t, "sb"),
+		"persistent_volumes": []map[string]any{
+			{"name": volName, "mount": "/workspace"},
+		},
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// Delete should fail (attached)
+	resp = doReq(t, ts, "DELETE", "/volumes/"+volName, nil)
+	if resp.StatusCode != 409 {
+		t.Fatalf("expected 409 (attached), got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestVolumeMountPathValidation(t *testing.T) {
+	_, ts := setup(t)
+	volName := uniqueName(t, "mount")
+
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": volName, "size_mb": 64})
+	resp.Body.Close()
+
+	tests := []struct {
+		mount  string
+		expect int
+	}{
+		{"/", 400},
+		{"/proc", 400},
+		{"/dev", 400},
+		{"/etc", 400},
+		{"relative", 400},
+		{"/workspace", 201}, // valid
+	}
+	for _, tt := range tests {
+		resp = doReq(t, ts, "POST", "/sandboxes", map[string]any{
+			"name": uniqueName(t, "m"),
+			"persistent_volumes": []map[string]any{
+				{"name": volName, "mount": tt.mount},
+			},
+		})
+		if resp.StatusCode != tt.expect {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("mount %q: expected %d, got %d: %s", tt.mount, tt.expect, resp.StatusCode, body)
+		}
+		resp.Body.Close()
+	}
+}
+
+func TestVolumeNameValidationHTTP(t *testing.T) {
+	_, ts := setup(t)
+
+	// Path traversal in name
+	resp := doReq(t, ts, "POST", "/volumes", map[string]any{"name": "../etc/passwd", "size_mb": 64})
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400 for path traversal name, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Empty name
+	resp = doReq(t, ts, "POST", "/volumes", map[string]any{"name": "", "size_mb": 64})
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400 for empty name, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestSandboxCreateNoVolumesRegression(t *testing.T) {
+	// The #1 regression test: v0.1-style sandbox creation (no persistent_volumes)
+	// must still work after all the volume resolution code was added.
+	_, ts := setup(t)
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"name": uniqueName(t, "novol"),
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201 (no-volume sandbox), got %d: %s", resp.StatusCode, body)
 	}
 	resp.Body.Close()
 }
@@ -560,7 +694,7 @@ func setupTwoUsers(t *testing.T) (*httptest.Server, func(t *testing.T, method, p
 	})
 
 	eng := newMockEngine()
-	srv := New(eng, st)
+	srv := New(eng, st, dir)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() { srv.Close(); ts.Close(); st.Close() })
 

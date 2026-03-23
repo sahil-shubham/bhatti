@@ -48,8 +48,9 @@ type Server struct {
 	dataDir      string // path to data directory (for age.key)
 	mux          *http.ServeMux
 	limiter      *rateLimiter
-	stopThermal  context.CancelFunc
-	startTime    time.Time
+	stopThermal     context.CancelFunc
+	stopTaskCleanup context.CancelFunc
+	startTime       time.Time
 	lastActivity sync.Map // engineID → time.Time — host-side activity cache
 
 	// Request counters for /metrics
@@ -81,13 +82,40 @@ func New(eng engine.Engine, st *store.Store, dataDir ...string) *Server {
 		startTime: time.Now(),
 	}
 	s.routes()
+	s.startTaskCleanup()
 	return s
 }
 
-// Close stops background goroutines (thermal manager).
+// startTaskCleanup runs a background goroutine that deletes completed/failed
+// tasks older than 24 hours. Never deletes running tasks.
+func (s *Server) startTaskCleanup() {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.stopTaskCleanup = cancel
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n, err := s.store.CleanupOldTasks(24 * time.Hour); err != nil {
+					slog.Warn("task cleanup failed", "error", err)
+				} else if n > 0 {
+					slog.Info("cleaned up old tasks", "count", n)
+				}
+			}
+		}
+	}()
+}
+
+// Close stops background goroutines (thermal manager, task cleanup).
 func (s *Server) Close() {
 	if s.stopThermal != nil {
 		s.stopThermal()
+	}
+	if s.stopTaskCleanup != nil {
+		s.stopTaskCleanup()
 	}
 }
 

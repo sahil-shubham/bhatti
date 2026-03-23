@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,6 +44,16 @@ type Engine struct {
 	userNetworks map[string]*UserNetwork // userID → network
 }
 
+// VolumeAttachmentInfo records a volume attached to a running VM.
+// Populated during Create(), persisted in engine_meta, used by checkpoint.
+type VolumeAttachmentInfo struct {
+	DriveID  string `json:"drive_id"`   // Firecracker drive ID ("vol0")
+	Name     string `json:"name"`       // volume name ("workspace")
+	FilePath string `json:"file_path"`  // host path to ext4 file
+	Mount    string `json:"mount"`      // guest mount point
+	ReadOnly bool   `json:"read_only"`
+}
+
 // VM holds per-sandbox state.
 type VM struct {
 	// stateMu protects all mutable fields below. The engine-level
@@ -73,6 +84,7 @@ type VM struct {
 	GuestIP     string
 	GuestMAC    string
 	Token       string // agent auth token
+	Volumes     []VolumeAttachmentInfo // populated in Create, used by checkpoint
 	Agent           *agent.AgentClient
 	Status          string // "running", "stopped"
 	Thermal         string // "hot", "warm", "cold"
@@ -93,8 +105,10 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 
-	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "sandboxes"), 0700); err != nil {
-		return nil, fmt.Errorf("create sandbox dir: %w", err)
+	for _, sub := range []string{"sandboxes", "images", "volumes", "snapshots"} {
+		if err := os.MkdirAll(filepath.Join(cfg.DataDir, sub), 0700); err != nil {
+			return nil, fmt.Errorf("create %s dir: %w", sub, err)
+		}
 	}
 
 	eng := &Engine{
@@ -235,10 +249,34 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		}
 	}()
 
-	// 1. Copy rootfs
+	// 1. Copy rootfs (from resolved image path or default base)
+	baseImage := e.cfg.BaseRootfs
+	if spec.BaseImage != "" {
+		baseImage = spec.BaseImage
+	}
 	rootfsPath := filepath.Join(sandboxDir, "rootfs.ext4")
-	if err = copyRootfs(e.cfg.BaseRootfs, rootfsPath); err != nil {
+	if err = copyRootfs(baseImage, rootfsPath); err != nil {
 		return info, fmt.Errorf("copy rootfs: %w", err)
+	}
+
+	// 1b. Re-inject lohar into rootfs to prevent protocol drift.
+	// Saved images / OCI images may have an older lohar that doesn't
+	// understand new config drive fields (e.g. ReadOnly). Without this,
+	// the read_only JSON key is silently ignored → data corruption.
+	if err = injectLoharIntoRootfs(rootfsPath, e.cfg.DataDir); err != nil {
+		slog.Warn("lohar injection failed", "error", err)
+		// Non-fatal — image's lohar may work, but warn loudly
+	}
+
+	// 1c. Resize rootfs if requested
+	if spec.DiskSizeMB > 0 {
+		exec.Command("e2fsck", "-f", "-y", rootfsPath).Run() // best effort
+		if err = exec.Command("truncate", "-s", fmt.Sprintf("%dM", spec.DiskSizeMB), rootfsPath).Run(); err != nil {
+			return info, fmt.Errorf("resize rootfs: %w", err)
+		}
+		if err = exec.Command("resize2fs", rootfsPath).Run(); err != nil {
+			return info, fmt.Errorf("resize2fs: %w", err)
+		}
 	}
 
 	// 2. Allocate CID and paths
@@ -291,7 +329,30 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	configDrivePath := filepath.Join(sandboxDir, "config.ext4")
 	var volumeMounts []VolumeMountConfig
+	var volAttachments []VolumeAttachmentInfo
 	driveIndex := byte('c') // vdb=config, vdc=first vol, vdd=second, ...
+
+	// Maximum 24 volumes per sandbox (vdc through vdz)
+	const maxVolumesPerSandbox = 24
+	totalVols := len(spec.ResolvedVolumes) + len(spec.NewVolumes)
+	if totalVols > maxVolumesPerSandbox {
+		return info, fmt.Errorf("too many volumes: %d (max %d)", totalVols, maxVolumesPerSandbox)
+	}
+
+	// Persistent volumes (resolved by server layer)
+	for _, vol := range spec.ResolvedVolumes {
+		device := fmt.Sprintf("/dev/vd%c", driveIndex)
+		volumeMounts = append(volumeMounts, VolumeMountConfig{
+			Device: device, Mount: vol.Mount, FS: "ext4", ReadOnly: vol.ReadOnly,
+		})
+		volAttachments = append(volAttachments, VolumeAttachmentInfo{
+			DriveID: vol.DriveID, Name: vol.Name, FilePath: vol.FilePath,
+			Mount: vol.Mount, ReadOnly: vol.ReadOnly,
+		})
+		driveIndex++
+	}
+
+	// Legacy ephemeral volumes (created in sandbox dir, destroyed with sandbox)
 	for _, vs := range spec.NewVolumes {
 		volPath := filepath.Join(sandboxDir, fmt.Sprintf("vol-%s.ext4", vs.Name))
 		if err = createVolume(volPath, vs.SizeMB); err != nil {
@@ -386,10 +447,19 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		return info, fmt.Errorf("set config drive: %w", err)
 	}
 
-	// 6c. Attach volume drives (/dev/vdc, /dev/vdd, ...)
+	// 6c. Attach persistent volume drives
+	for _, vol := range spec.ResolvedVolumes {
+		if err = fcPut(client, fmt.Sprintf("/drives/%s", vol.DriveID), fmt.Sprintf(
+			`{"drive_id":%q,"path_on_host":%q,"is_root_device":false,"is_read_only":%v}`,
+			vol.DriveID, vol.FilePath, vol.ReadOnly)); err != nil {
+			return info, fmt.Errorf("set persistent volume drive %s: %w", vol.DriveID, err)
+		}
+	}
+
+	// 6d. Attach legacy ephemeral volume drives
 	for i, vs := range spec.NewVolumes {
 		volPath := filepath.Join(sandboxDir, fmt.Sprintf("vol-%s.ext4", vs.Name))
-		driveID := fmt.Sprintf("vol%d", i)
+		driveID := fmt.Sprintf("ephvol%d", i)
 		if err = fcPut(client, fmt.Sprintf("/drives/%s", driveID), fmt.Sprintf(
 			`{"drive_id":%q,"path_on_host":%q,"is_root_device":false,"is_read_only":false}`,
 			driveID, volPath)); err != nil {
@@ -414,7 +484,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		VsockPath: vsockPath, RootfsPath: rootfsPath,
 		CID: cid, VcpuCount: vcpuCount, MemSizeMib: memMB,
 		TapDevice: tapName, GuestIP: guestIP, GuestMAC: mac,
-		Token: token, Agent: agentClient, Status: "running",
+		Token: token, Volumes: volAttachments,
+		Agent: agentClient, Status: "running",
 		Thermal: "hot", cancel: vmCancel, cmd: fcCmd,
 	}
 
@@ -426,6 +497,58 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		ID: id, Name: name, Status: "running",
 		IP: guestIP, EngineID: id,
 	}, nil
+}
+
+// --- SaveImage (save rootfs as image) ---
+
+// SaveImage pauses the VM, flushes the page cache, copies the rootfs to
+// destPath, and resumes. The copy is a complete flat ext4 file capturing
+// the filesystem at save time (no memory state).
+func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) error {
+	vm, err := e.getVM(sandboxID)
+	if err != nil {
+		return err
+	}
+
+	vm.stateMu.Lock()
+	defer vm.stateMu.Unlock()
+
+	// Flush guest page cache before pausing — pausing vCPUs does NOT
+	// flush dirty pages from guest RAM to the virtio-blk device.
+	if vm.Thermal == "hot" && vm.Agent != nil {
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		vm.Agent.Exec(syncCtx, []string{"sync"}, nil, "")
+		syncCancel()
+	}
+
+	wasPaused := vm.Thermal == "warm"
+	if vm.Thermal == "hot" {
+		client := fcAPIClient(vm.SocketPath)
+		if err := fcPatch(client, "/vm", `{"state":"Paused"}`); err != nil {
+			return fmt.Errorf("pause for save: %w", err)
+		}
+		vm.Thermal = "warm"
+	}
+
+	// Copy rootfs while VM is paused — no concurrent mutations possible
+	if err := copyRootfs(vm.RootfsPath, destPath); err != nil {
+		if !wasPaused {
+			client := fcAPIClient(vm.SocketPath)
+			fcPatch(client, "/vm", `{"state":"Resumed"}`)
+			vm.Thermal = "hot"
+		}
+		return fmt.Errorf("copy rootfs: %w", err)
+	}
+
+	if !wasPaused {
+		client := fcAPIClient(vm.SocketPath)
+		if err := fcPatch(client, "/vm", `{"state":"Resumed"}`); err != nil {
+			return fmt.Errorf("resume after save: %w", err)
+		}
+		vm.Thermal = "hot"
+	}
+
+	return nil
 }
 
 // --- Stop (Snapshot) ---
@@ -730,19 +853,20 @@ func (e *Engine) VMState(id string) map[string]interface{} {
 	vm.stateMu.Lock()
 	defer vm.stateMu.Unlock()
 	return map[string]interface{}{
-		"rootfs_path":   vm.RootfsPath,
-		"snap_mem_path": vm.SnapMemPath,
-		"snap_vm_path":  vm.SnapVMPath,
-		"vsock_cid":     vm.CID,
-		"tap_device":    vm.TapDevice,
-		"guest_ip":      vm.GuestIP,
-		"guest_mac":     vm.GuestMAC,
-		"vcpu_count":    vm.VcpuCount,
-		"mem_size_mib":  vm.MemSizeMib,
+		"rootfs_path":       vm.RootfsPath,
+		"snap_mem_path":     vm.SnapMemPath,
+		"snap_vm_path":      vm.SnapVMPath,
+		"vsock_cid":         vm.CID,
+		"tap_device":        vm.TapDevice,
+		"guest_ip":          vm.GuestIP,
+		"guest_mac":         vm.GuestMAC,
+		"vcpu_count":        vm.VcpuCount,
+		"mem_size_mib":      vm.MemSizeMib,
 		"socket_path":       vm.SocketPath,
 		"vsock_path":        vm.VsockPath,
 		"has_base_snapshot": vm.hasBaseSnapshot,
 		"agent_token":       vm.Token,
+		"volumes":           vm.Volumes,
 	}
 }
 
@@ -776,6 +900,12 @@ func (e *Engine) RestoreVM(id, name, status string, state map[string]interface{}
 		SnapMemPath:     stateStr(state, "snap_mem_path"),
 		SnapVMPath:      stateStr(state, "snap_vm_path"),
 		hasBaseSnapshot: stateBool(state, "has_base_snapshot"),
+	}
+
+	// Restore volume attachments (JSON round-trip through interface{})
+	if raw, ok := state["volumes"]; ok && raw != nil {
+		b, _ := json.Marshal(raw)
+		json.Unmarshal(b, &vm.Volumes)
 	}
 
 	if status == "running" {
@@ -1097,12 +1227,38 @@ func generateMAC() string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
+// injectLoharIntoRootfs mounts the rootfs and overwrites /usr/local/bin/lohar
+// with the current binary from DataDir. This ensures every sandbox uses the
+// latest guest agent, preventing protocol drift after daemon upgrades.
+// Adds ~50ms to sandbox creation (mount + cp + umount).
+func injectLoharIntoRootfs(rootfsPath, dataDir string) error {
+	loharSrc := filepath.Join(dataDir, "lohar")
+	if _, err := os.Stat(loharSrc); err != nil {
+		return nil // no lohar binary to inject (dev mode)
+	}
+	mnt, err := os.MkdirTemp("", "bhatti-inject-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(mnt)
+	if err := exec.Command("mount", "-o", "loop", rootfsPath, mnt).Run(); err != nil {
+		return fmt.Errorf("mount rootfs for lohar injection: %w", err)
+	}
+	defer exec.Command("umount", mnt).Run()
+	dst := filepath.Join(mnt, "usr/local/bin/lohar")
+	if err := exec.Command("cp", loharSrc, dst).Run(); err != nil {
+		return fmt.Errorf("copy lohar: %w", err)
+	}
+	return os.Chmod(dst, 0755)
+}
+
 func copyRootfs(src, dst string) error {
-	// Try CoW clone first
+	// Try CoW clone first (instant on btrfs/xfs)
 	if err := exec.Command("cp", "--reflink=always", src, dst).Run(); err == nil {
 		return nil
 	}
-	return exec.Command("cp", src, dst).Run()
+	// Fallback: preserve sparsity to avoid materializing empty blocks
+	return exec.Command("cp", "--sparse=always", src, dst).Run()
 }
 
 // fcAPIClient returns an HTTP client that talks to Firecracker's API over a Unix socket.
