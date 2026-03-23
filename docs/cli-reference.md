@@ -30,23 +30,25 @@ bhatti setup
 
 Prompts for API endpoint and API key, saves to `~/.bhatti/config.yaml`, tests the connection.
 
-### Environment variables
+### Config file
+
+`~/.bhatti/config.yaml`:
+
+```yaml
+api_url: https://api.bhatti.sh
+auth_token: bht_your_key_here
+```
+
+### Environment variables (override for CI/scripts)
 
 ```bash
 export BHATTI_URL=https://api.bhatti.sh    # API endpoint
 export BHATTI_TOKEN=bht_your_key_here      # API key
 ```
 
-### Config file
+Priority: `--flag` > config file > environment variable > default.
 
-`~/.bhatti/config.yaml`:
-
-```yaml
-auth_token: bht_your_key_here
-listen: :8080
-```
-
-Priority: environment variables > config file.
+The config file is the primary source — `bhatti setup` writes it and it just works. Environment variables are a fallback for CI pipelines and scripts, not the default.
 
 ## Commands
 

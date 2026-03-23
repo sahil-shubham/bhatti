@@ -4,21 +4,24 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
 	"github.com/sahil-shubham/bhatti/pkg"
@@ -26,23 +29,75 @@ import (
 )
 
 var (
-	apiURL   = envOr("BHATTI_URL", "http://localhost:8080")
-	apiToken = envOr("BHATTI_TOKEN", "")
+	apiURL   = "http://localhost:8080"
+	apiToken = ""
 )
 
+// rootCmd is the top-level cobra command. All subcommands attach here.
+// The serve command is added in main() since it's defined alongside
+// the daemon code in main.go.
+var rootCmd = &cobra.Command{
+	Use:          "bhatti",
+	Short:        "Firecracker microVM orchestrator",
+	SilenceUsage: true,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		loadConfig(cmd)
+	},
+}
+
 func init() {
-	if apiToken == "" {
-		if cfg, err := pkg.LoadConfig(); err == nil && cfg.AuthToken != "" {
-			apiToken = cfg.AuthToken
-		}
+	rootCmd.PersistentFlags().String("url", "", "API endpoint (overrides config)")
+	rootCmd.PersistentFlags().String("token", "", "API key (overrides config)")
+	rootCmd.PersistentFlags().Bool("json", false, "Output as JSON")
+	rootCmd.PersistentFlags().Bool("timing", false, "Show request timing breakdown")
+
+	rootCmd.AddCommand(createCmd)
+	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(destroyCmd)
+	rootCmd.AddCommand(execCmd)
+	rootCmd.AddCommand(shellCmd)
+	rootCmd.AddCommand(psCmd)
+	rootCmd.AddCommand(fileCmd)
+	rootCmd.AddCommand(secretCmd)
+	rootCmd.AddCommand(userCmd)
+	rootCmd.AddCommand(setupCmd)
+	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(completionCmd)
+}
+
+// runCLI is called from main() for any subcommand other than "serve".
+func runCLI() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// loadConfig sets apiURL and apiToken with precedence:
+//
+//	flag → config file → env var → default
+//
+// This means `bhatti setup` writes the config and it just works.
+// Env vars are the fallback for CI/scripts, not the override.
+func loadConfig(cmd *cobra.Command) {
+	cfg, _ := pkg.LoadConfig()
+
+	// URL: flag wins, then config, then env, then default
+	if v, _ := cmd.Flags().GetString("url"); v != "" {
+		apiURL = v
+	} else if cfg != nil && cfg.APIURL != "" {
+		apiURL = cfg.APIURL
+	} else if v := os.Getenv("BHATTI_URL"); v != "" {
+		apiURL = v
 	}
-	return fallback
+
+	// Token: same order
+	if v, _ := cmd.Flags().GetString("token"); v != "" {
+		apiToken = v
+	} else if cfg != nil && cfg.AuthToken != "" {
+		apiToken = cfg.AuthToken
+	} else if v := os.Getenv("BHATTI_TOKEN"); v != "" {
+		apiToken = v
+	}
 }
 
 // --- HTTP helpers ---
@@ -61,7 +116,7 @@ func apiRequest(method, path string, body any) (*http.Response, error) {
 	if apiToken != "" {
 		req.Header.Set("Authorization", "Bearer "+apiToken)
 	}
-	return http.DefaultClient.Do(req)
+	return httpClient().Do(req)
 }
 
 func apiJSON(method, path string, body any, result any) error {
@@ -83,104 +138,156 @@ func apiJSON(method, path string, body any, result any) error {
 	return nil
 }
 
-func fatal(args ...any) {
-	fmt.Fprintln(os.Stderr, args...)
-	os.Exit(1)
+// --- Output helpers ---
+
+func isJSON(cmd *cobra.Command) bool {
+	v, _ := cmd.Flags().GetBool("json")
+	return v
 }
 
-// --- Command router ---
+func outputJSON(v any) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.Encode(v)
+}
 
-func runCLI() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
-	}
-	switch os.Args[1] {
-	case "create":
-		cmdCreate(os.Args[2:])
-	case "list", "ls":
-		cmdList(os.Args[2:])
-	case "destroy", "rm":
-		cmdDestroy(os.Args[2:])
-	case "exec":
-		cmdExec(os.Args[2:])
-	case "shell", "sh":
-		cmdShell(os.Args[2:])
-	case "ps":
-		cmdPS(os.Args[2:])
-	case "file":
-		cmdFile(os.Args[2:])
-	case "secret":
-		cmdSecret(os.Args[2:])
-	case "user":
-		cmdUser(os.Args[2:])
-	case "setup":
-		cmdSetup(os.Args[2:])
-	case "version":
-		fmt.Printf("bhatti %s\n", version)
-		fmt.Printf("api: %s\n", apiURL)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
-		printUsage()
-		os.Exit(1)
+// --- Timing ---
+
+// requestTiming records timestamps from an HTTP request lifecycle.
+// Used by --timing to show where time was spent (dns, connect, tls,
+// server processing, transfer).
+type requestTiming struct {
+	mu           sync.Mutex
+	start        time.Time
+	dnsStart     time.Time
+	dnsDone      time.Time
+	connectStart time.Time
+	connectDone  time.Time
+	tlsStart     time.Time
+	tlsDone      time.Time
+	firstByte    time.Time
+	end          time.Time
+}
+
+func (t *requestTiming) trace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart:              func(_ httptrace.DNSStartInfo) { t.mu.Lock(); t.dnsStart = time.Now(); t.mu.Unlock() },
+		DNSDone:               func(_ httptrace.DNSDoneInfo) { t.mu.Lock(); t.dnsDone = time.Now(); t.mu.Unlock() },
+		ConnectStart:          func(_, _ string) { t.mu.Lock(); t.connectStart = time.Now(); t.mu.Unlock() },
+		ConnectDone:           func(_, _ string, _ error) { t.mu.Lock(); t.connectDone = time.Now(); t.mu.Unlock() },
+		TLSHandshakeStart:    func() { t.mu.Lock(); t.tlsStart = time.Now(); t.mu.Unlock() },
+		TLSHandshakeDone:     func(_ tls.ConnectionState, _ error) { t.mu.Lock(); t.tlsDone = time.Now(); t.mu.Unlock() },
+		GotFirstResponseByte: func() { t.mu.Lock(); t.firstByte = time.Now(); t.mu.Unlock() },
 	}
 }
 
-func printUsage() {
-	fmt.Fprintf(os.Stderr, `Usage: bhatti <command> [args]
-
-Commands:
-  serve                         Start the bhatti daemon
-  create [flags]                Create a new sandbox
-  list                          List sandboxes
-  destroy <id|name>             Destroy a sandbox
-  exec <id|name> -- CMD...      Execute a command
-  shell <id|name>               Open an interactive shell
-  ps <id|name>                  List sessions in a sandbox
-  file read|write|ls <id> PATH  File operations
-  secret set|list|delete        Manage secrets
-  user create|list|delete|rotate-key  Manage users (local)
-  setup                         Configure CLI (endpoint + API key)
-  version                       Print version and API endpoint
-
-Environment:
-  BHATTI_URL     API endpoint (default: http://localhost:8080)
-  BHATTI_TOKEN   Auth token (default: from ~/.bhatti/config.yaml)
-`)
+func (t *requestTiming) finish() {
+	t.mu.Lock()
+	t.end = time.Now()
+	t.mu.Unlock()
 }
 
-// --- create ---
+func (t *requestTiming) print() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-func cmdCreate(args []string) {
-	fs := flag.NewFlagSet("create", flag.ExitOnError)
-	name := fs.String("name", "", "sandbox name")
-	cpus := fs.Float64("cpus", 1, "vCPUs")
-	memory := fs.Int("memory", 512, "memory in MB")
-	env := fs.String("env", "", "env vars (K=V,K=V)")
-	initCmd := fs.String("init", "", "init script")
-	fs.Parse(args)
-
-	envMap := parseEnvFlag(*env)
-
-	req := map[string]any{
-		"name": *name, "cpus": *cpus, "memory_mb": *memory,
+	fmt.Fprintf(os.Stderr, "---\n")
+	if !t.dnsStart.IsZero() && !t.dnsDone.IsZero() {
+		fmt.Fprintf(os.Stderr, "dns:       %s\n", t.dnsDone.Sub(t.dnsStart).Round(time.Millisecond))
 	}
-	if len(envMap) > 0 {
-		req["env"] = envMap
+	if !t.connectStart.IsZero() && !t.connectDone.IsZero() {
+		fmt.Fprintf(os.Stderr, "connect:   %s\n", t.connectDone.Sub(t.connectStart).Round(time.Millisecond))
 	}
-	if *initCmd != "" {
-		req["init"] = *initCmd
+	if !t.tlsStart.IsZero() && !t.tlsDone.IsZero() {
+		fmt.Fprintf(os.Stderr, "tls:       %s\n", t.tlsDone.Sub(t.tlsStart).Round(time.Millisecond))
+	}
+	// server = time from TLS done (or connect done) to first response byte
+	serverStart := t.tlsDone
+	if serverStart.IsZero() {
+		serverStart = t.connectDone
+	}
+	if !serverStart.IsZero() && !t.firstByte.IsZero() {
+		fmt.Fprintf(os.Stderr, "server:    %s\n", t.firstByte.Sub(serverStart).Round(time.Millisecond))
+	}
+	if !t.firstByte.IsZero() && !t.end.IsZero() {
+		fmt.Fprintf(os.Stderr, "transfer:  %s\n", t.end.Sub(t.firstByte).Round(time.Millisecond))
+	}
+	if !t.start.IsZero() && !t.end.IsZero() {
+		fmt.Fprintf(os.Stderr, "total:     %s\n", t.end.Sub(t.start).Round(time.Millisecond))
+	}
+}
+
+type timingTransport struct {
+	inner  http.RoundTripper
+	timing *requestTiming
+}
+
+func (t *timingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.timing.start = time.Now()
+	ctx := httptrace.WithClientTrace(req.Context(), t.timing.trace())
+	req = req.WithContext(ctx)
+	resp, err := t.inner.RoundTrip(req)
+	t.timing.finish()
+	return resp, err
+}
+
+// currentTiming is set per-command when --timing is active.
+var currentTiming *requestTiming
+
+func httpClient() *http.Client {
+	if currentTiming != nil {
+		return &http.Client{
+			Transport: &timingTransport{
+				inner:  http.DefaultTransport,
+				timing: currentTiming,
+			},
+		}
+	}
+	return http.DefaultClient
+}
+
+func setupTiming(cmd *cobra.Command) {
+	if v, _ := cmd.Flags().GetBool("timing"); v {
+		currentTiming = &requestTiming{}
+	} else {
+		currentTiming = nil
+	}
+}
+
+func printTiming() {
+	if currentTiming != nil {
+		currentTiming.print()
+		currentTiming = nil
+	}
+}
+
+// --- Name-to-ID resolution ---
+
+func resolveID(nameOrID string) (string, error) {
+	// Try direct ID lookup first
+	resp, err := apiRequest("GET", "/sandboxes/"+nameOrID, nil)
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		return nameOrID, nil
+	}
+	if resp != nil {
+		resp.Body.Close()
 	}
 
-	var sb struct {
+	// Fall back to name search
+	var sandboxes []struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
-		IP   string `json:"ip"`
 	}
-	if err := apiJSON("POST", "/sandboxes", req, &sb); err != nil {
-		fatal(err)
+	if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
+		return "", fmt.Errorf("cannot list sandboxes: %w", err)
 	}
-	fmt.Printf("%s\t%s\t%s\n", sb.ID, sb.Name, sb.IP)
+	for _, sb := range sandboxes {
+		if sb.Name == nameOrID {
+			return sb.ID, nil
+		}
+	}
+	return "", fmt.Errorf("sandbox %q not found", nameOrID)
 }
 
 func parseEnvFlag(s string) map[string]string {
@@ -197,229 +304,420 @@ func parseEnvFlag(s string) map[string]string {
 	return m
 }
 
+// --- Completions ---
+
+// completeSandboxNames reads sandbox names from a local cache file.
+// The cache is written by `bhatti list` on every successful call.
+// Never hits the network — instant, works offline.
+func completeSandboxNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	path := completionCachePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	return strings.Split(raw, "\n"), cobra.ShellCompDirectiveNoFileComp
+}
+
+func completionCachePath() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("bhatti-completions-%d", os.Getuid()))
+}
+
+// =====================================================================
+// Commands
+// =====================================================================
+
+// --- create ---
+
+var createCmd = &cobra.Command{
+	Use:   "create [flags]",
+	Short: "Create a new sandbox",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		name, _ := cmd.Flags().GetString("name")
+		cpus, _ := cmd.Flags().GetFloat64("cpus")
+		memory, _ := cmd.Flags().GetInt("memory")
+		env, _ := cmd.Flags().GetString("env")
+		initScript, _ := cmd.Flags().GetString("init")
+
+		envMap := parseEnvFlag(env)
+		req := map[string]any{
+			"name": name, "cpus": cpus, "memory_mb": memory,
+		}
+		if len(envMap) > 0 {
+			req["env"] = envMap
+		}
+		if initScript != "" {
+			req["init"] = initScript
+		}
+
+		var sb struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			IP   string `json:"ip"`
+		}
+		if err := apiJSON("POST", "/sandboxes", req, &sb); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(sb)
+		} else {
+			fmt.Printf("%s\t%s\t%s\n", sb.ID, sb.Name, sb.IP)
+		}
+		return nil
+	},
+}
+
+func init() {
+	createCmd.Flags().String("name", "", "Sandbox name")
+	createCmd.Flags().Float64("cpus", 1, "Number of vCPUs")
+	createCmd.Flags().Int("memory", 512, "Memory in MB")
+	createCmd.Flags().String("env", "", "Environment variables (K=V,K=V)")
+	createCmd.Flags().String("init", "", "Init script")
+}
+
 // --- list ---
 
-func cmdList(args []string) {
-	var sandboxes []struct {
-		ID     string `json:"id"`
-		Name   string `json:"name"`
-		Status string `json:"status"`
-		IP     string `json:"ip"`
-	}
-	if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
-		fatal(err)
-	}
-	fmt.Printf("%-20s %-20s %-10s %-16s\n", "ID", "NAME", "STATUS", "IP")
-	for _, sb := range sandboxes {
-		fmt.Printf("%-20s %-20s %-10s %-16s\n", sb.ID, sb.Name, sb.Status, sb.IP)
-	}
+var listCmd = &cobra.Command{
+	Use:     "list",
+	Aliases: []string{"ls"},
+	Short:   "List sandboxes",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		var sandboxes []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			IP     string `json:"ip"`
+		}
+		if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
+			return err
+		}
+
+		// Update completion cache (best-effort, never errors)
+		var names []string
+		for _, sb := range sandboxes {
+			names = append(names, sb.Name)
+		}
+		path := completionCachePath()
+		os.WriteFile(path, []byte(strings.Join(names, "\n")), 0600)
+
+		if isJSON(cmd) {
+			outputJSON(sandboxes)
+		} else {
+			fmt.Printf("%-20s %-20s %-10s %-16s\n", "ID", "NAME", "STATUS", "IP")
+			for _, sb := range sandboxes {
+				fmt.Printf("%-20s %-20s %-10s %-16s\n", sb.ID, sb.Name, sb.Status, sb.IP)
+			}
+		}
+		return nil
+	},
 }
 
 // --- destroy ---
 
-func cmdDestroy(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti destroy <id|name>")
-	}
-	id := resolveID(args[0])
-	if err := apiJSON("DELETE", "/sandboxes/"+id, nil, nil); err != nil {
-		fatal(err)
-	}
-	fmt.Println("destroyed")
+var destroyCmd = &cobra.Command{
+	Use:               "destroy <id|name>",
+	Aliases:           []string{"rm"},
+	Short:             "Destroy a sandbox",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		if err := apiJSON("DELETE", "/sandboxes/"+id, nil, nil); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(map[string]string{"status": "destroyed"})
+		} else {
+			fmt.Println("destroyed")
+		}
+		return nil
+	},
 }
 
 // --- exec ---
 
-func cmdExec(args []string) {
-	var target string
-	var cmd []string
-	for i, a := range args {
-		if a == "--" {
-			target = args[0]
-			cmd = args[i+1:]
-			break
-		}
-	}
-	if target == "" || len(cmd) == 0 {
-		fatal("usage: bhatti exec <id|name> -- CMD...")
-	}
-	id := resolveID(target)
+var execCmd = &cobra.Command{
+	Use:               "exec <id|name> -- CMD...",
+	Short:             "Execute a command in a sandbox",
+	Args:              cobra.MinimumNArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
 
-	var result struct {
-		ExitCode int    `json:"exit_code"`
-		Stdout   string `json:"stdout"`
-		Stderr   string `json:"stderr"`
-	}
-	if err := apiJSON("POST", "/sandboxes/"+id+"/exec", map[string]any{
-		"cmd": cmd,
-	}, &result); err != nil {
-		fatal(err)
-	}
-	os.Stdout.WriteString(result.Stdout)
-	os.Stderr.WriteString(result.Stderr)
-	os.Exit(result.ExitCode)
+		// args[0] is the sandbox name/ID. Everything after "--" ends up
+		// as the remaining args — Cobra strips the separator.
+		target := args[0]
+		cmdArgs := args[1:]
+		if len(cmdArgs) == 0 {
+			return cmd.Help()
+		}
+
+		id, err := resolveID(target)
+		if err != nil {
+			return err
+		}
+
+		timeout, _ := cmd.Flags().GetInt("timeout")
+		reqBody := map[string]any{"cmd": cmdArgs}
+		if timeout > 0 {
+			reqBody["timeout_sec"] = timeout
+		}
+
+		var result struct {
+			ExitCode int    `json:"exit_code"`
+			Stdout   string `json:"stdout"`
+			Stderr   string `json:"stderr"`
+		}
+		if err := apiJSON("POST", "/sandboxes/"+id+"/exec", reqBody, &result); err != nil {
+			return err
+		}
+
+		if isJSON(cmd) {
+			outputJSON(result)
+		} else {
+			os.Stdout.WriteString(result.Stdout)
+			os.Stderr.WriteString(result.Stderr)
+		}
+		os.Exit(result.ExitCode)
+		return nil
+	},
+}
+
+func init() {
+	execCmd.Flags().Int("timeout", 0, "Exec timeout in seconds (default: 300, max: 3600)")
 }
 
 // --- shell ---
 
-func cmdShell(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti shell <id|name>")
-	}
-	id := resolveID(args[0])
-
-	wsURL := strings.Replace(apiURL, "http://", "ws://", 1)
-	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
-	header := http.Header{}
-	if apiToken != "" {
-		header.Set("Authorization", "Bearer "+apiToken)
-	}
-	conn, _, err := websocket.DefaultDialer.Dial(
-		wsURL+"/sandboxes/"+id+"/ws", header)
-	if err != nil {
-		fatal(err)
-	}
-	defer conn.Close()
-
-	// Raw terminal mode
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		fatal(err)
-	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-	// Initial size
-	w, h, _ := term.GetSize(int(os.Stdin.Fd()))
-	conn.WriteJSON(map[string]any{"type": "resize", "rows": h, "cols": w})
-
-	// SIGWINCH → resize
-	sigwinch := make(chan os.Signal, 1)
-	signal.Notify(sigwinch, syscall.SIGWINCH)
-	go func() {
-		for range sigwinch {
-			w, h, _ := term.GetSize(int(os.Stdin.Fd()))
-			conn.WriteJSON(map[string]any{
-				"type": "resize", "rows": h, "cols": w,
-			})
+var shellCmd = &cobra.Command{
+	Use:               "shell <id|name>",
+	Aliases:           []string{"sh"},
+	Short:             "Open an interactive shell",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
 		}
-	}()
 
-	// WebSocket → stdout
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			os.Stdout.Write(msg)
+		wsURL := strings.Replace(apiURL, "http://", "ws://", 1)
+		wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
+		header := http.Header{}
+		if apiToken != "" {
+			header.Set("Authorization", "Bearer "+apiToken)
 		}
-	}()
+		conn, _, err := websocket.DefaultDialer.Dial(
+			wsURL+"/sandboxes/"+id+"/ws", header)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
 
-	// stdin → WebSocket (Ctrl+\ = detach)
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil {
-				conn.Close()
-				return
+		// Raw terminal mode
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return err
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+		// Initial size
+		w, h, _ := term.GetSize(int(os.Stdin.Fd()))
+		conn.WriteJSON(map[string]any{"type": "resize", "rows": h, "cols": w})
+
+		// SIGWINCH → resize
+		sigwinch := make(chan os.Signal, 1)
+		signal.Notify(sigwinch, syscall.SIGWINCH)
+		go func() {
+			for range sigwinch {
+				w, h, _ := term.GetSize(int(os.Stdin.Fd()))
+				conn.WriteJSON(map[string]any{
+					"type": "resize", "rows": h, "cols": w,
+				})
 			}
-			for i := 0; i < n; i++ {
-				if buf[i] == 0x1c { // Ctrl+backslash
-					term.Restore(int(os.Stdin.Fd()), oldState)
-					fmt.Fprintf(os.Stderr, "\r\ndetached\r\n")
+		}()
+
+		// WebSocket → stdout
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				os.Stdout.Write(msg)
+			}
+		}()
+
+		// stdin → WebSocket (Ctrl+\ = detach)
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if err != nil {
 					conn.Close()
 					return
 				}
+				for i := 0; i < n; i++ {
+					if buf[i] == 0x1c { // Ctrl+backslash
+						term.Restore(int(os.Stdin.Fd()), oldState)
+						fmt.Fprintf(os.Stderr, "\r\ndetached\r\n")
+						conn.Close()
+						return
+					}
+				}
+				conn.WriteMessage(websocket.BinaryMessage, buf[:n])
 			}
-			conn.WriteMessage(websocket.BinaryMessage, buf[:n])
-		}
-	}()
+		}()
 
-	<-done
+		<-done
+		return nil
+	},
 }
 
 // --- ps ---
 
-func cmdPS(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti ps <id|name>")
-	}
-	id := resolveID(args[0])
+var psCmd = &cobra.Command{
+	Use:               "ps <id|name>",
+	Short:             "List sessions in a sandbox",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
 
-	var sessions []struct {
-		SessionID string `json:"session_id"`
-		Argv      string `json:"argv"`
-		Running   bool   `json:"running"`
-		Attached  bool   `json:"attached"`
-	}
-	if err := apiJSON("GET", "/sandboxes/"+id+"/sessions", nil, &sessions); err != nil {
-		fatal(err)
-	}
-	fmt.Printf("%-10s %-40s %-8s %-8s\n", "ID", "COMMAND", "RUNNING", "ATTACHED")
-	for _, s := range sessions {
-		fmt.Printf("%-10s %-40s %-8v %-8v\n",
-			s.SessionID, s.Argv, s.Running, s.Attached)
-	}
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+
+		var sessions []struct {
+			SessionID string `json:"session_id"`
+			Argv      string `json:"argv"`
+			Running   bool   `json:"running"`
+			Attached  bool   `json:"attached"`
+		}
+		if err := apiJSON("GET", "/sandboxes/"+id+"/sessions", nil, &sessions); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(sessions)
+		} else {
+			fmt.Printf("%-10s %-40s %-8s %-8s\n", "ID", "COMMAND", "RUNNING", "ATTACHED")
+			for _, s := range sessions {
+				fmt.Printf("%-10s %-40s %-8v %-8v\n",
+					s.SessionID, s.Argv, s.Running, s.Attached)
+			}
+		}
+		return nil
+	},
 }
 
 // --- file ---
 
-func cmdFile(args []string) {
-	if len(args) < 1 {
-		fatal("usage: bhatti file read|write|ls <id> <path>")
-	}
-	switch args[0] {
-	case "read":
-		if len(args) < 3 {
-			fatal("usage: bhatti file read <id> <path>")
-		}
-		id := resolveID(args[1])
-		resp, err := apiRequest("GET",
-			"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[2]), nil)
+var fileCmd = &cobra.Command{
+	Use:   "file <read|write|ls> <id|name> <path>",
+	Short: "File operations",
+}
+
+var fileReadCmd = &cobra.Command{
+	Use:               "read <id|name> <path>",
+	Short:             "Read a file from a sandbox",
+	Args:              cobra.ExactArgs(2),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		id, err := resolveID(args[0])
 		if err != nil {
-			fatal(err)
+			return err
+		}
+		resp, err := apiRequest("GET",
+			"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[1]), nil)
+		if err != nil {
+			return err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(resp.Body)
-			fatal(string(body))
+			return fmt.Errorf("%s", body)
 		}
 		io.Copy(os.Stdout, resp.Body)
+		return nil
+	},
+}
 
-	case "write":
-		if len(args) < 3 {
-			fatal("usage: bhatti file write <id> <path> < file")
+var fileWriteCmd = &cobra.Command{
+	Use:               "write <id|name> <path>",
+	Short:             "Write a file to a sandbox (reads from stdin)",
+	Args:              cobra.ExactArgs(2),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
 		}
-		id := resolveID(args[1])
 		// Read all stdin to get Content-Length
 		data, _ := io.ReadAll(os.Stdin)
 		req, _ := http.NewRequest("PUT",
-			apiURL+"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[2]),
+			apiURL+"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[1]),
 			bytes.NewReader(data))
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.ContentLength = int64(len(data))
 		if apiToken != "" {
 			req.Header.Set("Authorization", "Bearer "+apiToken)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient().Do(req)
 		if err != nil {
-			fatal(err)
+			return err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(resp.Body)
-			fatal(string(body))
+			return fmt.Errorf("%s", body)
 		}
 		fmt.Println("ok")
+		return nil
+	},
+}
 
-	case "ls":
-		if len(args) < 3 {
-			fatal("usage: bhatti file ls <id> <path>")
+var fileLSCmd = &cobra.Command{
+	Use:               "ls <id|name> <path>",
+	Short:             "List files in a sandbox directory",
+	Args:              cobra.ExactArgs(2),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
 		}
-		id := resolveID(args[1])
 		var files []struct {
 			Name  string `json:"name"`
 			Size  int64  `json:"size"`
@@ -427,223 +725,270 @@ func cmdFile(args []string) {
 			Mode  string `json:"mode"`
 		}
 		if err := apiJSON("GET",
-			"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[2])+"&ls=true",
+			"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[1])+"&ls=true",
 			nil, &files); err != nil {
-			fatal(err)
+			return err
 		}
-		for _, f := range files {
-			dirFlag := "-"
-			if f.IsDir {
-				dirFlag = "d"
+		if isJSON(cmd) {
+			outputJSON(files)
+		} else {
+			for _, f := range files {
+				dirFlag := "-"
+				if f.IsDir {
+					dirFlag = "d"
+				}
+				fmt.Printf("%s%s %8d %s\n", dirFlag, f.Mode, f.Size, f.Name)
 			}
-			fmt.Printf("%s%s %8d %s\n", dirFlag, f.Mode, f.Size, f.Name)
 		}
+		return nil
+	},
+}
 
-	default:
-		fatal("usage: bhatti file read|write|ls <id> <path>")
-	}
+func init() {
+	fileCmd.AddCommand(fileReadCmd)
+	fileCmd.AddCommand(fileWriteCmd)
+	fileCmd.AddCommand(fileLSCmd)
 }
 
 // --- secret ---
 
-func cmdSecret(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti secret set|list|delete")
-	}
-	switch args[0] {
-	case "set":
-		if len(args) < 3 {
-			fatal("usage: bhatti secret set NAME VALUE")
-		}
+var secretCmd = &cobra.Command{
+	Use:   "secret <set|list|delete>",
+	Short: "Manage secrets",
+}
+
+var secretSetCmd = &cobra.Command{
+	Use:   "set <name> <value>",
+	Short: "Create or update a secret",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
 		if err := apiJSON("POST", "/secrets", map[string]any{
-			"name": args[1], "value": args[2],
+			"name": args[0], "value": args[1],
 		}, nil); err != nil {
-			fatal(err)
+			return err
 		}
 		fmt.Println("ok")
-	case "list":
+		return nil
+	},
+}
+
+var secretListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List secrets",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
 		var secrets []struct {
 			Name string `json:"name"`
 		}
 		if err := apiJSON("GET", "/secrets", nil, &secrets); err != nil {
-			fatal(err)
+			return err
 		}
-		for _, s := range secrets {
-			fmt.Println(s.Name)
+		if isJSON(cmd) {
+			outputJSON(secrets)
+		} else {
+			for _, s := range secrets {
+				fmt.Println(s.Name)
+			}
 		}
-	case "delete":
-		if len(args) < 2 {
-			fatal("usage: bhatti secret delete NAME")
-		}
-		if err := apiJSON("DELETE", "/secrets/"+args[1], nil, nil); err != nil {
-			fatal(err)
+		return nil
+	},
+}
+
+var secretDeleteCmd = &cobra.Command{
+	Use:   "delete <name>",
+	Short: "Delete a secret",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		if err := apiJSON("DELETE", "/secrets/"+args[0], nil, nil); err != nil {
+			return err
 		}
 		fmt.Println("deleted")
-	default:
-		fatal("usage: bhatti secret set|list|delete")
-	}
+		return nil
+	},
+}
+
+func init() {
+	secretCmd.AddCommand(secretSetCmd)
+	secretCmd.AddCommand(secretListCmd)
+	secretCmd.AddCommand(secretDeleteCmd)
 }
 
 // --- user (local commands — operate on SQLite directly) ---
 
-func cmdUser(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti user create|list|delete|rotate-key")
-	}
-	switch args[0] {
-	case "create":
-		cmdUserCreate(args[1:])
-	case "list":
-		cmdUserList()
-	case "delete":
-		cmdUserDelete(args[1:])
-	case "rotate-key":
-		cmdUserRotateKey(args[1:])
-	default:
-		fatal("usage: bhatti user create|list|delete|rotate-key")
-	}
+var userCmd = &cobra.Command{
+	Use:   "user <create|list|delete|rotate-key>",
+	Short: "Manage users (local, requires DB access)",
 }
 
-func cmdUserCreate(args []string) {
-	fs := flag.NewFlagSet("user create", flag.ExitOnError)
-	name := fs.String("name", "", "user name (required)")
-	maxSandboxes := fs.Int("max-sandboxes", 5, "max sandboxes for this user")
-	maxCPUs := fs.Int("max-cpus", 4, "max CPUs per sandbox")
-	maxMemory := fs.Int("max-memory", 4096, "max memory MB per sandbox")
-	fs.Parse(args)
+var userCreateCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create a new user",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		name, _ := cmd.Flags().GetString("name")
+		maxSandboxes, _ := cmd.Flags().GetInt("max-sandboxes")
+		maxCPUs, _ := cmd.Flags().GetInt("max-cpus")
+		maxMemory, _ := cmd.Flags().GetInt("max-memory")
 
-	if *name == "" {
-		fatal("usage: bhatti user create --name NAME [--max-sandboxes N]")
-	}
-
-	st := openLocalStore()
-	defer st.Close()
-
-	// Generate API key
-	apiKey := generateAPIKey()
-	keyHash := sha256HexCLI(apiKey)
-
-	// Allocate subnet index
-	subnetIdx, err := st.NextSubnetIndex()
-	if err != nil {
-		fatal("subnet index:", err)
-	}
-
-	// Generate user ID
-	idBytes := make([]byte, 4)
-	rand.Read(idBytes)
-	userID := "usr_" + hex.EncodeToString(idBytes)
-
-	u := store.User{
-		ID:                    userID,
-		Name:                  *name,
-		APIKeyHash:            keyHash,
-		MaxSandboxes:          *maxSandboxes,
-		MaxCPUsPerSandbox:     *maxCPUs,
-		MaxMemoryMBPerSandbox: *maxMemory,
-		SubnetIndex:           subnetIdx,
-		CreatedAt:             time.Now(),
-	}
-
-	if err := st.CreateUser(u); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			fatal(fmt.Sprintf("user %q already exists", *name))
+		if name == "" {
+			return fmt.Errorf("--name is required")
 		}
-		fatal("create user:", err)
-	}
 
-	fmt.Printf("User created:\n")
-	fmt.Printf("  ID:       %s\n", u.ID)
-	fmt.Printf("  Name:     %s\n", u.Name)
-	fmt.Printf("  Subnet:   %d\n", u.SubnetIndex)
-	fmt.Printf("  API key:  %s\n", apiKey)
-	fmt.Println()
-	fmt.Println("This key will not be shown again. Save it now.")
-	fmt.Printf("\nQuick start:\n")
-	fmt.Printf("  export BHATTI_URL=%s\n", apiURL)
-	fmt.Printf("  export BHATTI_TOKEN=%s\n", apiKey)
-	fmt.Printf("  bhatti create --name my-sandbox\n")
-}
+		st := openLocalStore()
+		defer st.Close()
 
-func cmdUserList() {
-	st := openLocalStore()
-	defer st.Close()
+		apiKey := generateAPIKey()
+		keyHash := sha256HexCLI(apiKey)
 
-	users, err := st.ListUsers()
-	if err != nil {
-		fatal("list users:", err)
-	}
-
-	fmt.Printf("%-12s %-20s %-8s %-6s %-6s %-8s\n",
-		"ID", "NAME", "SANDBOXES", "CPUS", "MEM", "SUBNET")
-	for _, u := range users {
-		count, _ := st.CountUserSandboxes(u.ID)
-		fmt.Printf("%-12s %-20s %d/%-6d %-6d %-6d %-8d\n",
-			u.ID, u.Name, count, u.MaxSandboxes,
-			u.MaxCPUsPerSandbox, u.MaxMemoryMBPerSandbox, u.SubnetIndex)
-	}
-}
-
-func cmdUserDelete(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti user delete <name>")
-	}
-
-	st := openLocalStore()
-	defer st.Close()
-
-	// Find user by name
-	users, _ := st.ListUsers()
-	var userID string
-	for _, u := range users {
-		if u.Name == args[0] {
-			userID = u.ID
-			break
+		subnetIdx, err := st.NextSubnetIndex()
+		if err != nil {
+			return fmt.Errorf("subnet index: %w", err)
 		}
-	}
-	if userID == "" {
-		fatal(fmt.Sprintf("user %q not found", args[0]))
-	}
 
-	if err := st.DeleteUser(userID); err != nil {
-		fatal(err)
-	}
-	fmt.Printf("deleted user %q\n", args[0])
+		idBytes := make([]byte, 4)
+		rand.Read(idBytes)
+		userID := "usr_" + hex.EncodeToString(idBytes)
+
+		u := store.User{
+			ID:                    userID,
+			Name:                  name,
+			APIKeyHash:            keyHash,
+			MaxSandboxes:          maxSandboxes,
+			MaxCPUsPerSandbox:     maxCPUs,
+			MaxMemoryMBPerSandbox: maxMemory,
+			SubnetIndex:           subnetIdx,
+			CreatedAt:             time.Now(),
+		}
+
+		if err := st.CreateUser(u); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") {
+				return fmt.Errorf("user %q already exists", name)
+			}
+			return fmt.Errorf("create user: %w", err)
+		}
+
+		fmt.Printf("User created:\n")
+		fmt.Printf("  ID:       %s\n", u.ID)
+		fmt.Printf("  Name:     %s\n", u.Name)
+		fmt.Printf("  Subnet:   %d\n", u.SubnetIndex)
+		fmt.Printf("  API key:  %s\n", apiKey)
+		fmt.Println()
+		fmt.Println("This key will not be shown again. Save it now.")
+		fmt.Printf("\nQuick start:\n")
+		fmt.Printf("  export BHATTI_URL=%s\n", apiURL)
+		fmt.Printf("  export BHATTI_TOKEN=%s\n", apiKey)
+		fmt.Printf("  bhatti create --name my-sandbox\n")
+		return nil
+	},
 }
 
-func cmdUserRotateKey(args []string) {
-	if len(args) == 0 {
-		fatal("usage: bhatti user rotate-key <name>")
-	}
+var userListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List users",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		st := openLocalStore()
+		defer st.Close()
 
-	st := openLocalStore()
-	defer st.Close()
-
-	// Find user by name
-	users, _ := st.ListUsers()
-	var userID string
-	for _, u := range users {
-		if u.Name == args[0] {
-			userID = u.ID
-			break
+		users, err := st.ListUsers()
+		if err != nil {
+			return fmt.Errorf("list users: %w", err)
 		}
-	}
-	if userID == "" {
-		fatal(fmt.Sprintf("user %q not found", args[0]))
-	}
+		if isJSON(cmd) {
+			outputJSON(users)
+		} else {
+			fmt.Printf("%-12s %-20s %-8s %-6s %-6s %-8s\n",
+				"ID", "NAME", "SANDBOXES", "CPUS", "MEM", "SUBNET")
+			for _, u := range users {
+				count, _ := st.CountUserSandboxes(u.ID)
+				fmt.Printf("%-12s %-20s %d/%-6d %-6d %-6d %-8d\n",
+					u.ID, u.Name, count, u.MaxSandboxes,
+					u.MaxCPUsPerSandbox, u.MaxMemoryMBPerSandbox, u.SubnetIndex)
+			}
+		}
+		return nil
+	},
+}
 
-	newKey := generateAPIKey()
-	newHash := sha256HexCLI(newKey)
+var userDeleteCmd = &cobra.Command{
+	Use:   "delete <name>",
+	Short: "Delete a user",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		st := openLocalStore()
+		defer st.Close()
 
-	if err := st.RotateUserKey(userID, newHash); err != nil {
-		fatal(err)
-	}
+		users, _ := st.ListUsers()
+		var userID string
+		for _, u := range users {
+			if u.Name == args[0] {
+				userID = u.ID
+				break
+			}
+		}
+		if userID == "" {
+			return fmt.Errorf("user %q not found", args[0])
+		}
+		if err := st.DeleteUser(userID); err != nil {
+			return err
+		}
+		fmt.Printf("deleted user %q\n", args[0])
+		return nil
+	},
+}
 
-	fmt.Printf("API key rotated for %q\n", args[0])
-	fmt.Printf("  New key: %s\n", newKey)
-	fmt.Println()
-	fmt.Println("The old key is immediately invalidated.")
-	fmt.Println("This key will not be shown again. Save it now.")
+var userRotateKeyCmd = &cobra.Command{
+	Use:   "rotate-key <name>",
+	Short: "Rotate a user's API key",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		st := openLocalStore()
+		defer st.Close()
+
+		users, _ := st.ListUsers()
+		var userID string
+		for _, u := range users {
+			if u.Name == args[0] {
+				userID = u.ID
+				break
+			}
+		}
+		if userID == "" {
+			return fmt.Errorf("user %q not found", args[0])
+		}
+
+		newKey := generateAPIKey()
+		newHash := sha256HexCLI(newKey)
+
+		if err := st.RotateUserKey(userID, newHash); err != nil {
+			return err
+		}
+
+		fmt.Printf("API key rotated for %q\n", args[0])
+		fmt.Printf("  New key: %s\n", newKey)
+		fmt.Println()
+		fmt.Println("The old key is immediately invalidated.")
+		fmt.Println("This key will not be shown again. Save it now.")
+		return nil
+	},
+}
+
+func init() {
+	userCreateCmd.Flags().String("name", "", "User name (required)")
+	userCreateCmd.Flags().Int("max-sandboxes", 5, "Max sandboxes for this user")
+	userCreateCmd.Flags().Int("max-cpus", 4, "Max CPUs per sandbox")
+	userCreateCmd.Flags().Int("max-memory", 4096, "Max memory MB per sandbox")
+
+	userCmd.AddCommand(userCreateCmd)
+	userCmd.AddCommand(userListCmd)
+	userCmd.AddCommand(userDeleteCmd)
+	userCmd.AddCommand(userRotateKeyCmd)
 }
 
 // openLocalStore opens the SQLite store from the local config.
@@ -651,11 +996,13 @@ func cmdUserRotateKey(args []string) {
 func openLocalStore() *store.Store {
 	cfg, err := pkg.LoadConfig()
 	if err != nil {
-		fatal("load config:", err)
+		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		os.Exit(1)
 	}
 	st, err := store.New(filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
-		fatal("open store:", err)
+		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		os.Exit(1)
 	}
 	return st
 }
@@ -673,85 +1020,97 @@ func sha256HexCLI(s string) string {
 
 // --- setup ---
 
-func cmdSetup(args []string) {
-	// Interactive configuration
-	fmt.Printf("API endpoint [%s]: ", apiURL)
-	var endpoint string
-	fmt.Scanln(&endpoint)
-	if endpoint == "" {
-		endpoint = apiURL
-	}
+var setupCmd = &cobra.Command{
+	Use:   "setup",
+	Short: "Configure CLI (endpoint + API key)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Printf("API endpoint [%s]: ", apiURL)
+		var endpoint string
+		fmt.Scanln(&endpoint)
+		if endpoint == "" {
+			endpoint = apiURL
+		}
 
-	fmt.Print("API key: ")
-	keyBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
-	if err != nil {
-		fatal("read key:", err)
-	}
-	key := strings.TrimSpace(string(keyBytes))
-	if key == "" {
-		fatal("API key is required")
-	}
+		fmt.Print("API key: ")
+		keyBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return fmt.Errorf("read key: %w", err)
+		}
+		key := strings.TrimSpace(string(keyBytes))
+		if key == "" {
+			return fmt.Errorf("API key is required")
+		}
 
-	// Write config
-	cfgDir := pkg.DefaultDataDir()
-	os.MkdirAll(cfgDir, 0700)
-	cfgPath := filepath.Join(cfgDir, "config.yaml")
+		// Write config
+		cfgDir := pkg.DefaultDataDir()
+		os.MkdirAll(cfgDir, 0700)
+		cfgPath := filepath.Join(cfgDir, "config.yaml")
 
-	cfgContent := fmt.Sprintf("listen: %s\nauth_token: %s\n",
-		strings.TrimPrefix(endpoint, "http://"),
-		key)
+		var cfgContent string
+		if strings.HasPrefix(endpoint, "https://") || strings.HasPrefix(endpoint, "http://") {
+			// Remote endpoint — save URL and token
+			cfgContent = fmt.Sprintf("api_url: %s\nauth_token: %s\n", endpoint, key)
+		} else {
+			// Local — save listen address and token
+			cfgContent = fmt.Sprintf("listen: %s\nauth_token: %s\n", endpoint, key)
+		}
 
-	// For remote endpoints, store the URL as-is
-	if strings.HasPrefix(endpoint, "https://") || strings.HasPrefix(endpoint, "http://") {
-		cfgContent = fmt.Sprintf("auth_token: %s\n", key)
-	}
+		if err := os.WriteFile(cfgPath, []byte(cfgContent), 0600); err != nil {
+			return fmt.Errorf("write config: %w", err)
+		}
+		fmt.Printf("Saved to %s\n", cfgPath)
 
-	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0600); err != nil {
-		fatal("write config:", err)
-	}
-	fmt.Printf("Saved to %s\n", cfgPath)
-
-	// Test connection
-	fmt.Print("Testing connection... ")
-	apiURL = endpoint
-	apiToken = key
-	var health map[string]any
-	if err := apiJSON("GET", "/health", nil, &health); err != nil {
-		fmt.Printf("✗ %v\n", err)
-		return
-	}
-	fmt.Printf("✓ connected (sandboxes: %v, uptime: %v)\n",
-		health["sandboxes"], health["uptime"])
+		// Test connection
+		fmt.Print("Testing connection... ")
+		apiURL = endpoint
+		apiToken = key
+		var health map[string]any
+		if err := apiJSON("GET", "/health", nil, &health); err != nil {
+			fmt.Printf("✗ %v\n", err)
+			return nil
+		}
+		fmt.Printf("✓ connected (sandboxes: %v, uptime: %v)\n",
+			health["sandboxes"], health["uptime"])
+		return nil
+	},
 }
 
-// --- Name-to-ID resolution ---
+// --- version ---
 
-func resolveID(nameOrID string) string {
-	// Try direct ID lookup first
-	resp, err := apiRequest("GET", "/sandboxes/"+nameOrID, nil)
-	if err == nil && resp.StatusCode == 200 {
-		resp.Body.Close()
-		return nameOrID
-	}
-	if resp != nil {
-		resp.Body.Close()
-	}
-
-	// Fall back to name search
-	var sandboxes []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
-		fatal("cannot list sandboxes:", err)
-	}
-	for _, sb := range sandboxes {
-		if sb.Name == nameOrID {
-			return sb.ID
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print version and API endpoint",
+	Run: func(cmd *cobra.Command, args []string) {
+		if isJSON(cmd) {
+			outputJSON(map[string]string{
+				"version": version,
+				"api":     apiURL,
+			})
+		} else {
+			fmt.Printf("bhatti %s\n", version)
+			fmt.Printf("api: %s\n", apiURL)
 		}
-	}
-	fmt.Fprintf(os.Stderr, "sandbox %q not found\n", nameOrID)
-	os.Exit(1)
-	return ""
+	},
+}
+
+// --- completion ---
+
+var completionCmd = &cobra.Command{
+	Use:       "completion <bash|zsh|fish>",
+	Short:     "Generate shell completion script",
+	Args:      cobra.ExactArgs(1),
+	ValidArgs: []string{"bash", "zsh", "fish"},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		switch args[0] {
+		case "bash":
+			return rootCmd.GenBashCompletion(os.Stdout)
+		case "zsh":
+			return rootCmd.GenZshCompletion(os.Stdout)
+		case "fish":
+			return rootCmd.GenFishCompletion(os.Stdout, true)
+		default:
+			return cmd.Help()
+		}
+	},
 }

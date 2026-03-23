@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/server"
@@ -22,12 +24,17 @@ import (
 var version = "dev"
 
 func main() {
-	// CLI mode: any subcommand other than "serve" (or no args)
-	if len(os.Args) > 1 && os.Args[1] != "serve" {
-		runCLI()
-		return
-	}
-	runDaemon()
+	// Register the serve command here (not in cli.go) because it imports
+	// the engine packages which have Linux build tags.
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "serve",
+		Short: "Start the bhatti daemon",
+		Run: func(cmd *cobra.Command, args []string) {
+			runDaemon()
+		},
+	})
+
+	runCLI()
 }
 
 func runDaemon() {

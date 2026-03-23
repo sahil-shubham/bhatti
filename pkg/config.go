@@ -16,6 +16,7 @@ import (
 type Config struct {
 	Engine    string `yaml:"engine"`     // "firecracker" (default)
 	Listen    string `yaml:"listen"`     // e.g. ":8080"
+	APIURL    string `yaml:"api_url"`    // CLI: remote API endpoint (e.g. https://api.bhatti.sh)
 	AuthToken string `yaml:"auth_token"` // CLI: API key for remote requests
 	DataDir   string `yaml:"data_dir"`   // defaults to ~/.bhatti
 
