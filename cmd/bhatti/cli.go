@@ -223,7 +223,21 @@ type timingTransport struct {
 }
 
 func (t *timingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Reset timestamps so only the last request's timings are reported.
+	// For commands that call resolveID first, we want the timing
+	// of the actual operation (exec/create), not the name-lookup preamble.
+	t.timing.mu.Lock()
+	t.timing.dnsStart = time.Time{}
+	t.timing.dnsDone = time.Time{}
+	t.timing.connectStart = time.Time{}
+	t.timing.connectDone = time.Time{}
+	t.timing.tlsStart = time.Time{}
+	t.timing.tlsDone = time.Time{}
+	t.timing.firstByte = time.Time{}
+	t.timing.end = time.Time{}
 	t.timing.start = time.Now()
+	t.timing.mu.Unlock()
+
 	ctx := httptrace.WithClientTrace(req.Context(), t.timing.trace())
 	req = req.WithContext(ctx)
 	resp, err := t.inner.RoundTrip(req)
@@ -497,6 +511,8 @@ var execCmd = &cobra.Command{
 			os.Stdout.WriteString(result.Stdout)
 			os.Stderr.WriteString(result.Stderr)
 		}
+		// Print timing before os.Exit (defer won't run)
+		printTiming()
 		os.Exit(result.ExitCode)
 		return nil
 	},
