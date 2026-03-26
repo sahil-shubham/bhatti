@@ -176,6 +176,41 @@ func TestHealthNoAuth(t *testing.T) {
 	}
 }
 
+// TestSetupMustUseAuthenticatedEndpoint verifies that /sandboxes (the
+// endpoint setup should use for validation) actually rejects bad keys,
+// while /health does not. This is a regression test for the bug where
+// `bhatti setup` reported "✓ connected" with an invalid API key.
+func TestSetupMustUseAuthenticatedEndpoint(t *testing.T) {
+	_, ts := setup(t)
+
+	// /health succeeds with a bad token (unauthenticated)
+	req, _ := http.NewRequest("GET", ts.URL+"/health", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/health should return 200 even with bad token, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// /sandboxes rejects the same bad token (authenticated)
+	req, _ = http.NewRequest("GET", ts.URL+"/sandboxes", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 401 {
+		t.Fatalf("/sandboxes should return 401 with bad token, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// /sandboxes succeeds with the correct token
+	req, _ = http.NewRequest("GET", ts.URL+"/sandboxes", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("/sandboxes should return 200 with valid token, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 // --- Templates ---
 
 func TestTemplateCRUD(t *testing.T) {

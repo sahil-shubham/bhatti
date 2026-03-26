@@ -48,6 +48,7 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.PersistentFlags().String("url", "", "API endpoint (overrides config)")
 	rootCmd.PersistentFlags().String("token", "", "API key (overrides config)")
+	rootCmd.PersistentFlags().String("data-dir", "", "Data directory containing state.db (for user commands)")
 	rootCmd.PersistentFlags().Bool("json", false, "Output as JSON")
 	rootCmd.PersistentFlags().Bool("timing", false, "Show request timing breakdown")
 
@@ -1063,17 +1064,46 @@ func init() {
 	userCmd.AddCommand(userRotateKeyCmd)
 }
 
-// openLocalStore opens the SQLite store from the local config.
-// Used by user commands which operate directly on the DB.
+// openLocalStore opens the SQLite store for user admin commands.
+//
+// Resolution order for data_dir:
+//  1. --data-dir flag (explicit)
+//  2. config file's data_dir field (from LoadConfig — if it was set)
+//  3. /var/lib/bhatti if config.yaml exists there (standard server path)
+//  4. ~/.bhatti (default)
+//
+// Step 3 prevents the split-brain bug where `bhatti user rotate-key`
+// run from ~ opens ~/.bhatti/state.db while the daemon uses
+// /var/lib/bhatti/state.db (because ~/.bhatti/config.yaml has no
+// data_dir field and LoadConfig defaults to ~/.bhatti).
 func openLocalStore() *store.Store {
-	cfg, err := pkg.LoadConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-		os.Exit(1)
+	// Check --data-dir flag first
+	dataDir, _ := rootCmd.PersistentFlags().GetString("data-dir")
+
+	if dataDir == "" {
+		cfg, err := pkg.LoadConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		dataDir = cfg.DataDir
+
+		// If LoadConfig didn't find an explicit data_dir (fell back to
+		// ~/.bhatti), check the standard server location. This handles
+		// both `bhatti user rotate-key` (state.db exists) and fresh
+		// installs (config.yaml exists but state.db doesn't yet).
+		if dataDir == pkg.DefaultDataDir() {
+			const serverDataDir = "/var/lib/bhatti"
+			if _, err := os.Stat(filepath.Join(serverDataDir, "config.yaml")); err == nil {
+				dataDir = serverDataDir
+			}
+		}
 	}
-	st, err := store.New(filepath.Join(cfg.DataDir, "state.db"))
+
+	dbPath := filepath.Join(dataDir, "state.db")
+	st, err := store.New(dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		fmt.Fprintf(os.Stderr, "open store %s: %v\n", dbPath, err)
 		os.Exit(1)
 	}
 	return st
@@ -1133,17 +1163,19 @@ var setupCmd = &cobra.Command{
 		}
 		fmt.Printf("Saved to %s\n", cfgPath)
 
-		// Test connection
+		// Test connection using an authenticated endpoint.
+		// /health is unauthenticated — it only proves the server is
+		// reachable, not that the API key is valid. Use /sandboxes
+		// (GET) which requires auth, so we catch bad keys immediately.
 		fmt.Print("Testing connection... ")
 		apiURL = endpoint
 		apiToken = key
-		var health map[string]any
-		if err := apiJSON("GET", "/health", nil, &health); err != nil {
+		var sandboxes []any
+		if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
 			fmt.Printf("✗ %v\n", err)
 			return nil
 		}
-		fmt.Printf("✓ connected (sandboxes: %v, uptime: %v)\n",
-			health["sandboxes"], health["uptime"])
+		fmt.Printf("✓ authenticated (%d sandboxes)\n", len(sandboxes))
 		return nil
 	},
 }
