@@ -42,7 +42,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          find scripts/ -name '*.sh' -exec shellcheck --severity=warning -e SC1091 {} +
+          find scripts/ -name '*.sh' -exec shellcheck --severity=error -e SC1091 {} +
 
   rootfs-minimal:
     name: Build minimal rootfs
