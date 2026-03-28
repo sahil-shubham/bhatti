@@ -9,6 +9,8 @@ on:
 jobs:
   test:
     name: Test
+    # Self-hosted: only run on push or same-repo PRs (never fork PRs)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: arc-runner-set
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +36,7 @@ jobs:
 
   shellcheck:
     name: Shellcheck
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: arc-runner-set
     steps:
       - uses: actions/checkout@v4
