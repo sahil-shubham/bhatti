@@ -94,4 +94,4 @@ Pause/Resume (vCPU only):      ~400µs
 
 ## License
 
-[AGPL-3.0](../LICENSE). Commercial licensing available for organizations that need it — [get in touch](mailto:hello@sahil-shubham.in).
+[Apache 2.0](../LICENSE).
