@@ -26,6 +26,19 @@ WireGuard, TUN/TAP, and FUSE are all broken inside guests.
 
 ---
 
+## Target Machines
+
+| Machine | Arch | Role |
+|---------|------|------|
+| agni-01 | x86_64 / amd64 | Primary dev + test server. All Phase 1-2 work happens here. |
+| Raspberry Pis | aarch64 / arm64 | Secondary. arm64 builds run in CI or cross-compile from agni-01. |
+
+Architecture naming conventions used throughout this plan:
+- **Kernel / Firecracker:** `x86_64`, `aarch64`
+- **Debian / Ubuntu / Go:** `amd64`, `arm64`
+
+---
+
 ## Design Principle: Rootfs = Application Profile
 
 Bhatti is programmable Linux. The rootfs defines what kind of Linux.
@@ -41,6 +54,25 @@ There is no "default" tier with dev tools pre-installed. Users who want
 zsh/git/node/claude-code boot from `minimal`, install what they want,
 then `bhatti image save` to snapshot their custom environment. This is
 the primary workflow — ship minimal, users build their own.
+
+### Why not Playwright inside Docker?
+
+The browser tier runs Chromium directly in the VM, not inside a Docker
+container. This is deliberate:
+
+1. **Snapshot semantics.** Firecracker snapshots capture VM process memory.
+   Standalone Chromium is one process — clean snapshot/resume. Chromium
+   inside Docker means snapshotting dockerd + containerd + shim + chromium.
+   Docker's internal state machines (health checks, restart policies,
+   event streams) may not tolerate the time jump on resume.
+
+2. **No kernel dependency.** Browser tier needs only `/dev/shm` for
+   Chromium shared memory. No iptables, no bridge networking, no overlay
+   filesystem. It works with the stock Firecracker CI kernel — shipping
+   before the custom kernel is built.
+
+3. **Lighter and faster.** ~600MB vs ~800MB+. No dockerd startup (2-3s),
+   no container image pull. Chromium launches directly, CDP ready in <1s.
 
 ### Why no default tier
 
@@ -61,79 +93,87 @@ someone else's preferences.
 
 ### 1.1 Why
 
-The stock Firecracker CI kernel (v1.6 era) is missing:
-
-| Missing | Blocks |
-|---------|--------|
-| `NETFILTER` (entire subsystem) | Docker networking, iptables inside VMs |
-| `TUN` | VPNs (Tailscale, WireGuard-go, cloudflared) |
-| `FUSE_FS` | sshfs, rclone mount, s3fs, AppImage |
-| `WIREGUARD` | Kernel WireGuard (10x faster than wireguard-go) |
-| `TLS` | Kernel TLS offload (nginx, HAProxy) |
-| `SECURITY_APPARMOR` | Docker's default MAC enforcement |
+The stock Firecracker CI kernel (v1.6 era, 6.1.58) lacks
+`CONFIG_NETFILTER` entirely — no iptables inside VMs. Docker networking
+is completely broken.
 
 The v1.15 CI kernel (6.1.155) has `NETFILTER` and iptables but is
 missing `IP_NF_RAW` — a single flag that Docker 28+ requires for
 bridge networking.
 
-**Verified on agni-01 (2026-03-26):** Booted the v1.15 kernel with
-Firecracker v1.14.0. Docker 29.3.1 starts, pulls images, runs
+**Verified on agni-01 (x86_64, 2026-03-26):** Booted the v1.15 kernel
+with Firecracker v1.14.0. Docker 29.3.1 starts, pulls images, runs
 `hello-world` with `--network host`. Bridge networking fails with
 `iptables: can't initialize table 'raw'`. `/proc/config.gz` confirms
 `CONFIG_IP_NF_RAW is not set`.
 
 ### 1.2 What we change
 
-Start from the Firecracker CI v1.15 config (6.1.155). Enable 16 flags:
+Start from the Firecracker CI v1.15 config (6.1.155). Enable **13 flags**
+— strictly what Docker bridge networking requires:
 
 ```bash
-# Docker bridge networking (blocks container creation without these)
+# ── Docker bridge networking (hard blockers) ──
+# Without these, `docker run` fails with "can't initialize table 'raw'".
 scripts/config --enable CONFIG_IP_NF_RAW
 scripts/config --enable CONFIG_IP6_NF_RAW
 
-# Docker security tables (AppArmor network labels)
+# ── Docker container plumbing ──
+# BRIDGE: docker0 is a kernel bridge. Required for bridge networking.
+# VETH: every container gets a veth pair into docker0. No veth = no containers.
+# OVERLAY_FS: Docker's default storage driver. Without it, Docker falls back
+#   to `vfs` which copies the entire image per container — unusable in a 2GB rootfs.
+# NF_CONNTRACK + XT_CONNTRACK: required by iptables `-m state --state
+#   RELATED,ESTABLISHED` which Docker's FORWARD rules use.
+scripts/config --enable CONFIG_BRIDGE
+scripts/config --enable CONFIG_VETH
+scripts/config --enable CONFIG_OVERLAY_FS
+scripts/config --enable CONFIG_NF_CONNTRACK
+scripts/config --enable CONFIG_NETFILTER_XT_CONNTRACK
+
+# ── Docker security tables ──
+# Required by Docker's default iptables rules for container isolation.
 scripts/config --enable CONFIG_IP_NF_SECURITY
 scripts/config --enable CONFIG_IP6_NF_SECURITY
 
-# Docker advanced networking (macvlan, ipvlan, overlay networks)
-scripts/config --enable CONFIG_DUMMY
-scripts/config --enable CONFIG_MACVLAN
-scripts/config --enable CONFIG_IPVLAN
-scripts/config --enable CONFIG_VXLAN
-
-# Docker traffic accounting
+# ── Docker traffic shaping ──
+# NET_CLS_CGROUP: Docker uses cgroup net_cls for traffic classification.
+# XT_MARK: Docker uses MARK target for routing decisions.
 scripts/config --enable CONFIG_NET_CLS_CGROUP
 scripts/config --enable CONFIG_NETFILTER_XT_MARK
-
-# TUN/TAP (VPNs, userspace networking)
-scripts/config --enable CONFIG_TUN
-
-# FUSE (sshfs, rclone mount, s3fs, AppImage)
-scripts/config --enable CONFIG_FUSE_FS
-
-# WireGuard VPN (kernel implementation, 10x faster than wireguard-go)
-scripts/config --enable CONFIG_WIREGUARD
-
-# Kernel TLS offload (nginx ssl_conf_command Options KTLS)
-scripts/config --enable CONFIG_TLS
-
-# Security: AppArmor (Docker's default MAC) + Landlock (unprivileged sandboxing)
-scripts/config --enable CONFIG_SECURITY_APPARMOR
-scripts/config --enable CONFIG_SECURITY_LANDLOCK
 ```
 
-All flags are `=y` (built-in). Firecracker doesn't support loadable modules.
+All flags are `=y` (built-in). Firecracker doesn't support loadable
+modules — any flag set to `=m` in the CI config is effectively missing.
+
+**Pre-build verification step:** Before building, check which of these
+flags the v1.15 CI config already has as `=y`. Any that are already
+`=y` are harmless to re-enable (idempotent). Any that are `=m` must be
+flipped to `=y`. The `scripts/config --enable` call handles both cases.
+
+```bash
+# Run on agni-01 to audit the base config before building:
+curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155.config" \
+  | grep -E 'BRIDGE|VETH|OVERLAY_FS|NF_CONNTRACK|IP_NF_RAW|IP6_NF_RAW|IP_NF_SECURITY|IP6_NF_SECURITY|NETFILTER_XT_CONNTRACK|NET_CLS_CGROUP|NETFILTER_XT_MARK'
+```
 
 ### 1.3 What we deliberately skip
 
-**NF_TABLES + NFT_\*:** Docker works with `iptables-legacy`. nftables adds
-~20 config flags for zero benefit in our use case.
+**TUN, FUSE, WireGuard, kTLS, AppArmor, Landlock:** Useful but not
+needed by any v0.4 tier. Can be added later with zero risk — same
+process, append flags, rebuild. Keeping the flag set minimal means fewer
+unknowns to debug if the kernel misbehaves.
 
-**IP_VS\*:** IPVS is Docker Swarm load balancing. Nobody runs Swarm inside
-a single Firecracker VM.
+**DUMMY, MACVLAN, IPVLAN, VXLAN:** Docker Swarm overlay networks and
+macvlan drivers. Nobody runs Swarm inside a single Firecracker VM.
+Standard bridge networking covers all v0.4 use cases.
 
-**DRM / framebuffer:** No GPU in Firecracker. Computer-use tier (future)
-uses Xvfb which works without kernel DRM.
+**NF_TABLES + NFT_\*:** Docker works with `iptables-legacy`. nftables
+adds ~20 config flags for zero benefit in our use case.
+
+**IP_VS\*:** IPVS is Docker Swarm load balancing.
+
+**DRM / framebuffer:** No GPU in Firecracker. Xvfb works without DRM.
 
 **FTRACE:** Kernel function tracing adds overhead to every function call
 even when disabled (nop sled in function prologues). Not worth it for
@@ -141,9 +181,9 @@ application workloads.
 
 ### 1.4 One kernel for all tiers
 
-Every flag we enable is inert when unused. Empty iptables tables, no TUN
-devices created, no FUSE mounts. Zero runtime overhead for minimal/browser
-tiers. Ship one kernel artifact for all tiers.
+Every flag we enable is inert when unused. Empty iptables tables, no
+bridge devices created. Zero runtime overhead for minimal/browser tiers.
+Ship one kernel artifact for all tiers.
 
 ### 1.5 Build script
 
@@ -180,35 +220,52 @@ cd "linux-${KERNEL_VERSION}"
 echo "==> Downloading Firecracker CI config (${FC_CI_VERSION}/${ARCH})..."
 curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_CI_VERSION}/${ARCH}/vmlinux-${KERNEL_VERSION}.config" -o .config
 
-# Apply bhatti additions
-echo "==> Applying bhatti kernel config..."
+# Audit: show current state of our flags before modification
+echo "==> Current state of bhatti flags in CI config:"
+for flag in IP_NF_RAW IP6_NF_RAW BRIDGE VETH OVERLAY_FS NF_CONNTRACK \
+    NETFILTER_XT_CONNTRACK IP_NF_SECURITY IP6_NF_SECURITY \
+    NET_CLS_CGROUP NETFILTER_XT_MARK; do
+    grep "CONFIG_${flag}[= ]" .config 2>/dev/null || echo "# CONFIG_${flag} is not set"
+done
 
-# Docker bridge networking
+# Apply bhatti additions (idempotent — safe if already =y)
+echo "==> Applying bhatti kernel config (13 flags)..."
+
+# Docker bridge networking (hard blockers)
 scripts/config --enable CONFIG_IP_NF_RAW
 scripts/config --enable CONFIG_IP6_NF_RAW
+
+# Docker container plumbing
+scripts/config --enable CONFIG_BRIDGE
+scripts/config --enable CONFIG_VETH
+scripts/config --enable CONFIG_OVERLAY_FS
+scripts/config --enable CONFIG_NF_CONNTRACK
+scripts/config --enable CONFIG_NETFILTER_XT_CONNTRACK
+
+# Docker security tables
 scripts/config --enable CONFIG_IP_NF_SECURITY
 scripts/config --enable CONFIG_IP6_NF_SECURITY
 
-# Docker advanced networking
-scripts/config --enable CONFIG_DUMMY
-scripts/config --enable CONFIG_MACVLAN
-scripts/config --enable CONFIG_IPVLAN
-scripts/config --enable CONFIG_VXLAN
+# Docker traffic shaping
 scripts/config --enable CONFIG_NET_CLS_CGROUP
 scripts/config --enable CONFIG_NETFILTER_XT_MARK
 
-# TUN/TAP, FUSE, WireGuard, kTLS
-scripts/config --enable CONFIG_TUN
-scripts/config --enable CONFIG_FUSE_FS
-scripts/config --enable CONFIG_WIREGUARD
-scripts/config --enable CONFIG_TLS
-
-# Security
-scripts/config --enable CONFIG_SECURITY_APPARMOR
-scripts/config --enable CONFIG_SECURITY_LANDLOCK
-
-# Resolve dependencies
+# Resolve dependencies (turns on transitive deps, answers new prompts with defaults)
 make $CROSS olddefconfig
+
+# Post-build verification: ensure critical flags survived olddefconfig
+echo "==> Verifying critical flags in final config..."
+MISSING=0
+for flag in IP_NF_RAW IP6_NF_RAW BRIDGE VETH OVERLAY_FS NF_CONNTRACK NETFILTER_XT_CONNTRACK; do
+    if ! grep -q "CONFIG_${flag}=y" .config; then
+        echo "FATAL: CONFIG_${flag} not set to =y after olddefconfig" >&2
+        MISSING=1
+    fi
+done
+if [ "$MISSING" -eq 1 ]; then
+    echo "Aborting: critical kernel flags missing. Check dependency conflicts." >&2
+    exit 1
+fi
 
 # Build
 echo "==> Building vmlinux ($(nproc) cores)..."
@@ -221,45 +278,83 @@ echo "==> Built: dist/vmlinux-${KERNEL_VERSION}-${ARCH} ($(du -h "../dist/vmlinu
 
 ### 1.6 Verification
 
-After building, boot a VM and check:
+After building, boot a VM on agni-01 and check:
 
 ```bash
-bhatti exec test -- sh -c 'zcat /proc/config.gz | grep CONFIG_IP_NF_RAW'
+# Kernel flags
+bhatti exec test -- sh -c 'zcat /proc/config.gz | grep -E "IP_NF_RAW|BRIDGE|VETH|OVERLAY_FS|NF_CONNTRACK"'
 # CONFIG_IP_NF_RAW=y
+# CONFIG_BRIDGE=y
+# CONFIG_VETH=y
+# CONFIG_OVERLAY_FS=y
+# CONFIG_NF_CONNTRACK=y
 
+# iptables raw table works
 bhatti exec test -- sudo iptables -t raw -L
 # Chain PREROUTING (policy ACCEPT) ...
 
+# Docker full path
 bhatti exec test -- sudo docker run --rm hello-world
 # Hello from Docker!
 ```
 
-### 1.7 Firecracker version
+### 1.7 Firecracker version upgrade (v1.6 → v1.14)
 
 The kernel and Firecracker must be from the same generation. The v1.15 CI
 kernel doesn't boot with Firecracker v1.6 (kernel panic: `VFS: Cannot open
 root device "vda"`). **Upgrade to Firecracker v1.14.0** (latest stable in
 the v1.15 CI artifacts).
 
-Verified on agni-01: Firecracker v1.14.0 + kernel 6.1.155 boots and runs
-correctly.
+Verified on agni-01 (x86_64): Firecracker v1.14.0 + kernel 6.1.155 boots
+and runs correctly.
+
+**Migration on agni-01:**
+
+1. **Destroy all existing sandboxes and snapshots.** FC v1.6 snapshot
+   formats (mem.snap, vm.snap) are incompatible with FC v1.14 — they
+   cannot be resumed. This is a one-time cost.
+   ```bash
+   bhatti list --json | jq -r '.[].id' | xargs -I{} bhatti destroy {}
+   # Also delete any saved snapshots:
+   rm -rf /var/lib/bhatti/snapshots/*
+   ```
+
+2. **Verify API compatibility.** The Go code in `engine.go` talks to
+   Firecracker's HTTP API directly (PUT `/boot-source`, `/drives/*`,
+   `/machine-config`, `/vsock`, `/network-interfaces/*`, PATCH `/vm`,
+   PUT `/snapshot/create`, PUT `/snapshot/load`). All of these endpoints
+   exist in FC v1.14 with the same request schema. Verified against
+   the [v1.14 API spec](https://github.com/firecracker-microvm/firecracker/blob/main/src/api_server/swagger/firecracker.yaml).
+
+3. **Replace binary:**
+   ```bash
+   curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-x86_64.tgz" | tar xz
+   sudo mv release-v1.14.0-x86_64/firecracker-v1.14.0-x86_64 /usr/local/bin/firecracker
+   sudo chmod +x /usr/local/bin/firecracker
+   ```
+
+4. **Update `scripts/install.sh`:** Change `FC_VERSION="1.6.0"` →
+   `FC_VERSION="1.14.0"` and `FC_MAJOR_MINOR="1.6"` → remove (no longer
+   used for kernel URL — kernel is now a build artifact, not downloaded
+   from Firecracker CI).
 
 ### 1.8 Engineering overhead
 
 We are NOT patching kernel source or maintaining a fork. We take the exact
 `.config` that Firecracker's CI team maintains (tested against every FC
-commit), flip 16 flags from `n` to `y`, and run `make vmlinux`.
+commit), flip 13 flags from `n`/`m` to `=y`, and run `make vmlinux`.
 
 When Firecracker updates their CI kernel (e.g., 6.1.155 → 6.1.170 for a
-CVE), we download their new config, apply the same 16 flags, rebuild.
+CVE), we download their new config, apply the same 13 flags, rebuild.
 A 15-minute task that runs in CI.
 
 ### 1.9 Tests
 
 - `TestKernelHasNetfilterRaw` — boot VM, `zcat /proc/config.gz | grep IP_NF_RAW` → `=y`
-- `TestKernelHasTUN` — boot VM, `ls /dev/net/tun` → exists
-- `TestKernelHasFUSE` — boot VM, `ls /dev/fuse` → exists
-- `TestKernelHasWireGuard` — boot VM, `ip link add wg-test type wireguard` → succeeds
+- `TestKernelHasBridge` — boot VM, `zcat /proc/config.gz | grep CONFIG_BRIDGE` → `=y`
+- `TestKernelHasVeth` — boot VM, `zcat /proc/config.gz | grep CONFIG_VETH` → `=y`
+- `TestKernelHasOverlayFS` — boot VM, `zcat /proc/config.gz | grep OVERLAY_FS` → `=y`
+- `TestKernelHasConntrack` — boot VM, `zcat /proc/config.gz | grep NF_CONNTRACK` → `=y`
 - `TestDockerBridgeNetworking` — boot docker tier, start dockerd,
   `docker run --rm alpine ping -c1 8.8.8.8` → succeeds (bridge, not host network)
 
@@ -297,29 +392,87 @@ CI runners that install their own deps. The "start from nothing" path.
 Headless Chromium with Playwright for browser automation.
 
 **Contents (everything in minimal, plus):**
-- Chromium (headless-capable, from Ubuntu repos)
-- Chromium dependencies (libatk, libcups, libnss3, etc.)
-- Playwright system dependencies (`npx playwright install-deps`)
+- Chromium via Playwright's bundled build (see §2.2.1)
+- Chromium system dependencies (libatk, libcups, libnss3, etc.)
 - Node.js 22.x LTS (Playwright needs it)
-- Python 3.12 (Playwright Python bindings, pre-installed with `pip install playwright`)
+- Python 3.12 (Playwright Python bindings)
+- Playwright pinned to a specific version (see §2.2.2)
 - Boot profile: `/etc/bhatti/init.sh` starts Chromium with CDP on port 9222
+
+**Kernel dependency: none.** Browser tier needs only `/dev/shm` for
+Chromium shared memory, which lohar mounts unconditionally (§3.2.1).
+No iptables, no bridge, no overlay. Works with the stock Firecracker
+CI kernel. This is why browser ships before docker.
+
+#### 2.2.1 Chromium source: Playwright bundle, not Ubuntu repos
+
+On Ubuntu 24.04 (noble), `apt-get install chromium-browser` installs a
+transitional package that redirects to snap. In a minbase chroot without
+snapd, this gives you a broken shim, not an actual browser.
+
+Instead, use Playwright's bundled Chromium:
+```bash
+npx playwright install chromium        # downloads a known-good binary
+npx playwright install-deps chromium   # installs system lib dependencies
+```
+
+This gives a binary at a well-known path
+(`~/.cache/ms-playwright/chromium-*/chrome-linux/chrome`) that is tested
+against the exact Playwright version we pin.
+
+#### 2.2.2 Playwright version pinning
+
+Playwright's Chromium coupling is notoriously fragile. We pin the exact
+Playwright version so the bundled Chromium and the Python/Node API are
+tested together:
+
+```bash
+pip3 install --break-system-packages playwright==1.50.0
+npm install -g playwright@1.50.0
+npx playwright install chromium
+npx playwright install-deps chromium
+```
+
+Update the pinned version per release, not per rootfs build. The CI
+workflow validates the combination.
 
 **Boot profile (`/etc/bhatti/init.sh`):**
 ```bash
 #!/bin/sh
-chromium-browser \
-  --headless \
-  --no-sandbox \
-  --disable-gpu \
-  --disable-dev-shm-usage \
-  --remote-debugging-port=9222 \
-  --remote-debugging-address=0.0.0.0 &
+# Resolve Playwright's bundled Chromium path
+CHROMIUM=$(find /root/.cache/ms-playwright -name chrome -type f 2>/dev/null | head -1)
+if [ -z "$CHROMIUM" ]; then
+    echo "bhatti: chromium not found" >&2
+    exit 1
+fi
+
+"$CHROMIUM" \
+    --headless \
+    --no-sandbox \
+    --disable-gpu \
+    --remote-debugging-port=9222 \
+    --remote-debugging-address=0.0.0.0 &
+
+# Wait for CDP to accept connections (up to 5 seconds)
+for i in $(seq 1 50); do
+    curl -sf http://localhost:9222/json/version >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+if ! curl -sf http://localhost:9222/json/version >/dev/null 2>&1; then
+    echo "bhatti: chromium CDP not ready after 5s" >&2
+fi
 ```
+
+The readiness wait ensures that by the time the user's `--init` script
+runs (step 6 in boot order), CDP is accepting connections. Without this,
+a user init that immediately connects to `localhost:9222` would race
+against Chromium startup.
 
 **How it's used:**
 ```bash
 bhatti create --name scraper --image browser
-# Chromium starts automatically on port 9222
+# Chromium starts automatically on port 9222, ready by the time create returns
 
 # AI agent connects via CDP through bhatti's tunnel:
 bhatti exec scraper -- python3 -c "
@@ -347,28 +500,31 @@ Docker Engine running inside the VM.
 **Contents (everything in minimal, plus):**
 - `docker-ce`, `containerd`, `runc` (from Docker's apt repo)
 - `iptables` (legacy mode configured via `update-alternatives`)
-- Boot profile: `/etc/bhatti/init.sh` mounts cgroups and starts dockerd
+- Boot profile: `/etc/bhatti/init.sh` starts dockerd with readiness check
 
 **Boot profile (`/etc/bhatti/init.sh`):**
 ```bash
 #!/bin/sh
-# Mount cgroups v2 (Docker needs this)
-mkdir -p /sys/fs/cgroup
-mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
-
-# Switch to iptables-legacy (kernel has legacy iptables, not nftables)
+# iptables-legacy (kernel has legacy iptables, not nftables)
 update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
 update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
 
 # Start Docker daemon
 dockerd > /var/log/dockerd.log 2>&1 &
 
-# Wait for socket
-while [ ! -S /var/run/docker.sock ]; do sleep 0.1; done
+# Wait for socket (up to 10 seconds, then give up)
+for i in $(seq 1 100); do
+    [ -S /var/run/docker.sock ] && break
+    sleep 0.1
+done
 
-# Allow lohar user (uid 1000) to use Docker without sudo
-chmod 666 /var/run/docker.sock
+if [ ! -S /var/run/docker.sock ]; then
+    echo "bhatti: dockerd failed to start within 10s, check /var/log/dockerd.log" >&2
+fi
 ```
+
+Note: cgroups v2 and `/dev/shm` are mounted by lohar unconditionally
+(see §3.2), so the boot profile doesn't need to handle them.
 
 **How it's used:**
 ```bash
@@ -382,10 +538,12 @@ stack (Postgres + Redis + your app), wait for everything to be healthy,
 then `bhatti snapshot create`. Resume later — all containers are running,
 databases have data, app is connected. No cold start, no seeding.
 
-**Kernel requirement:** Custom kernel with `CONFIG_IP_NF_RAW=y`. Without
-it, Docker's bridge networking refuses to create containers. Verified on
-agni-01: with the stock v1.15 kernel, `docker run hello-world` fails
-with `can't initialize iptables table 'raw'`. With `IP_NF_RAW=y`, bridge
+**Kernel requirement:** Custom kernel with `CONFIG_IP_NF_RAW=y`,
+`CONFIG_BRIDGE=y`, `CONFIG_VETH=y`, `CONFIG_OVERLAY_FS=y`,
+`CONFIG_NF_CONNTRACK=y`. Without these, Docker's bridge networking
+refuses to create containers. Verified on agni-01: with the stock v1.15
+kernel, `docker run hello-world` fails with
+`can't initialize iptables table 'raw'`. With the bhatti kernel, bridge
 networking works.
 
 **Use case:** Docker-based CI pipelines, testcontainers, running
@@ -393,49 +551,99 @@ databases, any workload that needs Docker's ecosystem.
 
 ---
 
-## Part 3 — Boot Profiles
+## Part 3 — Boot Profiles + lohar changes
 
 ### 3.1 Mechanism
 
 A boot profile is a script at `/etc/bhatti/init.sh` inside the rootfs.
-Lohar runs it after system setup (mounts, networking, config drive) but
-before the user's `--init` script.
+Lohar runs it after system setup and **after the agent listeners are
+accepting connections**. This ordering is critical — if a boot profile
+hangs, the VM must still be reachable via `bhatti exec` for debugging.
 
 **Execution order:**
 ```
-1. lohar PID 1 init (mount /proc, /sys, /dev, etc.)
-2. loadConfigDrive() — env vars, files, volumes
-3. setupNetworking()
-4. /etc/bhatti/init.sh (boot profile — if it exists)
-5. user's --init script (from create request)
+1. lohar PID 1 init (mount /proc, /sys, /dev, /dev/pts, /dev/shm, /tmp, /run)
+2. lohar mounts cgroups v2 unconditionally
+3. loadConfigDrive() — env vars, files, volumes
+4. setupNetworking()
+5. installSignalHandlers()
+6. start vsock + TCP listeners ← agent is now reachable
+7. "lohar: ready"
+8. /etc/bhatti/init.sh (boot profile — if exists, 30s timeout)
+9. user's --init script (from create request, runs as uid 1000)
 ```
 
-The boot profile starts tier-specific services (Chromium, dockerd). The
-user's init runs in an environment where those services are already up.
+The boot profile starts tier-specific services (Chromium, dockerd) and
+**waits for them to be ready** before returning. The user's init runs
+in an environment where those services are already accepting connections.
 
 ### 3.2 lohar changes
 
 **File:** `cmd/lohar/main.go`
 
-After `installSignalHandlers()`, before the user init session:
+Two changes to PID 1 init, one change to post-listener startup.
+
+#### 3.2.1 Mount /dev/shm and cgroups v2 unconditionally
+
+Add to PID 1 init, right after the existing `/dev/pts` and `/tmp` mounts:
 
 ```go
-// Run boot profile if present
+// /dev/shm — required by Chromium (shared memory), Docker containers,
+// and any process using shm_open(3). Harmless when unused.
+mustMount("tmpfs", "/dev/shm", "tmpfs", 0, "")
+
+// cgroups v2 — required by Docker for resource isolation.
+// Mount unconditionally: zero overhead when unused, avoids needing
+// tier-specific logic in lohar.
+os.MkdirAll("/sys/fs/cgroup", 0755)
+if err := syscall.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, ""); err != nil {
+    // Non-fatal: may already be mounted, or kernel may not support it
+    fmt.Fprintf(os.Stderr, "lohar: mount cgroup2: %v\n", err)
+}
+// Enable cgroup controllers for Docker. Without this, dockerd can't
+// create cgroups for containers (errors like "cgroup: no such file").
+os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control",
+    []byte("+cpu +memory +io +pids"), 0644)
+```
+
+#### 3.2.2 Run boot profile after listeners, with timeout
+
+**After** the vsock + TCP listeners are started and "lohar: ready" is
+printed, but **before** the user init session:
+
+```go
+fmt.Fprintln(os.Stderr, "lohar: ready")
+
+// Run boot profile if present. Runs AFTER listeners so the VM is
+// reachable via bhatti exec even if the boot profile hangs.
+// 30-second hard timeout — if dockerd or chromium can't start in 30s,
+// something is broken. Don't block forever.
 if _, err := os.Stat("/etc/bhatti/init.sh"); err == nil {
-    cmd := exec.Command("/bin/sh", "/etc/bhatti/init.sh")
-    cmd.Stdout = os.Stderr // boot profile logs go to lohar's stderr
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    cmd := exec.CommandContext(ctx, "/bin/sh", "/etc/bhatti/init.sh")
+    cmd.Stdout = os.Stderr
     cmd.Stderr = os.Stderr
     cmd.Env = buildEnv(nil)
     if err := cmd.Run(); err != nil {
-        fmt.Fprintf(os.Stderr, "lohar: boot profile failed: %v\n", err)
-        // Non-fatal — sandbox is still usable, just without tier services
+        if ctx.Err() == context.DeadlineExceeded {
+            fmt.Fprintf(os.Stderr, "lohar: boot profile timed out after 30s\n")
+        } else {
+            fmt.Fprintf(os.Stderr, "lohar: boot profile failed: %v\n", err)
+        }
+        // Non-fatal — sandbox is still reachable, just without tier services
     }
+}
+
+// Init script runs as a TTY session (can be attached to via session ID "init")
+if cfg != nil && cfg.Init != "" {
+    go runInitSession(cfg.Init, cfg.User)
 }
 ```
 
 The boot profile runs as root (PID 1 context). It needs root to start
-dockerd, mount cgroups, etc. The user's `--init` runs as uid 1000 (via
-the existing `runInitSession` which applies `Credential{Uid: 1000}`).
+dockerd, etc. The user's `--init` runs as uid 1000 (via the existing
+`runInitSession` which applies `Credential{Uid: 1000}`).
 
 ### 3.3 Shell selection fix
 
@@ -447,37 +655,27 @@ return ag.Shell(ctx, []string{"/bin/zsh", "-li"}, ...)
 
 The minimal tier doesn't have zsh. `bhatti shell` would fail.
 
-**Fix:** Fall back through available shells.
+**Fix:** Change to `/bin/bash` with `-li` flags. Every tier has bash
+(comes with minbase). One-line change, no caching, no probing, no new
+struct fields.
 
-**File:** `pkg/engine/firecracker/engine.go`
+**File:** `pkg/engine/firecracker/engine.go`, line 1033:
 
 ```go
-func (e *Engine) Shell(ctx context.Context, id string) (engine.TerminalConn, error) {
-    // ... existing lock/thermal check ...
+// Before:
+return ag.Shell(ctx, []string{"/bin/zsh", "-li"}, map[string]string{
+    "TERM": "xterm-256color",
+}, 24, 80)
 
-    // Detect available shell — try zsh, bash, sh in order
-    shell := "/bin/sh"
-    for _, candidate := range []string{"/bin/zsh", "/bin/bash"} {
-        result, err := ag.Exec(ctx, []string{"test", "-x", candidate}, nil, "")
-        if err == nil && result.ExitCode == 0 {
-            shell = candidate
-            break
-        }
-    }
-
-    args := []string{shell}
-    if shell != "/bin/sh" {
-        args = append(args, "-li") // login + interactive
-    }
-
-    return ag.Shell(ctx, args, map[string]string{
-        "TERM": "xterm-256color",
-    }, 24, 80)
-}
+// After:
+return ag.Shell(ctx, []string{"/bin/bash", "-li"}, map[string]string{
+    "TERM": "xterm-256color",
+}, 24, 80)
 ```
 
-This adds two round-trips on first shell connection (~2ms total). The
-result could be cached per-VM but the cost is negligible.
+Users who install zsh and want it as their shell can `chsh` inside the
+VM and save the image. Zsh detection can be added in a future version
+if there's demand.
 
 ### 3.4 Tests
 
@@ -490,9 +688,11 @@ result could be cached per-VM but the cost is negligible.
   still boots, exec works
 - `TestBootProfileRunsAsRoot` — boot profile runs `whoami > /tmp/who`,
   verify contents is `root`
-- `TestShellFallbackToSh` — boot from minimal (no zsh), `bhatti shell` works
-- `TestShellPrefersZsh` — boot from image with zsh installed, shell is zsh
-- `TestShellPrefersBashOverSh` — image with bash but no zsh, shell is bash
+- `TestBootProfileTimeout` — boot profile that `sleep 60`, verify it
+  gets killed after 30s, sandbox is still reachable via exec
+- `TestDevShmMounted` — boot minimal, exec `mount | grep /dev/shm` → tmpfs
+- `TestCgroupsMounted` — boot minimal, exec `mount | grep cgroup2` → mounted
+- `TestShellUsesBash` — boot from minimal, `bhatti shell` opens bash
 
 ---
 
@@ -524,6 +724,10 @@ scripts/
 # Output: dist/rootfs-<tier>-<arch>.ext4
 # Environment:
 #   SIZE_MB — image size (default: auto per tier)
+#
+# For cross-arch builds (e.g., arm64 on amd64 host):
+#   sudo apt-get install qemu-user-static  # registers binfmt_misc handlers
+#   sudo ./scripts/build-tier.sh minimal arm64 ./lohar-arm64
 set -euo pipefail
 
 TIER="${1:?usage: build-tier.sh <tier> <arch> <lohar-binary>}"
@@ -549,7 +753,22 @@ IMG="dist/rootfs-${TIER}-${ARCH}.ext4"
 MOUNT="/mnt/bhatti-${TIER}-$$"
 
 mkdir -p dist
-trap 'umount "$MOUNT/dev/pts" "$MOUNT/dev" "$MOUNT/sys" "$MOUNT/proc" "$MOUNT" 2>/dev/null; rmdir "$MOUNT" 2>/dev/null' EXIT
+
+# Robust cleanup: kill leaked chroot processes, lazy-unmount everything.
+# Lazy unmount (-l) is essential for CI runners where stale mounts from
+# a failed previous build would block the next job.
+cleanup() {
+    set +e
+    echo "==> Cleaning up..."
+    fuser -km "$MOUNT" 2>/dev/null; sleep 1
+    umount -l "$MOUNT/dev/pts" 2>/dev/null
+    umount -l "$MOUNT/dev"     2>/dev/null
+    umount -l "$MOUNT/sys"     2>/dev/null
+    umount -l "$MOUNT/proc"    2>/dev/null
+    umount -l "$MOUNT"         2>/dev/null
+    rmdir "$MOUNT"             2>/dev/null
+}
+trap cleanup EXIT
 
 # Create ext4 image
 dd if=/dev/zero of="$IMG" bs=1M count="$SIZE_MB" status=progress
@@ -595,7 +814,7 @@ apt-get install -y --no-install-recommends \
 sed -i "/en_US.UTF-8/s/^# //g" /etc/locale.gen
 locale-gen
 
-# Create lohar user
+# Create lohar user (bash is the default shell — comes with minbase)
 useradd -m -s /bin/bash -G sudo lohar
 echo "lohar ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
@@ -628,50 +847,76 @@ chmod 755 "$MOUNT/usr/local/bin/lohar"
 # Sources minimal.sh first.
 set -euo pipefail
 
+PLAYWRIGHT_VERSION="1.50.0"
+
 # Build minimal base first
 "$SCRIPT_DIR/tiers/minimal.sh"
 
-chroot "$MOUNT" /bin/bash -c '
+chroot "$MOUNT" /bin/bash -c "
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 
-# Chromium + dependencies
-apt-get install -y --no-install-recommends \
-    chromium-browser \
-    fonts-liberation fonts-noto-color-emoji \
-    libnss3 libatk-bridge2.0-0 libcups2 libxdamage1 \
-    libxrandr2 libgbm1 libpango-1.0-0 libasound2t64
-
-# Node.js (for Playwright)
+# Node.js (for Playwright CLI)
 NODE_VERSION=22.16.0
-case $(dpkg --print-architecture) in
+case \$(dpkg --print-architecture) in
     amd64) NODE_ARCH=x64 ;;
     arm64) NODE_ARCH=arm64 ;;
 esac
-curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+curl -fsSL \"https://nodejs.org/dist/v\${NODE_VERSION}/node-v\${NODE_VERSION}-linux-\${NODE_ARCH}.tar.xz\" \\
     | tar -xJ --strip-components=1 -C /usr/local
 
-# Python 3 + Playwright
+# Python 3 + Playwright (pinned version)
 apt-get install -y --no-install-recommends python3 python3-pip
-pip3 install --break-system-packages playwright
-npx playwright install-deps 2>/dev/null || true
+pip3 install --break-system-packages playwright==${PLAYWRIGHT_VERSION}
+npm install -g playwright@${PLAYWRIGHT_VERSION}
+
+# Install Playwright's bundled Chromium + its system dependencies.
+# This avoids Ubuntu's chromium-browser package which is a snap redirect
+# in noble and broken in minbase chroots without snapd.
+npx playwright install chromium
+npx playwright install-deps chromium
 
 apt-get clean
-rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
-'
+rm -rf /var/lib/apt/lists/* /tmp/*
+"
 
-# Boot profile: start Chromium with CDP
+# Boot profile: start Chromium with CDP + readiness wait
 mkdir -p "$MOUNT/etc/bhatti"
 cat > "$MOUNT/etc/bhatti/init.sh" << 'PROFILE'
 #!/bin/sh
-chromium-browser \
+# Resolve Playwright's bundled Chromium path.
+# Playwright installs to a versioned directory; use the CLI to get the
+# exact path rather than fragile find+glob.
+CHROMIUM=$(python3 -c "from playwright._impl._driver import compute_driver_executable; import subprocess; print(subprocess.check_output([compute_driver_executable(), 'print-browsers-json']).decode())" 2>/dev/null \
+  | python3 -c "import sys,json; browsers=json.load(sys.stdin); print(next(b['executablePath'] for b in browsers if b['name']=='chromium'))" 2>/dev/null)
+
+# Fallback to find if the above fails
+if [ -z "$CHROMIUM" ]; then
+    CHROMIUM=$(find /root/.cache/ms-playwright -path '*/chrome-linux/chrome' -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$CHROMIUM" ]; then
+    echo "bhatti: chromium not found" >&2
+    exit 1
+fi
+
+"$CHROMIUM" \
     --headless \
     --no-sandbox \
     --disable-gpu \
-    --disable-dev-shm-usage \
     --remote-debugging-port=9222 \
     --remote-debugging-address=0.0.0.0 &
+
+# Wait for CDP to accept connections (up to 5 seconds)
+for i in $(seq 1 50); do
+    curl -sf http://localhost:9222/json/version >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+if ! curl -sf http://localhost:9222/json/version >/dev/null 2>&1; then
+    echo "bhatti: chromium CDP not ready after 5s" >&2
+fi
 PROFILE
 chmod 755 "$MOUNT/etc/bhatti/init.sh"
 ```
@@ -712,29 +957,44 @@ apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io
 update-alternatives --set iptables /usr/sbin/iptables-legacy
 update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
 
-# Add lohar user to docker group
+# Add lohar user to docker group (standard Docker access control)
 usermod -aG docker lohar
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 '
 
-# Boot profile: mount cgroups + start dockerd
+# Boot profile: start dockerd with readiness check + timeout
 mkdir -p "$MOUNT/etc/bhatti"
 cat > "$MOUNT/etc/bhatti/init.sh" << 'PROFILE'
 #!/bin/sh
-# Mount cgroups v2
-mkdir -p /sys/fs/cgroup
-mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+# iptables-legacy (kernel has legacy iptables, not nftables)
+update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null
+update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null
 
 # Start Docker daemon
 dockerd > /var/log/dockerd.log 2>&1 &
 
-# Wait for socket
-while [ ! -S /var/run/docker.sock ]; do sleep 0.1; done
+# Wait for socket (up to 10 seconds, then give up — non-fatal)
+for i in $(seq 1 100); do
+    [ -S /var/run/docker.sock ] && break
+    sleep 0.1
+done
+
+if [ ! -S /var/run/docker.sock ]; then
+    echo "bhatti: dockerd failed to start within 10s, check /var/log/dockerd.log" >&2
+fi
 PROFILE
 chmod 755 "$MOUNT/etc/bhatti/init.sh"
 ```
+
+Note: the old boot profile had `chmod 666 /var/run/docker.sock` which is
+overly permissive. Removed — the `docker` group membership from
+`usermod -aG docker lohar` in the tier script is the standard Docker
+access control mechanism.
+
+Note: cgroups v2 mount and `/dev/shm` are handled by lohar
+unconditionally (§3.2.1), so the Docker boot profile doesn't duplicate them.
 
 ### 4.6 Tests
 
@@ -746,18 +1006,19 @@ chmod 755 "$MOUNT/etc/bhatti/init.sh"
 - `TestMinimalTierNoZsh` — exec `which zsh` → not found
 - `TestMinimalTierSize` — rootfs < 200MB uncompressed
 
-**Browser tier tests (agni-01):**
-- `TestBrowserTierChromiumStarts` — boot, wait 5s, exec
+**Browser tier tests (agni-01, x86_64):**
+- `TestBrowserTierChromiumStarts` — boot, exec
   `curl -s http://localhost:9222/json/version` → returns Chromium version
 - `TestBrowserTierPlaywright` — boot, exec playwright script that
   navigates to example.com and returns title
 - `TestBrowserTierSnapshotResume` — navigate to a page, snapshot, resume,
   verify Chromium is still running with the page loaded (CDP connection alive)
 
-**Docker tier tests (agni-01):**
+**Docker tier tests (agni-01, x86_64):**
 - `TestDockerTierDaemonStarts` — boot, exec `docker version` → succeeds
 - `TestDockerTierHelloWorld` — exec `docker run --rm hello-world` → works
   with bridge networking (not `--network host`)
+- `TestDockerTierOverlayFS` — exec `docker info --format '{{.Driver}}'` → `overlay2`
 - `TestDockerTierBuildAndRun` — write a Dockerfile, `docker build`, `docker run`
 - `TestDockerTierComposeUp` — write docker-compose.yml, `docker compose up -d`,
   verify services running
@@ -815,12 +1076,23 @@ curl -fsSL "$RELEASE_URL/rootfs-${TIER}-${ARCH}.ext4.zst" | zstd -d > "$ROOTFS_P
 curl -fsSL "$RELEASE_URL/firecracker-v1.14.0-${ARCH}" -o /usr/local/bin/firecracker
 ```
 
+Where `ARCH` is `x86_64` / `aarch64` for kernel/firecracker and `amd64` /
+`arm64` for rootfs (matching the artifact naming conventions).
+
 **Tier selection:**
 ```bash
 sudo ./scripts/install.sh --systemd                    # minimal (default)
 sudo ./scripts/install.sh --systemd --image browser    # browser tier
 sudo ./scripts/install.sh --systemd --image docker     # docker tier
 ```
+
+**Key changes to install.sh:**
+- `FC_VERSION="1.6.0"` → `FC_VERSION="1.14.0"`
+- Remove `FC_MAJOR_MINOR` (kernel is no longer downloaded from FC CI)
+- Kernel download URL → GitHub release artifact
+- Remove debootstrap / build-rootfs.sh path entirely
+- Add `--image` flag for tier selection
+- Add `zstd` to dependencies (for decompression)
 
 **Fallback:** `build-tier.sh` remains for users who want to build from
 source or customize tier scripts. The install script checks if rootfs
@@ -877,7 +1149,10 @@ jobs:
           GOARCH=${{ matrix.arch }} GOOS=linux CGO_ENABLED=0 \
             go build -ldflags="-s -w" -o lohar ./cmd/lohar/
       - name: Install debootstrap
-        run: sudo apt-get install -y debootstrap qemu-user-static
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap
+          ${{ matrix.arch == 'arm64' && 'sudo apt-get install -y qemu-user-static' || '' }}
       - name: Build rootfs
         run: sudo ./scripts/build-tier.sh ${{ matrix.tier }} ${{ matrix.arch }} ./lohar
       - name: Compress
@@ -900,78 +1175,122 @@ jobs:
             rootfs-*/*
 ```
 
-For arm64 rootfs: `qemu-user-static` + binfmt_misc enables running arm64
-debootstrap on x86_64 runners. Slow (~20-30 min) but only runs on release.
+**Cross-arch build notes:**
+- **Kernel aarch64:** Built natively on x86_64 CI runner using
+  `gcc-aarch64-linux-gnu` cross-compiler. Fast (~5 min).
+- **Rootfs arm64:** Built on x86_64 CI runner using `qemu-user-static` +
+  binfmt_misc. QEMU userspace emulation intercepts arm64 syscalls from
+  the chroot. Slow (~20-30 min) but only runs on release tags.
+- **On agni-01 (x86_64):** Native amd64 builds only. To build arm64
+  rootfs locally, install `qemu-user-static` or use CI.
+- **On Raspberry Pis (aarch64):** Can build arm64 rootfs natively. Cannot
+  build amd64 rootfs (no x86 emulation path).
 
 ---
 
 ## Part 6 — Implementation Phases
 
-### Phase 1: Kernel + lohar changes
+### Phase 1: Firecracker upgrade + lohar changes
 
-No rootfs rebuilds. No CI changes. Just get the custom kernel working
-and lohar supporting boot profiles + shell fallback.
+No rootfs rebuilds. No kernel build. No CI changes. Just upgrade
+Firecracker, update lohar for boot profiles + shell fix + mounts.
 
-1. Write `scripts/build-kernel.sh`
-2. Build kernel on agni-01 (3-5 min)
-3. Add boot profile support to lohar (`/etc/bhatti/init.sh`)
-4. Add cgroups mount to lohar (always, harmless for non-docker)
-5. Fix hardcoded `/bin/zsh` in `engine.go`
-6. Deploy kernel + updated lohar + updated bhatti to agni-01
-7. Verify: boot existing rootfs with new kernel, Docker hello-world works
+1. **Migrate agni-01:** Destroy all sandboxes and snapshots (FC v1.6
+   snapshot format is incompatible with v1.14).
+2. **Upgrade Firecracker** on agni-01 from v1.6.0 to v1.14.0.
+3. Add `/dev/shm` mount to lohar (§3.2.1).
+4. Add cgroups v2 mount + subtree_control to lohar (§3.2.1).
+5. Add boot profile support to lohar — after listeners, with 30s
+   timeout (§3.2.2).
+6. Fix `/bin/zsh` → `/bin/bash` in `engine.go` (§3.3).
+7. Update `FC_VERSION` in `scripts/install.sh` to `1.14.0`.
+8. Deploy updated lohar + bhatti to agni-01.
+9. Verify: boot existing rootfs with new FC v1.14 + v1.15 CI kernel,
+   all existing functionality works (exec, shell, files, volumes,
+   snapshots).
 
-### Phase 2: Tier scripts + manual build
+### Phase 2: Minimal + browser tiers
 
-Write the tier scripts, build locally on agni-01, test each tier.
+Browser tier has no kernel dependency — it works with the stock v1.15
+CI kernel. Ship it first.
 
-1. Write `scripts/build-tier.sh` orchestrator
-2. Write `scripts/tiers/minimal.sh`
-3. Build minimal, boot, test
-4. Write `scripts/tiers/browser.sh`
-5. Build browser, boot, test Chromium + CDP + Playwright
-6. Write `scripts/tiers/docker.sh`
-7. Build docker, boot, test `docker run --rm hello-world` with bridge networking
-8. Test snapshot/resume for each tier
+1. Write `scripts/build-tier.sh` orchestrator.
+2. Write `scripts/tiers/minimal.sh`.
+3. Build minimal on agni-01, boot, test.
+4. Write `scripts/tiers/browser.sh`.
+5. Build browser on agni-01, boot, test Chromium + CDP + Playwright.
+6. Test snapshot/resume for browser tier (the money feature — snapshot
+   Chromium process memory, resume at exact page state).
 
-### Phase 3: CI + distribution
+### Phase 3: Custom kernel + docker tier
+
+Now build the kernel and ship Docker.
+
+1. Write `scripts/build-kernel.sh`.
+2. **Audit CI config:** Run the grep command from §1.2 to check which of
+   the 13 flags are already `=y`, `=m`, or unset. Record results in a
+   comment in `build-kernel.sh`.
+3. Build kernel on agni-01 (`./scripts/build-kernel.sh x86_64`, ~5 min).
+4. Deploy custom kernel to agni-01, verify boot.
+5. Write `scripts/tiers/docker.sh`.
+6. Build docker tier on agni-01, boot, test `docker run --rm hello-world`
+   with bridge networking.
+7. Test `docker info --format '{{.Driver}}'` → `overlay2`.
+8. Test snapshot/resume for docker tier.
+
+### Phase 4: CI + distribution
 
 Add CI workflows, update install script, cut release.
 
-1. Add `.github/workflows/build-images.yml`
-2. Update `scripts/install.sh` to download pre-built artifacts
-3. Update `.github/workflows/release.yml` to include kernel + rootfs
-4. Test clean install from scratch on a fresh machine
-5. Tag v0.4.0
+1. Add `.github/workflows/build-images.yml`.
+2. Update `scripts/install.sh` to download pre-built artifacts.
+3. Update `.github/workflows/release.yml` to include kernel + rootfs.
+4. Test clean install from scratch on a fresh x86_64 machine.
+5. Test clean install on a Raspberry Pi (arm64).
+6. Tag v0.4.0.
 
 ### Dependency graph
 
 ```
-Phase 1 (kernel + lohar)
+Phase 1 (FC upgrade + lohar)
      ↓
-Phase 2 (tier scripts)    — needs Phase 1 kernel for docker tier
+Phase 2 (minimal + browser)  — needs Phase 1 lohar (boot profiles, /dev/shm)
+     ↓                         does NOT need custom kernel
+Phase 3 (kernel + docker)    — needs Phase 1 lohar + custom kernel
      ↓
-Phase 3 (CI + distribution) — needs Phase 2 tier scripts
+Phase 4 (CI + distribution)  — needs Phase 2+3 tier scripts
 ```
+
+Phase 2 and Phase 3 are independent after Phase 1. Browser tier can
+ship to users while Docker kernel is still being built/tested.
 
 ---
 
-## Open Questions
+## Resolved Questions
 
 1. **Rootfs default size.** Minimal at 512MB, browser/docker at 2GB.
-   Users can resize with `--disk-size`. Should minimal be smaller
-   (256MB) to minimize download?
+   Users can resize with `--disk-size`. 512MB for minimal is fine — it's
+   the download that matters (zstd-compressed ~40MB), not on-disk size.
 
-2. **Chromium version pinning.** Ubuntu repos ship whatever version is
-   current. Should we pin a specific Chromium version for reproducibility,
-   or accept rolling updates per rootfs build?
+2. **Chromium source.** Use Playwright's bundled Chromium, not Ubuntu
+   repos. Ubuntu's `chromium-browser` is a snap redirect in noble and
+   broken in minbase chroots. Playwright bundles a known-good binary
+   tested against its own API. (§2.2.1)
 
-3. **Docker version pinning.** Same question. Docker 29.3.1 is current.
-   Pin to a specific version in the tier script, or use `docker-ce`
-   (latest)?
+3. **Docker version pinning.** Don't pin. Use `docker-ce` (latest from
+   Docker's apt repo). Docker is stable across minor versions. Pin only
+   if a specific version causes a regression.
 
-4. **Playwright version.** Pin `playwright==X.Y.Z` or use latest?
-   Playwright + Chromium version coupling is notoriously fragile.
+4. **Playwright version pinning.** Yes, pin. Playwright + Chromium
+   coupling is fragile. Pin `playwright==1.50.0` (or current at time of
+   implementation). Update per release, test combination in CI. (§2.2.2)
 
-5. **arm64 rootfs build time.** QEMU userspace emulation for arm64
-   debootstrap on x86 CI runners takes 20-30 min. Acceptable for
-   release builds? Alternative: self-hosted arm64 runner.
+5. **arm64 rootfs build time.** QEMU userspace emulation on x86_64 CI
+   runners takes 20-30 min. Acceptable for release builds (tagged only).
+   Future optimization: self-hosted arm64 runner (Raspberry Pi) or
+   `actions/cache` for the debootstrap tarball.
+
+6. **Browser tier vs Playwright inside Docker.** Standalone browser tier.
+   Cleaner snapshot semantics (one process vs dockerd+containerd+shim),
+   no kernel dependency, ~200MB lighter, faster boot. See "Why not
+   Playwright inside Docker?" section above.
