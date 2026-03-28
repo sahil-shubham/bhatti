@@ -38,6 +38,11 @@ jobs:
       - name: Build binaries
         run: make release
 
+      - name: Build lohar (for custom rootfs builds)
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-amd64 ./cmd/lohar/
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-arm64 ./cmd/lohar/
+
       - uses: actions/upload-artifact@v4
         with:
           name: binaries
