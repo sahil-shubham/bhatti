@@ -54,8 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arch: [x86_64]
-        # Add aarch64 when arm64 testing is in place
+        arch: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
 
@@ -63,6 +62,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+          ${{ matrix.arch == 'aarch64' && 'sudo apt-get install -y gcc-aarch64-linux-gnu' || 'true' }}
 
       - name: Cache kernel source
         uses: actions/cache@v4
@@ -85,8 +85,7 @@ jobs:
     strategy:
       matrix:
         tier: [minimal, browser, docker]
-        arch: [amd64]
-        # Add arm64 when arm64 testing is in place
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -101,6 +100,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq debootstrap
+          ${{ matrix.arch == 'arm64' && 'sudo apt-get install -y -qq qemu-user-static' || 'true' }}
           sudo ./scripts/build-tier.sh ${{ matrix.tier }} ${{ matrix.arch }} ./lohar
 
       - name: Compress
