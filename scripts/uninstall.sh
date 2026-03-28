@@ -82,12 +82,14 @@ for br in $(ip -o link show type bridge 2>/dev/null | grep "brbhatti" | awk -F':
 done
 
 # iptables rules (bhatti adds FORWARD rules per-bridge)
-for chain in FORWARD; do
-    iptables -S "$chain" 2>/dev/null | grep -i "brbhatti" | while read -r rule; do
+RULES=$(iptables -S FORWARD 2>/dev/null | grep -i "brbhatti" || true)
+if [[ -n "$RULES" ]]; then
+    echo "$RULES" | while read -r rule; do
         echo "  removing iptables rule: $rule"
+        # shellcheck disable=SC2086
         iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
     done
-done
+fi
 
 # --- 4. Remove binaries ---
 
