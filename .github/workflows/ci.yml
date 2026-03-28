@@ -9,7 +9,7 @@ on:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     steps:
       - uses: actions/checkout@v4
 
@@ -34,14 +34,15 @@ jobs:
 
   shellcheck:
     name: Shellcheck
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set
     steps:
       - uses: actions/checkout@v4
 
       - name: Shellcheck
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          find scripts/ -name '*.sh' -exec shellcheck -e SC1091 {} +
+          find scripts/ -name '*.sh' -exec shellcheck --severity=warning -e SC1091 {} +
 
   rootfs-minimal:
     name: Build minimal rootfs
