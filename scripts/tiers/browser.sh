@@ -18,9 +18,10 @@ echo "==> Installing browser tier packages..."
 chroot "$MOUNT" /bin/bash -c "
 set -eu
 export DEBIAN_FRONTEND=noninteractive
-# Enable universe repo (needed by playwright install-deps for fonts, xvfb)
-sed -i 's/^Components: main\$/Components: main universe/' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null \
-    || echo 'deb http://archive.ubuntu.com/ubuntu noble main universe' > /etc/apt/sources.list
+# Enable universe repo (needed by playwright install-deps for fonts, xvfb).
+# debootstrap creates /etc/apt/sources.list with the correct mirror for the
+# target arch. Don't replace it — just append universe to the existing line.
+sed -i 's/ main$/ main universe/' /etc/apt/sources.list
 apt-get update -qq
 
 # xz-utils needed to decompress Node.js tarball (.tar.xz)
