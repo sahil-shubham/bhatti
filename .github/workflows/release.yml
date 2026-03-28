@@ -106,7 +106,7 @@ jobs:
       - name: Compress
         run: |
           sudo apt-get install -y -qq zstd
-          zstd -19 dist/rootfs-${{ matrix.tier }}-${{ matrix.arch }}.ext4
+          sudo zstd -19 dist/rootfs-${{ matrix.tier }}-${{ matrix.arch }}.ext4
 
       - uses: actions/upload-artifact@v4
         with:
