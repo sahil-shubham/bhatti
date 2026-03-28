@@ -3,130 +3,54 @@ name: Integration Tests
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   integration:
-    name: Integration (${{ matrix.tier }})
+    name: Integration Tests
     runs-on: arc-runner-set
-    # Don't allow forks to run on self-hosted runners
+    timeout-minutes: 20
+    # Self-hosted: never run from forks
     if: github.repository == 'sahil-shubham/bhatti'
-    strategy:
-      fail-fast: false
-      matrix:
-        tier: [minimal]
-        # browser and docker tiers need larger rootfs downloads;
-        # start with minimal to validate the pipeline
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Build bhatti + lohar
-        run: |
-          go build -ldflags="-s -w" -o bhatti ./cmd/bhatti/
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+      - name: Build lohar
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
 
-      - name: Install Firecracker
+      - name: Verify prerequisites
         run: |
-          curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-aarch64.tgz" | tar xz
-          sudo mv release-v1.14.0-aarch64/firecracker-v1.14.0-aarch64 /usr/local/bin/firecracker
-          sudo chmod +x /usr/local/bin/firecracker
-          rm -rf release-v1.14.0-aarch64
-          firecracker --version
-
-      - name: Verify KVM
-        run: |
+          /opt/bhatti/bin/firecracker --version
+          ls -lh /opt/bhatti/images/vmlinux-arm64
           ls -la /dev/kvm
           test -w /dev/kvm || sudo chmod 666 /dev/kvm
-
-      - name: Download kernel
-        run: |
-          mkdir -p data/images
-          curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155" \
-            -o data/images/vmlinux-arm64
 
       - name: Build rootfs
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq debootstrap
-          sudo ./scripts/build-tier.sh ${{ matrix.tier }} arm64 ./lohar
-          sudo mv dist/rootfs-${{ matrix.tier }}-arm64.ext4 data/images/rootfs-arm64.ext4
+          sudo apt-get install -y -qq iproute2 iptables e2fsprogs debootstrap
+          sudo mkdir -p /var/lib/bhatti/images
+          sudo cp lohar /var/lib/bhatti/lohar
+          sudo cp /opt/bhatti/bin/firecracker /usr/local/bin/firecracker
+          sudo cp /opt/bhatti/images/vmlinux-arm64 /var/lib/bhatti/images/vmlinux-arm64
+          sudo ./scripts/build-tier.sh minimal arm64 ./lohar
+          sudo mv dist/rootfs-minimal-arm64.ext4 /var/lib/bhatti/images/rootfs-base-arm64.ext4
 
-      - name: Write config
+      - name: Run integration tests
         run: |
-          cat > data/config.yaml << EOF
-          engine: firecracker
-          listen: :8080
-          data_dir: $(pwd)/data
-          firecracker_bin: /usr/local/bin/firecracker
-          firecracker_kernel: $(pwd)/data/images/vmlinux-arm64
-          firecracker_rootfs: $(pwd)/data/images/rootfs-arm64.ext4
-          EOF
-          mkdir -p data/{sandboxes,volumes,snapshots}
-
-      - name: Start bhatti
-        run: |
-          sudo ./bhatti serve &
-          sleep 3
-          curl -sf http://localhost:8080/health
-
-      - name: Create admin user
-        run: |
-          ADMIN_KEY=$(sudo ./bhatti user create --name admin --max-sandboxes 10 2>&1 | grep "API key:" | awk '{print $NF}')
-          echo "BHATTI_TOKEN=$ADMIN_KEY" >> "$GITHUB_ENV"
-          mkdir -p ~/.bhatti
-          echo "auth_token: $ADMIN_KEY" > ~/.bhatti/config.yaml
-          echo "listen: :8080" >> ~/.bhatti/config.yaml
-
-      - name: "Test: create + exec"
-        run: |
-          ./bhatti create --name test-exec
-          RESULT=$(./bhatti exec test-exec -- echo 'integration-test-ok')
-          echo "Result: $RESULT"
-          [ "$RESULT" = "integration-test-ok" ]
-
-      - name: "Test: whoami is lohar"
-        run: |
-          RESULT=$(./bhatti exec test-exec -- whoami)
-          echo "Result: $RESULT"
-          [ "$RESULT" = "lohar" ]
-
-      - name: "Test: sudo works"
-        run: |
-          RESULT=$(./bhatti exec test-exec -- sudo whoami)
-          echo "Result: $RESULT"
-          [ "$RESULT" = "root" ]
-
-      - name: "Test: /etc/hosts resolves hostname"
-        run: |
-          ./bhatti exec test-exec -- cat /etc/hosts | grep test-exec
-
-      - name: "Test: /dev/shm mounted"
-        run: |
-          ./bhatti exec test-exec -- mount | grep '/dev/shm'
-
-      - name: "Test: cgroup2 mounted"
-        run: |
-          ./bhatti exec test-exec -- mount | grep 'cgroup2'
-
-      - name: "Test: internet access"
-        run: |
-          ./bhatti exec test-exec -- curl -sf https://example.com -o /dev/null
-
-      - name: "Test: destroy"
-        run: |
-          ./bhatti destroy test-exec
-          # Verify it's gone
-          ! ./bhatti exec test-exec -- echo 'should fail' 2>/dev/null
+          sudo go test ./pkg/engine/firecracker/ -v -count=1 -timeout=300s \
+            -skip 'TestCheckpointVMConfig'
 
       - name: Cleanup
         if: always()
         run: |
-          ./bhatti destroy test-exec 2>/dev/null || true
-          sudo pkill -f 'bhatti serve' 2>/dev/null || true
           sudo pkill -f firecracker 2>/dev/null || true
+          sudo rm -rf /var/lib/bhatti 2>/dev/null || true

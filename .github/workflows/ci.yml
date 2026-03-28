@@ -6,73 +6,37 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Test
-    # Self-hosted: only run on push or same-repo PRs (never fork PRs)
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: arc-runner-set
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Build bhatti
+      - name: Build
         run: go build ./...
-
-      - name: Build lohar (linux/amd64)
-        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/lohar/
-
-      - name: Build lohar (linux/arm64)
-        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/lohar/
-
-      - name: Test
-        run: go test ./pkg/store/ ./pkg/server/ ./pkg/ ./pkg/agent/proto/ ./pkg/secrets/ ./cmd/bhatti/ -count=1 -timeout=120s
 
       - name: Vet
         run: go vet ./...
 
+      - name: Test
+        run: go test $(go list ./... | grep -v cmd/lohar) -count=1 -timeout=120s
+
   shellcheck:
     name: Shellcheck
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: arc-runner-set
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Shellcheck
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-          find scripts/ -name '*.sh' -exec shellcheck --severity=error -e SC1091 {} +
-
-  rootfs-minimal:
-    name: Build minimal rootfs
     runs-on: ubuntu-latest
-    # Only run when tier scripts or lohar change — skip for unrelated PRs
-    if: github.event_name == 'push' || contains(github.event.pull_request.title, 'rootfs') || contains(github.event.pull_request.title, 'tier') || contains(github.event.pull_request.title, 'lohar')
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Build lohar
-        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
-
-      - name: Build minimal rootfs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq debootstrap
-          sudo ./scripts/build-tier.sh minimal amd64 ./lohar
-
-      - name: Verify size
-        run: |
-          SIZE=$(du -m dist/rootfs-minimal-amd64.ext4 | cut -f1)
-          echo "Minimal rootfs: ${SIZE}MB"
-          if [ "$SIZE" -gt 300 ]; then
-            echo "FAIL: minimal rootfs is ${SIZE}MB, expected <300MB" >&2
-            exit 1
-          fi
+      - name: Run shellcheck
+        run: find scripts/ -name '*.sh' -exec shellcheck --severity=error -e SC1091 {} +

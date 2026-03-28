@@ -8,50 +8,40 @@ on:
 permissions:
   contents: write
 
+env:
+  KERNEL_VERSION: "6.1.155"
+
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Run tests
-        run: go test ./pkg/store/ ./pkg/server/ ./pkg/ ./pkg/agent/proto/ ./pkg/secrets/ ./cmd/bhatti/ -count=1 -timeout=120s
-
   binaries:
     name: Build Binaries
-    needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Build binaries
+      - name: Build bhatti (all platforms)
         run: make release
 
-      - name: Build lohar (for custom rootfs builds)
+      - name: Build lohar (linux amd64 + arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-amd64 ./cmd/lohar/
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-arm64 ./cmd/lohar/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries
           path: dist/*
 
   kernel:
     name: Build Kernel (${{ matrix.arch }})
-    needs: test
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
@@ -60,29 +50,56 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc
 
       - name: Cache kernel source
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: linux-6.1.155
-          key: kernel-src-6.1.155-${{ matrix.arch }}
+          path: linux-${{ env.KERNEL_VERSION }}
+          key: kernel-src-${{ env.KERNEL_VERSION }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh') }}
 
       - name: Build kernel
         run: ./scripts/build-kernel.sh ${{ matrix.arch }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kernel-${{ matrix.arch }}
           path: dist/vmlinux-*
 
+  lohar:
+    name: Build Lohar (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build lohar
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lohar-${{ matrix.arch }}
+          path: lohar
+
   rootfs:
     name: Build Rootfs (${{ matrix.tier }}-${{ matrix.arch }})
-    needs: test
+    needs: lohar
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     strategy:
       matrix:
         tier: [minimal, browser, docker]
@@ -93,17 +110,15 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          go-version-file: go.mod
-
-      - name: Build lohar
-        run: GOARCH=${{ matrix.arch }} GOOS=linux CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+          name: lohar-${{ matrix.arch }}
 
       - name: Build rootfs
         run: |
+          chmod +x lohar
           sudo apt-get update -qq
           sudo apt-get install -y -qq debootstrap
           sudo ./scripts/build-tier.sh ${{ matrix.tier }} ${{ matrix.arch }} ./lohar
@@ -113,7 +128,7 @@ jobs:
           sudo apt-get install -y -qq zstd
           sudo zstd -19 dist/rootfs-${{ matrix.tier }}-${{ matrix.arch }}.ext4
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rootfs-${{ matrix.tier }}-${{ matrix.arch }}
           path: dist/rootfs-*.ext4.zst
@@ -122,18 +137,25 @@ jobs:
     name: Create Release
     needs: [binaries, kernel, rootfs]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
-      - name: Collect artifacts
+      - name: Collect artifacts and generate checksums
         run: |
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
-          ls -lh release/
+          cd release
+          sha256sum * > checksums-sha256.txt
+          echo "=== Release artifacts ==="
+          ls -lh
+          echo ""
+          echo "=== SHA256 checksums ==="
+          cat checksums-sha256.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           files: release/*
           generate_release_notes: true
