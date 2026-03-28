@@ -22,14 +22,14 @@ jobs:
       - name: Run tests
         run: go test ./pkg/store/ ./pkg/server/ ./pkg/ ./pkg/agent/proto/ ./pkg/secrets/ ./cmd/bhatti/ -count=1 -timeout=120s
 
-  release:
-    name: Build & Release
+  binaries:
+    name: Build Binaries
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # needed for git describe
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -38,8 +38,92 @@ jobs:
       - name: Build binaries
         run: make release
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: dist/*
+          name: binaries
+          path: dist/*
+
+  kernel:
+    name: Build Kernel (${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64]
+        # Add aarch64 when arm64 testing is in place
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+
+      - name: Cache kernel source
+        uses: actions/cache@v4
+        with:
+          path: linux-6.1.155
+          key: kernel-src-6.1.155
+
+      - name: Build kernel
+        run: ./scripts/build-kernel.sh ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: dist/vmlinux-*
+
+  rootfs:
+    name: Build Rootfs (${{ matrix.tier }}-${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tier: [minimal, browser, docker]
+        arch: [amd64]
+        # Add arm64 when arm64 testing is in place
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build lohar
+        run: GOARCH=${{ matrix.arch }} GOOS=linux CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+
+      - name: Build rootfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debootstrap
+          sudo ./scripts/build-tier.sh ${{ matrix.tier }} ${{ matrix.arch }} ./lohar
+
+      - name: Compress
+        run: |
+          sudo apt-get install -y -qq zstd
+          zstd -19 dist/rootfs-${{ matrix.tier }}-${{ matrix.arch }}.ext4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.tier }}-${{ matrix.arch }}
+          path: dist/rootfs-*.ext4.zst
+
+  release:
+    name: Create Release
+    needs: [binaries, kernel, rootfs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -lh release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
           generate_release_notes: true
