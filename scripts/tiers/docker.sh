@@ -61,6 +61,11 @@ done
 
 if [ ! -S /var/run/docker.sock ]; then
     echo "bhatti: dockerd failed to start within 10s, check /var/log/dockerd.log" >&2
+else
+    # Allow non-root access. lohar exec runs as uid 1000 without
+    # supplementary groups, so docker group membership doesn't work.
+    # This is safe — the VM is an isolated single-user sandbox.
+    chmod 666 /var/run/docker.sock
 fi
 PROFILE
 chmod 755 "$MOUNT/etc/bhatti/init.sh"
