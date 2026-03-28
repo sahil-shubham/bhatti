@@ -67,11 +67,14 @@ func main() {
 	// Try to load config drive (/dev/vdb)
 	cfg := loadConfigDrive()
 	if cfg != nil {
+		hostname := "bhatti"
 		if cfg.Hostname != "" {
-			syscall.Sethostname([]byte(cfg.Hostname))
-		} else {
-			syscall.Sethostname([]byte("bhatti"))
+			hostname = cfg.Hostname
 		}
+		syscall.Sethostname([]byte(hostname))
+		// Write /etc/hosts so sudo and other tools can resolve the hostname.
+		os.WriteFile("/etc/hosts", []byte(
+			"127.0.0.1 localhost "+hostname+"\n::1 localhost "+hostname+"\n"), 0644)
 		if len(cfg.DNS) > 0 {
 			applyDNS(cfg.DNS)
 		} else {
@@ -88,6 +91,8 @@ func main() {
 		os.RemoveAll("/run/bhatti/config")
 	} else {
 		syscall.Sethostname([]byte("bhatti"))
+		os.WriteFile("/etc/hosts", []byte(
+			"127.0.0.1 localhost bhatti\n::1 localhost bhatti\n"), 0644)
 		ensureResolvConf()
 	}
 
