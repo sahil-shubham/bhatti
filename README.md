@@ -28,14 +28,18 @@ On a Raspberry Pi 5 (ARM64, NVMe):
 
 ```
                                 p50       p95       p99
-Exec `true`:                    1.0ms     1.2ms     1.3ms
-1KB file read:                  472µs     826µs     881µs
-Warm→exec (resume + exec):     2.5ms     2.6ms     2.6ms
-10 concurrent execs:            18ms      19ms      19ms
+Exec command:                   1.26ms    1.88ms    2.93ms
+1KB file read:                  433µs     733µs     1.08ms
+1KB file write:                 754µs     1.17ms    1.82ms
+Warm resume + exec:             2.70ms    7.36ms    7.36ms
+Cold resume + exec:             40.8ms    42.3ms    42.3ms
+10 concurrent execs:            12.8ms    22.3ms    22.3ms
 
-VM boot:                        ~3.5s
-Diff snapshot (idle VM):        ~52ms
-Pause/Resume:                   ~400µs
+VM boot (create + first exec):  8.0s      8.4s      8.4s
+Full snapshot (512MB):           3.3s      3.6s      3.6s
+Diff snapshot:                  20.7ms    35.9ms    35.9ms
+Pause (hot→warm):               450µs     611µs     611µs
+Resume (warm→hot):               462µs     565µs     565µs
 ```
 
 ## Architecture
