@@ -43,9 +43,12 @@ func (l latencies) report(name string, t *testing.T) {
 		l[len(l)-1].Round(time.Microsecond))
 }
 
-// --- Perf workload tests ---
+// --- User-facing perf tests ---
+// These measure what a consumer of bhatti actually experiences.
 
-func TestPerfExecPercentiles(t *testing.T) {
+// TestPerfExecCommand measures end-to-end exec latency.
+// 100 sequential `echo hello` commands on a hot sandbox.
+func TestPerfExecCommand(t *testing.T) {
 	eng := testEngine(t)
 	ctx := context.Background()
 
@@ -55,30 +58,35 @@ func TestPerfExecPercentiles(t *testing.T) {
 	}
 	defer eng.Destroy(ctx, info.ID)
 
-	// Warmup
+	// Warmup — first few execs have cold TCP connection overhead
 	for i := 0; i < 5; i++ {
-		execWithTimeout(t, eng, info.ID, []string{"true"})
+		execWithTimeout(t, eng, info.ID, []string{"echo", "warmup"})
 	}
 
-	// 100 sequential execs
+	// 100 sequential execs of a realistic minimal command
 	var lats latencies
 	for i := 0; i < 100; i++ {
 		start := time.Now()
-		r, err := execWithTimeout(t, eng, info.ID, []string{"true"})
+		r, err := execWithTimeout(t, eng, info.ID, []string{"echo", "hello"})
 		elapsed := time.Since(start)
 		if err != nil || r.ExitCode != 0 {
 			t.Fatalf("exec %d failed: err=%v exit=%d", i, err, r.ExitCode)
 		}
+		if !strings.Contains(r.Stdout, "hello") {
+			t.Fatalf("exec %d: unexpected output: %q", i, r.Stdout)
+		}
 		lats = append(lats, elapsed)
 	}
-	lats.report("exec `true`", t)
+	lats.report("exec `echo hello`", t)
 
 	if lats.p(99) > 50*time.Millisecond {
 		t.Errorf("p99 exec latency too high: %v (want <50ms)", lats.p(99))
 	}
 }
 
-func TestPerfSmallFileLatency(t *testing.T) {
+// TestPerfFileReadWrite measures file I/O through the wire protocol.
+// 50 cycles of 1KB write + read.
+func TestPerfFileReadWrite(t *testing.T) {
 	eng := testEngine(t)
 	ctx := context.Background()
 
@@ -90,7 +98,6 @@ func TestPerfSmallFileLatency(t *testing.T) {
 
 	content := []byte(strings.Repeat("x", 1024)) // 1KB
 
-	// 50 write+read cycles
 	var writeLats, readLats latencies
 	for i := 0; i < 50; i++ {
 		path := fmt.Sprintf("/workspace/perf-%d.txt", i)
@@ -117,6 +124,310 @@ func TestPerfSmallFileLatency(t *testing.T) {
 	readLats.report("1KB file read", t)
 }
 
+// TestPerfWarmResumeExec measures the latency of executing a command on a
+// paused (warm) sandbox. This is the most common path in production — the
+// thermal manager pauses idle VMs after 30s, and the next API call
+// transparently resumes before executing.
+// 15 cycles of: pause → ensureHot → exec.
+func TestPerfWarmResumeExec(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("perf-warm"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Warmup exec
+	execWithTimeout(t, eng, info.ID, []string{"true"})
+
+	var lats latencies
+	for i := 0; i < 15; i++ {
+		// Pause → warm state
+		if err := eng.Pause(ctx, info.ID); err != nil {
+			t.Fatalf("Pause %d: %v", i, err)
+		}
+		time.Sleep(50 * time.Millisecond) // let FC socket pool drain
+
+		// Measure: resume + exec (what the user experiences)
+		start := time.Now()
+		if err := eng.EnsureHot(ctx, info.ID); err != nil {
+			t.Fatalf("EnsureHot %d: %v", i, err)
+		}
+		r, err := execWithTimeout(t, eng, info.ID, []string{"echo", "warm"})
+		elapsed := time.Since(start)
+		if err != nil || r.ExitCode != 0 {
+			t.Fatalf("exec %d: err=%v exit=%d", i, err, r.ExitCode)
+		}
+		lats = append(lats, elapsed)
+	}
+	lats.report("warm resume + exec", t)
+}
+
+// TestPerfColdResumeExec measures the latency of executing a command on a
+// cold sandbox (snapshotted to disk, FC process killed, RAM freed).
+// This is the slow path — happens after 30min idle.
+// 7 cycles of: stop → start → exec.
+func TestPerfColdResumeExec(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("perf-cold"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Write something so we can verify state survives
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo alive > /tmp/state"})
+
+	var lats latencies
+	for i := 0; i < 7; i++ {
+		// Stop → snapshot to disk, kill FC, free RAM
+		if err := eng.Stop(ctx, info.ID); err != nil {
+			t.Fatalf("Stop %d: %v", i, err)
+		}
+
+		// Measure: restore from snapshot + exec
+		start := time.Now()
+		if err := eng.Start(ctx, info.ID); err != nil {
+			t.Fatalf("Start %d: %v", i, err)
+		}
+		r, err := execWithTimeout(t, eng, info.ID, []string{"echo", "cold"})
+		elapsed := time.Since(start)
+		if err != nil || r.ExitCode != 0 {
+			t.Fatalf("exec %d: err=%v exit=%d", i, err, r.ExitCode)
+		}
+		lats = append(lats, elapsed)
+	}
+	lats.report("cold resume + exec", t)
+
+	// Verify state survived all cycles
+	r, _ := execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/state"})
+	if !strings.Contains(r.Stdout, "alive") {
+		t.Errorf("state lost after snapshot cycles: %q", r.Stdout)
+	}
+}
+
+// TestPerfPauseResume measures pause and resume as separate operations.
+// 20 cycles each.
+func TestPerfPauseResume(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("perf-pr"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Warmup
+	execWithTimeout(t, eng, info.ID, []string{"true"})
+
+	var pauseLats, resumeLats latencies
+	for i := 0; i < 20; i++ {
+		start := time.Now()
+		if err := eng.Pause(ctx, info.ID); err != nil {
+			t.Fatalf("Pause %d: %v", i, err)
+		}
+		pauseLats = append(pauseLats, time.Since(start))
+
+		time.Sleep(20 * time.Millisecond) // brief settle
+
+		start = time.Now()
+		if err := eng.Resume(ctx, info.ID); err != nil {
+			t.Fatalf("Resume %d: %v", i, err)
+		}
+		resumeLats = append(resumeLats, time.Since(start))
+
+		time.Sleep(20 * time.Millisecond)
+	}
+	pauseLats.report("pause (hot→warm)", t)
+	resumeLats.report("resume (warm→hot)", t)
+
+	// Verify VM still works
+	r, err := execWithTimeout(t, eng, info.ID, []string{"echo", "ok"})
+	if err != nil || !strings.Contains(r.Stdout, "ok") {
+		t.Fatalf("VM broken after 20 pause/resume cycles: err=%v out=%q", err, r.Stdout)
+	}
+}
+
+// TestPerfDiffSnapshot measures full vs diff snapshot with percentiles.
+// 1 full snapshot, then 7 diff snapshots.
+func TestPerfDiffSnapshot(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("perf-snap"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo init > /tmp/snap"})
+
+	// First stop → full snapshot (single measurement)
+	start := time.Now()
+	if err := eng.Stop(ctx, info.ID); err != nil {
+		t.Fatalf("Stop (full): %v", err)
+	}
+	fullDur := time.Since(start)
+
+	vm, _ := eng.getVM(info.ID)
+	fullSize, _ := fileSize(vm.SnapMemPath)
+	t.Logf("⏱ full snapshot: %v (%d MB)", fullDur.Round(time.Millisecond), fullSize/(1024*1024))
+
+	eng.Start(ctx, info.ID)
+
+	// Diff snapshots — 7 cycles
+	var diffLats latencies
+	for i := 0; i < 7; i++ {
+		// Small write to dirty a few pages
+		execWithTimeout(t, eng, info.ID, []string{"sh", "-c", fmt.Sprintf("echo diff-%d > /tmp/snap", i)})
+
+		start := time.Now()
+		if err := eng.Stop(ctx, info.ID); err != nil {
+			t.Fatalf("Stop (diff %d): %v", i, err)
+		}
+		diffLats = append(diffLats, time.Since(start))
+
+		eng.Start(ctx, info.ID)
+	}
+	diffLats.report("diff snapshot", t)
+
+	diffSize, _ := fileSize(vm.SnapMemPath)
+	if fullSize > 0 && diffSize < fullSize {
+		t.Logf("  diff is %dx smaller than full (%d MB vs %d MB)",
+			fullSize/max(diffSize, 1), diffSize/(1024*1024), fullSize/(1024*1024))
+	}
+
+	// Verify state survived
+	r, _ := execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/snap"})
+	if !strings.Contains(r.Stdout, "diff-6") {
+		t.Errorf("state lost: %q", r.Stdout)
+	}
+}
+
+// TestPerfVMBoot measures end-to-end sandbox creation time.
+// 5 VMs created and destroyed sequentially.
+func TestPerfVMBoot(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	var lats latencies
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		info, err := eng.Create(ctx, testSpec(fmt.Sprintf("perf-boot-%d", i)))
+		if err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+		// First exec confirms the VM is fully ready
+		r, err := execWithTimeout(t, eng, info.ID, []string{"echo", "booted"})
+		elapsed := time.Since(start)
+		if err != nil || r.ExitCode != 0 {
+			t.Fatalf("boot exec %d: err=%v exit=%d", i, err, r.ExitCode)
+		}
+		lats = append(lats, elapsed)
+		eng.Destroy(ctx, info.ID)
+	}
+	lats.report("VM boot (create + first exec)", t)
+}
+
+// TestPerfConcurrentExec measures 10 concurrent execs — common when an LLM
+// returns multiple tool calls in one message. Reports both per-exec latency
+// and total wall clock time.
+func TestPerfConcurrentExec(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("perf-conc"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	// Warmup
+	execWithTimeout(t, eng, info.ID, []string{"true"})
+
+	// Run 3 rounds of 10 concurrent execs for better percentiles
+	var perExecLats latencies
+	var wallClockLats latencies
+
+	for round := 0; round < 3; round++ {
+		var mu sync.Mutex
+		var roundLats latencies
+		var wg sync.WaitGroup
+		errors := 0
+
+		wallStart := time.Now()
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				start := time.Now()
+				r, err := execWithTimeout(t, eng, info.ID, []string{"echo", fmt.Sprintf("c-%d-%d", round, idx)})
+				elapsed := time.Since(start)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil || r.ExitCode != 0 {
+					errors++
+					return
+				}
+				roundLats = append(roundLats, elapsed)
+			}(i)
+		}
+		wg.Wait()
+		wallClock := time.Since(wallStart)
+
+		if errors > 0 {
+			t.Errorf("round %d: %d/10 concurrent execs failed", round, errors)
+		}
+
+		perExecLats = append(perExecLats, roundLats...)
+		wallClockLats = append(wallClockLats, wallClock)
+
+		time.Sleep(100 * time.Millisecond) // brief settle between rounds
+	}
+
+	perExecLats.report("10 concurrent execs (per-exec)", t)
+	wallClockLats.report("10 concurrent execs (wall clock)", t)
+}
+
+// --- Supporting perf tests (not for the website, but useful) ---
+
+func TestPerfStreamExecLatency(t *testing.T) {
+	eng := testEngine(t)
+	ctx := context.Background()
+
+	info, err := eng.Create(ctx, testSpec("perf-stream"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer eng.Destroy(ctx, info.ID)
+
+	var ttfbLats, totalLats latencies
+	for i := 0; i < 20; i++ {
+		start := time.Now()
+		var firstByte time.Duration
+		var gotFirst bool
+		eng.ExecStream(ctx, info.ID, []string{"echo", "perf-stream"}, func(e engine.StreamEvent) {
+			if !gotFirst && e.Type == "stdout" {
+				firstByte = time.Since(start)
+				gotFirst = true
+			}
+		})
+		total := time.Since(start)
+
+		if gotFirst {
+			ttfbLats = append(ttfbLats, firstByte)
+		}
+		totalLats = append(totalLats, total)
+	}
+	ttfbLats.report("stream exec TTFB", t)
+	totalLats.report("stream exec total", t)
+}
+
 func TestPerfParallelFileReads(t *testing.T) {
 	eng := testEngine(t)
 	ctx := context.Background()
@@ -127,14 +438,12 @@ func TestPerfParallelFileReads(t *testing.T) {
 	}
 	defer eng.Destroy(ctx, info.ID)
 
-	// Write 5 files
 	for i := 0; i < 5; i++ {
 		path := fmt.Sprintf("/workspace/file-%d.txt", i)
 		content := []byte(fmt.Sprintf("content-%d %s", i, strings.Repeat("x", 1024)))
 		eng.FileWrite(ctx, info.ID, path, "0644", int64(len(content)), bytes.NewReader(content))
 	}
 
-	// Read all 5 in parallel — common agentic pattern
 	var mu sync.Mutex
 	var lats latencies
 	var wg sync.WaitGroup
@@ -162,173 +471,6 @@ func TestPerfParallelFileReads(t *testing.T) {
 		t.Fatalf("expected 5 reads, got %d", len(lats))
 	}
 	lats.report("5 parallel 1KB reads", t)
-
-	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
-	t.Logf("  slowest single read: %v", lats[len(lats)-1].Round(time.Microsecond))
-}
-
-func TestPerfWarmExecHTTPLatency(t *testing.T) {
-	eng := testEngine(t)
-	ctx := context.Background()
-
-	info, err := eng.Create(ctx, testSpec("perf-warm"))
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	defer eng.Destroy(ctx, info.ID)
-
-	// Pause → warm
-	if err := eng.Pause(ctx, info.ID); err != nil {
-		t.Fatalf("Pause: %v", err)
-	}
-
-	// 5 cycles: ensureHot (warm→hot) + exec + pause
-	// Fewer cycles to avoid Firecracker's Unix socket connection limit.
-	var lats latencies
-	for i := 0; i < 5; i++ {
-		start := time.Now()
-		if err := eng.EnsureHot(ctx, info.ID); err != nil {
-			t.Fatalf("EnsureHot %d: %v", i, err)
-		}
-		r, err := execWithTimeout(t, eng, info.ID, []string{"true"})
-		elapsed := time.Since(start)
-		if err != nil || r.ExitCode != 0 {
-			t.Fatalf("exec %d: err=%v exit=%d", i, err, r.ExitCode)
-		}
-		lats = append(lats, elapsed)
-		eng.Pause(ctx, info.ID)
-		time.Sleep(50 * time.Millisecond) // let FC socket pool drain
-	}
-	lats.report("warm→exec (resume+exec)", t)
-}
-
-func TestPerfDiffVsFullSnapshot(t *testing.T) {
-	eng := testEngine(t)
-	ctx := context.Background()
-
-	info, err := eng.Create(ctx, testSpec("perf-diff"))
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	defer eng.Destroy(ctx, info.ID)
-
-	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo data > /tmp/test"})
-
-	// First stop → Full
-	start := time.Now()
-	eng.Stop(ctx, info.ID)
-	fullDur := time.Since(start)
-
-	vm, _ := eng.getVM(info.ID)
-	fullSize, _ := fileSize(vm.SnapMemPath)
-
-	eng.Start(ctx, info.ID)
-
-	// Small write to dirty a few pages
-	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo more > /tmp/test2"})
-
-	// Second stop → Diff
-	start = time.Now()
-	eng.Stop(ctx, info.ID)
-	diffDur := time.Since(start)
-
-	diffSize, _ := fileSize(vm.SnapMemPath)
-
-	eng.Start(ctx, info.ID)
-
-	// Verify data integrity
-	r, _ := execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/test"})
-	if !strings.Contains(r.Stdout, "data") {
-		t.Fatalf("data lost: %q", r.Stdout)
-	}
-	r, _ = execWithTimeout(t, eng, info.ID, []string{"cat", "/tmp/test2"})
-	if !strings.Contains(r.Stdout, "more") {
-		t.Fatalf("data2 lost: %q", r.Stdout)
-	}
-
-	t.Logf("⏱ full snapshot: %v (%d MB)", fullDur.Round(time.Millisecond), fullSize/(1024*1024))
-	t.Logf("⏱ diff snapshot: %v (%d MB)", diffDur.Round(time.Millisecond), diffSize/(1024*1024))
-	if diffSize < fullSize {
-		t.Logf("✓ diff is %dx smaller", fullSize/diffSize)
-	}
-}
-
-func TestPerfStreamExecLatency(t *testing.T) {
-	eng := testEngine(t)
-	ctx := context.Background()
-
-	info, err := eng.Create(ctx, testSpec("perf-stream"))
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	defer eng.Destroy(ctx, info.ID)
-
-	// Measure time-to-first-byte and time-to-exit for streaming exec
-	var ttfbLats, totalLats latencies
-	for i := 0; i < 20; i++ {
-		start := time.Now()
-		var firstByte time.Duration
-		var gotFirst bool
-		eng.ExecStream(ctx, info.ID, []string{"echo", "perf-stream"}, func(e engine.StreamEvent) {
-			if !gotFirst && e.Type == "stdout" {
-				firstByte = time.Since(start)
-				gotFirst = true
-			}
-		})
-		total := time.Since(start)
-
-		if gotFirst {
-			ttfbLats = append(ttfbLats, firstByte)
-		}
-		totalLats = append(totalLats, total)
-	}
-	ttfbLats.report("stream exec TTFB", t)
-	totalLats.report("stream exec total", t)
-}
-
-func TestPerfConcurrentExecLatency(t *testing.T) {
-	eng := testEngine(t)
-	ctx := context.Background()
-
-	info, err := eng.Create(ctx, testSpec("perf-conc"))
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	defer eng.Destroy(ctx, info.ID)
-
-	// Warmup
-	execWithTimeout(t, eng, info.ID, []string{"true"})
-
-	// 10 concurrent execs — common in agentic workloads
-	// (LLM returns multiple tool calls in one message)
-	var mu sync.Mutex
-	var lats latencies
-	var wg sync.WaitGroup
-	errors := 0
-
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			start := time.Now()
-			r, err := execWithTimeout(t, eng, info.ID, []string{"echo", fmt.Sprintf("concurrent-%d", idx)})
-			elapsed := time.Since(start)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil || r.ExitCode != 0 {
-				errors++
-				return
-			}
-			lats = append(lats, elapsed)
-		}(i)
-	}
-	wg.Wait()
-
-	if errors > 0 {
-		t.Errorf("%d/%d concurrent execs failed", errors, 10)
-	}
-	lats.report("10 concurrent execs", t)
-	t.Logf("  errors: %d/10", errors)
 }
 
 func TestPerfTruncatedFileRead(t *testing.T) {
@@ -341,11 +483,9 @@ func TestPerfTruncatedFileRead(t *testing.T) {
 	}
 	defer eng.Destroy(ctx, info.ID)
 
-	// Write a 10K-line file
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
 		"for i in $(seq 1 10000); do echo \"line $i of the log file with some padding to make it realistic\"; done > /workspace/big.log"})
 
-	// Full read
 	var fullLats latencies
 	for i := 0; i < 10; i++ {
 		var buf bytes.Buffer
@@ -355,7 +495,6 @@ func TestPerfTruncatedFileRead(t *testing.T) {
 	}
 	fullLats.report("10K-line full read", t)
 
-	// Truncated read (limit=100)
 	var truncLats latencies
 	for i := 0; i < 10; i++ {
 		var buf bytes.Buffer
