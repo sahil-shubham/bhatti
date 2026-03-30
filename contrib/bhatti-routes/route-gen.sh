@@ -1,33 +1,24 @@
 #!/bin/bash
-# route-gen.sh — Generates Caddy site config + Cloudflare DNS records from routes.yml
-#
-# Run periodically (e.g., systemd timer every 15s) to:
-#   1. Keep routed sandboxes warm (prevents cold VM 502s)
-#   2. Sync Caddy config with current sandbox IPs
-#   3. Ensure DNS records exist
-#
-# Configuration via environment or edit the variables below.
 set -euo pipefail
 
-ROUTES_FILE="${BHATTI_ROUTES_FILE:-/opt/bhatti-caddy/routes.yml}"
-OUTPUT_FILE="${BHATTI_SITES_FILE:-/opt/bhatti-caddy/sites.caddy}"
-DOMAIN="${BHATTI_DOMAIN:-dev2.example.com}"
-PUBLIC_IP="${BHATTI_PUBLIC_IP:-127.0.0.1}"
-BHATTI_URL="${BHATTI_URL:-http://localhost:8080}"
-CADDY_CONFIG="${BHATTI_CADDY_CONFIG:-/opt/bhatti-caddy/Caddyfile}"
+ROUTES_FILE="/opt/bhatti-caddy/routes.yml"
+OUTPUT_FILE="/opt/bhatti-caddy/sites.caddy"
+DOMAIN="dev2.ctxmill.com"
+PUBLIC_IP="100.72.221.54"
+BHATTI_URL="http://localhost:8080"
 
 BHATTI_TOKEN="${BHATTI_TOKEN:-$(grep auth_token /root/.bhatti/config.yaml 2>/dev/null | awk '{print $2}' || echo '')}"
 CF_TOKEN="${CF_DNS_API_TOKEN:-}"
-CF_ZONE_ID="${BHATTI_CF_ZONE_ID:-}"
+CF_ZONE_ID="ccd005bbeca3ab5e58af32b4f7308273"
 
 if [[ -z "$BHATTI_TOKEN" ]]; then
-    echo "error: BHATTI_TOKEN not set and not found in config" >&2
+    echo "error: BHATTI_TOKEN not set" >&2
     exit 1
 fi
 
 ensure_dns_record() {
     local name="$1"
-    [[ -z "$CF_TOKEN" || -z "$CF_ZONE_ID" ]] && return 0
+    [[ -z "$CF_TOKEN" ]] && return 0
     local existing
     existing=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
         "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=A&name=$name" \
@@ -49,12 +40,7 @@ get_sandbox_info() {
         | jq -r ".[] | select(.name == \"$name\") | \"\(.id) \(.ip)\""
 }
 
-wake_sandbox() {
-    local sandbox_id="$1"
-    curl -sf -H "Authorization: Bearer $BHATTI_TOKEN" "$BHATTI_URL/sandboxes/$sandbox_id" > /dev/null 2>&1 || true
-}
 
-# Parse routes (format: subdomain: sandbox:port OR subdomain: port)
 declare -A SUBDOMAINS SANDBOXES PORTS
 route_count=0
 while IFS=: read -r subdomain rest; do
@@ -102,10 +88,12 @@ fi
         ensure_dns_record "$subdomain.$DOMAIN"
         ensure_dns_record "*.$subdomain.$DOMAIN"
 
-        wake_sandbox "$sandbox_id"
-
         cat << SITE
 ${subdomain}.${DOMAIN}, *.${subdomain}.${DOMAIN} {
+	forward_auth ${BHATTI_URL} {
+		uri /sandboxes/${sandbox_id}
+		header_up Authorization "Bearer ${BHATTI_TOKEN}"
+	}
 	reverse_proxy ${sandbox_ip}:${port}
 }
 
@@ -116,4 +104,4 @@ SITE
 mv "${OUTPUT_FILE}.tmp" "$OUTPUT_FILE"
 echo "Written $OUTPUT_FILE ($route_count routes)" >&2
 
-caddy reload --config "$CADDY_CONFIG" 2>/dev/null || true
+caddy reload --config /opt/bhatti-caddy/Caddyfile 2>/dev/null || true
