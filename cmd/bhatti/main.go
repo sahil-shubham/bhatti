@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
@@ -136,16 +138,56 @@ func runDaemon() {
 	if cfg.PublicProxyListen != "" {
 		srvOpts = append(srvOpts, server.WithPublicProxyAddr(cfg.PublicProxyListen))
 	}
+	if cfg.Domain != nil {
+		srvOpts = append(srvOpts,
+			server.WithProxyZone(cfg.Domain.ProxyZone),
+			server.WithAPIHost(cfg.Domain.APIHost),
+		)
+	}
 	srv := server.New(eng, st, cfg.DataDir, srvOpts...)
 
-	// Resolve the port for display
-	port := cfg.Listen
+	var servers []*http.Server
+	if cfg.Domain != nil {
+		servers = startDomainMode(cfg, eng, st, srv)
+	} else {
+		servers = startPlainMode(cfg, eng, st, srv)
+	}
+
+	// Wait for SIGTERM/SIGINT
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	slog.Info("shutting down", "signal", sig)
+
+	// Drain HTTP connections (5s timeout)
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	for _, s := range servers {
+		s.Shutdown(shutCtx)
+	}
+
+	// Stop background goroutines (port scanner, thermal manager)
+	srv.Close()
+
+	// Stop engine (kill VMs, clean TAPs)
+	if shutdowner, ok := eng.(interface{ Shutdown() }); ok {
+		shutdowner.Shutdown()
+	}
+
+	slog.Info("shutdown complete")
+}
+
+// startPlainMode starts the API on :8080 + optional path-based public proxy.
+func startPlainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *server.Server) []*http.Server {
+	var servers []*http.Server
 
 	httpServer := &http.Server{
 		Addr:    cfg.Listen,
 		Handler: srv,
 	}
+	servers = append(servers, httpServer)
 
+	port := cfg.Listen
 	go func() {
 		slog.Info("bhatti listening", "addr", cfg.Listen)
 		if lanIP := getLanIP(); lanIP != "" {
@@ -160,7 +202,7 @@ func runDaemon() {
 		}
 	}()
 
-	// Start public proxy listener (path-based, for dev/testing)
+	// Optional path-based public proxy (dev/testing)
 	if cfg.PublicProxyListen != "" {
 		pubHandler := server.NewPublicProxyHandler(eng, st, srv.ResumeSem())
 		pubServer := &http.Server{
@@ -170,6 +212,7 @@ func runDaemon() {
 			WriteTimeout: 60 * time.Second,
 			IdleTimeout:  120 * time.Second,
 		}
+		servers = append(servers, pubServer)
 		go func() {
 			slog.Info("public proxy listening", "addr", cfg.PublicProxyListen)
 			if err := pubServer.ListenAndServe(); err != http.ErrServerClosed {
@@ -178,26 +221,101 @@ func runDaemon() {
 		}()
 	}
 
-	// Wait for SIGTERM/SIGINT
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-sigCh
-	slog.Info("shutting down", "signal", sig)
+	return servers
+}
 
-	// Drain HTTP connections (5s timeout)
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutCancel()
-	httpServer.Shutdown(shutCtx)
+// redirectHTTPS redirects HTTP to HTTPS.
+func redirectHTTPS(w http.ResponseWriter, r *http.Request) {
+	target := "https://" + r.Host + r.URL.RequestURI()
+	http.Redirect(w, r, target, http.StatusMovedPermanently)
+}
 
-	// Stop background goroutines (port scanner, thermal manager)
-	srv.Close()
+// startDomainMode starts :443 + :80 (redirect) + 127.0.0.1:8080 (internal).
+func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *server.Server) []*http.Server {
+	dom := cfg.Domain
+	var servers []*http.Server
 
-	// Stop engine (kill VMs, clean TAPs)
-	if shutdowner, ok := eng.(interface{ Shutdown() }); ok {
-		shutdowner.Shutdown()
+	// Create public proxy handler and attach to server for host-based routing
+	pubHandler := server.NewPublicProxyHandler(eng, st, srv.ResumeSem())
+	srv.SetPublicProxy(pubHandler)
+
+	// TLS config
+	var tlsConfig *tls.Config
+	var httpHandler http.Handler // :80 handler
+
+	if dom.TLSCert != "" && dom.TLSKey != "" {
+		// Option A: Bring your own (wildcard) cert
+		cert, err := tls.LoadX509KeyPair(dom.TLSCert, dom.TLSKey)
+		if err != nil {
+			slog.Error("load TLS cert", "error", err)
+			os.Exit(1)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		httpHandler = http.HandlerFunc(redirectHTTPS)
+	} else if dom.ACMEEmail != "" {
+		// Option B: Per-alias autocert
+		slog.Warn("per-alias TLS is rate-limited to 50 new aliases/week — for preview environments, use a wildcard cert (tls_cert/tls_key)")
+		certDir := filepath.Join(cfg.DataDir, "certs")
+		os.MkdirAll(certDir, 0700)
+		cm := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: srv.HostPolicy,
+			Cache:      autocert.DirCache(certDir),
+			Email:      dom.ACMEEmail,
+		}
+		tlsConfig = cm.TLSConfig()
+		httpHandler = cm.HTTPHandler(http.HandlerFunc(redirectHTTPS))
+	} else {
+		slog.Error("domain mode requires tls_cert+tls_key or acme_email")
+		os.Exit(1)
 	}
 
-	slog.Info("shutdown complete")
+	// :443 — serves both API (api.bhatti.sh) and proxy (*.deploy.bhatti.sh)
+	httpsServer := &http.Server{
+		Addr:              ":443",
+		Handler:           srv,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	servers = append(servers, httpsServer)
+	go func() {
+		slog.Info("bhatti listening (domain mode)",
+			"api", "https://"+dom.APIHost,
+			"proxy", "https://*."+dom.ProxyZone,
+		)
+		if err := httpsServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			slog.Error("HTTPS server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// :80 — ACME challenges + HTTPS redirect
+	httpServer := &http.Server{
+		Addr:    ":80",
+		Handler: httpHandler,
+	}
+	servers = append(servers, httpServer)
+	go func() {
+		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			slog.Error("HTTP redirect server failed", "error", err)
+		}
+	}()
+
+	// 127.0.0.1:8080 — internal API (health checks, monitoring, local tools)
+	loopback := &http.Server{
+		Addr:    "127.0.0.1:8080",
+		Handler: srv,
+	}
+	servers = append(servers, loopback)
+	go func() {
+		slog.Info("internal API listening", "addr", "127.0.0.1:8080")
+		if err := loopback.ListenAndServe(); err != http.ErrServerClosed {
+			slog.Error("loopback server failed", "error", err)
+		}
+	}()
+
+	return servers
 }
 
 // recoverVMs restores Firecracker VMs from the SQLite store on startup.

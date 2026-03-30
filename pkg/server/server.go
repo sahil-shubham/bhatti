@@ -119,6 +119,43 @@ func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOptio
 // ResumeSem returns the resume semaphore for sharing with PublicProxyHandler.
 func (s *Server) ResumeSem() chan struct{} { return s.resumeSem }
 
+// SetPublicProxy sets the public proxy handler (called after server creation
+// when the handler is created in main.go with shared resumeSem).
+func (s *Server) SetPublicProxy(h *PublicProxyHandler) { s.publicProxy = h }
+
+// HostPolicy returns nil for hosts that should be issued TLS certificates.
+// Used by autocert.Manager during TLS handshake for uncached certs.
+// Checks in-memory route cache first to avoid SQLite queries from
+// unauthenticated TLS handshakes (DoS protection).
+func (s *Server) HostPolicy(_ context.Context, host string) error {
+	if host == s.apiHost {
+		return nil
+	}
+	if s.proxyZone != "" && strings.HasSuffix(host, "."+s.proxyZone) {
+		alias := strings.TrimSuffix(host, "."+s.proxyZone)
+		// Fast path: check in-memory route cache
+		if s.publicProxy != nil {
+			if _, ok := s.publicProxy.routeCache.Get(alias); ok {
+				return nil
+			}
+		}
+		// Slow path: SQLite lookup
+		if _, err := s.store.GetPublishRuleByAlias(alias); err != nil {
+			return fmt.Errorf("no publish rule for %q", alias)
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown host: %s", host)
+}
+
+// stripPort removes the port from a host:port string.
+func stripPort(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
 // startTaskCleanup runs a background goroutine that deletes completed/failed
 // tasks older than 24 hours. Never deletes running tasks.
 func (s *Server) startTaskCleanup() {
@@ -252,6 +289,27 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Domain mode: route by Host header BEFORE auth.
+	// Proxy zone subdomains are served unauthenticated.
+	// API host falls through to normal auth flow.
+	if s.proxyZone != "" {
+		host := stripPort(r.Host)
+		if strings.HasSuffix(host, "."+s.proxyZone) {
+			alias := strings.TrimSuffix(host, "."+s.proxyZone)
+			if s.publicProxy != nil {
+				s.publicProxy.proxyToAlias(w, r, alias, r.URL.Path)
+			} else {
+				errResp(w, 503, "public proxy not configured")
+			}
+			return
+		}
+		if s.apiHost != "" && host != s.apiHost && host != "localhost" && host != "127.0.0.1" {
+			errResp(w, 404, "unknown host")
+			return
+		}
+		// host == apiHost or localhost → fall through to auth
+	}
+
 	// Normalize path before any checks to prevent path confusion attacks
 	cleanPath := path.Clean(r.URL.Path)
 

@@ -23,10 +23,22 @@ type Config struct {
 	// Public proxy (Phase 1: path-based, for dev/testing)
 	PublicProxyListen string `yaml:"public_proxy_listen,omitempty"` // e.g. ":8443"
 
+	// Domain mode (Phase 2: host-based routing + TLS)
+	Domain *DomainConfig `yaml:"domain,omitempty"`
+
 	// Firecracker-specific
 	FirecrackerBin    string `yaml:"firecracker_bin"`    // path to firecracker binary
 	FirecrackerKernel string `yaml:"firecracker_kernel"` // path to vmlinux
 	FirecrackerRootfs string `yaml:"firecracker_rootfs"` // path to base rootfs.ext4
+}
+
+// DomainConfig configures domain mode with host-based routing and TLS.
+type DomainConfig struct {
+	APIHost   string `yaml:"api_host"`   // e.g. "api.bhatti.sh"
+	ProxyZone string `yaml:"proxy_zone"` // e.g. "deploy.bhatti.sh"
+	ACMEEmail string `yaml:"acme_email"` // for per-alias autocert (fallback)
+	TLSCert   string `yaml:"tls_cert"`   // wildcard cert path (recommended)
+	TLSKey    string `yaml:"tls_key"`    // wildcard key path
 }
 
 // DefaultDataDir returns ~/.bhatti.
