@@ -92,6 +92,7 @@ sudo bhatti user create --name alice --max-sandboxes 5
 
 ## Key Features
 
+- **Preview URLs** — `bhatti publish dev -p 3000` → `https://dev-k3m9x2.bhatti.sh`, auto-wake from sleep on first request
 - **Multi-tenant** — per-user API keys, sandbox scoping, network isolation, rate limiting
 - **Streaming exec** — real-time NDJSON output via `Accept: application/x-ndjson`
 - **Server-side file truncation** — `offset`/`limit`/`max_bytes` on file reads

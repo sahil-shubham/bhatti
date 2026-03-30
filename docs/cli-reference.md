@@ -174,6 +174,34 @@ sudo bhatti user delete alice
 | `--max-cpus` | 4 | Maximum vCPUs per sandbox |
 | `--max-memory` | 4096 | Maximum memory (MB) per sandbox |
 
+### publish
+
+```bash
+bhatti publish dev -p 3000                  # auto-generated alias
+bhatti publish dev -p 3000 -a my-app        # explicit alias
+```
+
+Publishes a sandbox port with a public URL. The URL is accessible without authentication.
+
+With `-a`, the alias is used directly (`my-app.bhatti.sh`). Without `-a`, an alias is generated from the sandbox name with a random suffix (`dev-k3m9x2.bhatti.sh`) to prevent URL guessing.
+
+| Flag | Description |
+|------|-------------|
+| `-p, --port` | Port to publish (required) |
+| `-a, --alias` | Custom alias (optional, auto-generated if omitted) |
+
+### unpublish
+
+```bash
+bhatti unpublish dev -p 3000
+```
+
+Removes a published port. The URL stops working immediately.
+
+| Flag | Description |
+|------|-------------|
+| `-p, --port` | Port to unpublish (required) |
+
 ### setup
 
 ```bash

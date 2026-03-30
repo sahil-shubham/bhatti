@@ -141,14 +141,28 @@ ip neigh flush dev brbhatti0
 
 ## Reverse Proxy
 
-The ProxyManager provides HTTP and WebSocket reverse proxying into sandboxes through the engine's `Tunnel()` method:
+Two proxy paths exist:
 
+**Authenticated proxy** (API users):
 ```
 Browser → bhatti :8080 → /sandboxes/:id/proxy/:port/path → Engine.Tunnel() → lohar → localhost:port
 ```
 
-For HTTP: the server rewrites the request URL, writes it into the tunnel, reads the response, and copies it back to the client.
+**Public proxy** (published ports, no auth):
+```
+Browser → Cloudflare → bhatti :443 → Host: my-app.bhatti.sh → alias lookup → EnsureHot() → Tunnel() → lohar → localhost:port
+```
 
-For WebSocket: the server hijacks the client connection, sends the HTTP upgrade request through the tunnel, and relays frames bidirectionally.
+Both use `httputil.ReverseProxy` with a custom `tunnelTransport` that wraps `Engine.Tunnel()` as an `http.RoundTripper`. This gives proper hop-by-hop header removal, chunked transfer encoding, and streaming support (`FlushInterval: -1` flushes every chunk for SSE). A `context.AfterFunc` guard ensures tunnel FDs are cleaned up on client disconnect.
+
+WebSocket connections are hijacked and relayed bidirectionally with a 10-minute idle timeout.
+
+The public proxy adds:
+- In-memory route cache (LRU, 10K entries) — zero SQLite on hot path
+- `singleflight.Group` for resume coalescing — 50 concurrent requests to a cold sandbox share one wake
+- Per-alias + global rate limiting
+- 5-minute per-request deadline, 50MB body limit
 
 No direct network access to the VM is required — everything goes through the engine's tunnel abstraction. This works identically whether the VM's IP is reachable from the client or not (important for Docker Desktop on macOS, where container IPs are unreachable from the host).
+
+See [API Reference](api-reference.md#publish-public-preview-urls) and [CLI Reference](cli-reference.md#publish) for usage.

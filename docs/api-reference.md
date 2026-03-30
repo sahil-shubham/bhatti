@@ -246,6 +246,53 @@ ANY /sandboxes/:id/proxy/:port/*path
 
 HTTP requests and WebSocket connections are tunneled through the engine into the sandbox. The request is rewritten to target `localhost:<port>` inside the VM.
 
+## Publish (Public Preview URLs)
+
+### Publish a Port
+
+```
+POST /sandboxes/:id/publish
+```
+
+```json
+{"port": 3000, "alias": "my-app"}
+```
+
+`alias` is optional. If omitted, an alias is auto-generated from the sandbox name with a random suffix (e.g. `dev-k3m9x2`).
+
+Response (201):
+
+```json
+{
+  "id": "pub_a1b2c3d4",
+  "sandbox_id": "a1b2c3d4",
+  "port": 3000,
+  "alias": "my-app",
+  "url": "https://my-app.bhatti.sh",
+  "created_at": "2026-03-30T17:00:00Z"
+}
+```
+
+The URL is publicly accessible without authentication. The sandbox wakes automatically from any thermal state when a request arrives.
+
+### List Published Ports
+
+```
+GET /sandboxes/:id/publish
+```
+
+Response: array of publish rules with URLs.
+
+### Unpublish a Port
+
+```
+DELETE /sandboxes/:id/publish/:port
+```
+
+Response: 204 No Content.
+
+Publish rules are automatically cleaned up when a sandbox is destroyed.
+
 ## Templates
 
 ```
