@@ -1,0 +1,334 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["httpx", "rich", "InquirerPy"]
+# ///
+"""
+bhatti-routes — Preview subdomain routing for bhatti sandboxes.
+
+Manages Caddy reverse proxy routes that expose sandbox services as
+HTTPS subdomains (e.g., https://myapp.dev2.example.com).
+
+Routes directly to VM bridge IPs for zero-overhead proxying.
+A companion route-gen script keeps routed sandboxes warm and
+generates Caddy config + DNS records.
+
+Requires: uv (https://docs.astral.sh/uv/), bhatti CLI configured.
+"""
+
+import os
+import sys
+import re
+import subprocess
+from pathlib import Path
+
+import httpx
+from rich.console import Console
+from rich.table import Table
+from InquirerPy import inquirer
+
+ROUTES_FILE = Path(os.environ.get("BHATTI_ROUTES_FILE", "/opt/bhatti-caddy/routes.yml"))
+ROUTE_GEN = os.environ.get("BHATTI_ROUTE_GEN", "/opt/bhatti-caddy/route-gen.sh")
+DOMAIN = os.environ.get("BHATTI_DOMAIN", "dev2.example.com")
+BHATTI_CMD = os.environ.get("BHATTI_CMD", "bhatti")
+AGENT_PORTS = {"1024", "1025"}
+
+console = Console()
+
+
+# --- Routes file I/O ---
+# Format: subdomain: sandbox:port
+# Backward-compatible: subdomain: port (sandbox = subdomain)
+
+def read_routes() -> list[tuple[str, str, str]]:
+    if not ROUTES_FILE.exists():
+        return []
+    routes = []
+    for line in ROUTES_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        subdomain, _, rest = line.partition(":")
+        subdomain = subdomain.strip()
+        rest = rest.strip()
+        if ":" in rest:
+            sandbox, _, port = rest.partition(":")
+        else:
+            sandbox, port = subdomain, rest
+        routes.append((subdomain.strip(), sandbox.strip(), port.strip()))
+    return routes
+
+
+def write_routes(routes: list[tuple[str, str, str]]):
+    lines = [f"{sub}: {sb}:{port}" for sub, sb, port in routes]
+    ROUTES_FILE.write_text("\n".join(lines) + "\n" if lines else "")
+
+
+def sync():
+    subprocess.run(["sudo", ROUTE_GEN], check=True)
+
+
+# --- Port scanning ---
+
+def get_docker_port_map(sandbox: str) -> dict[str, str]:
+    result = subprocess.run(
+        [BHATTI_CMD, "exec", sandbox, "--", "sudo", "docker", "ps",
+         "--format", "{{.Names}}\t{{.Image}}\t{{.Ports}}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return {}
+
+    port_map: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        name, image, ports_str = parts[0], parts[1], parts[2]
+        image_short = image.split("/")[-1].split(":")[0]
+        label = f"{name} ({image_short})"
+        for segment in ports_str.split(","):
+            segment = segment.strip()
+            range_match = re.search(r"(?:0\.0\.0\.0|::):(\d+)-(\d+)->", segment)
+            if range_match:
+                for p in range(int(range_match.group(1)), int(range_match.group(2)) + 1):
+                    port_map[str(p)] = label
+                continue
+            single_match = re.search(r"(?:0\.0\.0\.0|::):(\d+)->", segment)
+            if single_match:
+                port_map[single_match.group(1)] = label
+    return port_map
+
+
+def get_listening_ports(sandbox: str) -> list[dict]:
+    docker_map = get_docker_port_map(sandbox)
+
+    result = subprocess.run(
+        [BHATTI_CMD, "exec", sandbox, "--", "sudo", "ss", "-tlnp"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        console.print(f"[red]Cannot reach sandbox '{sandbox}'[/red]")
+        sys.exit(1)
+
+    ports = []
+    seen = set()
+    for line in result.stdout.splitlines():
+        if line.startswith("State"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addr = parts[3]
+        match = re.search(r":(\d+)$", addr)
+        if not match:
+            continue
+        port = match.group(1)
+        if port in AGENT_PORTS or port in seen:
+            continue
+        seen.add(port)
+
+        if port in docker_map:
+            proc = docker_map[port]
+        else:
+            proc_match = re.search(r'users:\(\("([^"]+)"', line)
+            proc = proc_match.group(1) if proc_match else "-"
+
+        ports.append({"port": port, "process": proc})
+
+    return ports
+
+
+# --- Commands ---
+
+def cmd_add(args: list[str]):
+    if len(args) < 2:
+        console.print("Usage: bhatti-routes add <sandbox> <port> [subdomain]")
+        sys.exit(1)
+
+    sandbox, port = args[0], args[1]
+    subdomain = args[2] if len(args) > 2 else sandbox
+
+    routes = read_routes()
+    routes = [(s, sb, p) for s, sb, p in routes if s != subdomain]
+    routes.append((subdomain, sandbox, port))
+    write_routes(routes)
+
+    sync()
+    console.print(f"[green]https://{subdomain}.{DOMAIN}[/green] → {sandbox}:{port}")
+
+
+def cmd_rm(args: list[str]):
+    if not args:
+        console.print("Usage: bhatti-routes rm <subdomain>")
+        sys.exit(1)
+
+    subdomain = args[0]
+    routes = read_routes()
+    new_routes = [(s, sb, p) for s, sb, p in routes if s != subdomain]
+
+    if len(new_routes) == len(routes):
+        console.print(f"[red]No route for '{subdomain}'[/red]")
+        sys.exit(1)
+
+    write_routes(new_routes)
+    sync()
+    console.print(f"Removed: {subdomain}")
+
+
+def cmd_ls(_args: list[str]):
+    routes = read_routes()
+    if not routes:
+        console.print("No routes configured")
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Subdomain", style="cyan")
+    table.add_column("Sandbox")
+    table.add_column("Port", justify="right")
+    table.add_column("URL", style="green")
+
+    for subdomain, sandbox, port in routes:
+        table.add_row(subdomain, sandbox, port, f"https://{subdomain}.{DOMAIN}")
+
+    console.print(table)
+
+
+def cmd_ports(args: list[str]):
+    if not args:
+        console.print("Usage: bhatti-routes ports <sandbox>")
+        sys.exit(1)
+
+    sandbox = args[0]
+    ports = get_listening_ports(sandbox)
+
+    if not ports:
+        console.print(f"No listening ports in '{sandbox}'")
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("Port", justify="right", style="cyan")
+    table.add_column("Process")
+
+    for i, p in enumerate(ports, 1):
+        table.add_row(str(i), p["port"], p["process"])
+
+    console.print(table)
+
+
+def cmd_pick(args: list[str]):
+    if not args:
+        console.print("Usage: bhatti-routes pick <sandbox>")
+        sys.exit(1)
+
+    sandbox = args[0]
+    console.print(f"Scanning ports on [bold]{sandbox}[/bold]...\n")
+
+    ports = get_listening_ports(sandbox)
+    if not ports:
+        console.print(f"[red]No listening ports in '{sandbox}'[/red]")
+        return
+
+    routes = read_routes()
+
+    has_bindings = any(
+        sb == sandbox for _, sb, _ in routes
+    )
+
+    if has_bindings:
+        console.print("[bold]Already exposed:[/bold]")
+        for p in ports:
+            bound = [(sub, sb) for sub, sb, pt in routes if sb == sandbox and pt == p["port"]]
+            for sub, _ in bound:
+                console.print(f"  :{p['port']} ({p['process']}) → [green]https://{sub}.{DOMAIN}[/green]")
+        console.print()
+        console.print("[dim]A port can be exposed on multiple subdomains — just pick a unique subdomain name.[/dim]\n")
+
+    choices = [
+        {"name": f":{p['port']}  {p['process']}", "value": p["port"]}
+        for p in ports
+    ]
+
+    console.print("[dim]↑/↓ navigate  ·  space select  ·  enter confirm[/dim]\n")
+
+    selected = inquirer.checkbox(
+        message="Select ports to expose",
+        choices=choices,
+    ).execute()
+
+    if not selected:
+        console.print("Nothing selected")
+        return
+
+    added = []
+    for port in selected:
+        proc = next((p["process"] for p in ports if p["port"] == port), "-")
+
+        bound_subs = [sub for sub, sb, pt in routes if sb == sandbox and pt == port]
+        default_sub = sandbox if len(selected) == 1 and not bound_subs else f"{sandbox}-{port}"
+
+        if bound_subs:
+            console.print(f"[dim]  :{port} already exposed as: {', '.join(bound_subs)}[/dim]")
+
+        subdomain = inquirer.text(
+            message=f"Subdomain for :{port} ({proc})",
+            default=default_sub,
+        ).execute()
+
+        if not subdomain:
+            continue
+
+        routes = [(s, sb, p) for s, sb, p in routes if s != subdomain]
+        routes.append((subdomain, sandbox, port))
+        added.append((subdomain, port))
+
+    if not added:
+        console.print("Nothing added")
+        return
+
+    write_routes(routes)
+    sync()
+
+    console.print()
+    for subdomain, port in added:
+        console.print(f"  [green]https://{subdomain}.{DOMAIN}[/green] → {sandbox}:{port}")
+
+
+def cmd_sync(_args: list[str]):
+    sync()
+
+
+COMMANDS = {
+    "add": cmd_add,
+    "rm": cmd_rm,
+    "ls": cmd_ls,
+    "ports": cmd_ports,
+    "pick": cmd_pick,
+    "sync": cmd_sync,
+}
+
+if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+    console.print(f"""[bold]bhatti-routes[/bold] — manage preview subdomain routes
+
+[bold]Commands:[/bold]
+  [cyan]add[/cyan]  <sandbox> <port> [subdomain]   Expose a port as https://<subdomain>.{DOMAIN}
+  [cyan]rm[/cyan]   <subdomain>                    Remove a route
+  [cyan]ls[/cyan]                                  List active routes
+  [cyan]ports[/cyan] <sandbox>                     Show listening ports with process info
+  [cyan]pick[/cyan]  <sandbox>                     Interactive port picker
+  [cyan]sync[/cyan]                                Regenerate Caddy config + DNS
+
+[bold]Examples:[/bold]
+  bhatti-routes add myapp 3000                  → https://myapp.{DOMAIN}
+  bhatti-routes add myapp 8080 myapp-api        → https://myapp-api.{DOMAIN}
+  bhatti-routes pick myapp                      → interactive selector
+
+[bold]Environment:[/bold]
+  BHATTI_DOMAIN         Base domain (default: dev2.example.com)
+  BHATTI_ROUTES_FILE    Routes file path (default: /opt/bhatti-caddy/routes.yml)
+  BHATTI_ROUTE_GEN      Route-gen script path (default: /opt/bhatti-caddy/route-gen.sh)
+  BHATTI_CMD            Bhatti CLI binary (default: bhatti)""")
+    sys.exit(1 if len(sys.argv) > 1 else 0)
+
+COMMANDS[sys.argv[1]](sys.argv[2:])
