@@ -151,7 +151,7 @@ func buildEnv(env map[string]string) []string {
 	defaults := map[string]string{
 		"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"TERM": "xterm-256color",
-		"HOME": "/root",
+		"HOME": "/home/lohar",
 		"LANG": "en_US.UTF-8",
 	}
 	// Merge config drive env vars (secrets, etc.)

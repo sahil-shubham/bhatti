@@ -141,7 +141,7 @@ func main() {
 		cmd := exec.CommandContext(ctx, "/bin/sh", "/etc/bhatti/init.sh")
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
-		cmd.Env = buildEnv(nil)
+		cmd.Env = buildEnv(map[string]string{"HOME": "/root"})
 		if err := cmd.Run(); err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
 				fmt.Fprintf(os.Stderr, "lohar: boot profile timed out after 30s\n")

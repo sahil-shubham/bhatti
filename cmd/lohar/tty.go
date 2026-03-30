@@ -287,7 +287,11 @@ func runInitSession(script, user string) {
 	sess.Master = master
 
 	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = buildEnv(nil)
+	initEnv := map[string]string{}
+	if user == "root" {
+		initEnv["HOME"] = "/root"
+	}
+	cmd.Env = buildEnv(initEnv)
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	cmd.Stderr = slave
