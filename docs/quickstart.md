@@ -1,6 +1,6 @@
 # Quickstart
 
-There are two ways to use Bhatti: **install the CLI** to use someone else's server, or **run the full server** on your own hardware.
+There are two ways to use Bhatti: **install the CLI** to use someone else's server, or **run the full server** on your own hardware. Both use the same install command.
 
 ---
 
@@ -11,10 +11,10 @@ If someone gave you an API key, you just need the CLI binary. No KVM, no root, n
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install-cli.sh | bash
+curl -fsSL bhatti.sh/install | bash
 ```
 
-This downloads a ~11MB binary for your OS and architecture and puts it in `/usr/local/bin`.
+This downloads a ~11MB binary for your OS and architecture and puts it in `/usr/local/bin`. On Linux, the script asks whether you want just the CLI or a full server — pick CLI.
 
 ### Configure
 
@@ -59,43 +59,45 @@ Run Bhatti on your own Linux box with KVM — Raspberry Pi 5, AWS Graviton, Hetz
 ### Install
 
 ```bash
-git clone https://github.com/sahil-shubham/bhatti.git
-cd bhatti
-sudo ./scripts/install.sh
+curl -fsSL bhatti.sh/install | sudo bash
 ```
 
-This builds everything from source (~10 min on first run):
-- Installs Go and Firecracker if not present
-- Builds the host daemon (`bhatti`) and guest agent (`lohar`)
-- Downloads a Linux kernel and builds an Ubuntu 24.04 rootfs
+The script detects Linux, prompts for self-host, and asks which rootfs tier you want (minimal, browser, or docker). It then:
+- Downloads Firecracker, the bhatti daemon, and the lohar guest agent
+- Downloads a Linux kernel and pre-built Ubuntu 24.04 rootfs
 - Creates an admin user and saves the API key to `~/.bhatti/config.yaml`
 
 ```
-==> Installing bhatti on myhost (aarch64)
-==> Building bhatti and lohar from source...
-==> Downloading kernel...
-==> Building rootfs (this takes ~10 minutes on first install)...
-==> Creating admin user...
+==> Installing bhatti v0.5.0 (server, minimal tier) on myhost (aarch64)
+==> Installing Firecracker 1.14.0
+  ✓ Firecracker 1.14.0
+==> Installing bhatti v0.5.0
+  ✓ bhatti v0.5.0
+==> Installing lohar
+==> Installing kernel
+==> Installing minimal rootfs
+==> Creating admin user
 
 ============================================
-  bhatti installed on myhost (aarch64)
+  bhatti v0.5.0 installed
+  tier: minimal
 
   Admin API key: bht_abc123...
   (saved to ~/.bhatti/config.yaml)
 
-  To start the daemon:
+  Start the daemon:
     cd /var/lib/bhatti && sudo bhatti serve
+
+  Run as a systemd service:
+    sudo cp /var/lib/bhatti/bhatti.service /etc/systemd/system/
+    sudo systemctl enable --now bhatti
 
   ⚠  BACK UP: /var/lib/bhatti/age.key
      If lost, all encrypted secrets become unrecoverable.
 ============================================
 ```
 
-For a systemd service that starts on boot:
-
-```bash
-sudo ./scripts/install.sh --systemd
-```
+Re-running the same command updates all components to the latest version.
 
 ### Start the daemon
 

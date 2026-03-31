@@ -177,13 +177,13 @@ func checkServerVersion(resp *http.Response) {
 	// Hard warning: CLI is below the server's minimum required version.
 	if minCLI != "" && compareVersions(version, minCLI) < 0 {
 		fmt.Fprintf(os.Stderr, "⚠ CLI version %s is below server minimum %s — please update:\n", version, minCLI)
-		fmt.Fprintf(os.Stderr, "  curl -fsSL https://bhatti.sh/install.sh | bash\n\n")
+		fmt.Fprintf(os.Stderr, "  curl -fsSL bhatti.sh/install | bash\n\n")
 		return
 	}
 
 	// Soft notice: newer server version available.
 	if serverVer != "" && serverVer != "dev" && compareVersions(version, serverVer) < 0 {
-		fmt.Fprintf(os.Stderr, "Update available: %s → %s (curl -fsSL https://bhatti.sh/install.sh | bash)\n", version, serverVer)
+		fmt.Fprintf(os.Stderr, "Update available: %s → %s (curl -fsSL bhatti.sh/install | bash)\n", version, serverVer)
 	}
 }
 

@@ -11,16 +11,21 @@ bhatti shell dev                          # Ctrl+\ to detach
 bhatti destroy dev
 ```
 
-## Install the CLI
-
-No KVM, root, or Go needed — just a ~11MB binary. Works on macOS and Linux.
+## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install-cli.sh | bash
-bhatti setup     # enter API endpoint + key
+curl -fsSL bhatti.sh/install | bash
 ```
 
-Self-hosting? See [server installation](docs/quickstart.md#option-b-run-the-server-self-hosted).
+On macOS, installs the CLI (~11MB binary). On Linux, asks whether you want the CLI or a full self-hosted server. Re-running updates an existing installation.
+
+Self-hosting? Same command with `sudo` — it downloads pre-built binaries, a kernel, and an Ubuntu 24.04 rootfs:
+
+```bash
+curl -fsSL bhatti.sh/install | sudo bash
+```
+
+See [Quickstart](docs/quickstart.md) for full setup details.
 
 ## Performance
 

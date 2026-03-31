@@ -6,19 +6,11 @@ All sandbox commands accept sandbox name or ID interchangeably.
 
 ## Installation
 
-**Remote users** (macOS or Linux, no root needed):
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install-cli.sh | bash
+curl -fsSL bhatti.sh/install | bash
 ```
 
-**Server operators** — the CLI is included in the full install (`scripts/install.sh`).
-
-Pin a specific version:
-
-```bash
-BHATTI_VERSION=v0.1.0 curl -fsSL .../install-cli.sh | bash
-```
+On macOS, installs the CLI. On Linux, prompts for CLI or self-hosted server. Re-running updates an existing installation. The CLI is also included in the server install.
 
 ## Configuration
 

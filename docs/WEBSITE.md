@@ -321,7 +321,7 @@ go from reading to running in 30 seconds.
 One command. Any Linux machine with KVM.
 
 ```bash
-curl -fsSL https://bhatti.sh/install | sh
+curl -fsSL bhatti.sh/install | bash
 ```
 
 This downloads pre-built binaries (~15MB total), a kernel, and a minimal
@@ -344,7 +344,7 @@ sudo bhatti user create --name alice
 Give alice the key. She installs the CLI on her Mac:
 
 ```bash
-curl -fsSL https://bhatti.sh/install-cli | sh
+curl -fsSL bhatti.sh/install | bash
 bhatti setup   # paste the API key
 bhatti create --name dev
 bhatti shell dev
@@ -362,14 +362,11 @@ bhatti shell dev
 
 ---
 
-Note the two distinct install URLs:
-- `bhatti.sh/install` — full server install (Linux only, ~15MB download)
-- `bhatti.sh/install-cli` — CLI-only install (macOS + Linux, ~11MB download)
+One install URL for everything:
+- `bhatti.sh/install` — unified installer (detects platform, prompts on Linux for CLI vs server)
 
-Both should be short, memorable, and redirect to the latest version of
-the respective install scripts. The `/install` path is the headline CTA.
-`/install-cli` is referenced in the docs and the "give alice the key"
-flow.
+The same script handles macOS CLI, Linux CLI, and Linux server installs.
+Re-running updates an existing installation.
 
 ### 3.6 Try the Demo
 
@@ -505,12 +502,10 @@ no dashboard route. One file, one domain.
 | URL | What |
 |-----|------|
 | `bhatti.sh` | The page. Everything above lives here. |
-| `bhatti.sh/install` | Serves `scripts/install.sh` (full server) |
-| `bhatti.sh/install-cli` | Serves `scripts/install-cli.sh` (CLI only) |
-| `bhatti.sh/i` | Alias for `/install` |
-| `bhatti.sh/cli` | Alias for `/install-cli` |
+| `bhatti.sh/install` | Serves `scripts/install.sh` (unified installer) |
+| `bhatti.sh/install.sh` | Alias for `/install` |
 
-That's it. Five routes. Four of them serve shell scripts.
+That's it. Three routes. Two of them serve the install script.
 
 **Docs** link to GitHub. The markdown files in `docs/` render fine on
 GitHub. No need to build a docs site — the audience reads markdown.
@@ -528,22 +523,11 @@ hosting needed.
 The hero CTA is:
 
 ```bash
-curl -fsSL https://bhatti.sh/install | sh
+curl -fsSL bhatti.sh/install | bash
 ```
 
-This must work. Serve the script directly (not a redirect to GitHub) so
-there's no dependency on GitHub's CDN. The `-fsSL` flags handle HTTPS.
-
-### 4.1 Install Script Changes
-
-The existing `scripts/install-cli.sh` hardcodes the GitHub raw URL.
-After the website launches, update the README and all docs to:
-
-```bash
-curl -fsSL https://bhatti.sh/install-cli | sh
-```
-
-Decouples the install URL from the repo path.
+This must work. Currently served as a 302 redirect to GitHub raw.
+Could self-host the script for zero GitHub CDN dependency.
 
 ---
 
