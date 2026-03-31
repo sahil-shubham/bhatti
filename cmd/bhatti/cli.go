@@ -798,6 +798,7 @@ var shellCmd = &cobra.Command{
 		}()
 
 		var userDetached atomic.Bool
+		var cleanExit atomic.Bool
 		var sessionID string
 
 		// WebSocket → stdout
@@ -807,6 +808,11 @@ var shellCmd = &cobra.Command{
 			for {
 				msgType, msg, err := conn.ReadMessage()
 				if err != nil {
+					// CloseNormalClosure means the shell process exited
+					// (Ctrl+D / exit). Anything else is a real disconnection.
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+						cleanExit.Store(true)
+					}
 					return
 				}
 				// Parse session info message (sent once on connect).
@@ -855,11 +861,16 @@ var shellCmd = &cobra.Command{
 		// if we got here via the reader goroutine closing done).
 		term.Restore(int(os.Stdin.Fd()), oldState)
 		if !userDetached.Load() {
-			fmt.Fprintf(os.Stderr, "\r\nconnection lost")
-			if sessionID != "" {
-				fmt.Fprintf(os.Stderr, " (session %s still running)", sessionID)
+			if cleanExit.Load() {
+				// Shell exited normally (Ctrl+D / exit command).
+				// Nothing to reconnect to.
+			} else {
+				fmt.Fprintf(os.Stderr, "\r\nconnection lost")
+				if sessionID != "" {
+					fmt.Fprintf(os.Stderr, " (session %s still running)", sessionID)
+				}
+				fmt.Fprintf(os.Stderr, "\r\nreconnect: bhatti shell %s\r\n", args[0])
 			}
-			fmt.Fprintf(os.Stderr, "\r\nreconnect: bhatti shell %s\r\n", args[0])
 		}
 		return nil
 	},

@@ -130,6 +130,7 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 				}
 				sess.mu.Unlock()
 				master.Close()
+				removeSession(sess.ID)
 				return
 			}
 		}
@@ -365,6 +366,7 @@ func runInitSession(script, user string) {
 				sess.mu.Unlock()
 				master.Close()
 				logf("init session exited (code %d)", exitCode)
+				removeSession(sess.ID)
 				return
 			}
 		}
