@@ -310,16 +310,45 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 		}
 
 		thermal := te.ThermalState(sb.EngineID)
-		if thermal == "cold" || thermal == "" {
+
+		// --- Warm → Cold: host-side timing only, no agent query ---
+		// vCPUs are paused — the agent can't respond. Querying it either
+		// times out (skipping the cold check) or wakes the VM via TCP.
+		// Use lastActivity timestamp instead, set when hot→warm fired.
+		if thermal == "warm" {
+			ts, ok := s.lastActivity.Load(sb.EngineID)
+			if !ok {
+				continue
+			}
+			idle := time.Since(ts.(time.Time))
+			if idle > cfg.ColdTimeout {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := s.engine.Stop(stopCtx, sb.EngineID); err != nil {
+					stopCancel()
+					slog.Error("thermal snapshot failed — marking unknown",
+						"sandbox", sb.Name, "id", sb.ID, "error", err)
+					s.store.UpdateSandboxStatus(sb.ID, "unknown")
+					continue
+				}
+				stopCancel()
+				s.store.StopSandbox(sb.ID)
+				s.saveVMState(sb.ID, sb.EngineID)
+				slog.Info("thermal transition", "sandbox", sb.Name,
+					"from", "warm", "to", "cold", "idle", idle.Round(time.Second))
+			}
 			continue
 		}
 
-		// Fast path: check host-side activity cache. If the sandbox had
-		// API activity within warmTimeout, skip the agent query entirely.
-		// This avoids opening a TCP connection per sandbox per cycle.
+		if thermal != "hot" {
+			continue
+		}
+
+		// --- Hot → Warm: query agent (vCPUs running, agent can respond) ---
+
+		// Fast path: host-side activity cache.
 		if ts, ok := s.lastActivity.Load(sb.EngineID); ok {
 			if time.Since(ts.(time.Time)) < cfg.WarmTimeout {
-				continue // definitely active, skip agent query
+				continue
 			}
 		}
 
@@ -333,28 +362,16 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 
 		idle := time.Since(time.Unix(activity.LastActivityUnix, 0))
 
-		if thermal == "hot" && idle > cfg.WarmTimeout && activity.AttachedSessions == 0 {
+		if idle > cfg.WarmTimeout && activity.AttachedSessions == 0 {
 			if err := te.Pause(context.Background(), sb.EngineID); err != nil {
 				slog.Warn("thermal pause failed", "sandbox", sb.Name, "error", err)
 				continue
 			}
-			slog.Info("thermal transition", "sandbox", sb.Name, "from", "hot", "to", "warm", "idle", idle.Round(time.Second))
-		}
-
-		if thermal == "warm" && idle > cfg.ColdTimeout {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := s.engine.Stop(stopCtx, sb.EngineID); err != nil {
-				stopCancel()
-				// Stop() may have paused but failed to snapshot. The VM is
-				// stuck — mark it so we don't retry every 10s forever.
-				slog.Error("thermal snapshot failed — marking unknown",
-					"sandbox", sb.Name, "id", sb.ID, "error", err)
-				s.store.UpdateSandboxStatus(sb.ID, "unknown")
-				continue
-			}
-			stopCancel()
-			s.saveVMState(sb.ID, sb.EngineID)
-			slog.Info("thermal transition", "sandbox", sb.Name, "from", "warm", "to", "cold", "idle", idle.Round(time.Second))
+			// Record pause time so warm→cold timer starts from now,
+			// not from the last user interaction.
+			s.lastActivity.Store(sb.EngineID, time.Now())
+			slog.Info("thermal transition", "sandbox", sb.Name,
+				"from", "hot", "to", "warm", "idle", idle.Round(time.Second))
 		}
 	}
 }

@@ -8,26 +8,31 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
-// mockEngine implements engine.Engine for server tests.
+// mockEngine implements engine.Engine and ThermalEngine for server tests.
 // Minimal — just enough for HTTP layer testing. Real engine behavior
 // is tested by pkg/engine/firecracker/ on agni-01.
 type mockEngine struct {
 	mu        sync.Mutex
 	sandboxes map[string]*engine.SandboxInfo
+	thermal   map[string]string // engineID → thermal state
 	nextID    atomic.Int64
 
 	// Configurable per-test
 	ExecResult    engine.ExecResult
 	CreateErr     error
 	ExecErr       error
+	ActivityResult *proto.ActivityInfo
+	ActivityErr    error
 }
 
 func newMockEngine() *mockEngine {
 	return &mockEngine{
 		sandboxes: make(map[string]*engine.SandboxInfo),
+		thermal:   make(map[string]string),
 		ExecResult: engine.ExecResult{
 			ExitCode: 0,
 			Stdout:   "mock output\n",
@@ -158,6 +163,50 @@ func (m *mockEngine) Tunnel(_ context.Context, id string, port int) (io.ReadWrit
 	}
 	_, client := net.Pipe()
 	return client, nil
+}
+
+// --- ThermalEngine interface ---
+
+func (m *mockEngine) ThermalState(id string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.thermal[id]
+}
+
+func (m *mockEngine) Pause(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sandboxes[id]; !ok {
+		return fmt.Errorf("sandbox %q not found", id)
+	}
+	m.thermal[id] = "warm"
+	return nil
+}
+
+func (m *mockEngine) EnsureHot(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sandboxes[id]; !ok {
+		return fmt.Errorf("sandbox %q not found", id)
+	}
+	m.thermal[id] = "hot"
+	return nil
+}
+
+func (m *mockEngine) Activity(_ context.Context, id string) (*proto.ActivityInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ActivityErr != nil {
+		return nil, m.ActivityErr
+	}
+	if m.ActivityResult != nil {
+		return m.ActivityResult, nil
+	}
+	// Default: idle for a long time, no sessions
+	return &proto.ActivityInfo{
+		LastActivityUnix: 0,
+		AttachedSessions: 0,
+	}, nil
 }
 
 // mockTermConn wraps net.Pipe as engine.TerminalConn.
