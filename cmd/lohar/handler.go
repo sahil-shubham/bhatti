@@ -89,7 +89,8 @@ func handleControlConnection(conn net.Conn) {
 		}
 		if req.SessionID != nil {
 			// Attach to existing session
-			handleSessionAttach(conn, *req.SessionID)
+			ifDetached := req.IfDetached != nil && *req.IfDetached
+			handleSessionAttach(conn, *req.SessionID, ifDetached)
 		} else if len(req.Argv) == 0 {
 			proto.WriteFrame(conn, proto.ERROR, []byte("empty argv"))
 		} else if req.TTY != nil && *req.TTY {

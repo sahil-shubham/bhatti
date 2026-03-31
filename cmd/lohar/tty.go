@@ -136,7 +136,8 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 }
 
 // handleSessionAttach reconnects a client to an existing session.
-func handleSessionAttach(conn net.Conn, sessionID string) {
+// If ifDetached is true, the attach fails if the session is already attached.
+func handleSessionAttach(conn net.Conn, sessionID string, ifDetached bool) {
 	sess := getSession(sessionID)
 	if sess == nil {
 		proto.WriteFrame(conn, proto.ERROR, []byte("session not found"))
@@ -144,6 +145,11 @@ func handleSessionAttach(conn net.Conn, sessionID string) {
 	}
 
 	sess.mu.Lock()
+	if ifDetached && sess.Attached != nil {
+		sess.mu.Unlock()
+		proto.WriteFrame(conn, proto.ERROR, []byte("session is attached"))
+		return
+	}
 	// Detach previous client if any
 	if sess.Attached != nil {
 		exit := proto.ExitPayload(0)

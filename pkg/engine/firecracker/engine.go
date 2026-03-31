@@ -1052,23 +1052,53 @@ func (e *Engine) ExecStream(ctx context.Context, id string, cmd []string, onEven
 }
 
 func (e *Engine) Shell(ctx context.Context, id string) (engine.TerminalConn, error) {
+	_, term, err := e.ShellSession(ctx, id)
+	return term, err
+}
+
+// ShellSession opens a new TTY session and returns the session ID + terminal.
+// Implements engine.ShellSessioner.
+func (e *Engine) ShellSession(ctx context.Context, id string) (string, engine.TerminalConn, error) {
 	vm, err := e.getVM(id)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	// Capture agent ref under lock, release before long-lived Shell call.
 	vm.stateMu.Lock()
 	if vm.Thermal != "hot" {
 		vm.stateMu.Unlock()
-		return nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+		return "", nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
 	}
 	ag := vm.Agent
 	vm.stateMu.Unlock()
 
-	return ag.Shell(ctx, []string{"/bin/bash", "-li"}, map[string]string{
+	info, term, err := ag.ShellSession(ctx, []string{"/bin/bash", "-li"}, map[string]string{
 		"TERM": "xterm-256color",
-	}, 24, 80)
+	}, 24, 80, 3600) // 1 hour idle timeout for detached sessions
+	if err != nil {
+		return "", nil, err
+	}
+	return info.SessionID, term, nil
+}
+
+// ShellAttach reconnects to an existing TTY session by ID.
+// Implements engine.SessionAttacher.
+func (e *Engine) ShellAttach(ctx context.Context, id, sessionID string, ifDetached bool) (*proto.SessionInfo, engine.TerminalConn, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vm.stateMu.Lock()
+	if vm.Thermal != "hot" {
+		vm.stateMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	ag := vm.Agent
+	vm.stateMu.Unlock()
+
+	return ag.SessionAttach(ctx, sessionID, ifDetached)
 }
 
 func (e *Engine) ListeningPorts(ctx context.Context, id string) ([]int, error) {

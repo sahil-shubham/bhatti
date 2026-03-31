@@ -99,7 +99,7 @@ func TestTTYSessionCreateDetachReattach(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Create a TTY session running cat
-	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"cat"}, nil, 24, 80)
+	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"cat"}, nil, 24, 80, 0)
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestTTYSessionCreateDetachReattach(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Reattach
-	sessInfo2, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID)
+	sessInfo2, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID, false)
 	if err != nil {
 		t.Fatalf("SessionAttach: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestProcessSurvivesDetach(t *testing.T) {
 	// Process that outputs after a delay
 	sessInfo, term, err := vm.Agent.ShellSession(ctx,
 		[]string{"sh", "-c", "echo before; sleep 2; echo AFTER_DETACH"},
-		nil, 24, 80)
+		nil, 24, 80, 0)
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestProcessSurvivesDetach(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// Reattach — scrollback should have delayed output
-	_, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID)
+	_, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID, false)
 	if err != nil {
 		t.Fatalf("SessionAttach: %v", err)
 	}
@@ -195,9 +195,9 @@ func TestSessionList(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Create two sessions
-	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80)
+	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
 	defer term1.Close()
-	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80)
+	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80, 0)
 	defer term2.Close()
 	time.Sleep(500 * time.Millisecond)
 
@@ -223,7 +223,7 @@ func TestSessionKill(t *testing.T) {
 
 	vm, _ := eng.getVM(info.ID)
 
-	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80)
+	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestSessionKill(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Reattach — should get exit
-	_, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID)
+	_, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID, false)
 	if err != nil {
 		t.Logf("✓ session already cleaned up: %v", err)
 		return
@@ -289,7 +289,7 @@ func TestMaxIdle(t *testing.T) {
 	time.Sleep(4 * time.Second)
 
 	// Reattach — should get EXIT (process killed)
-	_, term, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID)
+	_, term, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID, false)
 	if err != nil {
 		t.Logf("✓ session cleaned up after idle: %v", err)
 		return
@@ -311,7 +311,7 @@ func TestAttachNonexistent(t *testing.T) {
 
 	vm, _ := eng.getVM(info.ID)
 
-	_, _, err = vm.Agent.SessionAttach(ctx, "nonexistent-session")
+	_, _, err = vm.Agent.SessionAttach(ctx, "nonexistent-session", false)
 	if err == nil {
 		t.Error("expected error attaching to nonexistent session")
 	} else {
@@ -352,7 +352,7 @@ func TestMaxIdleZeroStaysAlive(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Default TTY session (max_idle=0 = forever)
-	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80)
+	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestMaxIdleZeroStaysAlive(t *testing.T) {
 	time.Sleep(5 * time.Second)
 
 	// Reattach — should still be running
-	info2, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID)
+	info2, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID, false)
 	if err != nil {
 		t.Fatalf("SessionAttach after 5s: %v", err)
 	}
@@ -428,11 +428,11 @@ func TestSessionListAttachedField(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Session 1: attached
-	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80)
+	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
 	defer term1.Close()
 
 	// Session 2: detached
-	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80)
+	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80, 0)
 	term2.Close()
 	time.Sleep(500 * time.Millisecond)
 
@@ -475,7 +475,7 @@ func TestScrollbackOverflow(t *testing.T) {
 	// Output >64KB then a marker
 	sessInfo, term, err := vm.Agent.ShellSession(ctx,
 		[]string{"sh", "-c", "for i in $(seq 1 1000); do printf 'L%04d-' $i; head -c 80 /dev/urandom | base64 | head -c 80; echo; done; echo SCROLL_END"},
-		nil, 24, 80)
+		nil, 24, 80, 0)
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestScrollbackOverflow(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Reattach — get scrollback
-	_, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID)
+	_, term2, err := vm.Agent.SessionAttach(ctx, sessInfo.SessionID, false)
 	if err != nil {
 		t.Fatalf("SessionAttach: %v", err)
 	}

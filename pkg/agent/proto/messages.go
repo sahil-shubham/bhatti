@@ -10,6 +10,7 @@ type ExecRequest struct {
 	Cwd        *string           `json:"cwd,omitempty"`            // nil = agent's cwd (/)
 	SessionID  *string           `json:"session_id,omitempty"`     // nil = create new, non-nil = attach
 	MaxIdleSec *int              `json:"max_idle_sec,omitempty"`   // nil = default (0 = forever)
+	IfDetached *bool             `json:"if_detached,omitempty"`    // attach only if session is detached
 }
 
 // ActivityInfo reports the agent's activity state.

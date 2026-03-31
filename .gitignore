@@ -6,3 +6,4 @@ dist/
 .DS_Store
 pi-session-*.html
 /lohar
+.worktrees/

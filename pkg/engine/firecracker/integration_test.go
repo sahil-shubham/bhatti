@@ -199,7 +199,7 @@ func TestInitSessionAttach(t *testing.T) {
 
 	// Attach to the init session
 	vm, _ := eng.getVM(info.ID)
-	sessInfo, term, err := vm.Agent.SessionAttach(ctx, "init")
+	sessInfo, term, err := vm.Agent.SessionAttach(ctx, "init", false)
 	if err != nil {
 		t.Fatalf("SessionAttach init: %v", err)
 	}

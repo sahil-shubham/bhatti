@@ -234,7 +234,7 @@ func TestActivityTracking(t *testing.T) {
 
 	// Create a TTY session (attached)
 	vm, _ := eng.getVM(info.ID)
-	_, term, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80)
+	_, term, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
 	defer term.Close()
 	time.Sleep(300 * time.Millisecond)
 
@@ -273,7 +273,7 @@ func TestAttachedSessionPreventsWarm(t *testing.T) {
 
 	// Create attached session
 	vm, _ := eng.getVM(info.ID)
-	_, term, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80)
+	_, term, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
 	defer term.Close()
 	time.Sleep(300 * time.Millisecond)
 

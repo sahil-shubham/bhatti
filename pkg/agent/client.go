@@ -403,7 +403,7 @@ func (c *AgentClient) SessionKill(ctx context.Context, sessionID string) error {
 }
 
 // ShellSession opens a TTY session and returns both the session info and the terminal connection.
-func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[string]string, rows, cols uint16) (*proto.SessionInfo, engine.TerminalConn, error) {
+func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[string]string, rows, cols uint16, maxIdleSec int) (*proto.SessionInfo, engine.TerminalConn, error) {
 	conn, err := c.DialControl(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent connect: %w", err)
@@ -416,6 +416,9 @@ func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[s
 		TTY:  &tty,
 		Rows: &rows,
 		Cols: &cols,
+	}
+	if maxIdleSec > 0 {
+		req.MaxIdleSec = &maxIdleSec
 	}
 	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
 		conn.Close()
@@ -446,13 +449,17 @@ func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[s
 }
 
 // SessionAttach reconnects to an existing session and returns the session info and terminal.
-func (c *AgentClient) SessionAttach(ctx context.Context, sessionID string) (*proto.SessionInfo, engine.TerminalConn, error) {
+// If ifDetached is true, the attach fails if the session is currently attached by another client.
+func (c *AgentClient) SessionAttach(ctx context.Context, sessionID string, ifDetached bool) (*proto.SessionInfo, engine.TerminalConn, error) {
 	conn, err := c.DialControl(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent connect: %w", err)
 	}
 
 	req := proto.ExecRequest{SessionID: &sessionID}
+	if ifDetached {
+		req.IfDetached = &ifDetached
+	}
 	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("agent send attach: %w", err)

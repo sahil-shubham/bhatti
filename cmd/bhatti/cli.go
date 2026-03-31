@@ -58,6 +58,7 @@ func init() {
 	rootCmd.AddCommand(destroyCmd)
 	rootCmd.AddCommand(execCmd)
 	rootCmd.AddCommand(shellCmd)
+	shellCmd.Flags().Bool("new", false, "Force a new session (don't reattach)")
 	rootCmd.AddCommand(psCmd)
 	rootCmd.AddCommand(fileCmd)
 	rootCmd.AddCommand(secretCmd)
@@ -708,14 +709,19 @@ var shellCmd = &cobra.Command{
 			return err
 		}
 
+		forceNew, _ := cmd.Flags().GetBool("new")
+
 		wsURL := strings.Replace(apiURL, "http://", "ws://", 1)
 		wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
+		endpoint := wsURL + "/sandboxes/" + id + "/ws"
+		if forceNew {
+			endpoint += "?new=true"
+		}
 		header := http.Header{}
 		if apiToken != "" {
 			header.Set("Authorization", "Bearer "+apiToken)
 		}
-		conn, _, err := websocket.DefaultDialer.Dial(
-			wsURL+"/sandboxes/"+id+"/ws", header)
+		conn, _, err := websocket.DefaultDialer.Dial(endpoint, header)
 		if err != nil {
 			return err
 		}
@@ -790,15 +796,27 @@ var shellCmd = &cobra.Command{
 		}()
 
 		var userDetached atomic.Bool
+		var sessionID string
 
 		// WebSocket → stdout
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
 			for {
-				_, msg, err := conn.ReadMessage()
+				msgType, msg, err := conn.ReadMessage()
 				if err != nil {
 					return
+				}
+				// Parse session info message (sent once on connect).
+				if msgType == websocket.TextMessage {
+					var meta struct {
+						Type      string `json:"type"`
+						SessionID string `json:"session_id"`
+					}
+					if json.Unmarshal(msg, &meta) == nil && meta.Type == "session" {
+						sessionID = meta.SessionID
+						continue
+					}
 				}
 				os.Stdout.Write(msg)
 			}
@@ -835,8 +853,11 @@ var shellCmd = &cobra.Command{
 		// if we got here via the reader goroutine closing done).
 		term.Restore(int(os.Stdin.Fd()), oldState)
 		if !userDetached.Load() {
-			fmt.Fprintf(os.Stderr, "\r\nconnection lost\r\n")
-			fmt.Fprintf(os.Stderr, "session may still be running — reconnect with: bhatti shell %s\r\n", args[0])
+			fmt.Fprintf(os.Stderr, "\r\nconnection lost")
+			if sessionID != "" {
+				fmt.Fprintf(os.Stderr, " (session %s still running)", sessionID)
+			}
+			fmt.Fprintf(os.Stderr, "\r\nreconnect: bhatti shell %s\r\n", args[0])
 		}
 		return nil
 	},

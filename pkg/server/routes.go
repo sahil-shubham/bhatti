@@ -910,18 +910,92 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id stri
 		conn.WriteMessage(websocket.TextMessage, []byte("wake sandbox: "+err.Error()))
 		return
 	}
-	// Use context.Background — r.Context() is tied to the HTTP request
-	// and may be canceled after the WebSocket upgrade completes.
-	term, err := s.engine.Shell(context.Background(), sb.EngineID)
-	if err != nil {
-		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-		conn.WriteMessage(websocket.TextMessage, []byte("shell error: "+err.Error()))
-		return
+
+	// Session reattach logic. Use context.Background — r.Context() is
+	// tied to the HTTP request and may cancel after WebSocket upgrade.
+	sessionParam := r.URL.Query().Get("session")
+	forceNew := r.URL.Query().Get("new") == "true"
+
+	var term engine.TerminalConn
+	var sessionID string
+
+	sa, canAttach := s.engine.(engine.SessionAttacher)
+	sl, canList := s.engine.(interface {
+		SessionList(ctx context.Context, id string) ([]proto.SessionInfo, error)
+	})
+
+	if sessionParam != "" && canAttach {
+		// Explicit session reattach — forcibly detaches any existing client.
+		info, t, err := sa.ShellAttach(context.Background(), sb.EngineID, sessionParam, false)
+		if err != nil {
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			conn.WriteMessage(websocket.TextMessage, []byte("attach error: "+err.Error()))
+			return
+		}
+		term = t
+		sessionID = info.SessionID
+	} else if !forceNew && canAttach && canList {
+		// Auto-reattach: find a detached, running TTY session.
+		// Uses ifDetached=true to avoid stealing a session that was
+		// attached between the list call and the attach call.
+		sessions, err := sl.SessionList(context.Background(), sb.EngineID)
+		if err == nil {
+			var candidate *proto.SessionInfo
+			for i := range sessions {
+				si := &sessions[i]
+				if si.TTY && si.Running && !si.Attached {
+					if candidate == nil || si.CreatedAt > candidate.CreatedAt {
+						candidate = si
+					}
+				}
+			}
+			if candidate != nil {
+				info, t, err := sa.ShellAttach(context.Background(), sb.EngineID, candidate.SessionID, true)
+				if err == nil {
+					term = t
+					sessionID = info.SessionID
+				}
+				// If attach fails (race: session exited or was attached
+				// between list and attach), fall through to create new.
+			}
+		}
+	}
+
+	if term == nil {
+		// No session to reattach — create new.
+		if ss, ok := s.engine.(engine.ShellSessioner); ok {
+			sid, t, err := ss.ShellSession(context.Background(), sb.EngineID)
+			if err != nil {
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				conn.WriteMessage(websocket.TextMessage, []byte("shell error: "+err.Error()))
+				return
+			}
+			term = t
+			sessionID = sid
+		} else {
+			t, err := s.engine.Shell(context.Background(), sb.EngineID)
+			if err != nil {
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				conn.WriteMessage(websocket.TextMessage, []byte("shell error: "+err.Error()))
+				return
+			}
+			term = t
+		}
 	}
 	// N.B. defer order matters: conn.Close() (from earlier defer) runs
 	// after term.Close(). term.Close() unblocks the term→WS goroutine's
 	// Read(); conn.Close() unblocks the WS→term goroutine's ReadMessage().
 	defer term.Close()
+
+	// Send session ID to CLI so it can reconnect.
+	if sessionID != "" {
+		if meta, err := json.Marshal(map[string]string{
+			"type": "session", "session_id": sessionID,
+		}); err == nil {
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			conn.WriteMessage(websocket.TextMessage, meta)
+		}
+	}
 
 	// Serialize all WebSocket writes through a mutex. gorilla allows
 	// one concurrent reader + one concurrent writer, but we have

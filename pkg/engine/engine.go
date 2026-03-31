@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"io"
+
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
 
 // VolumeMount describes a named volume to mount into a sandbox.
@@ -118,6 +120,23 @@ type StreamEvent struct {
 // streaming exec output. Used by the NDJSON exec endpoint.
 type StreamExecEngine interface {
 	ExecStream(ctx context.Context, id string, cmd []string, onEvent func(StreamEvent)) error
+}
+
+// SessionAttacher is optionally implemented by engines that support
+// reconnecting to existing TTY sessions.
+//
+// ifDetached: if true, attach only if the session is currently detached.
+// Returns an error if the session is attached by another client. This
+// prevents the auto-reattach TOCTOU race (SessionList says "detached",
+// but another client attached between list and attach).
+type SessionAttacher interface {
+	ShellAttach(ctx context.Context, id, sessionID string, ifDetached bool) (*proto.SessionInfo, TerminalConn, error)
+}
+
+// ShellSessioner is optionally implemented by engines that return
+// session metadata alongside the terminal connection.
+type ShellSessioner interface {
+	ShellSession(ctx context.Context, id string) (string, TerminalConn, error)
 }
 
 // Engine is the sandbox lifecycle interface.
