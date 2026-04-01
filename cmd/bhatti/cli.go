@@ -74,6 +74,8 @@ func init() {
 	editCmd.GroupID = "core"
 	listCmd.GroupID = "core"
 	destroyCmd.GroupID = "core"
+	stopCmd.GroupID = "core"
+	startCmd.GroupID = "core"
 	execCmd.GroupID = "core"
 	shellCmd.GroupID = "core"
 
@@ -95,6 +97,9 @@ func init() {
 	rootCmd.AddCommand(editCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(destroyCmd)
+	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(startCmd)
+	rootCmd.AddCommand(inspectCmd)
 	rootCmd.AddCommand(execCmd)
 	rootCmd.AddCommand(shellCmd)
 	shellCmd.Flags().Bool("new", false, "Force a new session (don't reattach)")
@@ -251,6 +256,25 @@ func compareVersions(a, b string) int {
 		}
 	}
 	return 0
+}
+
+// --- Confirmation helper ---
+
+// confirmAction prompts for confirmation on destructive operations.
+// Returns true if --yes is set or the user confirms interactively.
+func confirmAction(cmd *cobra.Command, msg string) bool {
+	yes, _ := cmd.Flags().GetBool("yes")
+	if yes {
+		return true
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		fmt.Fprintf(os.Stderr, "Use --yes to confirm in non-interactive mode\n")
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "%s [y/N]: ", msg)
+	var answer string
+	fmt.Scanln(&answer)
+	return strings.ToLower(answer) == "y"
 }
 
 // --- Output helpers ---
@@ -560,9 +584,14 @@ with its own kernel, filesystem, and network.`,
 		keepHot, _ := cmd.Flags().GetBool("keep-hot")
 		volFlags, _ := cmd.Flags().GetStringSlice("volume")
 
+		tmpl, _ := cmd.Flags().GetString("template")
+
 		envMap := parseEnvFlag(env)
 		req := map[string]any{
 			"name": name, "cpus": cpus,
+		}
+		if tmpl != "" {
+			req["template_id"] = tmpl
 		}
 		if memory > 0 {
 			req["memory_mb"] = memory
@@ -632,6 +661,7 @@ func init() {
 	createCmd.Flags().String("env", "", "Environment variables (K=V,K=V)")
 	createCmd.Flags().String("init", "", "Init script")
 	createCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions (for autonomous agents)")
+	createCmd.Flags().String("template", "", "Template name or ID")
 	createCmd.Flags().StringSlice("volume", nil, "Persistent volume (name:mount[:ro])")
 
 	editCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions (for autonomous agents)")
@@ -689,6 +719,106 @@ toggling keep_hot to control thermal management.`,
 			if allowCold {
 				fmt.Println("  keep_hot: false (thermal transitions re-enabled)")
 			}
+		}
+		return nil
+	},
+}
+
+// --- stop ---
+
+var stopCmd = &cobra.Command{
+	Use:   "stop <sandbox>",
+	Short: "Snapshot and stop a sandbox",
+	Long: `Pause the sandbox and save a snapshot to disk. Resume later with
+'bhatti start'. Stopped sandboxes use zero CPU and memory.`,
+	Example: `  bhatti stop dev
+  bhatti start dev     # resume later`,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		var sb map[string]any
+		if err := apiJSON("POST", "/sandboxes/"+id+"/stop", nil, &sb); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(sb)
+		} else {
+			fmt.Println("stopped")
+		}
+		return nil
+	},
+}
+
+// --- start ---
+
+var startCmd = &cobra.Command{
+	Use:   "start <sandbox>",
+	Short: "Resume a stopped sandbox",
+	Long:  `Resume a sandbox from its snapshot. Continues exactly where it left off.`,
+	Example: `  bhatti start dev`,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		var sb map[string]any
+		if err := apiJSON("POST", "/sandboxes/"+id+"/start", nil, &sb); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(sb)
+		} else {
+			fmt.Printf("started (%s)\n", sb["status"])
+		}
+		return nil
+	},
+}
+
+// --- inspect ---
+
+var inspectCmd = &cobra.Command{
+	Use:     "inspect <sandbox>",
+	Short:   "Show sandbox details",
+	Aliases: []string{"info"},
+	Example: `  bhatti inspect dev
+  bhatti inspect dev --json`,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		var sb map[string]any
+		if err := apiJSON("GET", "/sandboxes/"+id, nil, &sb); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(sb)
+			return nil
+		}
+		fmt.Printf("Name:       %s\n", sb["name"])
+		fmt.Printf("ID:         %s\n", sb["id"])
+		fmt.Printf("Status:     %s\n", sb["status"])
+		fmt.Printf("IP:         %s\n", sb["ip"])
+		fmt.Printf("Created:    %s\n", sb["created_at"])
+		if t, ok := sb["template_id"]; ok && t != nil && t != "" {
+			fmt.Printf("Template:   %s\n", t)
+		}
+		if stopped, ok := sb["stopped_at"]; ok && stopped != nil {
+			fmt.Printf("Stopped:    %s\n", stopped)
 		}
 		return nil
 	},
@@ -779,6 +909,10 @@ Persistent volumes are detached but not deleted.`,
 		setupTiming(cmd)
 		defer printTiming()
 
+		if !confirmAction(cmd, fmt.Sprintf("Destroy sandbox %q?", args[0])) {
+			return nil
+		}
+
 		id, err := resolveID(args[0])
 		if err != nil {
 			return err
@@ -794,6 +928,10 @@ Persistent volumes are detached but not deleted.`,
 		}
 		return nil
 	},
+}
+
+func init() {
+	destroyCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 }
 
 // --- exec ---
@@ -1383,6 +1521,10 @@ var userDeleteCmd = &cobra.Command{
 	Short: "Delete a user",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !confirmAction(cmd, fmt.Sprintf("Delete user %q?", args[0])) {
+			return nil
+		}
+
 		st := openLocalStore()
 		defer st.Close()
 
@@ -1449,6 +1591,7 @@ func init() {
 
 	userCmd.AddCommand(userCreateCmd)
 	userCmd.AddCommand(userListCmd)
+	userDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	userCmd.AddCommand(userDeleteCmd)
 	userCmd.AddCommand(userRotateKeyCmd)
 }
@@ -1670,6 +1813,9 @@ var volumeDeleteCmd = &cobra.Command{
 		setupTiming(cmd)
 		defer printTiming()
 
+		if !confirmAction(cmd, fmt.Sprintf("Delete volume %q?", args[0])) {
+			return nil
+		}
 		if err := apiJSON("DELETE", "/volumes/"+args[0], nil, nil); err != nil {
 			return err
 		}
@@ -1708,6 +1854,7 @@ func init() {
 
 	volumeCmd.AddCommand(volumeCreateCmd)
 	volumeCmd.AddCommand(volumeListCmd)
+	volumeDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	volumeCmd.AddCommand(volumeDeleteCmd)
 	volumeCmd.AddCommand(volumeResizeCmd)
 }
@@ -1771,6 +1918,9 @@ var imageDeleteCmd = &cobra.Command{
 		setupTiming(cmd)
 		defer printTiming()
 
+		if !confirmAction(cmd, fmt.Sprintf("Delete image %q?", args[0])) {
+			return nil
+		}
 		if err := apiJSON("DELETE", "/images/"+args[0], nil, nil); err != nil {
 			return err
 		}
@@ -1897,6 +2047,7 @@ func init() {
 	imageSaveCmd.Flags().String("name", "", "Image name (required)")
 
 	imageCmd.AddCommand(imageListCmd)
+	imageDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	imageCmd.AddCommand(imageDeleteCmd)
 	imageCmd.AddCommand(imagePullCmd)
 	imageCmd.AddCommand(imageSaveCmd)
@@ -2017,6 +2168,9 @@ var snapshotDeleteCmd = &cobra.Command{
 		setupTiming(cmd)
 		defer printTiming()
 
+		if !confirmAction(cmd, fmt.Sprintf("Delete snapshot %q?", args[0])) {
+			return nil
+		}
 		if err := apiJSON("DELETE", "/snapshots/"+args[0], nil, nil); err != nil {
 			return err
 		}
@@ -2032,6 +2186,7 @@ func init() {
 	snapshotCmd.AddCommand(snapshotCreateCmd)
 	snapshotCmd.AddCommand(snapshotListCmd)
 	snapshotCmd.AddCommand(snapshotResumeCmd)
+	snapshotDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	snapshotCmd.AddCommand(snapshotDeleteCmd)
 }
 
