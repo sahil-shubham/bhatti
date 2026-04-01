@@ -9,7 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
@@ -383,3 +386,111 @@ func TestMergeDirPreservesExisting(t *testing.T) {
 
 // Silence the unused import warning
 var _ = io.EOF
+
+// --- ImportFromTarball tests ---
+
+// makeTarball creates a docker-save-style tarball from layers.
+// This builds a minimal but valid OCI image tarball that
+// tarball.ImageFromPath can read.
+func makeTarball(t *testing.T, layers []v1.Layer) string {
+	t.Helper()
+	// Build a v1.Image from the layers
+	img, err := mutate.AppendLayers(empty.Image, layers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write as a docker-save tarball
+	path := filepath.Join(t.TempDir(), "image.tar")
+	tag, _ := name.NewTag("test:latest")
+	if err := tarball.WriteToFile(path, tag, img); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestImportFromTarball(t *testing.T) {
+	// Create a layer with known content
+	layer := makeLayer(t, []tarEntry{
+		{name: "etc/", dir: true},
+		{name: "etc/os-release", content: "NAME=TestOS"},
+		{name: "bin/", dir: true},
+		{name: "bin/sh", content: "#!/bin/sh\necho hello", mode: 0755},
+		{name: "usr/", dir: true},
+		{name: "usr/local/", dir: true},
+		{name: "usr/local/bin/", dir: true},
+	})
+
+	tarPath := makeTarball(t, []v1.Layer{layer})
+
+	// Create a fake lohar binary for injection
+	loharDir := t.TempDir()
+	loharPath := filepath.Join(loharDir, "lohar")
+	os.WriteFile(loharPath, []byte("#!/bin/sh\necho lohar"), 0755)
+
+	outputPath := filepath.Join(t.TempDir(), "output.ext4")
+
+	ctx := t.Context()
+	config, err := ImportFromTarball(ctx, tarPath, outputPath, loharPath)
+	if err != nil {
+		// mke2fs may not be available on macOS/CI — that's ok,
+		// the extraction + injection still ran
+		if strings.Contains(err.Error(), "mke2fs") {
+			t.Skipf("mke2fs not available: %v", err)
+		}
+		t.Fatal(err)
+	}
+
+	if config == nil {
+		t.Fatal("config should not be nil")
+	}
+	if config.TotalSize == 0 {
+		t.Error("expected non-zero TotalSize")
+	}
+	t.Logf("imported: size=%d", config.TotalSize)
+}
+
+func TestImportPreservesConfig(t *testing.T) {
+	layer := makeLayer(t, []tarEntry{
+		{name: "bin/", dir: true},
+		{name: "bin/sh", content: "shell", mode: 0755},
+		{name: "usr/", dir: true},
+		{name: "usr/local/", dir: true},
+		{name: "usr/local/bin/", dir: true},
+	})
+
+	// Build image with config
+	img, _ := mutate.AppendLayers(empty.Image, layer)
+	cfg, _ := img.ConfigFile()
+	cfg.Config.Env = []string{"FOO=bar", "PATH=/usr/bin"}
+	cfg.Config.WorkingDir = "/workspace"
+	cfg.Config.Cmd = []string{"/bin/sh"}
+	img, _ = mutate.ConfigFile(img, cfg)
+
+	path := filepath.Join(t.TempDir(), "image.tar")
+	tag, _ := name.NewTag("test:latest")
+	tarball.WriteToFile(path, tag, img)
+
+	loharDir := t.TempDir()
+	loharPath := filepath.Join(loharDir, "lohar")
+	os.WriteFile(loharPath, []byte("fake"), 0755)
+
+	outputPath := filepath.Join(t.TempDir(), "output.ext4")
+
+	config, err := ImportFromTarball(t.Context(), path, outputPath, loharPath)
+	if err != nil {
+		if strings.Contains(err.Error(), "mke2fs") {
+			t.Skipf("mke2fs not available: %v", err)
+		}
+		t.Fatal(err)
+	}
+
+	if config.Env["FOO"] != "bar" {
+		t.Errorf("expected FOO=bar, got %v", config.Env)
+	}
+	if config.WorkingDir != "/workspace" {
+		t.Errorf("expected /workspace, got %q", config.WorkingDir)
+	}
+	if len(config.Cmd) == 0 || config.Cmd[0] != "/bin/sh" {
+		t.Errorf("expected [/bin/sh], got %v", config.Cmd)
+	}
+}

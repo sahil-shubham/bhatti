@@ -1165,8 +1165,9 @@ func (s *Store) GetImage(userID, name string) (*ImageRecord, error) {
 		return &img, nil
 	}
 	// 2. Image shared with this user
-	if scanImg(s.db.QueryRow(`SELECT `+cols+` FROM images i
-		JOIN image_shares s ON s.image_id = i.id
+	if scanImg(s.db.QueryRow(`SELECT i.id, i.user_id, i.name, i.source, i.file_path,
+		i.size_mb, i.oci_digest, i.oci_config_json, i.created_at
+		FROM images i JOIN image_shares s ON s.image_id = i.id
 		WHERE s.user_id = ? AND i.name = ?`, userID, name)) == nil {
 		return &img, nil
 	}
