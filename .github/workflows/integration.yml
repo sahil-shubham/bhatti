@@ -11,11 +11,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  integration:
-    name: Integration Tests
-    runs-on: arc-runner-set
-    timeout-minutes: 30
-    # Self-hosted: never run from forks
+  build-rootfs:
+    name: Build Rootfs
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
     if: github.repository == 'sahil-shubham/bhatti'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -25,48 +24,54 @@ jobs:
           go-version-file: go.mod
 
       - name: Build lohar
-        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
 
-      - name: Verify prerequisites
-        run: |
-          /opt/bhatti/bin/firecracker --version
-          ls -lh /opt/bhatti/images/vmlinux-arm64
-          ls -la /dev/kvm
-          test -w /dev/kvm || sudo chmod 666 /dev/kvm
-
-      - name: Build or reuse rootfs
+      - name: Build minimal rootfs
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iproute2 iptables e2fsprogs
+          sudo apt-get install -y -qq debootstrap e2fsprogs
+          sudo ./scripts/build-tier.sh minimal arm64 ./lohar
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rootfs
+          path: dist/rootfs-minimal-arm64.ext4
+          retention-days: 1
+
+  test:
+    name: Integration Tests
+    needs: build-rootfs
+    runs-on: arc-runner-set
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build lohar
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rootfs
+
+      - name: Setup
+        run: |
+          ls -la /dev/kvm
+          test -w /dev/kvm || sudo chmod 666 /dev/kvm
           sudo mkdir -p /var/lib/bhatti/images
           sudo cp lohar /var/lib/bhatti/lohar
           sudo cp /opt/bhatti/bin/firecracker /usr/local/bin/firecracker
           sudo cp /opt/bhatti/images/vmlinux-arm64 /var/lib/bhatti/images/vmlinux-arm64
-
-          # Cache key: hash of build scripts + lohar binary.
-          # If nothing changed, reuse the pre-built rootfs from /opt/bhatti.
-          CACHE_KEY=$(cat scripts/build-tier.sh scripts/tiers/minimal.sh | sha256sum | cut -c1-16)
-          LOHAR_KEY=$(sha256sum lohar | cut -c1-16)
-          ROOTFS_CACHE="/opt/bhatti/images/rootfs-minimal-arm64-${CACHE_KEY}-${LOHAR_KEY}.ext4"
-
-          if [ -f "$ROOTFS_CACHE" ]; then
-            echo "==> Reusing cached rootfs: $ROOTFS_CACHE"
-            sudo cp "$ROOTFS_CACHE" /var/lib/bhatti/images/rootfs-base-arm64.ext4
-          else
-            echo "==> Cache miss, building rootfs..."
-            sudo apt-get install -y -qq debootstrap
-            sudo ./scripts/build-tier.sh minimal arm64 ./lohar
-            sudo mv dist/rootfs-minimal-arm64.ext4 /var/lib/bhatti/images/rootfs-base-arm64.ext4
-            # Save for future runs
-            sudo cp /var/lib/bhatti/images/rootfs-base-arm64.ext4 "$ROOTFS_CACHE"
-            # Clean old cached rootfs images (keep only the 3 most recent)
-            ls -t /opt/bhatti/images/rootfs-minimal-arm64-*.ext4 2>/dev/null | tail -n +4 | xargs -r sudo rm -f
-          fi
+          sudo mv rootfs-minimal-arm64.ext4 /var/lib/bhatti/images/rootfs-base-arm64.ext4
 
       - name: Run integration tests
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 iptables e2fsprogs
           # TestCheckpointVMConfig: skipped — exec after resume returns empty stdout (separate bug)
-          # timeout=0 disables Go's test timer; the job-level timeout-minutes is the safety net.
           sudo go test ./pkg/engine/firecracker/ -v -count=1 -timeout=0 \
             -skip 'TestCheckpointVMConfig'
 
@@ -75,10 +80,6 @@ jobs:
         run: |
           sudo pkill -f firecracker 2>/dev/null || true
           sudo rm -rf /var/lib/bhatti 2>/dev/null || true
-          # Flush iptables rules injected by setupGlobalFirewall().
-          # These use 10.0.0.0/8 which overlaps with the k8s pod/service
-          # CIDR (10.42.0.0/16, 10.43.0.0/16) and will kill pod networking
-          # if left behind.
           IFACE=$(ip route show default | awk '/default/ {print $5}' | head -1)
           sudo iptables -D INPUT -s 10.0.0.0/8 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
           sudo iptables -D INPUT -s 10.0.0.0/8 -m state --state NEW -j DROP 2>/dev/null || true
@@ -86,7 +87,6 @@ jobs:
           sudo iptables -D FORWARD -s 10.0.0.0/8 ! -d 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
           sudo iptables -D FORWARD -d 10.0.0.0/8 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
           sudo iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-          # Clean up any leftover tap/bridge devices
           for dev in $(ip -o link show type tun 2>/dev/null | awk -F: '{print $2}' | grep '^tap'); do
             sudo ip link del "$dev" 2>/dev/null || true
           done
