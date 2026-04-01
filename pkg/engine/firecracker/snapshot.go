@@ -85,7 +85,7 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 	client := fcAPIClient(vm.SocketPath)
 	wasPaused := vm.Thermal == "warm"
 	if vm.Thermal == "hot" {
-		if err := fcPatch(client, "/vm", `{"state":"Paused"}`); err != nil {
+		if err := fcPatch(ctx, client, "/vm", `{"state":"Paused"}`); err != nil {
 			return nil, fmt.Errorf("pause for checkpoint: %w", err)
 		}
 		vm.Thermal = "warm"
@@ -94,7 +94,7 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 	// On any error after pause, resume the VM
 	resumeOnError := func() {
 		if !wasPaused {
-			fcPatch(client, "/vm", `{"state":"Resumed"}`)
+			fcPatch(ctx, client, "/vm", `{"state":"Resumed"}`)
 			vm.Thermal = "hot"
 		}
 	}
@@ -110,7 +110,7 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 	// Create Firecracker snapshot (mem.snap + vm.snap)
 	memPath := filepath.Join(tmpDir, "mem.snap")
 	vmPath := filepath.Join(tmpDir, "vm.snap")
-	if err := fcPut(client, "/snapshot/create", fmt.Sprintf(
+	if err := fcPut(ctx, client, "/snapshot/create", fmt.Sprintf(
 		`{"snapshot_type":"Full","snapshot_path":%q,"mem_file_path":%q}`,
 		vmPath, memPath)); err != nil {
 		os.RemoveAll(tmpDir)
@@ -204,7 +204,7 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 
 	// Resume VM
 	if !wasPaused {
-		if err := fcPatch(client, "/vm", `{"state":"Resumed"}`); err != nil {
+		if err := fcPatch(ctx, client, "/vm", `{"state":"Resumed"}`); err != nil {
 			return nil, fmt.Errorf("resume after checkpoint: %w", err)
 		}
 		vm.Thermal = "hot"
@@ -377,7 +377,7 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 
 	memSnapPath := filepath.Join(origSandboxDir, "mem.snap")
 	vmSnapPath := filepath.Join(origSandboxDir, "vm.snap")
-	if err = fcPut(client, "/snapshot/load", fmt.Sprintf(
+	if err = fcPut(ctx, client, "/snapshot/load", fmt.Sprintf(
 		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"enable_diff_snapshots":true}`,
 		vmSnapPath, memSnapPath)); err != nil {
 		if needCleanup {
