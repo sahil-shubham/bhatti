@@ -1857,6 +1857,121 @@ func init() {
 	volumeDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	volumeCmd.AddCommand(volumeDeleteCmd)
 	volumeCmd.AddCommand(volumeResizeCmd)
+	volumeCmd.AddCommand(volumeBackupCmd)
+	volumeCmd.AddCommand(volumeBackupListCmd)
+	volumeCmd.AddCommand(volumeRestoreCmd)
+	volumeBackupDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
+	volumeCmd.AddCommand(volumeBackupDeleteCmd)
+}
+
+var volumeBackupCmd = &cobra.Command{
+	Use:   "backup <volume-name>",
+	Short: "Backup a volume to S3-compatible storage",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		var result struct {
+			ID         string `json:"id"`
+			VolumeName string `json:"volume_name"`
+			SizeBytes  int64  `json:"size_bytes"`
+			S3Key      string `json:"s3_key"`
+			CreatedAt  string `json:"created_at"`
+		}
+		if err := apiJSON("POST", "/volumes/"+args[0]+"/backups", nil, &result); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(result)
+		} else {
+			fmt.Printf("backup %s created (%s, %d bytes)\n", result.ID, result.VolumeName, result.SizeBytes)
+		}
+		return nil
+	},
+}
+
+var volumeBackupListCmd = &cobra.Command{
+	Use:   "backup-list <volume-name>",
+	Short: "List backups for a volume",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		var backups []struct {
+			ID        string `json:"id"`
+			SizeBytes int64  `json:"size_bytes"`
+			CreatedAt string `json:"created_at"`
+		}
+		if err := apiJSON("GET", "/volumes/"+args[0]+"/backups", nil, &backups); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(backups)
+		} else {
+			if len(backups) == 0 {
+				fmt.Println("no backups")
+				return nil
+			}
+			fmt.Printf("%-20s %-12s %s\n", "ID", "SIZE", "CREATED")
+			for _, b := range backups {
+				size := fmt.Sprintf("%d MB", b.SizeBytes/1024/1024)
+				fmt.Printf("%-20s %-12s %s\n", b.ID, size, b.CreatedAt)
+			}
+		}
+		return nil
+	},
+}
+
+var volumeRestoreCmd = &cobra.Command{
+	Use:   "restore <volume-name> --backup-id <id>",
+	Short: "Restore a volume from a backup",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		backupID, _ := cmd.Flags().GetString("backup-id")
+		if backupID == "" {
+			return fmt.Errorf("--backup-id required")
+		}
+
+		var result struct {
+			Status   string `json:"status"`
+			BackupID string `json:"backup_id"`
+		}
+		if err := apiJSON("POST", "/volumes/"+args[0]+"/backups/restore", map[string]any{
+			"backup_id": backupID,
+		}, &result); err != nil {
+			return err
+		}
+		fmt.Printf("volume restored from backup %s\n", backupID)
+		return nil
+	},
+}
+
+var volumeBackupDeleteCmd = &cobra.Command{
+	Use:   "backup-delete <volume-name> <backup-id>",
+	Short: "Delete a volume backup",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupTiming(cmd)
+		defer printTiming()
+
+		if !confirmAction(cmd, fmt.Sprintf("Delete backup %s?", args[1])) {
+			return nil
+		}
+		if err := apiJSON("DELETE", "/volumes/"+args[0]+"/backups/"+args[1], nil, nil); err != nil {
+			return err
+		}
+		fmt.Println("deleted")
+		return nil
+	},
+}
+
+func init() {
+	volumeRestoreCmd.Flags().String("backup-id", "", "Backup ID to restore from (required)")
 }
 
 // --- image ---

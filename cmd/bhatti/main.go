@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/sahil-shubham/bhatti/pkg"
+	"github.com/sahil-shubham/bhatti/pkg/backup"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/server"
 	"github.com/sahil-shubham/bhatti/pkg/store"
@@ -146,6 +147,18 @@ func runDaemon() {
 
 	// Start server
 	var srvOpts []server.ServerOption
+
+	// Configure backup backend if S3 is configured
+	if cfg.Backup != nil && cfg.Backup.S3Endpoint != "" {
+		srvOpts = append(srvOpts, server.WithBackupBackend(backup.NewS3(backup.S3Config{
+			Endpoint:  cfg.Backup.S3Endpoint,
+			Region:    cfg.Backup.S3Region,
+			Bucket:    cfg.Backup.S3Bucket,
+			AccessKey: cfg.Backup.S3AccessKey,
+			SecretKey: cfg.Backup.S3SecretKey,
+		})))
+		slog.Info("backup configured", "endpoint", cfg.Backup.S3Endpoint, "bucket", cfg.Backup.S3Bucket)
+	}
 	if cfg.PublicProxyListen != "" {
 		srvOpts = append(srvOpts, server.WithPublicProxyAddr(cfg.PublicProxyListen))
 	}
@@ -162,6 +175,11 @@ func runDaemon() {
 		WarmTimeout: 30 * time.Second,  // hot → warm after 30s idle
 		ColdTimeout: 30 * time.Minute,  // warm → cold after 30min idle
 	})
+
+	// Start scheduled backup goroutine if configured
+	if cfg.Backup != nil && len(cfg.Backup.Schedule) > 0 {
+		srv.StartBackupScheduler(cfg.Backup.Schedule)
+	}
 
 	var servers []*http.Server
 	if cfg.Domain != nil {

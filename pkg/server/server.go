@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	pkg "github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/backup"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
@@ -236,6 +237,105 @@ func (s *Server) Close() {
 	if s.stopTaskCleanup != nil {
 		s.stopTaskCleanup()
 	}
+	if s.stopBackup != nil {
+		s.stopBackup()
+	}
+}
+
+// StartBackupScheduler runs scheduled volume backups based on config.
+func (s *Server) StartBackupScheduler(schedules []pkg.BackupSchedule) {
+	if s.backupBackend == nil || len(schedules) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.stopBackup = cancel
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				for _, sched := range schedules {
+					if !cronMatch(sched.Cron, now) {
+						continue
+					}
+					s.runScheduledBackup(ctx, sched)
+				}
+			}
+		}
+	}()
+
+	slog.Info("backup scheduler started", "schedules", len(schedules))
+}
+
+func (s *Server) runScheduledBackup(ctx context.Context, sched pkg.BackupSchedule) {
+	// Find the volume owner by scanning all users' volumes.
+	// Scheduled backups are admin-configured, so we search across users.
+	users, err := s.store.ListUsers()
+	if err != nil {
+		slog.Error("scheduled backup: list users", "error", err)
+		return
+	}
+	for _, user := range users {
+		vol, err := s.store.GetPersistentVolume(user.ID, sched.Volume)
+		if err != nil {
+			continue
+		}
+		backupCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		result, err := s.performVolumeBackup(backupCtx, &user, vol)
+		cancel()
+		if err != nil {
+			slog.Error("scheduled backup failed",
+				"volume", sched.Volume, "user", user.ID, "error", err)
+			continue
+		}
+		slog.Info("scheduled backup complete",
+			"volume", sched.Volume, "backup_id", result.ID, "size", result.SizeBytes)
+
+		// Apply retention
+		if sched.Retention > 0 {
+			old, err := s.store.OldestVolumeBackups(user.ID, sched.Volume, sched.Retention)
+			if err != nil {
+				slog.Warn("retention query failed", "error", err)
+				continue
+			}
+			for _, b := range old {
+				if err := s.backupBackend.Delete(ctx, b.S3Key); err != nil {
+					slog.Warn("retention delete from s3 failed", "key", b.S3Key, "error", err)
+				}
+				s.store.DeleteVolumeBackup(user.ID, b.ID)
+				slog.Info("retention: deleted old backup", "backup_id", b.ID, "volume", sched.Volume)
+			}
+		}
+	}
+}
+
+// cronMatch checks if a cron expression matches the given time.
+// Supports standard 5-field cron: minute hour day month weekday.
+// Each field can be * (any) or a number. No ranges/steps for simplicity.
+func cronMatch(expr string, t time.Time) bool {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return false
+	}
+	values := []int{t.Minute(), t.Hour(), t.Day(), int(t.Month()), int(t.Weekday())}
+	for i, field := range fields {
+		if field == "*" {
+			continue
+		}
+		var n int
+		if _, err := fmt.Sscanf(field, "%d", &n); err != nil {
+			return false
+		}
+		if values[i] != n {
+			return false
+		}
+	}
+	return true
 }
 
 // SnapshotAll stops every hot or warm sandbox so it has a snapshot on disk.
