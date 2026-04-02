@@ -1729,7 +1729,33 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 		return nil, fmt.Errorf("start jailer: %w", err)
 	}
 
-	waitForSocket(hostSock)
+	// Wait for the API socket, but also detect early jailer/FC death.
+	// If the process exits before the socket appears, we'd hang forever.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	socketReady := false
+	for i := 0; i < 100; i++ {
+		select {
+		case err := <-done:
+			// Process exited before socket appeared
+			cancel()
+			os.RemoveAll(filepath.Join(chrootBase, "firecracker", opts.id))
+			return nil, fmt.Errorf("jailer exited prematurely: %v\nstderr: %s", err, stderrBuf.String())
+		default:
+		}
+		if _, err := os.Stat(hostSock); err == nil {
+			socketReady = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !socketReady {
+		killFC(cmd, 1*time.Second)
+		cancel()
+		os.RemoveAll(filepath.Join(chrootBase, "firecracker", opts.id))
+		return nil, fmt.Errorf("jailer: API socket not ready after 2s\nstderr: %s", stderrBuf.String())
+	}
+
 	return &fcProcess{
 		cmd: cmd, cancel: cancel, stderrBuf: stderrBuf,
 		socket: hostSock, jailRoot: jailRoot,
