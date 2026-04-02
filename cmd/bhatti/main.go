@@ -138,6 +138,10 @@ func runDaemon() {
 		}
 	}
 
+	// Register tier rootfs images as system images so --image browser/minimal/docker works.
+	// Uses user_id='' (admin images visible to all users). Idempotent — skips if already exists.
+	registerTierImages(cfg, st)
+
 	// v0.4: Clean orphaned publish rules
 	if n, err := st.CleanupOrphanedPublishRules(); err != nil {
 		slog.Warn("orphaned publish rule cleanup failed", "error", err)
@@ -506,6 +510,43 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 				os.Remove(orphanPath)
 			}
 		}
+	}
+}
+
+// registerTierImages ensures the built-in rootfs tiers (minimal, browser, docker)
+// are registered in the images table as admin images (user_id=''). This allows
+// users to specify --image browser or --image minimal on create.
+func registerTierImages(cfg *pkg.Config, st *store.Store) {
+	// Auto-detect architecture
+	arch := "arm64"
+	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+		s := string(data)
+		if strings.Contains(s, "GenuineIntel") || strings.Contains(s, "AuthenticAMD") {
+			arch = "amd64"
+		}
+	}
+
+	tiers := []string{"minimal", "browser", "docker"}
+	for _, tier := range tiers {
+		path := filepath.Join(cfg.DataDir, "images", fmt.Sprintf("rootfs-%s-%s.ext4", tier, arch))
+		info, err := os.Stat(path)
+		if err != nil {
+			continue // tier not installed
+		}
+		// Check if already registered
+		if _, err := st.GetImage("", tier); err == nil {
+			continue // already exists
+		}
+		st.CreateImage(store.ImageRecord{
+			ID:       fmt.Sprintf("tier_%s_%s", tier, arch),
+			UserID:   "", // admin image, visible to all
+			Name:     tier,
+			Source:   "built-in",
+			FilePath: path,
+			SizeMB:   int(info.Size() / 1024 / 1024),
+			CreatedAt: info.ModTime(),
+		})
+		slog.Info("registered tier image", "name", tier, "path", path)
 	}
 }
 
