@@ -73,6 +73,20 @@ version_gt() {
     return 1
 }
 
+# major_version extracts the major version number from a semver string
+major_version() {
+    local v="${1#v}"
+    echo "${v%%.*}"
+}
+
+# crosses_major returns 0 (true) if upgrading from $1 to $2 crosses a major version
+crosses_major() {
+    local from_major to_major
+    from_major=$(major_version "$1")
+    to_major=$(major_version "$2")
+    [ "$from_major" != "$to_major" ]
+}
+
 # ── Installation detection ────────────────────────────
 
 # Returns: none | cli | server
@@ -271,6 +285,21 @@ do_cli_install() {
     fi
 
     if [ -n "$current" ]; then
+        # Guard against major version crossings for CLI updates too
+        if crosses_major "$current" "$VERSION"; then
+            echo ""
+            printf "  ${RED}⚠  Major version upgrade: ${current} → ${VERSION}${RESET}\n"
+            echo "  Review release notes: https://github.com/${GITHUB_REPO}/releases/tag/${VERSION}"
+            echo ""
+            if [ "${BHATTI_FORCE:-}" != "1" ]; then
+                printf "  Continue? [y/N]: "
+                read -r confirm < /dev/tty 2>/dev/null || confirm="n"
+                case "$confirm" in
+                    y|Y|yes|YES) ;;
+                    *) echo "  Aborted."; exit 0 ;;
+                esac
+            fi
+        fi
         heading "Updating bhatti ${current} → ${VERSION}"
     else
         heading "Installing bhatti ${VERSION} (${OS}/${ARCH})"
@@ -360,6 +389,27 @@ do_server_update() {
     if [ -n "$current" ] && [ "v${current#v}" = "${VERSION}" ] && [ "$all_present" = true ]; then
         success "bhatti ${VERSION} (server, ${tier} tier) is already up to date"
         return
+    fi
+
+    # Guard against major version crossings (e.g. v0.5.x → v1.0.0).
+    # Major version bumps may include breaking changes (snapshot format,
+    # config schema, etc.) that require manual migration steps.
+    if [ -n "$current" ] && crosses_major "$current" "$VERSION"; then
+        echo ""
+        printf "  ${RED}⚠  Major version upgrade: ${current} → ${VERSION}${RESET}\n"
+        echo "  This may include breaking changes. Review the release notes:"
+        echo "    https://github.com/${GITHUB_REPO}/releases/tag/${VERSION}"
+        echo ""
+        if [ "${BHATTI_FORCE:-}" = "1" ]; then
+            info "BHATTI_FORCE=1 set, proceeding"
+        else
+            printf "  Continue? [y/N]: "
+            read -r confirm < /dev/tty 2>/dev/null || confirm="n"
+            case "$confirm" in
+                y|Y|yes|YES) ;;
+                *) echo "  Aborted."; exit 0 ;;
+            esac
+        fi
     fi
 
     heading "Updating bhatti server (${tier} tier)"

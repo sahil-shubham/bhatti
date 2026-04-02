@@ -217,19 +217,17 @@ func checkServerVersion(resp *http.Response) {
 	versionChecked = true
 
 	minCLI := resp.Header.Get("X-Bhatti-Min-CLI")
-	serverVer := resp.Header.Get("X-Bhatti-Version")
 
 	// Hard warning: CLI is below the server's minimum required version.
+	// This is the ONLY case where we show an update notice — when the
+	// server explicitly requires a newer CLI via X-Bhatti-Min-CLI.
 	if minCLI != "" && compareVersions(version, minCLI) < 0 {
 		fmt.Fprintf(os.Stderr, "⚠ CLI version %s is below server minimum %s — please update:\n", version, minCLI)
 		fmt.Fprintf(os.Stderr, "  bhatti update\n\n")
 		return
 	}
 
-	// Soft notice: newer server version available.
-	if serverVer != "" && serverVer != "dev" && compareVersions(version, serverVer) < 0 {
-		fmt.Fprintf(os.Stderr, "Update available: %s → %s (bhatti update)\n", version, serverVer)
-	}
+	// No soft notice — don't nag users about optional updates on every command.
 }
 
 // compareVersions compares two semver strings (with optional 'v' prefix).
