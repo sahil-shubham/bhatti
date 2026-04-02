@@ -932,13 +932,53 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 
 	client := fcAPIClient(newSocketPath)
 
+	// If this VM was resumed from a snapshot, vm.snap has the original
+	// sandbox's paths baked in (FCPathOrigin). FC opens those exact paths
+	// during /snapshot/load. Create symlinks so they resolve to our files.
+	var symlinkDir string
+	if vm.FCPathOrigin != "" && vm.FCPathOrigin != vm.ID {
+		origDir := filepath.Join(e.cfg.DataDir, "sandboxes", vm.FCPathOrigin)
+		curDir := filepath.Dir(vm.RootfsPath)
+		if origDir != curDir {
+			os.MkdirAll(origDir, 0700)
+			symlinkDir = origDir
+			// Symlink all files FC might reference
+			for _, name := range []string{"rootfs.ext4", "config.ext4", "mem.snap", "vm.snap"} {
+				src := filepath.Join(curDir, name)
+				dst := filepath.Join(origDir, name)
+				os.Remove(dst)
+				os.Symlink(src, dst)
+			}
+			// Volume files
+			for _, vol := range vm.Volumes {
+				snapFile := fmt.Sprintf("vol-%s.ext4", vol.Name)
+				src := filepath.Join(curDir, snapFile)
+				dst := filepath.Join(origDir, snapFile)
+				os.Remove(dst)
+				if _, err := os.Stat(src); err == nil {
+					os.Symlink(src, dst)
+				}
+			}
+			// Vsock must NOT exist — FC needs to create it fresh
+			os.Remove(filepath.Join(origDir, "vsock.sock"))
+		}
+	}
+
 	// enable_diff_snapshots re-enables dirty page tracking after restore.
 	// network_overrides remaps the TAP device name so FC doesn't need the
 	// exact TAP name from when the snapshot was taken.
 	if err := fcPut(ctx, client, "/snapshot/load", fmt.Sprintf(
 		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"enable_diff_snapshots":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
 		vm.SnapVMPath, vm.SnapMemPath, vm.TapDevice)); err != nil {
+		if symlinkDir != "" {
+			os.RemoveAll(symlinkDir)
+		}
 		return restoreFailed("load snapshot: %v", err)
+	}
+
+	// Clean up symlinks — FC has opened the file descriptors
+	if symlinkDir != "" {
+		os.RemoveAll(symlinkDir)
 	}
 
 	vm.SocketPath = newSocketPath
@@ -1050,6 +1090,7 @@ func (e *Engine) VMState(id string) map[string]interface{} {
 		"has_base_snapshot": vm.hasBaseSnapshot,
 		"agent_token":       vm.Token,
 		"volumes":           vm.Volumes,
+		"fc_path_origin":    vm.FCPathOrigin,
 	}
 }
 
@@ -1088,6 +1129,7 @@ func (e *Engine) RestoreVM(id, name, status string, state map[string]interface{}
 		MemSizeMib:  stateInt64(state, "mem_size_mib"),
 		SnapMemPath:     stateStr(state, "snap_mem_path"),
 		SnapVMPath:      stateStr(state, "snap_vm_path"),
+		FCPathOrigin:    stateStr(state, "fc_path_origin"),
 		hasBaseSnapshot: false, // Always reset on recovery — first post-recovery
 		// snapshot will be Full, establishing a clean base. The persisted
 		// has_base_snapshot may refer to a base that was overwritten.

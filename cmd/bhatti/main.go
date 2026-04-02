@@ -440,6 +440,7 @@ func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
 			"subnet_index":      subnetIndex,
 			"agent_token":       fcState.AgentToken,
 			"has_base_snapshot": fcState.HasBaseSnapshot,
+			"fc_path_origin":    fcState.FCPathOrigin,
 		}
 
 		// Verify all critical snapshot files exist and are non-empty.

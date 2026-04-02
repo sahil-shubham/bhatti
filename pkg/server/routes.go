@@ -55,6 +55,7 @@ func (s *Server) saveVMState(sandboxID, engineID string) {
 		VsockPath:       strOrEmpty(state, "vsock_path"),
 		AgentToken:      strOrEmpty(state, "agent_token"),
 		HasBaseSnapshot: boolOrFalse(state, "has_base_snapshot"),
+		FCPathOrigin:    strOrEmpty(state, "fc_path_origin"),
 	})
 }
 

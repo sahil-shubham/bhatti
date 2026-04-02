@@ -246,6 +246,7 @@ ALTER TABLE users ADD COLUMN max_volume_storage_mb INTEGER NOT NULL DEFAULT 2048
 ALTER TABLE users ADD COLUMN max_images INTEGER NOT NULL DEFAULT 10;
 ALTER TABLE users ADD COLUMN max_snapshots INTEGER NOT NULL DEFAULT 5;
 ALTER TABLE sandboxes ADD COLUMN keep_hot INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sandboxes ADD COLUMN fc_path_origin TEXT DEFAULT '';
 `
 
 // New opens (or creates) the SQLite database and runs migrations.
@@ -920,6 +921,7 @@ type FirecrackerState struct {
 	VsockPath       string
 	AgentToken      string
 	HasBaseSnapshot bool
+	FCPathOrigin    string
 }
 
 // SaveFirecrackerState persists Firecracker-specific VM state.
@@ -932,12 +934,12 @@ func (s *Store) SaveFirecrackerState(id string, st FirecrackerState) error {
 		rootfs_path = ?, snap_mem_path = ?, snap_vm_path = ?,
 		vsock_cid = ?, tap_device = ?, guest_ip = ?, guest_mac = ?,
 		vcpu_count = ?, mem_size_mib = ?, socket_path = ?, vsock_path = ?,
-		agent_token = ?, has_base_snapshot = ?
+		agent_token = ?, has_base_snapshot = ?, fc_path_origin = ?
 		WHERE id = ?`,
 		st.RootfsPath, st.SnapMemPath, st.SnapVMPath,
 		st.VsockCID, st.TapDevice, st.GuestIP, st.GuestMAC,
 		st.VcpuCount, st.MemSizeMib, st.SocketPath, st.VsockPath,
-		st.AgentToken, hasSnap,
+		st.AgentToken, hasSnap, st.FCPathOrigin,
 		id)
 	return err
 }
@@ -950,12 +952,12 @@ func (s *Store) LoadFirecrackerState(id string) (*FirecrackerState, error) {
 		COALESCE(rootfs_path,''), COALESCE(snap_mem_path,''), COALESCE(snap_vm_path,''),
 		COALESCE(vsock_cid,0), COALESCE(tap_device,''), COALESCE(guest_ip,''), COALESCE(guest_mac,''),
 		COALESCE(vcpu_count,1), COALESCE(mem_size_mib,512), COALESCE(socket_path,''), COALESCE(vsock_path,''),
-		COALESCE(agent_token,''), COALESCE(has_base_snapshot,0)
+		COALESCE(agent_token,''), COALESCE(has_base_snapshot,0), COALESCE(fc_path_origin,'')
 		FROM sandboxes WHERE id = ?`, id).Scan(
 		&st.RootfsPath, &st.SnapMemPath, &st.SnapVMPath,
 		&st.VsockCID, &st.TapDevice, &st.GuestIP, &st.GuestMAC,
 		&st.VcpuCount, &st.MemSizeMib, &st.SocketPath, &st.VsockPath,
-		&st.AgentToken, &hasSnap)
+		&st.AgentToken, &hasSnap, &st.FCPathOrigin)
 	if err != nil {
 		return nil, err
 	}
