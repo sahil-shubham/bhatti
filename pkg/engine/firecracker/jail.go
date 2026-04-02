@@ -29,3 +29,12 @@ func (jp *jailPaths) resolve(chrootName, hostPath string) string {
 	jp.files[chrootName] = hostPath
 	return "/" + chrootName
 }
+
+// chrootPath returns the chroot-relative path WITHOUT registering for
+// hard-linking. Used for files FC creates itself (e.g. vsock socket).
+func (jp *jailPaths) chrootPath(chrootName, hostPath string) string {
+	if !jp.jailed {
+		return hostPath
+	}
+	return "/" + chrootName
+}

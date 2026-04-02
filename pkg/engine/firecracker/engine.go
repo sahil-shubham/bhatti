@@ -447,9 +447,9 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	kernelPath := jp.resolve("kernel", e.cfg.KernelPath)
 	rootfsRef := jp.resolve("rootfs.ext4", rootfsPath)
 	configRef := jp.resolve("config.ext4", configDrivePath)
-	vsockRef := jp.resolve("vsock.sock", vsockPath)
-	logRef := jp.resolve("firecracker.log", filepath.Join(sandboxDir, "firecracker.log"))
-	metricsRef := jp.resolve("firecracker.metrics", filepath.Join(sandboxDir, "firecracker.metrics"))
+	vsockRef := jp.chrootPath("vsock.sock", vsockPath)
+	logRef := jp.chrootPath("firecracker.log", filepath.Join(sandboxDir, "firecracker.log"))
+	metricsRef := jp.chrootPath("firecracker.metrics", filepath.Join(sandboxDir, "firecracker.metrics"))
 
 	// Start Firecracker process
 	fcProc, err := e.startFC(socketPath, startFCOpts{
