@@ -214,6 +214,14 @@ func (m *mockEngine) Activity(_ context.Context, id string) (*proto.ActivityInfo
 	}, nil
 }
 
+func (m *mockEngine) BalloonSet(_ context.Context, _ string, _ int64) error {
+	return nil
+}
+
+func (m *mockEngine) MemSizeMib(_ string) int64 {
+	return 2048
+}
+
 // mockTermConn wraps net.Pipe as engine.TerminalConn.
 type mockTermConn struct {
 	conn   net.Conn
