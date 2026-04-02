@@ -35,7 +35,7 @@ case "$HOST_ARCH" in
         ;;
 esac
 
-IMG="${IMG:-/var/lib/bhatti/images/rootfs-base-${DEB_ARCH}.ext4}"
+IMG="${IMG:-/var/lib/bhatti/images/rootfs-minimal-${DEB_ARCH}.ext4}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "error: must run as root (need mount/chroot)" >&2

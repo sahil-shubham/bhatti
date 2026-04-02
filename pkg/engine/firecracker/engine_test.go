@@ -35,7 +35,7 @@ func testEngine(t *testing.T) *Engine {
 	eng, err := New(Config{
 		DataDir:    "/var/lib/bhatti",
 		KernelPath: fmt.Sprintf("/var/lib/bhatti/images/vmlinux-%s", arch),
-		BaseRootfs: fmt.Sprintf("/var/lib/bhatti/images/rootfs-base-%s.ext4", arch),
+		BaseRootfs: fmt.Sprintf("/var/lib/bhatti/images/rootfs-minimal-%s.ext4", arch),
 		FCBinary:   "/usr/local/bin/firecracker",
 	})
 	if err != nil {

@@ -65,7 +65,7 @@ jobs:
           sudo cp lohar /var/lib/bhatti/lohar
           sudo cp /opt/bhatti/bin/firecracker /usr/local/bin/firecracker
           sudo cp /opt/bhatti/images/vmlinux-arm64 /var/lib/bhatti/images/vmlinux-arm64
-          sudo mv rootfs-minimal-arm64.ext4 /var/lib/bhatti/images/rootfs-base-arm64.ext4
+          sudo mv rootfs-minimal-arm64.ext4 /var/lib/bhatti/images/rootfs-minimal-arm64.ext4
 
       - name: Run integration tests
         run: |

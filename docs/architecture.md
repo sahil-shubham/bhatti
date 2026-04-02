@@ -182,7 +182,7 @@ Each NDJSON line is flushed immediately. The Firecracker engine implements `Stre
 ├── lohar                         guest agent binary (baked into rootfs)
 ├── images/
 │   ├── vmlinux-arm64             kernel (or vmlinux-amd64)
-│   └── rootfs-base-arm64.ext4   base rootfs (Ubuntu 24.04 + Node 22 + rg + fd)
+│   └── rootfs-minimal-arm64.ext4 minimal rootfs (Ubuntu 24.04)
 └── sandboxes/
     └── <id>/
         ├── rootfs.ext4           CoW copy of base rootfs
