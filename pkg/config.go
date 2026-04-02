@@ -31,6 +31,11 @@ type Config struct {
 	FirecrackerKernel string `yaml:"firecracker_kernel"` // path to vmlinux
 	FirecrackerRootfs string `yaml:"firecracker_rootfs"` // path to base rootfs.ext4
 
+	// Jailer (empty = bare mode, no isolation)
+	FirecrackerJailer string `yaml:"firecracker_jailer,omitempty"` // path to jailer binary
+	JailUID           int    `yaml:"jail_uid,omitempty"`           // uid for jailed FC (e.g. 10000)
+	JailGID           int    `yaml:"jail_gid,omitempty"`           // gid for jailed FC (e.g. 10000)
+
 	// Backup to S3-compatible storage
 	Backup *BackupConfig `yaml:"backup,omitempty"`
 }

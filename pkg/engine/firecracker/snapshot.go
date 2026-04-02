@@ -299,7 +299,20 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 	socketPath := filepath.Join(sandboxDir, "firecracker.sock")
 	vsockPath := filepath.Join(sandboxDir, "vsock.sock")
 
-	fcProc, startErr := e.startFC(socketPath)
+	// Build jail paths for snapshot resume
+	jp := newJailPaths(e.cfg.jailed())
+	for _, drive := range manifest.Drives {
+		jp.resolve(drive.SnapshotFile, filepath.Join(sandboxDir, drive.SnapshotFile))
+	}
+	jp.resolve("mem.snap", filepath.Join(sandboxDir, "mem.snap"))
+	jp.resolve("vm.snap", filepath.Join(sandboxDir, "vm.snap"))
+
+	fcProc, startErr := e.startFC(socketPath, startFCOpts{
+		id:    id,
+		vcpus: manifest.VMConfig.VcpuCount,
+		memMB: manifest.VMConfig.MemSizeMib,
+		files: jp.files,
+	})
 	if startErr != nil {
 		err = startErr
 		return info, err
@@ -308,63 +321,51 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 	vmCancel = fcProc.cancel
 	stderrBuf := fcProc.stderrBuf
 
-	client := fcAPIClient(socketPath)
-
-	// 4. Pre-load resource configuration — ALL PUTs BEFORE /snapshot/load
+	apiSocket := socketPath
+	if fcProc.socket != "" {
+		apiSocket = fcProc.socket
+	}
+	client := fcAPIClient(apiSocket)
 
 	// 5. Load snapshot.
-	// Firecracker v1.6 requires /snapshot/load as the ONLY API call on a
-	// fresh VMM — no pre-configuration of drives/network/vsock allowed.
-	// The vm.snap file records the original block device paths from when
-	// the checkpoint was taken. Firecracker opens those exact paths during
-	// snapshot load.
-	//
-	// Solution: the new sandbox dir IS the sandbox dir. We already copied
-	// all block devices there with the same filenames used during Create().
-	// But the vm.snap records the ORIGINAL sandbox dir path (e.g.
-	// /var/lib/bhatti/sandboxes/<old-id>/rootfs.ext4).
-	//
-	// We must place our files at those original paths. Since the original
-	// sandbox was destroyed, those paths are free. We use the new sandbox
-	// dir but create symlinks at the old paths pointing to our copies.
-	// Use FCPathOrigin (the sandbox whose paths FC recorded in vm.snap),
-	// not CreatedFrom (which may be a different sandbox for nested snapshots).
-	origSandboxDir := filepath.Join(e.cfg.DataDir, "sandboxes", fcOrigin)
-	needCleanup := false
-	if _, err := os.Stat(origSandboxDir); os.IsNotExist(err) {
-		os.MkdirAll(origSandboxDir, 0700)
-		needCleanup = true
+	var loadVMPath, loadMemPath string
+	var symlinkCleanup string
+
+	if e.cfg.jailed() {
+		// Jailed mode: paths are chroot-relative. The jailer already
+		// hard-linked all files into the chroot root.
+		loadVMPath = "/vm.snap"
+		loadMemPath = "/mem.snap"
+	} else {
+		// Bare mode: vm.snap has the original sandbox's absolute paths.
+		// Create symlinks so FC can find the files at those paths.
+		origSandboxDir := filepath.Join(e.cfg.DataDir, "sandboxes", fcOrigin)
+		if _, statErr := os.Stat(origSandboxDir); os.IsNotExist(statErr) {
+			os.MkdirAll(origSandboxDir, 0700)
+			symlinkCleanup = origSandboxDir
+		}
+		for _, drive := range manifest.Drives {
+			src := filepath.Join(sandboxDir, drive.SnapshotFile)
+			dst := filepath.Join(origSandboxDir, drive.SnapshotFile)
+			os.Remove(dst)
+			os.Symlink(src, dst)
+		}
+		for _, f := range []string{"mem.snap", "vm.snap"} {
+			src := filepath.Join(sandboxDir, f)
+			dst := filepath.Join(origSandboxDir, f)
+			os.Remove(dst)
+			os.Symlink(src, dst)
+		}
+		os.Remove(filepath.Join(origSandboxDir, "vsock.sock"))
+		loadVMPath = filepath.Join(origSandboxDir, "vm.snap")
+		loadMemPath = filepath.Join(origSandboxDir, "mem.snap")
 	}
 
-	// Place files at original paths (symlinks for efficiency)
-	for _, drive := range manifest.Drives {
-		src := filepath.Join(sandboxDir, drive.SnapshotFile)
-		dst := filepath.Join(origSandboxDir, drive.SnapshotFile)
-		os.Remove(dst)
-		os.Symlink(src, dst)
-	}
-	// mem.snap and vm.snap
-	for _, f := range []string{"mem.snap", "vm.snap"} {
-		src := filepath.Join(sandboxDir, f)
-		dst := filepath.Join(origSandboxDir, f)
-		os.Remove(dst)
-		os.Symlink(src, dst)
-	}
-
-	// The vm.snap also references the original vsock.sock path.
-	// Firecracker will try to bind this UDS. It must NOT already exist.
-	origVsockPath := filepath.Join(origSandboxDir, "vsock.sock")
-	os.Remove(origVsockPath)
-
-	memSnapPath := filepath.Join(origSandboxDir, "mem.snap")
-	vmSnapPath := filepath.Join(origSandboxDir, "vm.snap")
-	// network_overrides remaps the TAP device to the fresh name, eliminating
-	// the need to recreate the original TAP name from FCPathOrigin.
 	if err = fcPut(ctx, client, "/snapshot/load", fmt.Sprintf(
 		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
-		vmSnapPath, memSnapPath, tapName)); err != nil {
-		if needCleanup {
-			os.RemoveAll(origSandboxDir)
+		loadVMPath, loadMemPath, tapName)); err != nil {
+		if symlinkCleanup != "" {
+			os.RemoveAll(symlinkCleanup)
 		}
 		if fcStderr := stderrBuf.String(); fcStderr != "" {
 			return info, fmt.Errorf("load snapshot: %w\nFC stderr: %s", err, fcStderr)
@@ -372,9 +373,8 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 		return info, fmt.Errorf("load snapshot: %w", err)
 	}
 
-	// Cleanup symlinks — FC has opened the file descriptors, symlinks no longer needed
-	if needCleanup {
-		os.RemoveAll(origSandboxDir)
+	if symlinkCleanup != "" {
+		os.RemoveAll(symlinkCleanup)
 	}
 
 	// 6. Flush bridge FDB for the MAC to avoid ARP staleness

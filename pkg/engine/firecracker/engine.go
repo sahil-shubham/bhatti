@@ -51,7 +51,15 @@ type Config struct {
 	BaseRootfs string // path to base rootfs.ext4
 	FCBinary   string // path to firecracker binary
 	RateLimits RateLimitConfig
+
+	// Jailer (empty JailerBinary = bare mode, no isolation)
+	JailerBinary string // path to jailer binary
+	JailUID      int    // uid for jailed FC processes (e.g. 10000)
+	JailGID      int    // gid for jailed FC processes (e.g. 10000)
 }
+
+// jailed returns true if the jailer is configured.
+func (c Config) jailed() bool { return c.JailerBinary != "" }
 
 // Engine manages Firecracker microVMs.
 type Engine struct {
@@ -431,8 +439,21 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		return info, fmt.Errorf("create config drive: %w", err)
 	}
 
-	// 5. Start Firecracker process
-	fcProc, err := e.startFC(socketPath)
+	// 5. Build path resolver for FC API calls
+	jp := newJailPaths(e.cfg.jailed())
+
+	// Resolve all paths FC will reference
+	kernelPath := jp.resolve("kernel", e.cfg.KernelPath)
+	rootfsRef := jp.resolve("rootfs.ext4", rootfsPath)
+	configRef := jp.resolve("config.ext4", configDrivePath)
+	vsockRef := jp.resolve("vsock.sock", vsockPath)
+	logRef := jp.resolve("firecracker.log", filepath.Join(sandboxDir, "firecracker.log"))
+	metricsRef := jp.resolve("firecracker.metrics", filepath.Join(sandboxDir, "firecracker.metrics"))
+
+	// Start Firecracker process
+	fcProc, err := e.startFC(socketPath, startFCOpts{
+		id: id, vcpus: vcpuCount, memMB: memMB, files: jp.files,
+	})
 	if err != nil {
 		return info, err
 	}
@@ -440,20 +461,24 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	vmCancel = fcProc.cancel
 	stderrBuf := fcProc.stderrBuf
 
+	// In jailed mode, the API socket is inside the chroot
+	apiSocket := socketPath
+	if fcProc.socket != "" {
+		apiSocket = fcProc.socket
+	}
+
 	// 6. Configure via HTTP API
-	client := fcAPIClient(socketPath)
+	client := fcAPIClient(apiSocket)
 
 	// FC logger and metrics must be set before any other configuration.
 	// Warning level only — Debug is guest-influenceable. Non-fatal if setup fails.
-	logPath := filepath.Join(sandboxDir, "firecracker.log")
 	if err = fcPut(ctx, client, "/logger", fmt.Sprintf(
 		`{"log_path":%q,"level":"Warning","show_level":true,"show_log_origin":true}`,
-		logPath)); err != nil {
+		logRef)); err != nil {
 		slog.Warn("FC logger setup failed", "error", err)
 	}
-	metricsPath := filepath.Join(sandboxDir, "firecracker.metrics")
 	if err = fcPut(ctx, client, "/metrics", fmt.Sprintf(
-		`{"metrics_path":%q}`, metricsPath)); err != nil {
+		`{"metrics_path":%q}`, metricsRef)); err != nil {
 		slog.Warn("FC metrics setup failed", "error", err)
 	}
 
@@ -465,11 +490,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	if err = fcPut(ctx, client, "/boot-source", fmt.Sprintf(
 		`{"kernel_image_path":%q,"boot_args":%q}`,
-		e.cfg.KernelPath, bootArgs)); err != nil {
+		kernelPath, bootArgs)); err != nil {
 		return info, fmt.Errorf("set boot-source: %w", err)
 	}
 
-	rootfsDrive := fmt.Sprintf(`{"drive_id":"rootfs","path_on_host":%q,"is_root_device":true,"is_read_only":false`, rootfsPath)
+	rootfsDrive := fmt.Sprintf(`{"drive_id":"rootfs","path_on_host":%q,"is_root_device":true,"is_read_only":false`, rootfsRef)
 	if bw := e.cfg.RateLimits.diskBandwidth(); bw > 0 {
 		iops := e.cfg.RateLimits.diskIOPS()
 		rootfsDrive += fmt.Sprintf(`,"rate_limiter":{"bandwidth":{"size":%d,"refill_time":1000},"ops":{"size":%d,"refill_time":1000}}`, bw, iops)
@@ -510,7 +535,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 
 	if err = fcPut(ctx, client, "/vsock", fmt.Sprintf(
-		`{"guest_cid":%d,"uds_path":%q}`, cid, vsockPath)); err != nil {
+		`{"guest_cid":%d,"uds_path":%q}`, cid, vsockRef)); err != nil {
 		return info, fmt.Errorf("set vsock: %w", err)
 	}
 
@@ -528,15 +553,16 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// 6b. Attach config drive as /dev/vdb
 	if err = fcPut(ctx, client, "/drives/config", fmt.Sprintf(
 		`{"drive_id":"config","path_on_host":%q,"is_root_device":false,"is_read_only":true}`,
-		configDrivePath)); err != nil {
+		configRef)); err != nil {
 		return info, fmt.Errorf("set config drive: %w", err)
 	}
 
 	// 6c. Attach persistent volume drives
 	for _, vol := range spec.ResolvedVolumes {
+		volRef := jp.resolve(fmt.Sprintf("vol-%s.ext4", vol.Name), vol.FilePath)
 		if err = fcPut(ctx, client, fmt.Sprintf("/drives/%s", vol.DriveID), fmt.Sprintf(
 			`{"drive_id":%q,"path_on_host":%q,"is_root_device":false,"is_read_only":%v}`,
-			vol.DriveID, vol.FilePath, vol.ReadOnly)); err != nil {
+			vol.DriveID, volRef, vol.ReadOnly)); err != nil {
 			return info, fmt.Errorf("set persistent volume drive %s: %w", vol.DriveID, err)
 		}
 	}
@@ -544,10 +570,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// 6d. Attach legacy ephemeral volume drives
 	for i, vs := range spec.NewVolumes {
 		volPath := filepath.Join(sandboxDir, fmt.Sprintf("vol-%s.ext4", vs.Name))
+		ephVolRef := jp.resolve(fmt.Sprintf("ephvol-%s.ext4", vs.Name), volPath)
 		driveID := fmt.Sprintf("ephvol%d", i)
 		if err = fcPut(ctx, client, fmt.Sprintf("/drives/%s", driveID), fmt.Sprintf(
 			`{"drive_id":%q,"path_on_host":%q,"is_root_device":false,"is_read_only":false}`,
-			driveID, volPath)); err != nil {
+			driveID, ephVolRef)); err != nil {
 			return info, fmt.Errorf("set volume drive %d: %w", i, err)
 		}
 	}
@@ -894,7 +921,22 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 	newSocketPath := baseSockPath + ".resume"
 	os.Remove(vm.VsockPath)
 
-	fcProc, err := e.startFC(newSocketPath)
+	// Build jail files for resume — need snapshot files + drives in chroot
+	jp := newJailPaths(e.cfg.jailed())
+	if e.cfg.jailed() {
+		jp.resolve("mem.snap", vm.SnapMemPath)
+		jp.resolve("vm.snap", vm.SnapVMPath)
+		jp.resolve("rootfs.ext4", vm.RootfsPath)
+		configPath := filepath.Join(filepath.Dir(vm.RootfsPath), "config.ext4")
+		jp.resolve("config.ext4", configPath)
+		for _, vol := range vm.Volumes {
+			jp.resolve(fmt.Sprintf("vol-%s.ext4", vol.Name), vol.FilePath)
+		}
+	}
+
+	fcProc, err := e.startFC(newSocketPath, startFCOpts{
+		id: id, vcpus: vm.VcpuCount, memMB: vm.MemSizeMib, files: jp.files,
+	})
 	if err != nil {
 		return err
 	}
@@ -915,13 +957,18 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 		return fmt.Errorf("%s", errMsg)
 	}
 
-	client := fcAPIClient(newSocketPath)
+	apiSocket := newSocketPath
+	if fcProc.socket != "" {
+		apiSocket = fcProc.socket
+	}
+	client := fcAPIClient(apiSocket)
 
-	// If this VM was resumed from a snapshot, vm.snap has the original
-	// sandbox's paths baked in (FCPathOrigin). FC opens those exact paths
-	// during /snapshot/load. Create symlinks so they resolve to our files.
+	// In bare mode, if this VM was resumed from a snapshot, vm.snap has the
+	// original sandbox's paths baked in (FCPathOrigin). Create symlinks so
+	// they resolve to our files. In jailed mode, the chroot handles this
+	// — all paths are chroot-relative.
 	var symlinkDir string
-	if vm.FCPathOrigin != "" && vm.FCPathOrigin != vm.ID {
+	if !e.cfg.jailed() && vm.FCPathOrigin != "" && vm.FCPathOrigin != vm.ID {
 		origDir := filepath.Join(e.cfg.DataDir, "sandboxes", vm.FCPathOrigin)
 		curDir := filepath.Dir(vm.RootfsPath)
 		if origDir != curDir {
@@ -949,11 +996,18 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 		}
 	}
 
+	// In jailed mode, paths are chroot-relative. In bare mode, use host paths.
+	snapVMRef := vm.SnapVMPath
+	snapMemRef := vm.SnapMemPath
+	if e.cfg.jailed() {
+		snapVMRef = "/vm.snap"
+		snapMemRef = "/mem.snap"
+	}
 	// network_overrides remaps the TAP device name so FC doesn't need the
 	// exact TAP name from when the snapshot was taken.
 	if err := fcPut(ctx, client, "/snapshot/load", fmt.Sprintf(
 		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
-		vm.SnapVMPath, vm.SnapMemPath, vm.TapDevice)); err != nil {
+		snapVMRef, snapMemRef, vm.TapDevice)); err != nil {
 		if symlinkDir != "" {
 			os.RemoveAll(symlinkDir)
 		}
@@ -1022,6 +1076,12 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	vm.stateMu.Unlock()
 
 	os.RemoveAll(rootfsDir)
+
+	// Clean up jailer chroot and cgroup if jailed
+	if e.cfg.jailed() {
+		jailDir := filepath.Join(e.cfg.DataDir, "jails", "firecracker", id)
+		os.RemoveAll(jailDir)
+	}
 
 	e.mu.Lock()
 	delete(e.vms, id)
@@ -1536,12 +1596,29 @@ type fcProcess struct {
 	cmd       *exec.Cmd
 	cancel    context.CancelFunc
 	stderrBuf *ringBuffer
-	socket    string
+	socket    string    // host-visible API socket path
+	jailRoot  string    // chroot root dir (empty if bare mode)
 }
 
-// startFC launches a new Firecracker process and waits for its API socket.
-// Consolidates ring buffer creation, socket validation, and socket wait.
-func (e *Engine) startFC(socketPath string) (*fcProcess, error) {
+// startFCOpts are passed to startFC for jailed mode. Bare mode ignores them.
+type startFCOpts struct {
+	id       string // sandbox/VM ID
+	vcpus    int64
+	memMB    int64
+	files    map[string]string // chroot filename → host path (hard-linked into jail)
+}
+
+// startFC launches a Firecracker process. In jailed mode, sets up the chroot,
+// hard-links files, applies cgroups, and drops privileges.
+func (e *Engine) startFC(socketPath string, opts startFCOpts) (*fcProcess, error) {
+	if e.cfg.jailed() {
+		return e.startFCJailed(socketPath, opts)
+	}
+	return e.startFCBare(socketPath)
+}
+
+// startFCBare launches FC directly (no isolation). Used in dev mode.
+func (e *Engine) startFCBare(socketPath string) (*fcProcess, error) {
 	if err := validateSocketPath(socketPath); err != nil {
 		return nil, err
 	}
@@ -1554,14 +1631,97 @@ func (e *Engine) startFC(socketPath string) (*fcProcess, error) {
 		cancel()
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
-	// Wait for API socket to appear
+	waitForSocket(socketPath)
+	return &fcProcess{cmd: cmd, cancel: cancel, stderrBuf: stderrBuf, socket: socketPath}, nil
+}
+
+// startFCJailed launches FC inside a jailer chroot with UID drop, PID namespace,
+// and cgroup limits.
+func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess, error) {
+	chrootBase := filepath.Join(e.cfg.DataDir, "jails")
+	jailRoot := filepath.Join(chrootBase, "firecracker", opts.id, "root")
+	if err := os.MkdirAll(jailRoot, 0700); err != nil {
+		return nil, fmt.Errorf("create jail root: %w", err)
+	}
+
+	// Hard-link all files FC needs into the chroot.
+	// Hard-links are instant (same filesystem) and FC writes go to the
+	// same inode — no copy, no sync issue.
+	for name, hostPath := range opts.files {
+		dst := filepath.Join(jailRoot, name)
+		os.Remove(dst) // remove stale from previous run
+		if err := os.Link(hostPath, dst); err != nil {
+			// Cross-device? Fall back to copy (e.g. kernel on different mount)
+			if err := copyBlock(hostPath, dst); err != nil {
+				os.RemoveAll(filepath.Join(chrootBase, "firecracker", opts.id))
+				return nil, fmt.Errorf("link %s into jail: %w", name, err)
+			}
+		}
+	}
+
+	// chown the chroot tree to the jail user so FC can write
+	uid, gid := e.cfg.JailUID, e.cfg.JailGID
+	filepath.Walk(jailRoot, func(path string, info os.FileInfo, err error) error {
+		if err == nil {
+			os.Lchown(path, uid, gid)
+		}
+		return nil
+	})
+
+	// The API socket path as seen from inside the chroot.
+	// Must be short to stay under the 108-byte Unix socket limit.
+	internalSock := "api.sock"
+	hostSock := filepath.Join(jailRoot, internalSock)
+	os.Remove(hostSock)
+
+	vmCtx, cancel := context.WithCancel(context.Background())
+	stderrBuf := newRingBuffer(64 * 1024)
+
+	args := []string{
+		"--id", opts.id,
+		"--exec-file", e.cfg.FCBinary,
+		"--uid", fmt.Sprintf("%d", uid),
+		"--gid", fmt.Sprintf("%d", gid),
+		"--chroot-base-dir", chrootBase,
+		"--new-pid-ns",
+		"--cgroup-version", "2",
+	}
+
+	// cgroup limits
+	if opts.vcpus > 0 {
+		args = append(args, "--cgroup", fmt.Sprintf("cpu.max=%d 100000", opts.vcpus*100000))
+	}
+	if opts.memMB > 0 {
+		// +128MB for FC overhead outside guest memory
+		args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", (opts.memMB+128)*1024*1024))
+	}
+
+	// Everything after "--" is forwarded to firecracker
+	args = append(args, "--", "--api-sock", internalSock)
+
+	cmd := exec.CommandContext(vmCtx, e.cfg.JailerBinary, args...)
+	cmd.Stderr = stderrBuf
+	if err := cmd.Start(); err != nil {
+		cancel()
+		os.RemoveAll(filepath.Join(chrootBase, "firecracker", opts.id))
+		return nil, fmt.Errorf("start jailer: %w", err)
+	}
+
+	waitForSocket(hostSock)
+	return &fcProcess{
+		cmd: cmd, cancel: cancel, stderrBuf: stderrBuf,
+		socket: hostSock, jailRoot: jailRoot,
+	}, nil
+}
+
+// waitForSocket polls for a Unix socket to appear (up to 1s).
+func waitForSocket(path string) {
 	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(socketPath); err == nil {
-			break
+		if _, err := os.Stat(path); err == nil {
+			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return &fcProcess{cmd: cmd, cancel: cancel, stderrBuf: stderrBuf, socket: socketPath}, nil
 }
 
 // validateSocketPath checks that a Unix socket path fits within the 108-byte
