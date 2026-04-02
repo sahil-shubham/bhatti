@@ -290,6 +290,89 @@ Exec latency is agent-bound, not disk-bound, so it won't change.
 
 ---
 
+## Post-Migration Issues (April 2, 2026)
+
+The following issues were discovered during and after the migration.
+None were caused by btrfs — all were pre-existing bugs exposed by
+active usage during the migration window.
+
+### 1. vm.snap sanity check false alarm
+
+**Symptom:** Every snapshot logged `vm.snap is not valid JSON (truncated
+or corrupt)` — the Phase 2.1 sanity check assumed FC stores vm.snap as
+JSON.
+
+**Cause:** Firecracker ≥1.14 uses a binary format for vm.snap, not JSON.
+
+**Fix:** Replaced JSON validation with stat + non-empty check.
+Commit: `04674bf`.
+
+### 2. Stale vsock blocks restore after failure
+
+**Symptom:** After a failed snapshot restore, subsequent attempts (via
+`--force` or daemon restart) fail with `Address in use (os error 98)`.
+
+**Cause:** The failed FC process created vsock.sock before crashing.
+The `restoreFailed` cleanup killed FC but didn't remove the socket.
+The circuit breaker then blocked retries, so the stale socket persisted.
+
+**Fix:** `restoreFailed` now removes vsock.sock after killing FC.
+Commit: `a5a74ca`.
+
+### 3. Destroy/stop routes used name instead of resolved ID
+
+**Symptom:** `bhatti destroy rory` returned 500. The engine destroy
+succeeded (bridge cleaned up) but `DeleteSandbox("rory")` failed
+because it matches by ID column, not name.
+
+**Cause:** Phase 4.1 added name resolution to `GetSandbox`, but the
+destroy and stop routes passed the raw URL parameter to subsequent
+store operations instead of the resolved `sb.ID`.
+
+**Fix:** All post-resolution operations now use `sb.ID`.
+Commit: `8ffede6`.
+
+**Manual remediation on agni-01:** Since the engine had already
+destroyed rory's VM and bridge but the DB record remained, we
+manually updated the DB:
+```sql
+UPDATE sandboxes SET status='destroyed' WHERE id='80ddac6a6acf2095';
+DELETE FROM volume_attachments WHERE sandbox_id='80ddac6a6acf2095';
+```
+
+### 4. Rory's corrupt Diff snapshot
+
+**Symptom:** `bhatti shell rory` → FC panics with
+`The number of available virtio descriptors 34618 is greater than queue size: 256!`
+
+**Cause:** This is the original April 1 rory incident. The thermal
+snapshot in the sandbox directory was a Diff snapshot taken on a hot
+VM by the old v0.5.10 SnapshotAll code. The v0.5.14 Phase 1.1 fix
+(ForceFullSnapshot in SnapshotAll) prevents this for new snapshots
+but cannot repair existing corrupt ones.
+
+**Resolution:** Destroyed the old rory sandbox and resumed from the
+named snapshot `rory-ready-v2` (taken as Full via Checkpoint, clean).
+The `rory-data` volume was safe throughout.
+
+### 5. keep_hot didn't wake sandbox
+
+**Symptom:** `bhatti edit rory --keep-hot` updated the DB flag but
+didn't bring the sandbox from cold to hot.
+
+**Fix:** PATCH handler now calls `ensureHot()` when setting
+`keep_hot=true`. Commit: `a6ad239`.
+
+### 6. keep_hot sandboxes stay cold after daemon restart
+
+**Symptom:** After `systemctl restart bhatti`, keep_hot sandboxes
+remained cold until manually accessed.
+
+**Fix:** Background goroutine auto-wakes all keep_hot sandboxes
+after recovery. Commit: `0471a51`.
+
+---
+
 ## Summary
 
 | Phase | Action | Downtime | Risk |
