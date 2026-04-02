@@ -33,6 +33,8 @@ type ThermalEngine interface {
 	ThermalState(id string) string
 	Pause(ctx context.Context, id string) error
 	Activity(ctx context.Context, id string) (*proto.ActivityInfo, error)
+	BalloonSet(ctx context.Context, id string, amountMiB int64) error
+	MemSizeMib(id string) int64
 }
 
 // ThermalConfig controls automatic thermal transitions.
@@ -437,6 +439,12 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 				if err := te.Pause(context.Background(), sb.EngineID); err != nil {
 					slog.Warn("thermal force-pause failed", "sandbox", sb.Name, "error", err)
 				} else {
+					// Inflate balloon on force-paused VMs too
+					if memMiB := te.MemSizeMib(sb.EngineID); memMiB > 0 {
+						bCtx, bCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						te.BalloonSet(bCtx, sb.EngineID, memMiB/2)
+						bCancel()
+					}
 					s.lastActivity.Store(sb.EngineID, time.Now())
 					slog.Info("thermal transition", "sandbox", sb.Name,
 						"from", "hot", "to", "warm", "reason", "force-pause")
@@ -453,6 +461,15 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			if err := te.Pause(context.Background(), sb.EngineID); err != nil {
 				slog.Warn("thermal pause failed", "sandbox", sb.Name, "error", err)
 				continue
+			}
+			// Inflate balloon to reclaim ~50% of guest memory while paused.
+			// deflate_on_oom ensures the guest reclaims it when resumed.
+			if memMiB := te.MemSizeMib(sb.EngineID); memMiB > 0 {
+				balloonCtx, balloonCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := te.BalloonSet(balloonCtx, sb.EngineID, memMiB/2); err != nil {
+					slog.Debug("balloon inflate failed", "sandbox", sb.Name, "error", err)
+				}
+				balloonCancel()
 			}
 			// Record pause time so warm→cold timer starts from now,
 			// not from the last user interaction.

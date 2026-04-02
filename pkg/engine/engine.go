@@ -70,6 +70,7 @@ type SandboxSpec struct {
 	Files      map[string]FileSpec  `json:"files,omitempty"` // path → content
 	NewVolumes []VolumeSpec         `json:"new_volumes,omitempty"`
 	Init       string               `json:"init,omitempty"`
+	Hugepages  bool                 `json:"hugepages,omitempty"` // 2MB hugepages, faster boot, no Diff snapshots
 
 	// v0.3: Persistent volume references (replaces VolumeMount for persistent vols)
 	PersistentVolumes []PersistentVolume `json:"persistent_volumes,omitempty"`

@@ -295,6 +295,7 @@ type createSandboxReq struct {
 	NewVolumes []engine.VolumeSpec  `json:"new_volumes,omitempty"`
 	Volumes    []engine.VolumeMount `json:"volumes,omitempty"`
 	KeepHot    bool                 `json:"keep_hot,omitempty"`
+	Hugepages  bool                 `json:"hugepages,omitempty"` // 2MB hugepages (faster boot, no Diff snapshots)
 
 	// v0.3: persistent volumes
 	PersistentVolumes []engine.PersistentVolume `json:"persistent_volumes,omitempty"`
@@ -457,6 +458,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				Files:             secretFiles,
 				Volumes:           volumes,
 				PersistentVolumes: req.PersistentVolumes,
+				Hugepages:         req.Hugepages,
 			}
 			// Request image overrides template image
 			if req.Image != "" {
@@ -474,6 +476,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				NewVolumes:        req.NewVolumes,
 				Volumes:           req.Volumes,
 				PersistentVolumes: req.PersistentVolumes,
+				Hugepages:         req.Hugepages,
 			}
 			volumes = req.Volumes
 

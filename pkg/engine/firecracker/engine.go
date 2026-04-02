@@ -493,8 +493,16 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 
 	// track_dirty_pages enables diff snapshots (only dirty pages are written).
+	// Hugepages (2M) improve boot time ~50% but are mutually exclusive with
+	// dirty page tracking — no Diff snapshots possible.
+	trackDirty := !spec.Hugepages
+	hugePages := "None"
+	if spec.Hugepages {
+		hugePages = "2M"
+	}
 	if err = fcPut(ctx, client, "/machine-config", fmt.Sprintf(
-		`{"vcpu_count":%d,"mem_size_mib":%d,"track_dirty_pages":true}`, vcpuCount, memMB)); err != nil {
+		`{"vcpu_count":%d,"mem_size_mib":%d,"track_dirty_pages":%v,"huge_pages":%q}`,
+		vcpuCount, memMB, trackDirty, hugePages)); err != nil {
 		return info, fmt.Errorf("set machine-config: %w", err)
 	}
 
@@ -503,6 +511,15 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	if err = fcPut(ctx, client, "/entropy",
 		`{"rate_limiter":{"bandwidth":{"size":1024,"one_time_burst":8192,"refill_time":100}}}`); err != nil {
 		slog.Warn("entropy device setup failed", "error", err) // non-fatal
+	}
+
+	// Balloon device — allows host to reclaim guest memory dynamically.
+	// deflate_on_oom: guest reclaims memory when it needs it.
+	// stats_polling_interval_s: FC collects balloon stats every 5s.
+	// The thermal manager inflates the balloon on warm VMs to reclaim memory.
+	if err = fcPut(ctx, client, "/balloon",
+		`{"amount_mib":0,"deflate_on_oom":true,"stats_polling_interval_s":5}`); err != nil {
+		slog.Warn("balloon device setup failed", "error", err) // non-fatal
 	}
 
 	if err = fcPut(ctx, client, "/vsock", fmt.Sprintf(
@@ -777,6 +794,34 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 	}
 	vm.Thermal = "hot"
 	return nil
+}
+
+// BalloonSet adjusts the virtio balloon to reclaim or release guest memory.
+// amountMiB is how much memory the balloon should occupy (0 = fully deflated).
+// Only works on warm VMs (vCPUs paused, FC process alive).
+func (e *Engine) BalloonSet(ctx context.Context, id string, amountMiB int64) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	vm.stateMu.Lock()
+	defer vm.stateMu.Unlock()
+
+	if vm.Thermal != "warm" {
+		return fmt.Errorf("balloon: sandbox %q is not warm (thermal=%s)", id, vm.Thermal)
+	}
+	client := fcAPIClient(vm.SocketPath)
+	return fcPatch(ctx, client, "/balloon",
+		fmt.Sprintf(`{"amount_mib":%d}`, amountMiB))
+}
+
+// MemSizeMib returns the configured memory size for a VM.
+func (e *Engine) MemSizeMib(id string) int64 {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return 0
+	}
+	return vm.MemSizeMib
 }
 
 // ThermalState returns the current thermal state of a VM.
