@@ -1705,18 +1705,27 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 		"--uid", fmt.Sprintf("%d", uid),
 		"--gid", fmt.Sprintf("%d", gid),
 		"--chroot-base-dir", chrootBase,
-		"--new-pid-ns",
+		// NOTE: --new-pid-ns is intentionally omitted. With --new-pid-ns,
+		// the jailer's pivot_root makes the API socket inaccessible from
+		// the host mount namespace. Chroot + UID drop + cgroups provide
+		// the critical isolation. PID namespace can be revisited when we
+		// add per-VM network namespaces (Phase 6b).
 		"--cgroup-version", "2",
 	}
 
-	// cgroup limits
-	if opts.vcpus > 0 {
-		args = append(args, "--cgroup", fmt.Sprintf("cpu.max=%d 100000", opts.vcpus*100000))
+	// cgroup limits — at least one --cgroup flag is REQUIRED with cgroup v2.
+	// Without it, the jailer tries to move the process directly into
+	// /sys/fs/cgroup/firecracker which hits "no internal process constraint".
+	vcpus := opts.vcpus
+	if vcpus < 1 {
+		vcpus = 1
 	}
-	if opts.memMB > 0 {
-		// +128MB for FC overhead outside guest memory
-		args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", (opts.memMB+128)*1024*1024))
+	memMB := opts.memMB
+	if memMB < 128 {
+		memMB = 2048
 	}
+	args = append(args, "--cgroup", fmt.Sprintf("cpu.max=%d 100000", vcpus*100000))
+	args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", (memMB+128)*1024*1024))
 
 	// Everything after "--" is forwarded to firecracker
 	args = append(args, "--", "--api-sock", internalSock)
