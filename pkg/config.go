@@ -30,6 +30,26 @@ type Config struct {
 	FirecrackerBin    string `yaml:"firecracker_bin"`    // path to firecracker binary
 	FirecrackerKernel string `yaml:"firecracker_kernel"` // path to vmlinux
 	FirecrackerRootfs string `yaml:"firecracker_rootfs"` // path to base rootfs.ext4
+
+	// Backup to S3-compatible storage
+	Backup *BackupConfig `yaml:"backup,omitempty"`
+}
+
+// BackupConfig configures volume backup to S3-compatible object storage.
+type BackupConfig struct {
+	S3Endpoint  string           `yaml:"s3_endpoint"`   // e.g. "https://s3.eu-central-003.backblazeb2.com"
+	S3Region    string           `yaml:"s3_region"`     // e.g. "eu-central-003"
+	S3Bucket    string           `yaml:"s3_bucket"`
+	S3AccessKey string           `yaml:"s3_access_key"`
+	S3SecretKey string           `yaml:"s3_secret_key"`
+	Schedule    []BackupSchedule `yaml:"schedule,omitempty"`
+}
+
+// BackupSchedule defines an automatic backup schedule for a volume.
+type BackupSchedule struct {
+	Volume    string `yaml:"volume"`    // volume name
+	Cron      string `yaml:"cron"`      // cron expression (minute hour day month weekday)
+	Retention int    `yaml:"retention"` // keep last N backups
 }
 
 // DomainConfig configures domain mode with host-based routing and TLS.

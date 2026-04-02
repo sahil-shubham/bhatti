@@ -60,6 +60,17 @@ type PersistentVolume struct {
 	CreatedAt   time.Time          `json:"created_at"`
 }
 
+// VolumeBackup records a backup of a persistent volume to S3.
+type VolumeBackup struct {
+	ID         string    `json:"id"`
+	VolumeName string    `json:"volume_name"`
+	UserID     string    `json:"user_id"`
+	S3Key      string    `json:"s3_key"`
+	SizeBytes  int64     `json:"size_bytes"`
+	SHA256     string    `json:"sha256"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // VolumeAttachment records a volume attached to a sandbox.
 type VolumeAttachment struct {
 	SandboxID string `json:"sandbox_id"`
@@ -324,6 +335,18 @@ func New(dbPath string) (*Store, error) {
 		UNIQUE(sandbox_id, port)
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_publish_rules_sandbox ON publish_rules(sandbox_id)`)
+
+	// v0.5: volume backups
+	db.Exec(`CREATE TABLE IF NOT EXISTS volume_backups (
+		id TEXT PRIMARY KEY,
+		volume_name TEXT NOT NULL,
+		user_id TEXT NOT NULL,
+		s3_key TEXT NOT NULL,
+		size_bytes INTEGER NOT NULL,
+		sha256 TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_volume_backups_name ON volume_backups(user_id, volume_name, created_at DESC)`)
 
 	// Create unique index on (created_by, name) for non-destroyed sandboxes.
 	// Prevents a user from having two sandboxes with the same name.
@@ -1542,4 +1565,76 @@ func (s *Store) CleanupOrphanedPublishRules() (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// --- Volume Backups ---
+
+// CreateVolumeBackup records a new backup.
+func (s *Store) CreateVolumeBackup(b VolumeBackup) error {
+	_, err := s.db.Exec(
+		`INSERT INTO volume_backups (id, volume_name, user_id, s3_key, size_bytes, sha256, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		b.ID, b.VolumeName, b.UserID, b.S3Key, b.SizeBytes, b.SHA256, b.CreatedAt)
+	return err
+}
+
+// ListVolumeBackups returns backups for a volume, newest first.
+func (s *Store) ListVolumeBackups(userID, volumeName string) ([]VolumeBackup, error) {
+	rows, err := s.db.Query(
+		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, created_at
+		 FROM volume_backups WHERE user_id = ? AND volume_name = ?
+		 ORDER BY created_at DESC`, userID, volumeName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []VolumeBackup
+	for rows.Next() {
+		var b VolumeBackup
+		if err := rows.Scan(&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// GetVolumeBackup returns a single backup by ID.
+func (s *Store) GetVolumeBackup(userID, backupID string) (*VolumeBackup, error) {
+	var b VolumeBackup
+	err := s.db.QueryRow(
+		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, created_at
+		 FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID).Scan(
+		&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// DeleteVolumeBackup removes a backup record.
+func (s *Store) DeleteVolumeBackup(userID, backupID string) error {
+	_, err := s.db.Exec(`DELETE FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID)
+	return err
+}
+
+// OldestVolumeBackups returns the oldest backups beyond the retention count.
+func (s *Store) OldestVolumeBackups(userID, volumeName string, keepCount int) ([]VolumeBackup, error) {
+	rows, err := s.db.Query(
+		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, created_at
+		 FROM volume_backups WHERE user_id = ? AND volume_name = ?
+		 ORDER BY created_at DESC LIMIT -1 OFFSET ?`, userID, volumeName, keepCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []VolumeBackup
+	for rows.Next() {
+		var b VolumeBackup
+		if err := rows.Scan(&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }

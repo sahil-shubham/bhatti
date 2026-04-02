@@ -1371,9 +1371,15 @@ func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Sub-routes
+	// Sub-routes: /volumes/{name}/{action}[/{id}]
 	if len(parts) == 2 {
-		switch parts[1] {
+		sub := parts[1]
+		// Handle /volumes/{name}/backups and /volumes/{name}/backups/{id}
+		if sub == "backups" || strings.HasPrefix(sub, "backups/") {
+			s.handleVolumeBackups(w, r, user, name, strings.TrimPrefix(sub, "backups"))
+			return
+		}
+		switch sub {
 		case "resize":
 			s.handleVolumeResize(w, r, user, name)
 		case "snapshot":
@@ -1418,6 +1424,182 @@ func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) 
 	default:
 		errResp(w, 405, "method not allowed")
 	}
+}
+
+func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, user *store.User, volumeName, subPath string) {
+	if s.backupBackend == nil {
+		errResp(w, 501, "backup not configured — add backup section to config.yaml")
+		return
+	}
+
+	// subPath is "" for /backups, "/{id}" for /backups/{id}, "/restore" for /backups/restore
+	subPath = strings.TrimPrefix(subPath, "/")
+
+	switch {
+	case subPath == "" && r.Method == http.MethodGet:
+		// List backups
+		backups, err := s.store.ListVolumeBackups(user.ID, volumeName)
+		if err != nil {
+			errRespInternal(w, r, "list backups failed", err)
+			return
+		}
+		if backups == nil {
+			backups = []store.VolumeBackup{}
+		}
+		writeJSON(w, 200, backups)
+
+	case subPath == "" && r.Method == http.MethodPost:
+		// Trigger backup
+		vol, err := s.store.GetPersistentVolume(user.ID, volumeName)
+		if err != nil {
+			errResp(w, 404, "volume not found")
+			return
+		}
+		result, err := s.performVolumeBackup(r.Context(), user, vol)
+		if err != nil {
+			errRespInternal(w, r, "backup failed", err)
+			return
+		}
+		writeJSON(w, 201, result)
+
+	case subPath == "restore" && r.Method == http.MethodPost:
+		// Restore from backup
+		var req struct {
+			BackupID string `json:"backup_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BackupID == "" {
+			errResp(w, 400, "missing backup_id")
+			return
+		}
+		vol, err := s.store.GetPersistentVolume(user.ID, volumeName)
+		if err != nil {
+			errResp(w, 404, "volume not found")
+			return
+		}
+		// Volume must be detached
+		if len(vol.Attachments) > 0 {
+			errResp(w, 409, "volume is attached to a sandbox — detach before restoring")
+			return
+		}
+		backup, err := s.store.GetVolumeBackup(user.ID, req.BackupID)
+		if err != nil {
+			errResp(w, 404, "backup not found")
+			return
+		}
+		if err := s.performVolumeRestore(r.Context(), vol, backup); err != nil {
+			errRespInternal(w, r, "restore failed", err)
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "restored", "backup_id": req.BackupID})
+
+	case subPath != "" && subPath != "restore" && r.Method == http.MethodDelete:
+		// Delete a backup
+		backupID := subPath
+		b, err := s.store.GetVolumeBackup(user.ID, backupID)
+		if err != nil {
+			errResp(w, 404, "backup not found")
+			return
+		}
+		if err := s.backupBackend.Delete(r.Context(), b.S3Key); err != nil {
+			slog.Warn("s3 delete failed", "key", b.S3Key, "error", err)
+			// Continue — remove from DB even if S3 delete fails
+		}
+		s.store.DeleteVolumeBackup(user.ID, backupID)
+		writeJSON(w, 200, map[string]string{"status": "deleted"})
+
+	default:
+		errResp(w, 405, "method not allowed")
+	}
+}
+
+func (s *Server) performVolumeBackup(ctx context.Context, user *store.User, vol *store.PersistentVolume) (*store.VolumeBackup, error) {
+	// Clone the volume file for a consistent snapshot.
+	// On btrfs this is instant (reflink), on ext4 it's a full copy.
+	tmpFile := vol.FilePath + ".backup-tmp"
+	defer os.Remove(tmpFile)
+	if err := exec.CommandContext(ctx, "cp", "--reflink=auto", "--sparse=always", vol.FilePath, tmpFile).Run(); err != nil {
+		return nil, fmt.Errorf("clone volume: %w", err)
+	}
+
+	// Compress with zstd and stream to S3
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	s3Key := fmt.Sprintf("volumes/%s/%s/%s.ext4.zst", user.ID, vol.Name, timestamp)
+
+	compressedFile := tmpFile + ".zst"
+	defer os.Remove(compressedFile)
+	if err := exec.CommandContext(ctx, "zstd", "-3", "-q", tmpFile, "-o", compressedFile).Run(); err != nil {
+		return nil, fmt.Errorf("compress volume: %w", err)
+	}
+	os.Remove(tmpFile) // free space early
+
+	// Get compressed size and compute hash
+	f, err := os.Open(compressedFile)
+	if err != nil {
+		return nil, fmt.Errorf("open compressed: %w", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	// Upload to S3
+	if err := s.backupBackend.Upload(ctx, s3Key, f, fi.Size()); err != nil {
+		return nil, fmt.Errorf("upload to s3: %w", err)
+	}
+
+	// Record in DB
+	id := genID()
+	record := store.VolumeBackup{
+		ID:         id,
+		VolumeName: vol.Name,
+		UserID:     user.ID,
+		S3Key:      s3Key,
+		SizeBytes:  fi.Size(),
+		CreatedAt:  time.Now().UTC(),
+	}
+	if err := s.store.CreateVolumeBackup(record); err != nil {
+		return nil, fmt.Errorf("record backup: %w", err)
+	}
+
+	slog.Info("volume backup created",
+		"volume", vol.Name, "backup_id", id,
+		"size", fi.Size(), "s3_key", s3Key)
+
+	return &record, nil
+}
+
+func (s *Server) performVolumeRestore(ctx context.Context, vol *store.PersistentVolume, b *store.VolumeBackup) error {
+	// Download from S3
+	reader, err := s.backupBackend.Download(ctx, b.S3Key)
+	if err != nil {
+		return fmt.Errorf("download from s3: %w", err)
+	}
+	defer reader.Close()
+
+	// Write compressed data to temp file
+	compressedFile := vol.FilePath + ".restore-tmp.zst"
+	defer os.Remove(compressedFile)
+	out, err := os.Create(compressedFile)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, reader); err != nil {
+		out.Close()
+		return fmt.Errorf("download: %w", err)
+	}
+	out.Close()
+
+	// Decompress over the volume file
+	if err := exec.CommandContext(ctx, "zstd", "-d", "-q", "-f", compressedFile, "-o", vol.FilePath).Run(); err != nil {
+		return fmt.Errorf("decompress: %w", err)
+	}
+
+	slog.Info("volume restored from backup",
+		"volume", vol.Name, "backup_id", b.ID)
+
+	return nil
 }
 
 func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user *store.User, name string) {

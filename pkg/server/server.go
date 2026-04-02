@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
+	"github.com/sahil-shubham/bhatti/pkg/backup"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
@@ -73,6 +74,10 @@ type Server struct {
 	publicProxyAddr string              // e.g. "host:8443" (for URL generation)
 	publicProxy     *PublicProxyHandler // nil until configured
 	resumeSem       chan struct{}       // bounds concurrent cold resumes
+
+	// Backup
+	backupBackend   backup.Backend      // nil if backup not configured
+	stopBackup      context.CancelFunc
 }
 
 // maxThermalFailures is the number of consecutive Activity query failures
@@ -124,6 +129,11 @@ func WithAPIHost(host string) ServerOption {
 // WithPublicProxyAddr sets the address used for generating public URLs.
 func WithPublicProxyAddr(addr string) ServerOption {
 	return func(s *Server) { s.publicProxyAddr = addr }
+}
+
+// WithBackupBackend sets the S3-compatible backup backend.
+func WithBackupBackend(b backup.Backend) ServerOption {
+	return func(s *Server) { s.backupBackend = b }
 }
 
 // New creates a new API server. dataDir is the path to the data directory
