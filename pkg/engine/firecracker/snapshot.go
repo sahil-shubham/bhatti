@@ -361,7 +361,7 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 	// network_overrides remaps the TAP device to the fresh name, eliminating
 	// the need to recreate the original TAP name from FCPathOrigin.
 	if err = fcPut(ctx, client, "/snapshot/load", fmt.Sprintf(
-		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"enable_diff_snapshots":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
+		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
 		vmSnapPath, memSnapPath, tapName)); err != nil {
 		if needCleanup {
 			os.RemoveAll(origSandboxDir)

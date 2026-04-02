@@ -58,7 +58,7 @@ func TestEnsureHotExecFromCold(t *testing.T) {
 	defer eng.Destroy(ctx, info.ID)
 
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo cold-state > /tmp/data"})
-	eng.Stop(ctx, info.ID, engine.StopOpts{})
+	eng.Stop(ctx, info.ID)
 
 	if eng.ThermalState(info.ID) != "cold" {
 		t.Fatalf("expected cold")

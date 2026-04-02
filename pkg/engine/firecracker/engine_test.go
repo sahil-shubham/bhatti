@@ -139,7 +139,7 @@ func TestSnapshotResume(t *testing.T) {
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo MY_STATE=preserved > /tmp/env-test"})
 
 	// 4. Stop (snapshot)
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	s, _ := eng.Status(ctx, info.ID)
@@ -199,7 +199,7 @@ func TestSnapshotResume(t *testing.T) {
 
 	// 11. Second stop/start cycle — verify it works multiple times
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo cycle2 > /tmp/cycle2"})
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop (cycle 2): %v", err)
 	}
 	if err := eng.Start(ctx, info.ID); err != nil {
@@ -227,7 +227,7 @@ func TestDiffSnapshot(t *testing.T) {
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo snap-v1 > /tmp/data"})
 
 	// First stop → Full snapshot
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop 1: %v", err)
 	}
 
@@ -253,7 +253,7 @@ func TestDiffSnapshot(t *testing.T) {
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo snap-v2 > /tmp/data2"})
 
 	// Second stop → Diff snapshot (should be smaller)
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop 2: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestDiffSnapshotMultipleCycles(t *testing.T) {
 		execWithTimeout(t, eng, info.ID, []string{"sh", "-c",
 			fmt.Sprintf("echo cycle-%d > /tmp/cycle%d", cycle, cycle)})
 
-		if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+		if err := eng.Stop(ctx, info.ID); err != nil {
 			t.Fatalf("Stop cycle %d: %v", cycle, err)
 		}
 		if err := eng.Start(ctx, info.ID); err != nil {

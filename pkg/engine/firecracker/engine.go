@@ -107,7 +107,7 @@ type VM struct {
 	Agent           *agent.AgentClient
 	Status          string // "running", "stopped"
 	Thermal         string // "hot", "warm", "cold"
-	hasBaseSnapshot bool   // true after first Full snapshot (enables Diff)
+	hasBaseSnapshot bool   // unused — Diff snapshots disabled. Kept for DB compat.
 	restoreFailed   bool   // set on restore failure, blocks retries until --force
 	restoreError    string // the error message for user display
 	stderrBuf       *ringBuffer // last 64KB of FC stderr
@@ -479,17 +479,17 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		return info, fmt.Errorf("set drive: %w", err)
 	}
 
-	// track_dirty_pages enables diff snapshots (only dirty pages are written).
-	// Hugepages (2M) improve boot time ~50% but are mutually exclusive with
-	// dirty page tracking — no Diff snapshots possible.
-	trackDirty := !spec.Hugepages
+	// track_dirty_pages is disabled — all snapshots are Full. This eliminates
+	// Diff snapshot corruption (the rory incident) at the cost of ~500ms extra
+	// per snapshot. With NVMe + btrfs this is negligible.
+	// Disabling dirty page tracking also unlocks hugepages.
 	hugePages := "None"
 	if spec.Hugepages {
 		hugePages = "2M"
 	}
 	if err = fcPut(ctx, client, "/machine-config", fmt.Sprintf(
-		`{"vcpu_count":%d,"mem_size_mib":%d,"track_dirty_pages":%v,"huge_pages":%q}`,
-		vcpuCount, memMB, trackDirty, hugePages)); err != nil {
+		`{"vcpu_count":%d,"mem_size_mib":%d,"track_dirty_pages":false,"huge_pages":%q}`,
+		vcpuCount, memMB, hugePages)); err != nil {
 		return info, fmt.Errorf("set machine-config: %w", err)
 	}
 
@@ -645,7 +645,7 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 
 // --- Stop (Snapshot) ---
 
-func (e *Engine) Stop(ctx context.Context, id string, opts engine.StopOpts) error {
+func (e *Engine) Stop(ctx context.Context, id string) error {
 	vm, err := e.getVM(id)
 	if err != nil {
 		return err
@@ -683,26 +683,13 @@ func (e *Engine) Stop(ctx context.Context, id string, opts engine.StopOpts) erro
 		}
 	}
 
-	// Create snapshot — use Diff if we have a base and caller allows it.
-	// Diff snapshots write only dirty pages since the last snapshot,
-	// reducing write time from ~4s (512MB full) to ~0.5s (10-50MB diff).
-	// ForceFullSnapshot is set by SnapshotAll (daemon shutdown) and
-	// user-initiated stop — correctness over speed. Diff remains valid
-	// for thermal warm→cold (VM already paused, small dirty set).
+	// Always take Full snapshots. Diff snapshots are disabled —
+	// track_dirty_pages is false, and Full eliminates the corruption
+	// class that caused the rory incident.
 	vm.SnapMemPath = filepath.Join(filepath.Dir(vm.RootfsPath), "mem.snap")
 	vm.SnapVMPath = filepath.Join(filepath.Dir(vm.RootfsPath), "vm.snap")
 
 	snapshotType := "Full"
-	if vm.hasBaseSnapshot && !opts.ForceFullSnapshot {
-		// Verify base snapshot files still exist
-		if _, err := os.Stat(vm.SnapMemPath); err != nil {
-			slog.Warn("base snapshot missing, falling back to full",
-				"id", id, "path", vm.SnapMemPath, "error", err)
-			vm.hasBaseSnapshot = false
-		} else {
-			snapshotType = "Diff"
-		}
-	}
 
 	// Snapshot timeout comes from the caller's ctx (60s from thermal cycle,
 	// or whatever the caller passes). Previously the hardcoded 10s
@@ -720,9 +707,7 @@ func (e *Engine) Stop(ctx context.Context, id string, opts engine.StopOpts) erro
 		// no snapshot. The error is logged for investigation.
 	}
 
-	if !vm.hasBaseSnapshot {
-		vm.hasBaseSnapshot = true
-	}
+	// hasBaseSnapshot no longer used — all snapshots are Full.
 
 	// Stop VMM process — SIGTERM first, SIGKILL after 3s
 	killFC(vm.cmd, 3*time.Second)
@@ -964,11 +949,10 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 		}
 	}
 
-	// enable_diff_snapshots re-enables dirty page tracking after restore.
 	// network_overrides remaps the TAP device name so FC doesn't need the
 	// exact TAP name from when the snapshot was taken.
 	if err := fcPut(ctx, client, "/snapshot/load", fmt.Sprintf(
-		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"enable_diff_snapshots":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
+		`{"snapshot_path":%q,"mem_backend":{"backend_path":%q,"backend_type":"File"},"resume_vm":true,"network_overrides":[{"iface_id":"eth0","host_dev_name":%q}]}`,
 		vm.SnapVMPath, vm.SnapMemPath, vm.TapDevice)); err != nil {
 		if symlinkDir != "" {
 			os.RemoveAll(symlinkDir)

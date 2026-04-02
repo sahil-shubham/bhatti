@@ -384,14 +384,14 @@ func (s *Server) SnapshotAll() {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 
-			err := s.engine.Stop(ctx, sb.EngineID, engine.StopOpts{ForceFullSnapshot: true})
+			err := s.engine.Stop(ctx, sb.EngineID)
 			if err != nil {
 				// Retry once with a fresh context — transient failures
 				// (FC API timeout, disk hiccup) often succeed on retry.
 				slog.Warn("snapshot-all: first attempt failed, retrying",
 					"sandbox", sb.Name, "id", sb.ID, "error", err)
 				retryCtx, retryCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				err = s.engine.Stop(retryCtx, sb.EngineID, engine.StopOpts{ForceFullSnapshot: true})
+				err = s.engine.Stop(retryCtx, sb.EngineID)
 				retryCancel()
 			}
 			if err != nil {
@@ -482,7 +482,7 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			idle := time.Since(ts.(time.Time))
 			if idle > cfg.ColdTimeout {
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				err := s.engine.Stop(stopCtx, sb.EngineID, engine.StopOpts{})
+				err := s.engine.Stop(stopCtx, sb.EngineID)
 				stopCancel()
 
 				if err != nil {

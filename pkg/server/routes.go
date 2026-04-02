@@ -813,7 +813,7 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 	if sb == nil {
 		return
 	}
-	if err := s.engine.Stop(r.Context(), sb.EngineID, engine.StopOpts{ForceFullSnapshot: true}); err != nil {
+	if err := s.engine.Stop(r.Context(), sb.EngineID); err != nil {
 		errRespInternal(w, r, "stop sandbox failed", err)
 		return
 	}

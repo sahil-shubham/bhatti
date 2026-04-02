@@ -232,7 +232,7 @@ func TestVolumePersistsAcrossReboot(t *testing.T) {
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo persist-me > /data/test.txt"})
 
 	// Snapshot and resume
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if err := eng.Start(ctx, info.ID); err != nil {
@@ -406,7 +406,7 @@ func TestAuthSurvivesResume(t *testing.T) {
 	defer eng.Destroy(ctx, info.ID)
 
 	// Snapshot and resume
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if err := eng.Start(ctx, info.ID); err != nil {

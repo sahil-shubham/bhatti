@@ -73,7 +73,7 @@ func (m *mockEngine) Destroy(_ context.Context, id string) error {
 	return nil
 }
 
-func (m *mockEngine) Stop(_ context.Context, id string, _ engine.StopOpts) error {
+func (m *mockEngine) Stop(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.StopErr != nil {

@@ -243,7 +243,7 @@ func TestVolumeSurvivesThermalSnapshot(t *testing.T) {
 
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo thermal-data > /workspace/t.txt"})
 
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if err := eng.Start(ctx, info.ID); err != nil {

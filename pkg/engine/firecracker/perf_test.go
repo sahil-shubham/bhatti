@@ -185,7 +185,7 @@ func TestPerfColdResumeExec(t *testing.T) {
 	var lats latencies
 	for i := 0; i < 7; i++ {
 		// Stop → snapshot to disk, kill FC, free RAM
-		if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+		if err := eng.Stop(ctx, info.ID); err != nil {
 			t.Fatalf("Stop %d: %v", i, err)
 		}
 
@@ -270,7 +270,7 @@ func TestPerfSnapshot(t *testing.T) {
 		execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "dd if=/dev/urandom of=/tmp/data bs=64K count=16 2>/dev/null"})
 
 		start := time.Now()
-		if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+		if err := eng.Stop(ctx, info.ID); err != nil {
 			t.Fatalf("Stop (full %d): %v", i, err)
 		}
 		fullLats = append(fullLats, time.Since(start))
@@ -288,7 +288,7 @@ func TestPerfSnapshot(t *testing.T) {
 	execWithTimeout(t, eng, info.ID, []string{"sh", "-c", "echo init > /tmp/snap"})
 
 	// First stop is full (establishes base)
-	eng.Stop(ctx, info.ID, engine.StopOpts{})
+	eng.Stop(ctx, info.ID)
 	eng.Start(ctx, info.ID)
 
 	var diffLats latencies
@@ -296,7 +296,7 @@ func TestPerfSnapshot(t *testing.T) {
 		execWithTimeout(t, eng, info.ID, []string{"sh", "-c", fmt.Sprintf("echo diff-%d > /tmp/snap", i)})
 
 		start := time.Now()
-		if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+		if err := eng.Stop(ctx, info.ID); err != nil {
 			t.Fatalf("Stop (diff %d): %v", i, err)
 		}
 		diffLats = append(diffLats, time.Since(start))

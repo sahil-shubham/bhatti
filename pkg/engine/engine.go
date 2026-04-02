@@ -140,16 +140,11 @@ type ShellSessioner interface {
 	ShellSession(ctx context.Context, id string) (string, TerminalConn, error)
 }
 
-// StopOpts controls snapshot behavior during Stop().
-type StopOpts struct {
-	ForceFullSnapshot bool // true for SnapshotAll (daemon shutdown) and user-initiated stop
-}
-
 // Engine is the sandbox lifecycle interface.
 type Engine interface {
 	Create(ctx context.Context, spec SandboxSpec) (SandboxInfo, error)
 	Destroy(ctx context.Context, id string) error
-	Stop(ctx context.Context, id string, opts StopOpts) error
+	Stop(ctx context.Context, id string) error
 	Start(ctx context.Context, id string) error
 	Status(ctx context.Context, id string) (SandboxInfo, error)
 	List(ctx context.Context) ([]SandboxInfo, error)

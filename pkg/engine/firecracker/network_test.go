@@ -381,7 +381,7 @@ func TestNetworkSurvivesSnapshot(t *testing.T) {
 	t.Log("✓ pre-snapshot exec works")
 
 	// Snapshot and resume
-	if err := eng.Stop(ctx, info.ID, engine.StopOpts{}); err != nil {
+	if err := eng.Stop(ctx, info.ID); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if err := eng.Start(ctx, info.ID); err != nil {
