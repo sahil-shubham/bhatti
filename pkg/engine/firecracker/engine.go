@@ -1471,16 +1471,17 @@ func injectLoharIntoRootfs(rootfsPath, dataDir string) error {
 }
 
 // verifySnapshotArtifacts performs lightweight sanity checks on snapshot files.
-// Catches truncated files, zero-byte files, and corrupt vm.snap without
-// spawning a throwaway Firecracker process.
+// Catches truncated files and zero-byte files without spawning a throwaway
+// Firecracker process.
 func verifySnapshotArtifacts(vmSnapPath, memSnapPath string, memSizeMib int64, snapshotType string) error {
-	// vm.snap must be valid JSON (FC stores device state as JSON)
-	vmData, err := os.ReadFile(vmSnapPath)
+	// vm.snap must exist and be non-empty.
+	// Note: FC ≥1.14 uses a binary format for vm.snap, not JSON.
+	vmInfo, err := os.Stat(vmSnapPath)
 	if err != nil {
-		return fmt.Errorf("read vm.snap: %w", err)
+		return fmt.Errorf("stat vm.snap: %w", err)
 	}
-	if !json.Valid(vmData) {
-		return fmt.Errorf("vm.snap is not valid JSON (truncated or corrupt)")
+	if vmInfo.Size() == 0 {
+		return fmt.Errorf("vm.snap is empty (0 bytes)")
 	}
 
 	// mem.snap size sanity
