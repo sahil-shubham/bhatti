@@ -64,9 +64,11 @@ jobs:
           sudo mkdir -p /var/lib/bhatti/images
           sudo cp lohar /var/lib/bhatti/lohar
           sudo cp /opt/bhatti/bin/firecracker /usr/local/bin/firecracker
+          sudo cp /opt/bhatti/bin/jailer /usr/local/bin/jailer
           sudo cp /opt/bhatti/images/vmlinux-arm64 /var/lib/bhatti/images/vmlinux-arm64
           sudo mv rootfs-minimal-arm64.ext4 /var/lib/bhatti/images/rootfs-minimal-arm64.ext4
-          # jailer and bhatti-vm user are pre-installed on the runner
+          # Create jail user inside the runner pod
+          sudo useradd -r -s /usr/sbin/nologin -u 10000 bhatti-vm 2>/dev/null || true
 
       - name: Run integration tests
         run: |
