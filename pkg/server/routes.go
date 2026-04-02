@@ -786,6 +786,16 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			}
 			sb.KeepHot = *req.KeepHot
 			slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name, "keep_hot", sb.KeepHot, "user", user.Name)
+
+			// If setting keep_hot=true, wake the sandbox immediately.
+			if *req.KeepHot {
+				if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+					errRespInternal(w, r, "wake sandbox failed", err)
+					return
+				}
+				sb.Status = "running"
+				s.store.UpdateSandboxStatus(sb.ID, "running")
+			}
 		}
 		writeJSON(w, 200, sb)
 	default:
