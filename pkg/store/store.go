@@ -1120,6 +1120,47 @@ func (s *Store) DetachAllPersistentVolumesForSandbox(sandboxID string) error {
 	return err
 }
 
+// AttachedPersistentVolumesForSandbox returns all persistent volumes attached
+// to a sandbox, with their file paths and mount info. Used during recovery to
+// rebuild the VM's volume list so resume can hard-link them into the jail.
+func (s *Store) AttachedPersistentVolumesForSandbox(sandboxID string) ([]struct {
+	VolumeName string
+	FilePath   string
+	Mount      string
+	ReadOnly   bool
+}, error) {
+	rows, err := s.db.Query(
+		`SELECT v.name, v.file_path, va.mount, va.read_only
+		 FROM volume_attachments va
+		 JOIN volumes_v2 v ON v.id = va.volume_id
+		 WHERE va.sandbox_id = ?`, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []struct {
+		VolumeName string
+		FilePath   string
+		Mount      string
+		ReadOnly   bool
+	}
+	for rows.Next() {
+		var v struct {
+			VolumeName string
+			FilePath   string
+			Mount      string
+			ReadOnly   bool
+		}
+		var ro int
+		if err := rows.Scan(&v.VolumeName, &v.FilePath, &v.Mount, &ro); err != nil {
+			return nil, err
+		}
+		v.ReadOnly = ro != 0
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // DetachOrphanedPersistentVolumes removes attachments for destroyed/missing sandboxes.
 // Must be called AFTER recoverVMs updates sandbox statuses.
 func (s *Store) DetachOrphanedPersistentVolumes() (int64, error) {

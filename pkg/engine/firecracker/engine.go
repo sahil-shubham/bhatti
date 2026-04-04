@@ -302,6 +302,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 				e.mu.RUnlock()
 			}
 			os.RemoveAll(sandboxDir)
+			// Clean up jailer chroot — without this, failed creates
+			// leak jail dirs under jails/firecracker/<id>/.
+			if e.cfg.jailed() {
+				os.RemoveAll(filepath.Join(e.cfg.DataDir, "jails", "firecracker", id))
+			}
 		}
 	}()
 

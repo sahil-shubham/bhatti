@@ -97,7 +97,9 @@ func runDaemon() {
 
 	// Pre-upgrade check: refuse to start if jailer is configured but
 	// bare-mode sandboxes exist (their snapshots have absolute paths
-	// that don't work inside a chroot).
+	// that don't work inside a chroot). Skip sandboxes that already
+	// have a jail dir — those were created with the jailer and are safe
+	// to recover.
 	if cfg.FirecrackerJailer != "" {
 		if sandboxes, err := st.ListAllSandboxes(); err == nil {
 			for _, sb := range sandboxes {
@@ -105,6 +107,13 @@ func runDaemon() {
 					continue
 				}
 				if sb.Status == "running" || sb.Status == "stopped" {
+					// Check if this sandbox was jailed — its engine_id is
+					// the FC process ID and jail dirs live under jails/firecracker/<id>.
+					// Sandboxes dir also uses engine_id as the dir name.
+					jailDir := filepath.Join(cfg.DataDir, "jails", "firecracker", sb.EngineID)
+					if _, err := os.Stat(jailDir); err == nil {
+						continue // was jailed, safe to recover
+					}
 					slog.Error("jailer is configured but bare-mode sandboxes exist",
 						"sandbox", sb.Name, "id", sb.ID, "status", sb.Status)
 					fmt.Fprintf(os.Stderr, "\nERROR: jailer is configured but bare-mode sandboxes exist.\n"+
@@ -451,6 +460,21 @@ func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
 			}
 		}
 
+		// Rebuild volume attachments from the store so resume can
+		// hard-link volume files into the jail chroot.
+		var volumes []map[string]interface{}
+		if attached, err := st.AttachedPersistentVolumesForSandbox(sb.ID); err == nil {
+			for i, v := range attached {
+				volumes = append(volumes, map[string]interface{}{
+					"drive_id":  fmt.Sprintf("vol%d", i),
+					"name":      v.VolumeName,
+					"file_path": v.FilePath,
+					"mount":     v.Mount,
+					"read_only": v.ReadOnly,
+				})
+			}
+		}
+
 		state := map[string]interface{}{
 			"rootfs_path":       fcState.RootfsPath,
 			"snap_mem_path":     fcState.SnapMemPath,
@@ -468,6 +492,7 @@ func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
 			"agent_token":       fcState.AgentToken,
 			"has_base_snapshot": fcState.HasBaseSnapshot,
 			"fc_path_origin":    fcState.FCPathOrigin,
+			"volumes":           volumes,
 		}
 
 		// Verify all critical snapshot files exist and are non-empty.
