@@ -6,44 +6,22 @@ import (
 	"testing"
 )
 
-// TestIPPoolReleaseUnallocated verifies that releasing an IP that was
-// never allocated doesn't corrupt the pool.
-// This is the unit-level test for Bug #4.
-func TestIPPoolReleaseUnallocated(t *testing.T) {
-	p := newIPPool("10.0.99.1")
+// ---------------------------------------------------------------------------
+// Bug #4: IP pool corruption on TryAllocate failure in ResumeSnapshot.
+//
+// The bug: ResumeSnapshot sets guestIP = manifest.Network.GuestIP BEFORE
+// calling TryAllocate. If TryAllocate fails, the cleanup defer sees a
+// non-empty guestIP and calls pool.Release() on an IP that was never
+// allocated — freeing another sandbox's IP.
+//
+// These tests verify pool invariants that the fix must satisfy.
+// The integration test (TestResumeIPConflictNoPoolCorruption) tests the
+// actual ResumeSnapshot code path end-to-end.
+// ---------------------------------------------------------------------------
 
-	// Allocate .2
-	ip1, err := p.Allocate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ip1 != "10.0.99.2" {
-		t.Fatalf("expected 10.0.99.2, got %s", ip1)
-	}
-
-	// Release .2 without having allocated it via TryAllocate first.
-	// This simulates Bug #4: cleanup defer calls Release on an IP that
-	// TryAllocate failed to allocate.
-	p.Release("10.0.99.2")
-
-	// .2 should now be free (this is correct — the release worked).
-	// But in Bug #4, the IP was allocated by ANOTHER sandbox, and the
-	// Release freed it from under them.
-
-	// Allocate again — should get .2 back (pool thinks it's free)
-	ip2, err := p.Allocate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ip2 != "10.0.99.2" {
-		t.Fatalf("expected 10.0.99.2 after release, got %s", ip2)
-	}
-}
-
-// TestIPPoolTryAllocateFailDoesntCorrupt is the precise Bug #4 scenario:
-// IP .2 is allocated by sandbox A. TryAllocate(.2) fails. If a buggy
-// cleanup then calls Release(.2), sandbox A's IP is freed.
-func TestIPPoolTryAllocateFailDoesntCorrupt(t *testing.T) {
+// TestIPPoolTryAllocateRejectsInUse verifies that TryAllocate returns an
+// error when the requested IP is already allocated by another sandbox.
+func TestIPPoolTryAllocateRejectsInUse(t *testing.T) {
 	p := newIPPool("10.0.99.1")
 
 	// Sandbox A allocates .2
@@ -55,36 +33,52 @@ func TestIPPoolTryAllocateFailDoesntCorrupt(t *testing.T) {
 		t.Fatalf("expected 10.0.99.2, got %s", ipA)
 	}
 
-	// Snapshot resume tries to TryAllocate .2 — fails (in use)
+	// TryAllocate .2 must fail — it's in use
 	err = p.TryAllocate("10.0.99.2")
 	if err == nil {
-		t.Fatal("TryAllocate should fail — .2 is in use by A")
+		t.Fatal("TryAllocate should reject an in-use IP")
 	}
 
-	// BUG #4 SCENARIO: the cleanup defer calls Release(.2) even though
-	// TryAllocate failed. This frees A's IP.
-	// In CURRENT buggy code, this happens. After the fix, the cleanup
-	// should NOT call Release because guestIP is only set after success.
-	//
-	// Simulate the buggy behavior:
-	p.Release("10.0.99.2") // THIS IS THE BUG — freeing an IP we don't own
-
-	// Sandbox B allocates — gets .2 (double-allocated with A!)
+	// After the failed TryAllocate, .2 must STILL be allocated to A.
+	// Verify by allocating the next IP — it should be .3, not .2.
 	ipB, err := p.Allocate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ipB == ipA {
-		t.Fatalf("Bug #4 confirmed: sandbox B got A's IP %s after buggy Release.\n"+
-			"Fix: only set guestIP after successful TryAllocate, so cleanup "+
-			"defer doesn't Release an IP that was never allocated.", ipB)
+	if ipB != "10.0.99.3" {
+		t.Fatalf("expected .3 (next free), got %s — TryAllocate failure corrupted the pool", ipB)
 	}
-	// After fix, .2 should still be allocated to A, and B gets .3
-	t.Logf("B got %s (A has %s) — no corruption", ipB, ipA)
+	t.Logf("✓ TryAllocate failure didn't corrupt pool: A=%s, next=%s", ipA, ipB)
 }
 
-// TestIPPoolTryAllocateSuccessThenRelease verifies the correct path:
-// TryAllocate succeeds, then Release on cleanup properly frees it.
+// TestIPPoolReleaseOnlyOwned verifies that Release on an IP that is
+// legitimately in use by another caller frees it (i.e., Release has no
+// ownership check — it's the CALLER's responsibility not to release
+// IPs they don't own). This documents why Bug #4 matters: the pool
+// can't protect against this; the caller must get it right.
+func TestIPPoolReleaseOnlyOwned(t *testing.T) {
+	p := newIPPool("10.0.99.1")
+
+	// A allocates .2
+	ipA, _ := p.Allocate()
+
+	// Releasing .2 (even though we're "B") frees it — pool has no ownership
+	p.Release(ipA)
+
+	// .2 is now free and will be handed out again
+	ipNext, _ := p.Allocate()
+	if ipNext != ipA {
+		t.Fatalf("expected %s to be re-allocatable after Release, got %s", ipA, ipNext)
+	}
+
+	// This confirms: Release is unconditional. The fix for Bug #4 must
+	// prevent the cleanup defer from calling Release on an IP that wasn't
+	// successfully allocated, because the pool itself can't stop it.
+	t.Log("✓ Release is unconditional — caller must only release IPs they own")
+}
+
+// TestIPPoolTryAllocateSuccessThenRelease verifies the correct cleanup
+// path: TryAllocate succeeds, then Release correctly frees the IP.
 func TestIPPoolTryAllocateSuccessThenRelease(t *testing.T) {
 	p := newIPPool("10.0.99.1")
 
@@ -94,26 +88,22 @@ func TestIPPoolTryAllocateSuccessThenRelease(t *testing.T) {
 		t.Fatalf("TryAllocate .5: %v", err)
 	}
 
-	// Allocate sequentially — .5 should be skipped
+	// .5 is now allocated — sequential Allocate should skip it
 	ip1, _ := p.Allocate()
 	if ip1 != "10.0.99.2" {
 		t.Fatalf("expected .2, got %s", ip1)
 	}
-	ip2, _ := p.Allocate()
-	if ip2 != "10.0.99.3" {
-		t.Fatalf("expected .3, got %s", ip2)
-	}
 
-	// Release .5 (cleanup after failed resume)
+	// Release .5 (simulating cleanup after a failed resume that DID
+	// successfully allocate the IP before failing at a later step)
 	p.Release("10.0.99.5")
 
-	// Now .4 should be next, then .5 is available again
-	ip3, _ := p.Allocate()
-	if ip3 != "10.0.99.4" {
-		t.Fatalf("expected .4, got %s", ip3)
-	}
-	ip4, _ := p.Allocate()
+	// .5 should be available again
+	ip2, _ := p.Allocate() // .3
+	ip3, _ := p.Allocate() // .4
+	ip4, _ := p.Allocate() // .5 (now free)
 	if ip4 != "10.0.99.5" {
-		t.Fatalf("expected .5 after release, got %s", ip4)
+		t.Fatalf("expected .5 after release, got %s (got .3=%s .4=%s)", ip4, ip2, ip3)
 	}
+	t.Log("✓ TryAllocate + Release round-trip works correctly")
 }

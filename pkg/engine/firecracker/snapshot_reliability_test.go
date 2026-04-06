@@ -635,12 +635,12 @@ func TestResumeSnapshotCleanupOnAgentTimeout(t *testing.T) {
 	}
 
 	// Try to resume — should fail (agent timeout or FC load failure)
-	_, err = eng.ResumeSnapshot(ctx, snapPath, manifest, "cleanup-test")
+	resumeInfo, err := eng.ResumeSnapshot(ctx, snapPath, manifest, "cleanup-test")
 	if err == nil {
 		// If it somehow succeeded (mem corruption didn't hit critical path),
 		// that's OK — just clean up and skip the resource leak check
 		t.Log("resume succeeded despite corruption — skipping cleanup check")
-		eng.Destroy(ctx, "cleanup-test")
+		eng.Destroy(ctx, resumeInfo.ID)
 		return
 	}
 	t.Logf("resume failed as expected: %v", err)
