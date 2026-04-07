@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -33,9 +34,10 @@ func setupPublicProxy(t *testing.T) (*Server, *mockEngine, *httptest.Server) {
 	eng := newMockEngine()
 	srv := New(eng, st, dir)
 
-	// Wire exactly like main.go: onActivity → srv.TouchActivity
+	// Wire exactly like main.go: both callbacks delegate to Server
 	pub := NewPublicProxyHandler(eng, st, srv.ResumeSem(),
 		func(engineID string) { srv.TouchActivity(engineID) },
+		func(ctx context.Context, engineID string) error { return srv.EnsureHot(ctx, engineID) },
 	)
 	srv.SetPublicProxy(pub)
 
@@ -153,7 +155,10 @@ func TestPublicProxyThermalCycleRespectsHTTPTraffic(t *testing.T) {
 	srv, eng, ts := setupPublicProxy(t)
 	_, eid := publishSandbox(t, srv, eng, "thermal-http", "therm-http", 8080)
 
-	cfg := ThermalConfig{WarmTimeout: 50 * time.Millisecond, ColdTimeout: time.Hour}
+	// WarmTimeout must be longer than the mock tunnel round-trip (~100ms)
+	// so that lastActivity set by onActivity is still fresh when the
+	// thermal cycle runs. In production, HTTP requests complete in <10ms.
+	cfg := ThermalConfig{WarmTimeout: 500 * time.Millisecond, ColdTimeout: time.Hour}
 
 	// Agent reports idle — without activity tracking, thermal manager
 	// would pause this sandbox.
@@ -166,10 +171,11 @@ func TestPublicProxyThermalCycleRespectsHTTPTraffic(t *testing.T) {
 
 	te := srv.engine.(ThermalEngine)
 
-	// Simulate continuous HTTP traffic interleaved with thermal cycles
+	// Simulate continuous HTTP traffic interleaved with thermal cycles.
+	// Each hitPublicProxy sets lastActivity via onActivity before the
+	// mock tunnel blocks. The thermal cycle should see fresh activity.
 	for i := 0; i < 5; i++ {
 		hitPublicProxy(t, ts, "therm-http")
-		time.Sleep(20 * time.Millisecond)
 		srv.runThermalCycle(te, cfg)
 	}
 

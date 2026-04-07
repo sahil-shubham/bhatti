@@ -31,7 +31,8 @@ type PublicProxyHandler struct {
 	resumeSem   chan struct{}
 	resumeGroup singleflight.Group // coalesces concurrent resumes per sandbox
 	routeCache  *routeCache        // in-memory alias → route mapping
-	onActivity  func(engineID string) // called by WS proxy to signal thermal manager
+	onActivity  func(engineID string) // called on every request to signal thermal manager
+	onEnsureHot func(ctx context.Context, engineID string) error // canonical wake logic (delegates to Server.ensureHot)
 
 	// Observability
 	requestsTotal   atomic.Int64
@@ -43,14 +44,19 @@ type PublicProxyHandler struct {
 }
 
 // NewPublicProxyHandler creates a new public proxy handler.
-func NewPublicProxyHandler(eng engine.Engine, st *store.Store, resumeSem chan struct{}, onActivity func(engineID string)) *PublicProxyHandler {
+// onActivity is called on every proxied request to keep the thermal manager informed.
+// onEnsureHot is the canonical wake function (typically Server.EnsureHot) — it handles
+// touchActivity, store status updates, and VM state persistence. PublicProxyHandler
+// wraps it with singleflight coalescing and bounded concurrency.
+func NewPublicProxyHandler(eng engine.Engine, st *store.Store, resumeSem chan struct{}, onActivity func(engineID string), onEnsureHot func(ctx context.Context, engineID string) error) *PublicProxyHandler {
 	return &PublicProxyHandler{
-		engine:     eng,
-		store:      st,
-		limiter:    newPublicRateLimiter(),
-		resumeSem:  resumeSem,
-		routeCache: newRouteCache(),
-		onActivity: onActivity,
+		engine:      eng,
+		store:       st,
+		limiter:     newPublicRateLimiter(),
+		resumeSem:   resumeSem,
+		routeCache:  newRouteCache(),
+		onActivity:  onActivity,
+		onEnsureHot: onEnsureHot,
 	}
 }
 
@@ -279,6 +285,12 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 		wasCold = true // conservative: we called ensureHotBounded
 	}
 
+	// Signal activity on every request (HTTP and WebSocket) so the
+	// thermal manager knows this sandbox has public traffic.
+	if h.onActivity != nil {
+		h.onActivity(route.engineID)
+	}
+
 	// WebSocket
 	if websocket.IsWebSocketUpgrade(r) {
 		h.webSocketActive.Add(1)
@@ -328,7 +340,10 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 	h.logRequest(alias, r.Method, path, sw.status, time.Since(start), wasCold, cached)
 }
 
-// ensureHotBounded wraps EnsureHot with singleflight + semaphore.
+// ensureHotBounded wraps the canonical ensureHot callback with singleflight
+// coalescing and semaphore-based concurrency limiting. The actual wake logic
+// (touchActivity, store update, saveVMState) lives in Server.ensureHot —
+// we only add public-proxy-specific concerns here.
 func (h *PublicProxyHandler) ensureHotBounded(ctx context.Context, te ThermalEngine, engineID string) error {
 	thermal := te.ThermalState(engineID)
 	if thermal == "hot" {
@@ -343,7 +358,7 @@ func (h *PublicProxyHandler) ensureHotBounded(ctx context.Context, te ThermalEng
 		default:
 			return nil, errServerBusy
 		}
-		return nil, te.EnsureHot(ctx, engineID)
+		return nil, h.onEnsureHot(ctx, engineID)
 	})
 	return err
 }

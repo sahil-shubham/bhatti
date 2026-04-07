@@ -201,7 +201,10 @@ func setupDomainMode(t *testing.T) (*Server, *httptest.Server) {
 		WithProxyZone("test.sh"),
 		WithAPIHost("api.test.sh"),
 	)
-	pub := NewPublicProxyHandler(eng, st, srv.ResumeSem(), nil)
+	pub := NewPublicProxyHandler(eng, st, srv.ResumeSem(),
+		func(engineID string) { srv.TouchActivity(engineID) },
+		func(ctx context.Context, engineID string) error { return srv.EnsureHot(ctx, engineID) },
+	)
 	srv.SetPublicProxy(pub)
 
 	ts := httptest.NewServer(srv)

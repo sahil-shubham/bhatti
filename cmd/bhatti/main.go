@@ -308,6 +308,8 @@ func startPlainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *se
 	if cfg.PublicProxyListen != "" {
 		pubHandler := server.NewPublicProxyHandler(eng, st, srv.ResumeSem(), func(engineID string) {
 			srv.TouchActivity(engineID)
+		}, func(ctx context.Context, engineID string) error {
+			return srv.EnsureHot(ctx, engineID)
 		})
 		pubServer := &http.Server{
 			Addr:         cfg.PublicProxyListen,
@@ -342,6 +344,8 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 	// Create public proxy handler and attach to server for host-based routing
 	pubHandler := server.NewPublicProxyHandler(eng, st, srv.ResumeSem(), func(engineID string) {
 		srv.TouchActivity(engineID)
+	}, func(ctx context.Context, engineID string) error {
+		return srv.EnsureHot(ctx, engineID)
 	})
 	srv.SetPublicProxy(pubHandler)
 
