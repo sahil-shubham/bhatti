@@ -289,6 +289,233 @@ func TestShellSessionTracker(t *testing.T) {
 	tracker.DisconnectAll("sb_unknown")
 }
 
+func TestShellWSDestroyedSandbox(t *testing.T) {
+	_, ts, sb := setupShellTest(t)
+
+	// Generate token, then destroy the sandbox
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/shell-token", nil)
+	var result map[string]string
+	decodeJSON(t, resp, &result)
+	token := result["token"]
+
+	// Destroy sandbox
+	dr := doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
+	dr.Body.Close()
+
+	// Connect WS — should still upgrade (anti-enumeration)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/_shell/" + sb.ID + "/ws"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial should succeed: %v", err)
+	}
+	defer ws.Close()
+
+	ws.WriteJSON(map[string]string{"type": "auth", "token": token})
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg, err := ws.ReadMessage()
+	if err != nil {
+		t.Fatalf("ws read: %v", err)
+	}
+	var errMsg map[string]string
+	json.Unmarshal(msg, &errMsg)
+	if errMsg["error"] != "unauthorized" {
+		t.Fatalf("expected unauthorized for destroyed sandbox, got %v", errMsg["error"])
+	}
+}
+
+func TestShellWSTokenRotationInvalidatesOld(t *testing.T) {
+	_, ts, sb := setupShellTest(t)
+
+	// Generate first token
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/shell-token", nil)
+	var result1 map[string]string
+	decodeJSON(t, resp, &result1)
+	oldToken := result1["token"]
+
+	// Rotate — generate second token
+	resp2 := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/shell-token", nil)
+	var result2 map[string]string
+	decodeJSON(t, resp2, &result2)
+
+	// Old token should fail
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/_shell/" + sb.ID + "/ws"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer ws.Close()
+
+	ws.WriteJSON(map[string]string{"type": "auth", "token": oldToken})
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg, err := ws.ReadMessage()
+	if err != nil {
+		t.Fatalf("ws read: %v", err)
+	}
+	var errMsg map[string]string
+	json.Unmarshal(msg, &errMsg)
+	if errMsg["error"] != "unauthorized" {
+		t.Fatalf("old token should be unauthorized, got %v", errMsg["error"])
+	}
+}
+
+func TestShellWSConcurrentLimit(t *testing.T) {
+	srv, ts, sb := setupShellTest(t)
+	_ = srv
+
+	// Generate token
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/shell-token", nil)
+	var result map[string]string
+	decodeJSON(t, resp, &result)
+	token := result["token"]
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/_shell/" + sb.ID + "/ws"
+
+	// Open 5 connections (the limit)
+	var conns []*websocket.Conn
+	for i := 0; i < 5; i++ {
+		ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatalf("ws dial %d: %v", i, err)
+		}
+		ws.WriteJSON(map[string]string{"type": "auth", "token": token})
+		ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			t.Fatalf("ws %d read: %v", i, err)
+		}
+		var connected map[string]interface{}
+		json.Unmarshal(msg, &connected)
+		if connected["type"] != "connected" {
+			t.Fatalf("ws %d: expected connected, got %v", i, connected)
+		}
+		conns = append(conns, ws)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	// 6th connection should authenticate but get "too many sessions"
+	ws6, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial 6: %v", err)
+	}
+	defer ws6.Close()
+
+	ws6.WriteJSON(map[string]string{"type": "auth", "token": token})
+	ws6.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg6, err := ws6.ReadMessage()
+	if err != nil {
+		t.Fatalf("ws 6 read: %v", err)
+	}
+	var errMsg map[string]string
+	json.Unmarshal(msg6, &errMsg)
+	if errMsg["error"] != "too many sessions" {
+		t.Fatalf("expected 'too many sessions', got %v", errMsg["error"])
+	}
+}
+
+func TestShellPathTraversal(t *testing.T) {
+	_, ts, _ := setupShellTest(t)
+
+	// path.Clean normalizes traversals BEFORE they reach handleWebShell.
+	// /_shell/../health → /health (served normally, NOT as shell page)
+	// /_shell/sbx_abc/../../../etc/passwd → /etc/passwd (401 auth required)
+	// The key invariant: traversal never leaks shell HTML for non-shell paths,
+	// and never bypasses auth to reach internal endpoints.
+
+	// Traversal out of /_shell/ lands on normal routes (not shell HTML)
+	resp, err := http.Get(ts.URL + "/_shell/../health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	// path.Clean → /health → served as JSON health check. This proves
+	// traversal escapes the /_shell/ prefix, NOT that it serves shell content.
+	if resp.StatusCode != 200 {
+		t.Fatalf("/_shell/../health: expected 200 (health endpoint), got %d", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "json") {
+		t.Fatalf("/_shell/../health should serve JSON health, got %s", ct)
+	}
+
+	// Deep traversal goes to auth-protected routes → 401
+	resp2, err := http.Get(ts.URL + "/_shell/sbx_abc/../../../etc/passwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 401 {
+		t.Fatalf("deep traversal: expected 401, got %d", resp2.StatusCode)
+	}
+}
+
+func TestShellRateLimit(t *testing.T) {
+	_, ts, sb := setupShellTest(t)
+
+	// Generate a token
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/shell-token", nil)
+	resp.Body.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/_shell/" + sb.ID + "/ws"
+
+	// Rapidly open many connections — should eventually get rate limited.
+	// The rate limiter allows 10/sec/IP. Fire 20 rapidly.
+	var rateLimited bool
+	for i := 0; i < 20; i++ {
+		ws, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			if resp != nil && resp.StatusCode == 429 {
+				rateLimited = true
+				break
+			}
+			// Other errors (e.g. connection refused) are fine too
+			continue
+		}
+		ws.Close()
+	}
+	if !rateLimited {
+		t.Fatal("expected rate limiting after 20 rapid connections")
+	}
+}
+
+func TestShellRoutingEdgeCases(t *testing.T) {
+	_, ts, _ := setupShellTest(t)
+
+	// /_shell/ with no ID → 404
+	resp, err := http.Get(ts.URL + "/_shell/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("/_shell/ with no ID: expected 404, got %d", resp.StatusCode)
+	}
+
+	// /_shell/sbx_abc/unknown → 404
+	resp2, err := http.Get(ts.URL + "/_shell/sbx_abc/unknown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Fatalf("/_shell/sbx_abc/unknown: expected 404, got %d", resp2.StatusCode)
+	}
+
+	// /_shell/sbx_abc/ (trailing slash, no sub) → serves HTML
+	resp3, err := http.Get(ts.URL + "/_shell/sbx_abc/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	// path.Clean strips trailing slash → /_shell/sbx_abc → serves HTML
+	if resp3.StatusCode != 200 {
+		t.Fatalf("/_shell/sbx_abc/: expected 200, got %d", resp3.StatusCode)
+	}
+}
+
 func TestShellWSRevokeDisconnects(t *testing.T) {
 	_, ts, sb := setupShellTest(t)
 

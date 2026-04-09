@@ -690,7 +690,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Web shell (unauthenticated — token validated on WebSocket)
-	if strings.HasPrefix(cleanPath, "/_shell/") {
+	if strings.HasPrefix(cleanPath, "/_shell/") || cleanPath == "/_shell" {
 		s.handleWebShell(w, r, cleanPath)
 		return
 	}

@@ -20,6 +20,12 @@ var shellHTML []byte
 
 // handleWebShell routes /_shell/:id and /_shell/:id/ws.
 func (s *Server) handleWebShell(w http.ResponseWriter, r *http.Request, cleanPath string) {
+	// Handle bare /_shell (path.Clean strips trailing slash)
+	if cleanPath == "/_shell" || cleanPath == "/_shell/" {
+		errResp(w, 404, "not found")
+		return
+	}
+
 	trimmed := strings.TrimPrefix(cleanPath, "/_shell/")
 	parts := strings.SplitN(trimmed, "/", 2)
 	sandboxID := parts[0]
