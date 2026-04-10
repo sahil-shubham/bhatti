@@ -250,7 +250,10 @@ func TestShellHTMLServed(t *testing.T) {
 	}
 
 	// Verify nonce changes per request (no caching)
-	resp2, _ := http.Get(ts.URL + "/_shell/" + sb.ID)
+	resp2, err := http.Get(ts.URL + "/_shell/" + sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp2.Body.Close()
 	csp2 := resp2.Header.Get("Content-Security-Policy")
 	if csp == csp2 {
