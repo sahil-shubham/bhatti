@@ -5,7 +5,7 @@ info:
     bhatti creates isolated Linux VMs in seconds. Each sandbox has its own kernel,
     filesystem, and network. Paused sandboxes resume in under 3ms.
 
-    All endpoints require `Authorization: Bearer <token>` except `/health` and `/metrics`.
+    All endpoints require `Authorization: Bearer <token>` except `/health`.
   version: "0.5"
   contact:
     name: Sahil Shubham
@@ -25,7 +25,7 @@ security:
 
 tags:
   - name: System
-    description: Health checks and metrics (unauthenticated)
+    description: Health check (unauthenticated)
   - name: Sandboxes
     description: Create, manage, and destroy isolated Linux VMs
   - name: Execution
@@ -54,7 +54,7 @@ paths:
     get:
       operationId: getHealth
       summary: "Health check"
-      description: "Returns server status, sandbox count, and uptime. No authentication required."
+      description: "Returns server status and uptime. No authentication required."
       tags:
         - System
       responses:
@@ -67,49 +67,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, example: "ok" }
-                  sandboxes: { type: integer, example: 3 }
                   uptime: { type: string, example: "2h15m30s" }
-  /metrics:
-    get:
-      operationId: getMetrics
-      summary: "Server metrics"
-      description: "Returns server metrics including sandbox counts by thermal state, user counts, host stats, and request counters. No authentication required."
-      tags:
-        - System
-      responses:
-
-        "200":
-          description: Server metrics
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  uptime: { type: string }
-                  sandboxes:
-                    type: object
-                    properties:
-                      total: { type: integer }
-                      hot: { type: integer }
-                      warm: { type: integer }
-                      cold: { type: integer }
-                  users:
-                    type: object
-                    properties:
-                      total: { type: integer }
-                      active: { type: integer }
-                  host:
-                    type: object
-                    properties:
-                      load_1m: { type: number }
-                      memory_total_mb: { type: integer }
-                      memory_available_mb: { type: integer }
-                  requests:
-                    type: object
-                    properties:
-                      total: { type: integer }
-                      errors_5xx: { type: integer }
-                      auth_failures: { type: integer }
   /sandboxes:
     get:
       operationId: listSandboxes

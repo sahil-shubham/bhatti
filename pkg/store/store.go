@@ -238,6 +238,43 @@ func New(dbPath string) (*Store, error) {
 		PRIMARY KEY (image_id, user_id)
 	)`)
 
+	// Observability: events + metrics snapshots
+	db.Exec(`CREATE TABLE IF NOT EXISTS events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+		type TEXT NOT NULL,
+		user_id TEXT NOT NULL DEFAULT '',
+		sandbox_id TEXT NOT NULL DEFAULT '',
+		meta TEXT NOT NULL DEFAULT '{}'
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, ts)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, ts)`)
+
+	db.Exec(`CREATE TABLE IF NOT EXISTS metrics_snapshots (
+		ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+		api_requests INTEGER NOT NULL DEFAULT 0,
+		api_errors INTEGER NOT NULL DEFAULT 0,
+		api_auth_failures INTEGER NOT NULL DEFAULT 0,
+		api_rate_limited INTEGER NOT NULL DEFAULT 0,
+		proxy_requests INTEGER NOT NULL DEFAULT 0,
+		proxy_errors INTEGER NOT NULL DEFAULT 0,
+		proxy_cold_wakes INTEGER NOT NULL DEFAULT 0,
+		proxy_rate_limited INTEGER NOT NULL DEFAULT 0,
+		events_dropped INTEGER NOT NULL DEFAULT 0,
+		sandboxes_total INTEGER NOT NULL DEFAULT 0,
+		sandboxes_hot INTEGER NOT NULL DEFAULT 0,
+		sandboxes_warm INTEGER NOT NULL DEFAULT 0,
+		sandboxes_cold INTEGER NOT NULL DEFAULT 0,
+		users_total INTEGER NOT NULL DEFAULT 0,
+		users_active INTEGER NOT NULL DEFAULT 0,
+		websockets_active INTEGER NOT NULL DEFAULT 0,
+		host_load_1m REAL NOT NULL DEFAULT 0,
+		host_mem_total_mb INTEGER NOT NULL DEFAULT 0,
+		host_mem_avail_mb INTEGER NOT NULL DEFAULT 0
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_ms_ts ON metrics_snapshots(ts)`)
+
 	return &Store{db: db}, nil
 }
 

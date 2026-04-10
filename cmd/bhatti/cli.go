@@ -79,6 +79,7 @@ func init() {
 	setupCmd.GroupID = "admin"
 	userCmd.GroupID = "admin"
 	updateCmd.GroupID = "admin"
+	adminCmd.GroupID = "admin"
 
 	// inspect, ps, file, version, completion have no GroupID →
 	// fall into "Additional Commands"
@@ -100,6 +101,7 @@ func init() {
 	rootCmd.AddCommand(imageCmd)
 	rootCmd.AddCommand(snapshotCmd)
 	rootCmd.AddCommand(userCmd)
+	rootCmd.AddCommand(adminCmd)
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(updateCmd)
 	rootCmd.AddCommand(versionCmd)

@@ -204,6 +204,22 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id stri
 	// Read(); conn.Close() unblocks the WS→term goroutine's ReadMessage().
 	defer term.Close()
 
+	// Record shell session event at disconnect (defer runs after wsRelay returns).
+	user := UserFromContext(r.Context())
+	shellStart := time.Now()
+	reattach := sessionParam != ""
+	defer func() {
+		s.RecordEvent(store.Event{
+			Type: "shell.session", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{
+				"sandbox":    sb.Name,
+				"session_id": sessionID,
+				"reattach":   reattach,
+				"duration_s": int(time.Since(shellStart).Seconds()),
+			},
+		})
+	}()
+
 	// Send session ID to CLI so it can reconnect.
 	if sessionID != "" {
 		if meta, err := json.Marshal(map[string]string{

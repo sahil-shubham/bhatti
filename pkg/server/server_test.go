@@ -1153,50 +1153,6 @@ func TestExecTimeoutClamped(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestMetricsEndpoint(t *testing.T) {
-	_, ts := setup(t)
-
-	// Create a sandbox so metrics show something
-	sb := createSandbox(t, ts, uniqueName(t, "metrics"))
-	_ = sb
-
-	// /metrics requires no auth
-	req, _ := http.NewRequest("GET", ts.URL+"/metrics", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-
-	var m map[string]any
-	decodeJSON(t, resp, &m)
-
-	// Check required fields
-	if _, ok := m["uptime"]; !ok {
-		t.Error("missing uptime")
-	}
-	if sb, ok := m["sandboxes"].(map[string]any); ok {
-		if sb["total"].(float64) < 1 {
-			t.Error("expected at least 1 sandbox")
-		}
-	} else {
-		t.Error("missing sandboxes field")
-	}
-	if u, ok := m["users"].(map[string]any); ok {
-		if u["total"].(float64) < 1 {
-			t.Error("expected at least 1 user")
-		}
-	} else {
-		t.Error("missing users field")
-	}
-	if _, ok := m["requests"]; !ok {
-		t.Error("missing requests field")
-	}
-	t.Logf("metrics: %+v", m)
-}
-
 func TestErrorSanitization(t *testing.T) {
 	srv, ts := setup(t)
 
@@ -1243,24 +1199,6 @@ func TestRequestHasID(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestMetricsNoAuth(t *testing.T) {
-	_, ts := setup(t)
-
-	// /metrics should work without auth, like /health
-	req, _ := http.NewRequest("GET", ts.URL+"/metrics", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200 without auth, got %d", resp.StatusCode)
-	}
-	var m map[string]any
-	decodeJSON(t, resp, &m)
-	if _, ok := m["sandboxes"]; !ok {
-		t.Error("expected sandboxes field in metrics")
-	}
-}
 
 func TestClassifyRequest(t *testing.T) {
 	tests := []struct {

@@ -206,11 +206,19 @@ func runDaemon() {
 	}
 	srv := server.New(eng, st, cfg.DataDir, srvOpts...)
 
+	// Start observability: event recorder, metrics snapshots, retention
+	srv.StartEventRecorder()
+	srv.StartRetention()
+
 	// Start thermal manager to transition idle VMs: hot → warm → cold
 	srv.StartThermalManager(server.ThermalConfig{
 		WarmTimeout: 30 * time.Second,  // hot → warm after 30s idle
 		ColdTimeout: 30 * time.Minute,  // warm → cold after 30min idle
 	})
+
+	// Start metrics snapshots after thermal manager and public proxy are
+	// wired up (so the snapshot goroutine can read proxy counters).
+	// Deferred to after startDomainMode/startPlainMode which sets publicProxy.
 
 	// Start scheduled backup goroutine if configured
 	if cfg.Backup != nil && len(cfg.Backup.Schedule) > 0 {
@@ -223,6 +231,27 @@ func runDaemon() {
 	} else {
 		servers = startPlainMode(cfg, eng, st, srv)
 	}
+
+	// Start metrics snapshots now that public proxy is wired up.
+	srv.StartMetricsSnapshots()
+
+	// Record daemon.started event
+	recoveredCount := 0
+	if allSandboxes, err := st.ListAllSandboxes(); err == nil {
+		for _, sb := range allSandboxes {
+			if sb.Status == "running" || sb.Status == "stopped" {
+				recoveredCount++
+			}
+		}
+	}
+	srv.RecordEvent(store.Event{
+		Type: "daemon.started",
+		Meta: map[string]any{
+			"version":       version,
+			"recovered_vms": recoveredCount,
+			"listen":        cfg.Listen,
+		},
+	})
 
 	// Auto-wake keep_hot sandboxes after recovery. These sandboxes maintain
 	// persistent external connections that die on pause — leaving them cold
@@ -263,13 +292,22 @@ func runDaemon() {
 		s.Shutdown(shutCtx)
 	}
 
-	// Stop background goroutines (thermal manager, task cleanup)
-	srv.Close()
-
 	// Snapshot all running VMs before killing the engine.
+	// Done before Close() so the event recorder is still alive.
 	// This ensures every hot/warm sandbox has a snapshot on disk
 	// so recoverVMs can restore them on the next startup.
 	srv.SnapshotAll()
+
+	// Record shutdown event before closing the event recorder
+	srv.RecordEvent(store.Event{
+		Type: "daemon.shutdown",
+		Meta: map[string]any{
+			"signal": sig.String(),
+		},
+	})
+
+	// Stop background goroutines (thermal, metrics, retention, event recorder)
+	srv.Close()
 
 	// Stop engine (kill VMs, clean TAPs)
 	if shutdowner, ok := eng.(interface{ Shutdown() }); ok {
@@ -311,6 +349,7 @@ func startPlainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *se
 		}, func(ctx context.Context, engineID string) error {
 			return srv.EnsureHot(ctx, engineID)
 		})
+		pubHandler.SetRecordEvent(func(e store.Event) { srv.RecordEvent(e) })
 		pubServer := &http.Server{
 			Addr:         cfg.PublicProxyListen,
 			Handler:      http.HandlerFunc(pubHandler.ServeHTTPPathBased),
@@ -347,6 +386,7 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 	}, func(ctx context.Context, engineID string) error {
 		return srv.EnsureHot(ctx, engineID)
 	})
+	pubHandler.SetRecordEvent(func(e store.Event) { srv.RecordEvent(e) })
 	srv.SetPublicProxy(pubHandler)
 
 	// TLS config

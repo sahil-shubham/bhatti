@@ -141,6 +141,11 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID
 		return
 	}
 
+	s.RecordEvent(store.Event{
+		Type: "publish.created", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{"sandbox": sb.Name, "port": req.Port, "alias": alias,
+			"url": publishedURL(alias, s.proxyZone, s.publicProxyAddr)},
+	})
 	writeJSON(w, 201, map[string]interface{}{
 		"id":         rule.ID,
 		"sandbox_id": sb.ID,
@@ -189,6 +194,10 @@ func (s *Server) handleUnpublish(w http.ResponseWriter, r *http.Request, sandbox
 			if s.publicProxy != nil {
 				s.publicProxy.routeCache.Invalidate(r.Alias)
 			}
+			s.RecordEvent(store.Event{
+				Type: "publish.deleted", UserID: user.ID, SandboxID: sb.ID,
+				Meta: map[string]any{"sandbox": sb.Name, "port": port, "alias": r.Alias},
+			})
 			break
 		}
 	}

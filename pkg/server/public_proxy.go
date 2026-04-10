@@ -35,6 +35,7 @@ type PublicProxyHandler struct {
 	onEnsureHot func(ctx context.Context, engineID string) error // canonical wake logic (delegates to Server.ensureHot)
 
 	// Observability
+	onRecordEvent func(store.Event) // optional callback to record events
 	requestsTotal   atomic.Int64
 	requestsError   atomic.Int64
 	coldWakes       atomic.Int64
@@ -58,6 +59,11 @@ func NewPublicProxyHandler(eng engine.Engine, st *store.Store, resumeSem chan st
 		onActivity:  onActivity,
 		onEnsureHot: onEnsureHot,
 	}
+}
+
+// SetRecordEvent sets the event recording callback.
+func (h *PublicProxyHandler) SetRecordEvent(fn func(store.Event)) {
+	h.onRecordEvent = fn
 }
 
 // --- Route Cache ---
@@ -329,6 +335,12 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			h.requestsError.Add(1)
 			slog.Warn("public proxy error", "alias", alias, "error", err)
+			if h.onRecordEvent != nil {
+				h.onRecordEvent(store.Event{
+					Type: "proxy.error",
+					Meta: map[string]any{"alias": alias, "status": 502, "error": err.Error(), "duration_ms": time.Since(start).Milliseconds()},
+				})
+			}
 			errResp(w, 502, "bad gateway")
 		},
 	}

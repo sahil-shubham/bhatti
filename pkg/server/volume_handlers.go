@@ -89,6 +89,10 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 		vol.Status = "ready"
 
 		slog.Info("volume.created", "name", req.Name, "user", user.Name, "size_mb", req.SizeMB)
+		s.RecordEvent(store.Event{
+			Type: "volume.created", UserID: user.ID,
+			Meta: map[string]any{"name": req.Name, "size_mb": req.SizeMB},
+		})
 		writeJSON(w, 201, vol)
 	default:
 		errResp(w, 405, "method not allowed")
@@ -159,6 +163,10 @@ func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) 
 			os.Remove(vol.FilePath)
 		}
 		slog.Info("volume.deleted", "name", name, "user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "volume.deleted", UserID: user.ID,
+			Meta: map[string]any{"name": name},
+		})
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 	default:
 		errResp(w, 405, "method not allowed")
@@ -229,6 +237,10 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 			errRespInternal(w, r, "restore failed", err)
 			return
 		}
+		s.RecordEvent(store.Event{
+			Type: "volume.restored", UserID: user.ID,
+			Meta: map[string]any{"name": vol.Name, "backup_id": req.BackupID},
+		})
 		writeJSON(w, 200, map[string]string{"status": "restored", "backup_id": req.BackupID})
 
 	case subPath != "" && subPath != "restore" && r.Method == http.MethodDelete:
@@ -305,6 +317,10 @@ func (s *Server) performVolumeBackup(ctx context.Context, user *store.User, vol 
 	slog.Info("volume backup created",
 		"volume", vol.Name, "backup_id", id,
 		"size", fi.Size(), "s3_key", s3Key)
+	s.RecordEvent(store.Event{
+		Type: "volume.backup_created", UserID: user.ID,
+		Meta: map[string]any{"name": vol.Name, "backup_id": id, "size_bytes": fi.Size(), "s3_key": s3Key},
+	})
 
 	return &record, nil
 }
@@ -387,6 +403,10 @@ func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user
 
 	s.store.UpdatePersistentVolumeSize(user.ID, name, req.SizeMB)
 	slog.Info("volume.resized", "name", name, "user", user.Name, "new_size_mb", req.SizeMB)
+	s.RecordEvent(store.Event{
+		Type: "volume.resized", UserID: user.ID,
+		Meta: map[string]any{"name": name, "old_mb": vol.SizeMB, "new_mb": req.SizeMB},
+	})
 	writeJSON(w, 200, map[string]any{"status": "resized", "size_mb": req.SizeMB})
 }
 
@@ -446,6 +466,10 @@ func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, us
 	vol.Status = "ready"
 
 	slog.Info("volume.snapshot", "src", srcName, "dst", req.Name, "user", user.Name, "size_mb", src.SizeMB)
+	s.RecordEvent(store.Event{
+		Type: "volume.snapshot", UserID: user.ID,
+		Meta: map[string]any{"src": srcName, "dst": req.Name, "size_mb": src.SizeMB},
+	})
 	writeJSON(w, 201, vol)
 }
 

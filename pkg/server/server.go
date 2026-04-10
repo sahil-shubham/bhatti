@@ -64,10 +64,16 @@ type Server struct {
 	pullCancelMu sync.Mutex
 	pullCancels  map[string]context.CancelFunc // taskID → cancel
 
-	// Request counters for /metrics
+	// Request counters (read by metrics snapshot goroutine)
 	requestTotal  atomic.Int64
 	requestErrors atomic.Int64
 	authFailures  atomic.Int64
+	rateLimited   atomic.Int64
+
+	// Observability
+	events        *EventRecorder
+	stopMetrics   context.CancelFunc
+	stopRetention context.CancelFunc
 
 	// Public proxy (set via options)
 	proxyZone       string              // e.g. "bhatti.sh"
@@ -246,6 +252,15 @@ func (s *Server) Close() {
 	if s.stopBackup != nil {
 		s.stopBackup()
 	}
+	if s.stopMetrics != nil {
+		s.stopMetrics()
+	}
+	if s.stopRetention != nil {
+		s.stopRetention()
+	}
+	if s.events != nil {
+		s.events.Close()
+	}
 }
 
 // StartBackupScheduler runs scheduled volume backups based on config.
@@ -297,6 +312,10 @@ func (s *Server) runScheduledBackup(ctx context.Context, sched pkg.BackupSchedul
 		if err != nil {
 			slog.Error("scheduled backup failed",
 				"volume", sched.Volume, "user", user.ID, "error", err)
+			s.RecordEvent(store.Event{
+				Type: "volume.backup_failed", UserID: user.ID,
+				Meta: map[string]any{"name": sched.Volume, "error": err.Error()},
+			})
 			continue
 		}
 		slog.Info("scheduled backup complete",
@@ -513,6 +532,10 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 							"sandbox", sb.Name, "id", sb.ID, "error", err,
 							"attempt", count, "max_attempts", 3)
 					}
+					s.RecordEvent(store.Event{
+						Type: "thermal.snapshot_failed", SandboxID: sb.ID,
+						Meta: map[string]any{"sandbox": sb.Name, "error": err.Error(), "attempt": count, "max_attempts": 3},
+					})
 					continue
 				}
 
@@ -522,6 +545,14 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 				s.saveVMState(sb.ID, sb.EngineID)
 				slog.Info("thermal transition", "sandbox", sb.Name,
 					"from", "warm", "to", "cold", "idle", idle.Round(time.Second))
+				s.RecordEvent(store.Event{
+					Type: "sandbox.stopped", SandboxID: sb.ID,
+					Meta: map[string]any{"name": sb.Name, "reason": "thermal"},
+				})
+				s.RecordEvent(store.Event{
+					Type: "thermal.snapshot", SandboxID: sb.ID,
+					Meta: map[string]any{"sandbox": sb.Name, "idle_s": int(idle.Seconds())},
+				})
 			}
 			continue
 		}
@@ -564,6 +595,10 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 					s.lastActivity.Store(sb.EngineID, time.Now())
 					slog.Info("thermal transition", "sandbox", sb.Name,
 						"from", "hot", "to", "warm", "reason", "force-pause")
+					s.RecordEvent(store.Event{
+						Type: "thermal.force_pause", SandboxID: sb.ID,
+						Meta: map[string]any{"sandbox": sb.Name, "consecutive_failures": count},
+					})
 				}
 				s.resetThermalFails(sb.EngineID)
 			}
@@ -592,6 +627,10 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			s.lastActivity.Store(sb.EngineID, time.Now())
 			slog.Info("thermal transition", "sandbox", sb.Name,
 				"from", "hot", "to", "warm", "idle", idle.Round(time.Second))
+			s.RecordEvent(store.Event{
+				Type: "thermal.pause", SandboxID: sb.ID,
+				Meta: map[string]any{"sandbox": sb.Name, "idle_s": int(idle.Seconds())},
+			})
 		} else if activity.AttachedSessions > 0 {
 			slog.Debug("thermal skip: active sessions",
 				"sandbox", sb.Name, "sessions", activity.AttachedSessions)
@@ -616,9 +655,16 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 		return nil
 	}
 
+	fromState := te.ThermalState(engineID)
+	if fromState == "hot" {
+		return nil // already hot, no wake needed
+	}
+
+	start := time.Now()
 	if err := te.EnsureHot(ctx, engineID); err != nil {
 		return err
 	}
+	wakeMs := time.Since(start).Milliseconds()
 
 	// After a successful wake, update store status if it was stale.
 	// This handles: cold→hot (store said "stopped"),
@@ -630,6 +676,10 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 			s.store.UpdateSandboxStatus(sb.ID, "running")
 			s.saveVMState(sb.ID, engineID)
 		}
+		s.RecordEvent(store.Event{
+			Type: "thermal.wake", SandboxID: sb.ID,
+			Meta: map[string]any{"sandbox": sb.Name, "from_state": fromState, "wake_ms": wakeMs},
+		})
 	}
 
 	return nil
@@ -684,7 +734,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean(r.URL.Path)
 
 	// Unauthenticated endpoints (exact match only)
-	if cleanPath == "/health" || cleanPath == "/metrics" {
+	if cleanPath == "/health" {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -710,12 +760,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.authFailures.Add(1)
 		slog.Warn("auth.failed", "ip", r.RemoteAddr)
+		s.RecordEvent(store.Event{
+			Type: "auth.failed",
+			Meta: map[string]any{"ip": r.RemoteAddr},
+		})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
 		return
 	}
 
 	// Rate limiting per user
 	if !s.limiter.Allow(user.ID, r) {
+		s.rateLimited.Add(1)
 		errResp(w, 429, "rate limit exceeded")
 		return
 	}

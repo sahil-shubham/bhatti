@@ -397,6 +397,14 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		slog.Info("sandbox.created",
 			"sandbox_id", sb.ID, "name", sb.Name, "user", user.Name,
 			"cpus", spec.CPUs, "memory_mb", spec.MemoryMB)
+		s.RecordEvent(store.Event{
+			Type: "sandbox.created", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{
+				"name": sb.Name, "cpus": spec.CPUs, "memory_mb": spec.MemoryMB,
+				"image": spec.Image, "template_id": templateID,
+				"keep_hot": req.KeepHot,
+			},
+		})
 		writeJSON(w, 201, sb)
 	default:
 		errResp(w, 405, "method not allowed")
@@ -501,6 +509,13 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Info("sandbox.destroyed", "sandbox_id", sb.ID, "name", sb.Name, "user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "sandbox.destroyed", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{
+				"name":       sb.Name,
+				"lifetime_s": int(time.Since(sb.CreatedAt).Seconds()),
+			},
+		})
 		writeJSON(w, 200, map[string]string{"status": "destroyed"})
 	case http.MethodPatch:
 		sb, err := s.store.GetSandbox(user.ID, id)
@@ -522,6 +537,10 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			}
 			sb.KeepHot = *req.KeepHot
 			slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name, "keep_hot", sb.KeepHot, "user", user.Name)
+			s.RecordEvent(store.Event{
+				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
+				Meta: map[string]any{"name": sb.Name, "keep_hot": sb.KeepHot},
+			})
 
 			// If setting keep_hot=true, wake the sandbox immediately.
 			if *req.KeepHot {
@@ -554,6 +573,11 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 	}
 	s.store.StopSandbox(sb.ID)
 	s.saveVMState(sb.ID, sb.EngineID) // persist snapshot paths
+	user := UserFromContext(r.Context())
+	s.RecordEvent(store.Event{
+		Type: "sandbox.stopped", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{"name": sb.Name, "reason": "api"},
+	})
 	updated, _ := s.store.GetSandboxByID(sb.ID)
 	writeJSON(w, 200, updated)
 }
@@ -580,6 +604,11 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 		s.store.UpdateSandboxStatus(id, "running")
 	}
 	s.saveVMState(id, sb.EngineID) // persist updated state
+	user := UserFromContext(r.Context())
+	s.RecordEvent(store.Event{
+		Type: "sandbox.started", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{"name": sb.Name, "reason": "api"},
+	})
 	updated, _ := s.store.GetSandboxByID(id)
 	writeJSON(w, 200, updated)
 }

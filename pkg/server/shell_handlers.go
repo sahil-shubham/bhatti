@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "embed"
+
+	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
 //go:embed shell.html
@@ -130,8 +132,17 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID
 		"ip", r.RemoteAddr)
 	start := time.Now()
 	defer func() {
+		dur := int(time.Since(start).Seconds())
 		slog.Info("shell_close", "sandbox", sb.Name, "sandbox_id", sb.ID,
 			"duration", time.Since(start).Round(time.Second))
+		s.RecordEvent(store.Event{
+			Type: "shell.web_session", SandboxID: sb.ID,
+			Meta: map[string]any{
+				"sandbox":    sb.Name,
+				"ip":         r.RemoteAddr,
+				"duration_s": dur,
+			},
+		})
 	}()
 
 	// 7. Send sandbox info.

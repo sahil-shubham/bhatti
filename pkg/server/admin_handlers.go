@@ -228,6 +228,10 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 			os.Remove(img.FilePath)
 		}
 		slog.Info("image.deleted", "name", name, "user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "image.deleted", UserID: user.ID,
+			Meta: map[string]any{"name": name},
+		})
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 	default:
 		errResp(w, 405, "method not allowed")
@@ -294,6 +298,10 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		snapDir := filepath.Dir(snap.MemPath)
 		os.RemoveAll(snapDir)
 		slog.Info("snapshot.deleted", "name", name, "user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "snapshot.deleted", UserID: user.ID,
+			Meta: map[string]any{"name": name},
+		})
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 	default:
 		errResp(w, 405, "method not allowed")
@@ -447,6 +455,10 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 	s.saveVMState(sb.ID, sb.EngineID) // persist updated state
 	slog.Info("snapshot.created", "name", req.Name, "sandbox", sb.ID,
 		"user", user.Name, "size_mb", sizeMB)
+	s.RecordEvent(store.Event{
+		Type: "snapshot.created", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{"name": req.Name, "sandbox": sb.ID, "size_mb": sizeMB},
+	})
 	writeJSON(w, 201, snap)
 }
 
@@ -582,6 +594,10 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	s.saveVMState(sbID, info.EngineID)
 	slog.Info("snapshot.resumed", "snapshot", snapName, "sandbox_id", sbID,
 		"name", sandboxName, "user", user.Name)
+	s.RecordEvent(store.Event{
+		Type: "snapshot.resumed", UserID: user.ID, SandboxID: sbID,
+		Meta: map[string]any{"name": snapName, "new_sandbox": sandboxName},
+	})
 	writeJSON(w, 201, sb)
 }
 
@@ -668,6 +684,10 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 			os.Remove(outputPath)
 			s.store.FailTask(taskID, err.Error())
 			slog.Error("image pull failed", "ref", req.Ref, "user", user.ID, "error", err)
+			s.RecordEvent(store.Event{
+				Type: "image.pull_failed", UserID: user.ID,
+				Meta: map[string]any{"ref": req.Ref, "error": err.Error()},
+			})
 			return
 		}
 
@@ -695,6 +715,10 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 		s.store.CompleteTask(taskID, string(resultJSON))
 		slog.Info("image.pulled", "ref", req.Ref, "name", req.Name,
 			"user", user.Name, "size_mb", sizeMB, "digest", config.Digest)
+		s.RecordEvent(store.Event{
+			Type: "image.pulled", UserID: user.ID,
+			Meta: map[string]any{"ref": req.Ref, "name": req.Name, "size_mb": sizeMB, "digest": config.Digest},
+		})
 	}()
 
 	w.WriteHeader(http.StatusAccepted)
@@ -766,6 +790,10 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user 
 	}
 
 	slog.Info("image.imported", "name", name, "user", user.Name, "size_mb", sizeMB)
+	s.RecordEvent(store.Event{
+		Type: "image.imported", UserID: user.ID,
+		Meta: map[string]any{"name": name, "size_mb": sizeMB},
+	})
 	writeJSON(w, 201, map[string]any{"name": name, "size_mb": sizeMB})
 }
 
@@ -839,6 +867,10 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, 
 
 	slog.Info("image.saved", "name", req.Name, "source_sandbox", sb.ID,
 		"user", user.Name, "size_mb", sizeMB)
+	s.RecordEvent(store.Event{
+		Type: "image.saved", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{"name": req.Name, "source_sandbox": sb.ID, "size_mb": sizeMB},
+	})
 	writeJSON(w, 201, img)
 }
 

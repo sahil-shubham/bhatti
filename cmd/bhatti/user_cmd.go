@@ -73,6 +73,10 @@ var userCreateCmd = &cobra.Command{
 			}
 			return fmt.Errorf("create user: %w", err)
 		}
+		st.InsertEvents([]store.Event{{
+			Type: "user.created", UserID: userID,
+			Meta: map[string]any{"name": name, "max_sandboxes": maxSandboxes, "subnet_index": subnetIdx},
+		}})
 
 		fmt.Printf("User created:\n")
 		fmt.Printf("  ID:       %s\n", u.ID)
@@ -142,6 +146,10 @@ var userDeleteCmd = &cobra.Command{
 		if err := st.DeleteUser(userID); err != nil {
 			return err
 		}
+		st.InsertEvents([]store.Event{{
+			Type: "user.deleted", UserID: userID,
+			Meta: map[string]any{"name": args[0]},
+		}})
 		fmt.Printf("deleted user %q\n", args[0])
 		return nil
 	},
@@ -173,6 +181,10 @@ var userRotateKeyCmd = &cobra.Command{
 		if err := st.RotateUserKey(userID, newHash); err != nil {
 			return err
 		}
+		st.InsertEvents([]store.Event{{
+			Type: "user.key_rotated", UserID: userID,
+			Meta: map[string]any{"name": args[0]},
+		}})
 
 		fmt.Printf("API key rotated for %q\n", args[0])
 		fmt.Printf("  New key: %s\n", newKey)
