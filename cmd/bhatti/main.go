@@ -429,6 +429,17 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 			Email:      dom.ACMEEmail,
 		}
 		tlsConfig = cm.TLSConfig()
+		// Strip "h2" from autocert's NextProtos — we disable HTTP/2 via
+		// TLSNextProto (below), but if the TLS layer still advertises h2
+		// in ALPN, Cloudflare will negotiate it and then send h2 frames
+		// that Go's HTTP/1.1 parser cannot read → broken connections.
+		filtered := tlsConfig.NextProtos[:0]
+		for _, p := range tlsConfig.NextProtos {
+			if p != "h2" {
+				filtered = append(filtered, p)
+			}
+		}
+		tlsConfig.NextProtos = filtered
 		httpHandler = cm.HTTPHandler(http.HandlerFunc(redirectHTTPS))
 	} else {
 		slog.Error("domain mode requires tls_cert+tls_key or acme_email")
@@ -436,10 +447,24 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 	}
 
 	// :443 — serves both API (api.bhatti.sh) and proxy (*.bhatti.sh)
+	//
+	// Disable HTTP/2 on the origin. Cloudflare's "HTTP/2 to Origin" (enabled
+	// by default) negotiates h2 via ALPN when the origin advertises it.
+	// gorilla/websocket (and Go's net/http) cannot perform the HTTP/1.1
+	// 101 Switching Protocols upgrade over an HTTP/2 connection (RFC 8441
+	// extended CONNECT is not yet supported), so WebSocket endpoints
+	// (/_shell/*/ws, sandbox exec, proxy) silently fail with 400.
+	//
+	// Setting TLSNextProto to an empty map is the standard Go idiom to
+	// disable HTTP/2.  Cloudflare still serves HTTP/2 to end-user clients;
+	// only the Cloudflare↔origin hop drops to HTTP/1.1.
+	//
+	// See: gorilla/websocket#663, caddyserver/caddy#7292, golang/go#49918
 	httpsServer := &http.Server{
 		Addr:              ":443",
 		Handler:           srv,
 		TLSConfig:         tlsConfig,
+		TLSNextProto:      make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
