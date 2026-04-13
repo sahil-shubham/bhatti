@@ -226,16 +226,17 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Check for duplicate name before booting a VM.
-		// Without this, a name conflict is only discovered after engine.Create()
-		// has already booted a VM (~3.5s), which then gets destroyed.
+		// Idempotent create: if a non-destroyed sandbox with this name already
+		// exists, return it with 200 instead of 409. This eliminates the
+		// TOCTOU race where two concurrent creates both pass a check, both
+		// boot VMs, and one wastes ~3.5s. Callers (e.g. karkhana) no longer
+		// need list→filter→create dance.
 		if spec.Name != "" {
-			existing, _ := s.store.ListSandboxes(user.ID)
-			for _, sb := range existing {
-				if sb.Name == spec.Name && sb.Status != "destroyed" {
-					errResp(w, 409, fmt.Sprintf("sandbox %q already exists", spec.Name))
-					return
-				}
+			existing, err := s.store.GetActiveSandboxByName(user.ID, spec.Name)
+			if err == nil {
+				w.Header().Set("X-Bhatti-Existing", "true")
+				writeJSON(w, 200, existing)
+				return
 			}
 		}
 
@@ -381,7 +382,25 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			KeepHot:    req.KeepHot,
 		}
 		if err := s.store.CreateSandbox(sb); err != nil {
+			// UNIQUE constraint violation → name race. Another concurrent
+			// request won the insert. Destroy the VM we just booted and
+			// return the winner's sandbox.
+			if strings.Contains(err.Error(), "UNIQUE") && spec.Name != "" {
+				s.engine.Destroy(r.Context(), info.EngineID)
+				if len(resolvedVolumes) > 0 {
+					s.store.DetachAllPersistentVolumesForSandbox(sbID)
+				}
+				existing, lookupErr := s.store.GetActiveSandboxByName(user.ID, spec.Name)
+				if lookupErr == nil {
+					w.Header().Set("X-Bhatti-Existing", "true")
+					writeJSON(w, 200, existing)
+					return
+				}
+			}
 			s.engine.Destroy(r.Context(), info.EngineID)
+			if len(resolvedVolumes) > 0 {
+				s.store.DetachAllPersistentVolumesForSandbox(sbID)
+			}
 			errRespInternal(w, r, "store sandbox failed", err)
 			return
 		}

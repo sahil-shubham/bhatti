@@ -943,23 +943,20 @@ func TestDuplicateSandboxNameHTTP(t *testing.T) {
 	decodeJSON(t, resp, &sb)
 	t.Cleanup(func() { alice(t, "DELETE", "/sandboxes/"+sb.ID, nil) })
 
-	// Duplicate — should be 409, not 500 with raw SQLite error
+	// Duplicate — should return existing sandbox with 200 (idempotent create)
 	resp = alice(t, "POST", "/sandboxes", map[string]any{"name": name})
-	if resp.StatusCode == 500 {
+	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("duplicate name returned 500 (should be 409): %s", body)
+		t.Fatalf("duplicate: expected 200, got %d: %s", resp.StatusCode, body)
 	}
-	if resp.StatusCode == 201 {
-		var sb2 store.Sandbox
-		decodeJSON(t, resp, &sb2)
-		alice(t, "DELETE", "/sandboxes/"+sb2.ID, nil)
-		t.Fatal("duplicate name should not succeed")
+	if resp.Header.Get("X-Bhatti-Existing") != "true" {
+		t.Error("missing X-Bhatti-Existing header")
 	}
-	if resp.StatusCode != 409 {
-		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("duplicate name: expected 409, got %d: %s", resp.StatusCode, body)
+	var sb2 store.Sandbox
+	decodeJSON(t, resp, &sb2)
+	if sb2.ID != sb.ID {
+		t.Errorf("expected same sandbox ID %q, got %q", sb.ID, sb2.ID)
 	}
-	resp.Body.Close()
 }
 
 func TestCrossUserSecretIsolationHTTP(t *testing.T) {
@@ -1141,10 +1138,10 @@ func TestExecTimeoutClamped(t *testing.T) {
 	_, ts := setup(t)
 	sb := createSandbox(t, ts, uniqueName(t, "clamp"))
 
-	// timeout_sec > 3600 should be ignored (uses default 300)
+	// timeout_sec > 86400 should be ignored (uses default 300)
 	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
 		"cmd":         []string{"echo", "ok"},
-		"timeout_sec": 99999,
+		"timeout_sec": 100000,
 	})
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)

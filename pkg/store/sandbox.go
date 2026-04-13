@@ -54,6 +54,13 @@ func (s *Store) GetSandbox(userID, idOrName string) (*Sandbox, error) {
 	return scanSandbox(row)
 }
 
+// GetActiveSandboxByName returns a non-destroyed sandbox by name for a user.
+// Returns sql.ErrNoRows if no active sandbox with that name exists.
+func (s *Store) GetActiveSandboxByName(userID, name string) (*Sandbox, error) {
+	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ? AND status != 'destroyed'`, name, userID)
+	return scanSandbox(row)
+}
+
 // GetSandboxByID returns a sandbox by ID regardless of owner. For internal use (thermal manager, recovery).
 func (s *Store) GetSandboxByID(id string) (*Sandbox, error) {
 	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE id = ?`, id)

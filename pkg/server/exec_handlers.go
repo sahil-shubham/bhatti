@@ -16,7 +16,7 @@ import (
 
 type execReq struct {
 	Cmd        []string `json:"cmd"`
-	TimeoutSec int      `json:"timeout_sec,omitempty"` // default 300, max 3600
+	TimeoutSec int      `json:"timeout_sec,omitempty"` // default 300, max 86400
 }
 
 func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id string) {
@@ -42,9 +42,9 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
-	// Apply exec timeout (default 300s, max 3600s)
+	// Apply exec timeout (default 300s, max 86400s / 24h)
 	timeout := 300 * time.Second
-	if req.TimeoutSec > 0 && req.TimeoutSec <= 3600 {
+	if req.TimeoutSec > 0 && req.TimeoutSec <= 86400 {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
 	}
 	execCtx, cancel := context.WithTimeout(r.Context(), timeout)
