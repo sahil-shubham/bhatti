@@ -99,7 +99,7 @@ func TestTTYSessionCreateDetachReattach(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Create a TTY session running cat
-	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"cat"}, nil, 24, 80, 0)
+	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"cat"}, nil, 24, 80, 0, "")
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestProcessSurvivesDetach(t *testing.T) {
 	// Process that outputs after a delay
 	sessInfo, term, err := vm.Agent.ShellSession(ctx,
 		[]string{"sh", "-c", "echo before; sleep 2; echo AFTER_DETACH"},
-		nil, 24, 80, 0)
+		nil, 24, 80, 0, "")
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -195,9 +195,9 @@ func TestSessionList(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Create two sessions
-	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
+	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0, "")
 	defer term1.Close()
-	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80, 0)
+	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80, 0, "")
 	defer term2.Close()
 	time.Sleep(500 * time.Millisecond)
 
@@ -223,7 +223,7 @@ func TestSessionKill(t *testing.T) {
 
 	vm, _ := eng.getVM(info.ID)
 
-	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
+	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0, "")
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestMaxIdleZeroStaysAlive(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Default TTY session (max_idle=0 = forever)
-	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
+	sessInfo, term, err := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0, "")
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}
@@ -428,11 +428,11 @@ func TestSessionListAttachedField(t *testing.T) {
 	vm, _ := eng.getVM(info.ID)
 
 	// Session 1: attached
-	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0)
+	_, term1, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3600"}, nil, 24, 80, 0, "")
 	defer term1.Close()
 
 	// Session 2: detached
-	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80, 0)
+	_, term2, _ := vm.Agent.ShellSession(ctx, []string{"sleep", "3601"}, nil, 24, 80, 0, "")
 	term2.Close()
 	time.Sleep(500 * time.Millisecond)
 
@@ -478,7 +478,7 @@ func TestScrollbackOverflow(t *testing.T) {
 	// before reattach.
 	sessInfo, term, err := vm.Agent.ShellSession(ctx,
 		[]string{"sh", "-c", "for i in $(seq 1 1000); do printf 'L%04d-' $i; head -c 80 /dev/urandom | base64 | head -c 80; echo; done; echo SCROLL_END; sleep 3600"},
-		nil, 24, 80, 0)
+		nil, 24, 80, 0, "")
 	if err != nil {
 		t.Fatalf("ShellSession: %v", err)
 	}

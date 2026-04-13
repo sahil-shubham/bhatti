@@ -403,7 +403,7 @@ func (c *AgentClient) SessionKill(ctx context.Context, sessionID string) error {
 }
 
 // ShellSession opens a TTY session and returns both the session info and the terminal connection.
-func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[string]string, rows, cols uint16, maxIdleSec int) (*proto.SessionInfo, engine.TerminalConn, error) {
+func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[string]string, rows, cols uint16, maxIdleSec int, cwd string) (*proto.SessionInfo, engine.TerminalConn, error) {
 	conn, err := c.DialControl(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent connect: %w", err)
@@ -419,6 +419,9 @@ func (c *AgentClient) ShellSession(ctx context.Context, argv []string, env map[s
 	}
 	if maxIdleSec > 0 {
 		req.MaxIdleSec = &maxIdleSec
+	}
+	if cwd != "" {
+		req.Cwd = &cwd
 	}
 	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
 		conn.Close()

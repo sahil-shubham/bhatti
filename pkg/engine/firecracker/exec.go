@@ -107,7 +107,7 @@ func (e *Engine) ShellSession(ctx context.Context, id string) (string, engine.Te
 
 	info, term, err := ag.ShellSession(ctx, []string{"/bin/bash", "-li"}, map[string]string{
 		"TERM": "xterm-256color",
-	}, 24, 80, 3600) // 1 hour idle timeout for detached sessions
+	}, 24, 80, 3600, "/workspace") // 1 hour idle timeout for detached sessions
 	if err != nil {
 		return "", nil, err
 	}
