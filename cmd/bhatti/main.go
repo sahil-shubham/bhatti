@@ -58,6 +58,11 @@ func runDaemon() {
 		slog.Error("load config", "error", err)
 		os.Exit(1)
 	}
+	if cfg.ConfigPath != "" {
+		slog.Info("config loaded", "path", cfg.ConfigPath)
+	} else {
+		slog.Info("no config file found, using defaults")
+	}
 
 	// Ensure data directory
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {

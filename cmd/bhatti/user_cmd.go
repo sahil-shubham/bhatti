@@ -212,14 +212,12 @@ func init() {
 //
 // Resolution order for data_dir:
 //  1. --data-dir flag (explicit)
-//  2. config file's data_dir field (from LoadConfig — if it was set)
-//  3. /var/lib/bhatti if config.yaml exists there (standard server path)
-//  4. ~/.bhatti (default)
+//  2. config file's data_dir field (from LoadConfig)
+//  3. ~/.bhatti (default)
 //
-// Step 3 prevents the split-brain bug where `bhatti user rotate-key`
-// run from ~ opens ~/.bhatti/state.db while the daemon uses
-// /var/lib/bhatti/state.db (because ~/.bhatti/config.yaml has no
-// data_dir field and LoadConfig defaults to ~/.bhatti).
+// On a server, LoadConfig finds /etc/bhatti/config.yaml which has
+// data_dir: /var/lib/bhatti, so the correct state.db is used without
+// any hardcoded fallbacks.
 func openLocalStore() *store.Store {
 	// Check --data-dir flag first
 	dataDir, _ := rootCmd.PersistentFlags().GetString("data-dir")
@@ -231,17 +229,6 @@ func openLocalStore() *store.Store {
 			os.Exit(1)
 		}
 		dataDir = cfg.DataDir
-
-		// If LoadConfig didn't find an explicit data_dir (fell back to
-		// ~/.bhatti), check the standard server location. This handles
-		// both `bhatti user rotate-key` (state.db exists) and fresh
-		// installs (config.yaml exists but state.db doesn't yet).
-		if dataDir == pkg.DefaultDataDir() {
-			const serverDataDir = "/var/lib/bhatti"
-			if _, err := os.Stat(filepath.Join(serverDataDir, "config.yaml")); err == nil {
-				dataDir = serverDataDir
-			}
-		}
 	}
 
 	dbPath := filepath.Join(dataDir, "state.db")

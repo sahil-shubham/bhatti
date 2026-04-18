@@ -20,6 +20,10 @@ type Config struct {
 	AuthToken string `yaml:"auth_token"` // CLI: API key for remote requests
 	DataDir   string `yaml:"data_dir"`   // defaults to ~/.bhatti
 
+	// ConfigPath is the file path LoadConfig actually loaded from.
+	// Not persisted — set at load time for logging/debugging.
+	ConfigPath string `yaml:"-"`
+
 	// Public proxy (Phase 1: path-based, for dev/testing)
 	PublicProxyListen string `yaml:"public_proxy_listen,omitempty"` // e.g. ":8443"
 
@@ -74,8 +78,11 @@ func DefaultDataDir() string {
 
 // LoadConfig reads config.yaml from one of these locations (first match wins):
 //  1. $BHATTI_CONFIG (explicit path)
-//  2. ./config.yaml (working directory — for systemd WorkingDirectory)
-//  3. ~/.bhatti/config.yaml (user default)
+//  2. /etc/bhatti/config.yaml (server config — FHS standard)
+//  3. ~/.bhatti/config.yaml (CLI / user config)
+//
+// For migration: if /var/lib/bhatti/config.yaml exists and nothing above
+// matched, it is loaded as a deprecated fallback with a stderr warning.
 //
 // Returns sensible defaults if no config file is found.
 func LoadConfig() (*Config, error) {
@@ -86,11 +93,11 @@ func LoadConfig() (*Config, error) {
 		DataDir: dir,
 	}
 
-	// Search order for config file
+	// Explicit paths — each has a clear meaning.
 	candidates := []string{
 		os.Getenv("BHATTI_CONFIG"),          // explicit override
-		"config.yaml",                       // working directory
-		filepath.Join(dir, "config.yaml"),   // ~/.bhatti/config.yaml
+		"/etc/bhatti/config.yaml",           // server config (FHS)
+		filepath.Join(dir, "config.yaml"),   // ~/.bhatti/config.yaml (CLI)
 	}
 
 	var data []byte
@@ -107,6 +114,17 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	// Migration fallback: old location inside data dir.
+	// TODO: remove after a few releases (added v1.6.0).
+	if data == nil {
+		const deprecated = "/var/lib/bhatti/config.yaml"
+		if d, err := os.ReadFile(deprecated); err == nil {
+			data = d
+			loadedFrom = deprecated
+			fmt.Fprintf(os.Stderr, "⚠ config loaded from deprecated location %s\n  move to /etc/bhatti/config.yaml\n\n", deprecated)
+		}
+	}
+
 	if data == nil {
 		return cfg, nil // no config found, use defaults
 	}
@@ -117,6 +135,7 @@ func LoadConfig() (*Config, error) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = dir
 	}
+	cfg.ConfigPath = loadedFrom
 	return cfg, nil
 }
 

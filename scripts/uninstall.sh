@@ -147,7 +147,8 @@ if [[ "$PURGE" == "true" ]]; then
 else
     echo "  Binaries + service removed."
     echo "  Data preserved: $DATA_DIR"
-    echo "    (config, kernel, rootfs, volumes, secrets)"
+    echo "    (kernel, rootfs, volumes, secrets)"
+    echo "  Config preserved: /etc/bhatti/config.yaml"
     echo ""
     echo "  To reinstall:"
     echo "    sudo ./scripts/install.sh --systemd"

@@ -91,7 +91,10 @@ crosses_major() {
 
 # Returns: none | cli | server
 detect_install_type() {
-    if [ -d "$DATA_DIR" ] && [ -f "$DATA_DIR/config.yaml" ]; then
+    if [ -f "/etc/bhatti/config.yaml" ]; then
+        echo "server"
+    elif [ -d "$DATA_DIR" ] && [ -f "$DATA_DIR/config.yaml" ]; then
+        # Pre-v1.6 installs kept config in the data dir
         echo "server"
     elif command -v bhatti >/dev/null 2>&1; then
         echo "cli"
@@ -105,9 +108,11 @@ detect_install_type() {
 # The glob fallback handles edge cases (missing config, manual installs).
 detect_tier() {
     # Primary: parse firecracker_rootfs from config.yaml
-    if [ -f "$DATA_DIR/config.yaml" ]; then
+    local config_file="/etc/bhatti/config.yaml"
+    [ -f "$config_file" ] || config_file="$DATA_DIR/config.yaml"  # pre-v1.6 fallback
+    if [ -f "$config_file" ]; then
         local rootfs_path
-        rootfs_path=$(grep '^firecracker_rootfs:' "$DATA_DIR/config.yaml" | awk '{print $2}' | tr -d '"' | tr -d "'")
+        rootfs_path=$(grep '^firecracker_rootfs:' "$config_file" | awk '{print $2}' | tr -d '"' | tr -d "'")
         if [ -n "$rootfs_path" ]; then
             local tier
             tier=$(basename "$rootfs_path" | sed "s/rootfs-//;s/-${ARCH}\.ext4//")
@@ -235,7 +240,8 @@ setup_jail_user() {
 
 generate_config() {
     local tier="$1"
-    cat > "$DATA_DIR/config.yaml" << EOF
+    mkdir -p /etc/bhatti
+    cat > /etc/bhatti/config.yaml << EOF
 engine: firecracker
 listen: :8080
 data_dir: ${DATA_DIR}
@@ -246,6 +252,12 @@ jail_gid: 10000
 firecracker_kernel: ${DATA_DIR}/images/vmlinux-${ARCH}
 firecracker_rootfs: ${DATA_DIR}/images/rootfs-${tier}-${ARCH}.ext4
 EOF
+
+    # Clean up pre-v1.6 config location
+    if [ -f "$DATA_DIR/config.yaml" ]; then
+        rm -f "$DATA_DIR/config.yaml"
+        info "Migrated config to /etc/bhatti/config.yaml"
+    fi
 }
 
 create_admin_user() {
@@ -264,8 +276,8 @@ create_admin_user() {
             if [ -n "$user_home" ] && [ -d "$user_home" ]; then
                 mkdir -p "$user_home/.bhatti"
                 cat > "$user_home/.bhatti/config.yaml" << EOF
+api_url: http://localhost:8080
 auth_token: ${ADMIN_KEY}
-listen: :8080
 EOF
                 chown -R "$SUDO_USER:$user_group" "$user_home/.bhatti"
             fi
@@ -273,8 +285,8 @@ EOF
 
         mkdir -p /root/.bhatti
         cat > /root/.bhatti/config.yaml << EOF
+api_url: http://localhost:8080
 auth_token: ${ADMIN_KEY}
-listen: :8080
 EOF
         success "Admin user created"
     else
@@ -468,7 +480,14 @@ do_server_update() {
     install_rootfs "$tier"
     setup_jail_user
     write_systemd_unit
-    # config.yaml and admin user are PRESERVED
+
+    # Migrate config from old location if needed (pre-v1.6)
+    if [ -f "$DATA_DIR/config.yaml" ] && [ ! -f "/etc/bhatti/config.yaml" ]; then
+        mkdir -p /etc/bhatti
+        mv "$DATA_DIR/config.yaml" /etc/bhatti/config.yaml
+        info "Migrated config to /etc/bhatti/config.yaml"
+    fi
+    # admin user is PRESERVED
 
     if [ "$was_running" = true ]; then
         heading "Restarting bhatti service"

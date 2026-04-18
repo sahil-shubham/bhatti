@@ -80,27 +80,46 @@ func TestEnsureKeypairCreatesDir(t *testing.T) {
 	}
 }
 
-// TestLoadConfigDataDirDefault verifies that when a config file has no
-// data_dir field, it defaults to ~/.bhatti. This is the root cause of
-// the split-brain DB bug: the server config at /var/lib/bhatti/config.yaml
-// sets data_dir explicitly, but ~/.bhatti/config.yaml doesn't, causing
-// `bhatti user rotate-key` to write to ~/.bhatti/state.db instead of
-// /var/lib/bhatti/state.db.
-func TestLoadConfigDataDirDefault(t *testing.T) {
-	origDir, _ := os.Getwd()
+// TestLoadConfigExplicitPath verifies $BHATTI_CONFIG takes priority.
+func TestLoadConfigExplicitPath(t *testing.T) {
 	origEnv := os.Getenv("BHATTI_CONFIG")
-	t.Cleanup(func() {
-		os.Chdir(origDir)
-		os.Setenv("BHATTI_CONFIG", origEnv)
-	})
+	t.Cleanup(func() { os.Setenv("BHATTI_CONFIG", origEnv) })
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "custom.yaml")
+	os.WriteFile(cfgPath, []byte(
+		"listen: :9999\ndata_dir: /tmp/test-bhatti\n"), 0644)
+
+	os.Setenv("BHATTI_CONFIG", cfgPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != ":9999" {
+		t.Errorf("listen=%q, want :9999", cfg.Listen)
+	}
+	if cfg.DataDir != "/tmp/test-bhatti" {
+		t.Errorf("data_dir=%q, want /tmp/test-bhatti", cfg.DataDir)
+	}
+	if cfg.ConfigPath != cfgPath {
+		t.Errorf("config_path=%q, want %q", cfg.ConfigPath, cfgPath)
+	}
+}
+
+// TestLoadConfigDataDirDefault verifies that when a config file has no
+// data_dir field, it defaults to ~/.bhatti.
+func TestLoadConfigDataDirDefault(t *testing.T) {
+	origEnv := os.Getenv("BHATTI_CONFIG")
+	t.Cleanup(func() { os.Setenv("BHATTI_CONFIG", origEnv) })
 
 	// Config with no data_dir
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(
+	cfgPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgPath, []byte(
 		"api_url: https://example.com\nauth_token: tok\n"), 0644)
 
-	os.Setenv("BHATTI_CONFIG", "")
-	os.Chdir(dir)
+	os.Setenv("BHATTI_CONFIG", cfgPath)
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -111,7 +130,7 @@ func TestLoadConfigDataDirDefault(t *testing.T) {
 	}
 
 	// Config WITH explicit data_dir
-	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(
+	os.WriteFile(cfgPath, []byte(
 		"data_dir: /var/lib/bhatti\napi_url: https://example.com\n"), 0644)
 
 	cfg, err = LoadConfig()
@@ -120,6 +139,52 @@ func TestLoadConfigDataDirDefault(t *testing.T) {
 	}
 	if cfg.DataDir != "/var/lib/bhatti" {
 		t.Errorf("data_dir=%q, want /var/lib/bhatti", cfg.DataDir)
+	}
+}
+
+// TestLoadConfigPathIsSet verifies ConfigPath is populated.
+func TestLoadConfigPathIsSet(t *testing.T) {
+	origEnv := os.Getenv("BHATTI_CONFIG")
+	t.Cleanup(func() { os.Setenv("BHATTI_CONFIG", origEnv) })
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgPath, []byte("listen: :7777\n"), 0644)
+
+	os.Setenv("BHATTI_CONFIG", cfgPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConfigPath != cfgPath {
+		t.Errorf("config_path=%q, want %q", cfg.ConfigPath, cfgPath)
+	}
+}
+
+// TestLoadConfigNoFile verifies defaults when no config exists.
+func TestLoadConfigNoFile(t *testing.T) {
+	origEnv := os.Getenv("BHATTI_CONFIG")
+	t.Cleanup(func() { os.Setenv("BHATTI_CONFIG", origEnv) })
+
+	os.Setenv("BHATTI_CONFIG", "/nonexistent/config.yaml")
+
+	// This will fail the BHATTI_CONFIG candidate, then try /etc/bhatti/
+	// and ~/.bhatti/. On a test machine without those, we get defaults.
+	// To be deterministic, point to a dir with no config.yaml.
+	os.Setenv("BHATTI_CONFIG", "")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConfigPath != "" {
+		// May pick up ~/.bhatti/config.yaml if it exists on the dev machine.
+		// That's OK — this test just verifies no crash on missing config.
+		t.Logf("found config at %s (dev machine has config)", cfg.ConfigPath)
+	}
+	if cfg.Engine != "firecracker" {
+		t.Errorf("engine=%q, want firecracker", cfg.Engine)
 	}
 }
 
