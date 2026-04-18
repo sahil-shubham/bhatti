@@ -151,12 +151,19 @@ func (rc *routeCache) InvalidateSandbox(sandboxID string) {
 
 // --- Rate Limiter ---
 
-// publicRateLimiter uses a per-alias + global token bucket scheme.
-// Per-alias buckets are only created for known aliases (after alias
-// lookup succeeds). Uses a bounded map with LRU eviction.
+// publicRateLimiter uses a three-tier token bucket scheme:
+//   - Per-IP (primary): prevents one source from overwhelming the proxy.
+//     Generous burst to accommodate Vite/webpack dev servers that serve
+//     each source file as a separate ESM module request (100-300+ per page load).
+//   - Per-alias (secondary): aggregate safety net against distributed attacks
+//     where many IPs target a single published alias.
+//   - Global: protects the proxy process from total overload.
+//
+// Both per-IP and per-alias maps are bounded with LRU eviction.
 type publicRateLimiter struct {
 	mu       sync.Mutex
-	perAlias map[string]*publicBucket
+	perIP    map[string]*publicBucket // primary: per source IP
+	perAlias map[string]*publicBucket // secondary: aggregate per alias
 	global   *tokenBucket
 }
 
@@ -169,43 +176,80 @@ const publicRateLimiterMaxSize = 10_000
 
 func newPublicRateLimiter() *publicRateLimiter {
 	return &publicRateLimiter{
+		perIP:    make(map[string]*publicBucket),
 		perAlias: make(map[string]*publicBucket),
 		global:   newTokenBucket(10000, 10000),
 	}
 }
 
-// Allow checks rate limits. Only called for aliases known to exist.
-func (l *publicRateLimiter) Allow(alias string) bool {
+// Allow checks rate limits: global → per-IP → per-alias.
+// Only called for aliases known to exist.
+func (l *publicRateLimiter) Allow(alias, ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if !l.global.allow() {
 		return false
 	}
-	pb, ok := l.perAlias[alias]
+
+	// Primary: per source IP
+	ipb := l.getOrCreate(l.perIP, ip, 500, 1500)
+	if !ipb.allow() {
+		return false
+	}
+
+	// Secondary: per-alias aggregate
+	ab := l.getOrCreate(l.perAlias, alias, 2000, 5000)
+	if !ab.allow() {
+		return false
+	}
+
+	return true
+}
+
+// getOrCreate returns the token bucket for key, creating one if needed.
+// Evicts the oldest entry if the map exceeds publicRateLimiterMaxSize.
+func (l *publicRateLimiter) getOrCreate(
+	m map[string]*publicBucket, key string,
+	burst, perMin float64,
+) *tokenBucket {
+	pb, ok := m[key]
 	if !ok {
-		// Evict oldest if at capacity
-		if len(l.perAlias) >= publicRateLimiterMaxSize {
-			var oldestKey string
-			var oldestTime time.Time
-			for k, v := range l.perAlias {
-				if oldestKey == "" || v.lastAccess.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = v.lastAccess
-				}
-			}
-			if oldestKey != "" {
-				delete(l.perAlias, oldestKey)
-			}
+		if len(m) >= publicRateLimiterMaxSize {
+			evictOldest(m)
 		}
 		pb = &publicBucket{
-			bucket:     newTokenBucket(100, 200),
+			bucket:     newTokenBucket(burst, perMin),
 			lastAccess: time.Now(),
 		}
-		l.perAlias[alias] = pb
+		m[key] = pb
 	}
 	pb.lastAccess = time.Now()
-	return pb.bucket.allow()
+	return pb.bucket
+}
+
+// evictOldest removes the least-recently-accessed entry from the map.
+func evictOldest(m map[string]*publicBucket) {
+	var oldestKey string
+	var oldestTime time.Time
+	for k, v := range m {
+		if oldestKey == "" || v.lastAccess.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.lastAccess
+		}
+	}
+	if oldestKey != "" {
+		delete(m, oldestKey)
+	}
+}
+
+// extractIP strips the port from a RemoteAddr "host:port" string.
+func extractIP(remoteAddr string) string {
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr // bare IP, no port
+	}
+	return ip
 }
 
 // --- Path-Based Routing ---
@@ -261,7 +305,8 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 	}
 
 	// Rate limit AFTER alias validation.
-	if !h.limiter.Allow(alias) {
+	clientIP := extractIP(r.RemoteAddr)
+	if !h.limiter.Allow(alias, clientIP) {
 		h.rateLimited.Add(1)
 		w.Header().Set("Retry-After", "1")
 		errResp(w, 429, "rate limit exceeded")
