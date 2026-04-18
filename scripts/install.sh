@@ -32,7 +32,35 @@ RESET='\033[0m'
 info()    { printf "  ${DIM}%s${RESET}\n" "$*"; }
 heading() { printf "\n${BOLD}==> %s${RESET}\n" "$*"; }
 success() { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
-die()     { printf "${RED}error: %s${RESET}\n" "$*" >&2; exit 1; }
+
+die() {
+    printf "\n${RED}error: %s${RESET}\n" "$1" >&2
+    shift
+    for line in "$@"; do
+        printf "  %s\n" "$line" >&2
+    done
+    exit 1
+}
+
+# ── Error trap ────────────────────────────────────────
+# Safety net: if any command fails unexpectedly (set -e), we
+# print exactly what failed instead of exiting silently.
+# Every KNOWN failure path uses die() with a descriptive message.
+# This trap catches everything else — the "should never happen" cases.
+
+_err_trap() {
+    local exit_code=$?
+    printf "\n${RED}install failed unexpectedly${RESET}\n" >&2
+    printf "  line %d: %s\n" "$1" "$BASH_COMMAND" >&2
+    printf "  exit code: %d\n" "$exit_code" >&2
+    printf "\n  Please report this at:\n" >&2
+    printf "  https://github.com/%s/issues\n\n" "$GITHUB_REPO" >&2
+}
+trap '_err_trap $LINENO' ERR
+
+# Clean up temp files on any exit
+_cleanup() { rm -f /tmp/bhatti.tmp; }
+trap '_cleanup' EXIT
 
 # ── Platform detection ────────────────────────────────
 
@@ -47,12 +75,65 @@ detect_platform() {
     esac
 }
 
+# ── Download helpers ──────────────────────────────────
+
+# download URL DEST — download a file and validate it's non-empty.
+# On failure, prints what went wrong with actionable context.
+download() {
+    local url="$1" dest="$2"
+    local http_code
+
+    http_code=$(curl -fsSL -w '%{http_code}' -o "$dest" "$url") || {
+        rm -f "$dest"
+        die "download failed: $url" \
+            "HTTP status: ${http_code:-unknown}" \
+            "Check your network connection and try again."
+    }
+
+    if [ ! -s "$dest" ]; then
+        rm -f "$dest"
+        die "download produced an empty file: $url" \
+            "This usually means the release asset is missing." \
+            "Check: $url"
+    fi
+}
+
+# download_pipe URL CMD... — stream a download into a command (e.g. tar, zstd).
+# Validates that curl succeeds and the pipeline produces output.
+download_pipe() {
+    local url="$1"; shift
+
+    # Use a temp file for curl errors since we're in a pipeline
+    local err_file
+    err_file=$(mktemp)
+
+    if ! curl -fsSL "$url" 2>"$err_file" | "$@"; then
+        local curl_err
+        curl_err=$(cat "$err_file")
+        rm -f "$err_file"
+        die "download + extract failed: $url" \
+            "${curl_err:-pipeline failed}" \
+            "Check your network connection and disk space."
+    fi
+    rm -f "$err_file"
+}
+
 # ── Version helpers ───────────────────────────────────
 
 resolve_latest_version() {
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
-        | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
-    [ -n "$VERSION" ] || die "could not resolve latest release version"
+    local response
+    response=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest") \
+        || die "could not reach GitHub API" \
+               "Check your network connection." \
+               "You can also download directly from:" \
+               "  https://github.com/${GITHUB_REPO}/releases"
+
+    VERSION=$(echo "$response" | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/') || true
+    [ -n "$VERSION" ] || die "could not determine latest release version" \
+                              "GitHub API returned unexpected response." \
+                              "Try again, or download manually from:" \
+                              "  https://github.com/${GITHUB_REPO}/releases"
+
     RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}"
 }
 
@@ -112,13 +193,13 @@ detect_tier() {
     [ -f "$config_file" ] || config_file="$DATA_DIR/config.yaml"  # pre-v1.6 fallback
     if [ -f "$config_file" ]; then
         local rootfs_path
-        rootfs_path=$(grep '^firecracker_rootfs:' "$config_file" | awk '{print $2}' | tr -d '"' | tr -d "'")
+        rootfs_path=$(grep '^firecracker_rootfs:' "$config_file" | awk '{print $2}' | tr -d '"' | tr -d "'") || true
         if [ -n "$rootfs_path" ]; then
             local tier
             tier=$(basename "$rootfs_path" | sed "s/rootfs-//;s/-${ARCH}\.ext4//")
             if [ -n "$tier" ]; then
                 echo "$tier"
-                return
+                return 0
             fi
         fi
     fi
@@ -126,23 +207,28 @@ detect_tier() {
     for f in "$DATA_DIR/images/rootfs-"*"-${ARCH}.ext4"; do
         [ -f "$f" ] || continue
         basename "$f" | sed "s/rootfs-//;s/-${ARCH}\.ext4//"
-        return
+        return 0
     done
     echo "minimal"
 }
 
+# ── Version queries ───────────────────────────────────
+# These functions return empty string (not error) when the
+# tool isn't installed. They must always exit 0 — a missing
+# binary is expected state, not an error.
+
 # Get installed bhatti version (empty if not installed or dev build)
 installed_bhatti_version() {
-    command -v bhatti >/dev/null 2>&1 || return
+    command -v bhatti >/dev/null 2>&1 || { echo ""; return 0; }
     local ver
     ver=$(bhatti version 2>/dev/null | awk '/^bhatti/{print $2}') || true
-    [ "$ver" = "dev" ] && return
+    [ "$ver" = "dev" ] && { echo ""; return 0; }
     echo "$ver"
 }
 
 # Get installed firecracker version (empty if not installed)
 installed_fc_version() {
-    command -v firecracker >/dev/null 2>&1 || return
+    command -v firecracker >/dev/null 2>&1 || { echo ""; return 0; }
     firecracker --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
 
@@ -150,26 +236,25 @@ installed_fc_version() {
 
 install_bhatti_binary() {
     local binary="bhatti-${OS}-${ARCH}"
-    curl -fsSL "${RELEASE_URL}/${binary}" -o /tmp/bhatti
-    chmod +x /tmp/bhatti
+    download "${RELEASE_URL}/${binary}" /tmp/bhatti.tmp
+    chmod +x /tmp/bhatti.tmp
 
     if [ -w "/usr/local/bin" ]; then
-        mv /tmp/bhatti /usr/local/bin/bhatti
+        mv /tmp/bhatti.tmp /usr/local/bin/bhatti
     else
-        sudo mv /tmp/bhatti /usr/local/bin/bhatti
+        sudo mv /tmp/bhatti.tmp /usr/local/bin/bhatti
     fi
 }
 
 install_firecracker() {
     local installed_fc
     installed_fc=$(installed_fc_version)
-    local need_download=true
 
     if [ -n "$installed_fc" ] && ! version_gt "$FC_VERSION" "$installed_fc"; then
         # FC is up to date, but jailer might be missing
         if [ -x /usr/local/bin/jailer ]; then
             success "Firecracker ${installed_fc} + jailer (up to date)"
-            return
+            return 0
         fi
         info "Firecracker ${installed_fc} up to date, installing missing jailer"
     elif [ -n "$installed_fc" ]; then
@@ -180,13 +265,25 @@ install_firecracker() {
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    curl -fsSL \
+
+    download_pipe \
         "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${FC_ARCH}.tgz" \
-        | tar xz -C "$tmpdir"
-    mv "$tmpdir/release-v${FC_VERSION}-${FC_ARCH}/firecracker-v${FC_VERSION}-${FC_ARCH}" \
-        /usr/local/bin/firecracker
-    mv "$tmpdir/release-v${FC_VERSION}-${FC_ARCH}/jailer-v${FC_VERSION}-${FC_ARCH}" \
-        /usr/local/bin/jailer
+        tar xz -C "$tmpdir"
+
+    local release_dir="$tmpdir/release-v${FC_VERSION}-${FC_ARCH}"
+
+    [ -f "$release_dir/firecracker-v${FC_VERSION}-${FC_ARCH}" ] \
+        || die "firecracker binary not found in release archive" \
+               "Expected: $release_dir/firecracker-v${FC_VERSION}-${FC_ARCH}" \
+               "The release archive may be corrupt. Try again."
+
+    [ -f "$release_dir/jailer-v${FC_VERSION}-${FC_ARCH}" ] \
+        || die "jailer binary not found in release archive" \
+               "Expected: $release_dir/jailer-v${FC_VERSION}-${FC_ARCH}" \
+               "The release archive may be corrupt. Try again."
+
+    mv "$release_dir/firecracker-v${FC_VERSION}-${FC_ARCH}" /usr/local/bin/firecracker
+    mv "$release_dir/jailer-v${FC_VERSION}-${FC_ARCH}" /usr/local/bin/jailer
     chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer
     rm -rf "$tmpdir"
     success "Firecracker ${FC_VERSION} + jailer"
@@ -194,7 +291,7 @@ install_firecracker() {
 
 install_lohar() {
     heading "Installing lohar"
-    curl -fsSL "${RELEASE_URL}/lohar-linux-${ARCH}" -o "$DATA_DIR/lohar"
+    download "${RELEASE_URL}/lohar-linux-${ARCH}" "$DATA_DIR/lohar"
     chmod +x "$DATA_DIR/lohar"
     success "lohar ($(du -h "$DATA_DIR/lohar" | cut -f1))"
 }
@@ -202,7 +299,7 @@ install_lohar() {
 install_kernel() {
     heading "Installing kernel"
     local kernel_path="$DATA_DIR/images/vmlinux-${ARCH}"
-    curl -fsSL "${RELEASE_URL}/vmlinux-${KERNEL_VERSION}-${FC_ARCH}" -o "$kernel_path"
+    download "${RELEASE_URL}/vmlinux-${KERNEL_VERSION}-${FC_ARCH}" "$kernel_path"
     success "kernel ($(du -h "$kernel_path" | cut -f1))"
 }
 
@@ -216,18 +313,31 @@ install_rootfs() {
     if ! command -v zstd >/dev/null 2>&1; then
         info "Installing zstd..."
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y -qq zstd >/dev/null
+            apt-get update -qq && apt-get install -y -qq zstd >/dev/null || true
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y -q zstd >/dev/null
+            dnf install -y -q zstd >/dev/null || true
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y -q zstd >/dev/null
-        else
-            die "zstd is required but not installed — install it manually and re-run"
+            yum install -y -q zstd >/dev/null || true
         fi
+
+        # Verify it actually installed — catches permission errors, broken repos, etc.
+        command -v zstd >/dev/null 2>&1 \
+            || die "failed to install zstd" \
+                   "Try installing it manually and re-run:" \
+                   "  sudo apt-get install zstd   # Debian/Ubuntu" \
+                   "  sudo dnf install zstd       # Fedora/RHEL" \
+                   "  sudo yum install zstd       # CentOS"
     fi
 
-    curl -fsSL "${RELEASE_URL}/rootfs-${tier}-${ARCH}.ext4.zst" \
-        | zstd -d -f -o "$rootfs_path"
+    download_pipe \
+        "${RELEASE_URL}/rootfs-${tier}-${ARCH}.ext4.zst" \
+        zstd -d -f -o "$rootfs_path"
+
+    [ -s "$rootfs_path" ] \
+        || die "rootfs decompression produced an empty file" \
+               "This may indicate insufficient disk space." \
+               "Available space: $(df -h "$DATA_DIR" 2>/dev/null | tail -1 | awk '{print $4}')"
+
     success "rootfs ${tier} ($(du -h "$rootfs_path" | cut -f1))"
 }
 
@@ -324,7 +434,7 @@ do_cli_install() {
 
     if [ -n "$current" ] && [ "v${current#v}" = "${VERSION}" ]; then
         success "bhatti ${VERSION} is already installed"
-        return
+        return 0
     fi
 
     if [ -n "$current" ]; then
@@ -362,14 +472,19 @@ do_cli_install() {
 do_server_install() {
     local tier="${1:-minimal}"
 
-    [ "$(id -u)" -eq 0 ] || die "server installation requires root — re-run with:\n  curl -fsSL bhatti.sh/install | sudo bash"
+    [ "$(id -u)" -eq 0 ] || die "server installation requires root" \
+                                "Re-run with:" \
+                                "  curl -fsSL bhatti.sh/install | sudo bash"
 
     # Preflight
     if [ ! -e /dev/kvm ]; then
         modprobe kvm 2>/dev/null || true
     fi
-    [ -e /dev/kvm ] || die "/dev/kvm not available — KVM is required"
-    command -v curl >/dev/null 2>&1 || die "curl is required"
+    [ -e /dev/kvm ] || die "/dev/kvm not available — KVM is required" \
+                           "Enable virtualization in your BIOS/hypervisor settings," \
+                           "or use a VM with nested virtualization enabled."
+    command -v curl >/dev/null 2>&1 || die "curl is required" \
+                                          "Install it with: apt-get install curl"
 
     heading "Installing bhatti ${VERSION} (server, ${tier} tier) on $(hostname) (${HOST_ARCH})"
 
@@ -416,7 +531,9 @@ do_server_install() {
 }
 
 do_server_update() {
-    [ "$(id -u)" -eq 0 ] || die "server update requires root — re-run with:\n  curl -fsSL bhatti.sh/install | sudo bash"
+    [ "$(id -u)" -eq 0 ] || die "server update requires root" \
+                                "Re-run with:" \
+                                "  curl -fsSL bhatti.sh/install | sudo bash"
 
     local tier current
     tier=$(detect_tier)
@@ -432,7 +549,7 @@ do_server_update() {
 
     if [ -n "$current" ] && [ "v${current#v}" = "${VERSION}" ] && [ "$all_present" = true ]; then
         success "bhatti ${VERSION} (server, ${tier} tier) is already up to date"
-        return
+        return 0
     fi
 
     # Guard against major version crossings (e.g. v0.5.x → v1.0.0).
