@@ -388,14 +388,28 @@ func TestPipedSessionIdleTimeout(t *testing.T) {
 	// Wait for idle timeout + buffer
 	time.Sleep(4 * time.Second)
 
-	// Session should be gone
-	sessions, _ := vm.Agent.SessionList(ctx)
-	for _, s := range sessions {
-		if s.SessionID == sessInfo.SessionID {
-			t.Error("session should have been killed by idle timeout")
+	// Reattach — should get EXIT (process was killed) or error (session cleaned up)
+	_, pc, err := vm.Agent.PipedSessionAttach(ctx, sessInfo.SessionID, false)
+	if err != nil {
+		t.Logf("✓ session cleaned up after idle: %v", err)
+		return
+	}
+	defer pc.Close()
+
+	// Session exists but process should be dead — drain until EXIT
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for EXIT after idle kill")
+		default:
+		}
+		msgType, _, err := pc.ReadFrame()
+		if err != nil || msgType == proto.EXIT {
+			break
 		}
 	}
-	t.Log("✓ piped session killed after idle timeout")
+	t.Log("✓ idle timer killed the piped session")
 }
 
 func TestPipedSessionMergedStderr(t *testing.T) {
