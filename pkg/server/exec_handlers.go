@@ -355,7 +355,201 @@ func wsRelay(conn *websocket.Conn, term engine.TerminalConn) {
 	<-done
 }
 
-// --- Secrets ---
+// --- Piped Sessions (WebSocket) ---
+
+func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id string) {
+	sb := s.getUserSandbox(w, r, id)
+	if sb == nil {
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Error("exec ws upgrade failed", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"wake sandbox: `+err.Error()+`"}`))
+		return
+	}
+
+	pe, ok := s.engine.(engine.PipedSessionEngine)
+	if !ok {
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"engine does not support piped sessions"}`))
+		return
+	}
+
+	sessionParam := r.URL.Query().Get("session")
+
+	var pipedConn engine.PipedConn
+	var sessionID string
+
+	if sessionParam != "" {
+		// Reattach to existing session
+		info, pc, err := pe.PipedSessionAttach(context.Background(), sb.EngineID, sessionParam, false)
+		if err != nil {
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"attach: `+err.Error()+`"}`))
+			return
+		}
+		pipedConn = pc
+		sessionID = info.SessionID
+	} else {
+		// Read first WebSocket message as JSON command spec
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		conn.SetReadDeadline(time.Time{})
+
+		var spec struct {
+			Cmd        []string          `json:"cmd"`
+			Env        map[string]string `json:"env,omitempty"`
+			MaxIdleSec int               `json:"max_idle_sec,omitempty"`
+		}
+		if json.Unmarshal(msg, &spec) != nil || len(spec.Cmd) == 0 {
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"cmd required"}`))
+			return
+		}
+		maxIdleSec := spec.MaxIdleSec
+		if maxIdleSec == 0 {
+			maxIdleSec = 3600 // default 1 hour
+		}
+
+		info, pc, err := pe.PipedSession(context.Background(), sb.EngineID, spec.Cmd, spec.Env, maxIdleSec)
+		if err != nil {
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"start: `+err.Error()+`"}`))
+			return
+		}
+		pipedConn = pc
+		sessionID = info.SessionID
+	}
+	defer pipedConn.Close()
+
+	// Send session info
+	if meta, err := json.Marshal(map[string]string{
+		"type": "session", "session_id": sessionID,
+	}); err == nil {
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		conn.WriteMessage(websocket.TextMessage, meta)
+	}
+
+	// Record event
+	user := UserFromContext(r.Context())
+	start := time.Now()
+	reattach := sessionParam != ""
+	defer func() {
+		s.RecordEvent(store.Event{
+			Type: "exec.piped_session", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{
+				"sandbox":    sb.Name,
+				"session_id": sessionID,
+				"reattach":   reattach,
+				"duration_s": int(time.Since(start).Seconds()),
+			},
+		})
+	}()
+
+	// Bidirectional relay
+	pipedWSRelay(conn, pipedConn)
+}
+
+// pipedWSRelay bridges a WebSocket and a piped session connection.
+// WebSocket text messages → STDIN frames to child.
+// STDOUT frames from child → WebSocket text messages.
+// EXIT frame → WebSocket close.
+func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn) {
+	var wsMu sync.Mutex
+	wsWrite := func(msgType int, data []byte) error {
+		wsMu.Lock()
+		defer wsMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		return conn.WriteMessage(msgType, data)
+	}
+
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	closeDone := func() { closeOnce.Do(func() { close(done) }) }
+
+	// Ping/pong keepalive
+	conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
+		return nil
+	})
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := wsWrite(websocket.PingMessage, nil); err != nil {
+					closeDone()
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Piped session → WebSocket (STDOUT/EXIT frames)
+	go func() {
+		defer closeDone()
+		for {
+			frameType, payload, err := pc.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch frameType {
+			case proto.STDOUT, proto.STDERR:
+				if err := wsWrite(websocket.TextMessage, payload); err != nil {
+					return
+				}
+			case proto.EXIT:
+				code, _ := proto.ParseExitCode(payload)
+				exitMsg, _ := json.Marshal(map[string]any{
+					"type": "exit", "exit_code": code,
+				})
+				wsWrite(websocket.TextMessage, exitMsg)
+				wsWrite(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				return
+			case proto.ERROR:
+				errMsg, _ := json.Marshal(map[string]any{
+					"type": "error", "message": string(payload),
+				})
+				wsWrite(websocket.TextMessage, errMsg)
+				return
+			}
+		}
+	}()
+
+	// WebSocket → piped session (text messages → STDIN frames)
+	go func() {
+		defer closeDone()
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := pc.WriteStdin(msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	<-done
+}
+
+// --- Sessions ---
 
 func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {

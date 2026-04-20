@@ -240,7 +240,7 @@ func readHostInput(conn net.Conn, sess *Session) {
 				sess.Master.Write(payload)
 			}
 		case proto.RESIZE:
-			if sess.Master != nil {
+			if sess.TTY && sess.Master != nil {
 				if r, c, ok := proto.ParseResize(payload); ok {
 					setWinsize(sess.Master, r, c)
 				}

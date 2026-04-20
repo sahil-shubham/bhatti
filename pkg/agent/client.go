@@ -546,6 +546,131 @@ func (c *AgentClient) SessionAttach(ctx context.Context, sessionID string, ifDet
 	return &info, &agentTermConn{conn: conn}, nil
 }
 
+// --- Piped Sessions (non-TTY, with scrollback+reattach) ---
+
+// PipedSessionConn wraps a vsock connection for piped session I/O.
+// Read returns STDOUT/EXIT frame payloads. Write sends STDIN frames.
+type PipedSessionConn struct {
+	conn net.Conn
+}
+
+// ReadFrame reads the next frame. Returns the frame type and payload.
+// Callers check for STDOUT (data), EXIT (process ended), ERROR.
+func (p *PipedSessionConn) ReadFrame() (byte, []byte, error) {
+	return proto.ReadFrame(p.conn)
+}
+
+// WriteStdin sends bytes as a STDIN frame.
+func (p *PipedSessionConn) WriteStdin(data []byte) error {
+	return proto.WriteFrame(p.conn, proto.STDIN, data)
+}
+
+// Kill sends a KILL frame.
+func (p *PipedSessionConn) Kill() error {
+	return proto.WriteFrame(p.conn, proto.KILL, nil)
+}
+
+// Close closes the underlying connection. The session detaches
+// but the process keeps running.
+func (p *PipedSessionConn) Close() error {
+	return p.conn.Close()
+}
+
+// PipedSession creates a non-TTY session for a long-running process.
+// Returns the session info and a bidirectional connection that relays
+// STDIN/STDOUT frames. The session survives host disconnect and is
+// reattachable via PipedSessionAttach.
+func (c *AgentClient) PipedSession(ctx context.Context, argv []string,
+	env map[string]string, maxIdleSec int) (*proto.SessionInfo, *PipedSessionConn, error) {
+
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	session := true
+	req := proto.ExecRequest{
+		Argv:    argv,
+		Env:     env,
+		Session: &session,
+	}
+	if maxIdleSec > 0 {
+		req.MaxIdleSec = &maxIdleSec
+	}
+	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+
+	// Read SESSION_INFO
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("read session info: %w", err)
+	}
+	if msgType == proto.ERROR {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.SESSION_INFO {
+		conn.Close()
+		return nil, nil, fmt.Errorf("expected SESSION_INFO, got 0x%02x", msgType)
+	}
+	var info proto.SessionInfo
+	if err := json.Unmarshal(payload, &info); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("parse session info: %w", err)
+	}
+
+	return &info, &PipedSessionConn{conn: conn}, nil
+}
+
+// PipedSessionAttach reconnects to an existing piped session.
+// Returns the session info and a PipedSessionConn for I/O.
+func (c *AgentClient) PipedSessionAttach(ctx context.Context,
+	sessionID string, ifDetached bool) (*proto.SessionInfo, *PipedSessionConn, error) {
+
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req := proto.ExecRequest{SessionID: &sessionID}
+	if ifDetached {
+		req.IfDetached = &ifDetached
+	}
+	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+
+	// Read SESSION_INFO (or ERROR)
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("read session info: %w", err)
+	}
+	if msgType == proto.ERROR {
+		conn.Close()
+		return nil, nil, fmt.Errorf("agent: %s", payload)
+	}
+	if msgType != proto.SESSION_INFO {
+		conn.Close()
+		return nil, nil, fmt.Errorf("expected SESSION_INFO, got 0x%02x", msgType)
+	}
+	var info proto.SessionInfo
+	if err := json.Unmarshal(payload, &info); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("parse session info: %w", err)
+	}
+
+	// Scrollback follows as STDOUT frames before the live stream.
+	// The caller handles these identically to live STDOUT frames.
+	return &info, &PipedSessionConn{conn: conn}, nil
+}
+
+// --- File Operations ---
+
 // FileRead reads a file from the guest and writes its contents to w.
 // Returns the file size and mode.
 // FileReadOpts controls server-side truncation for file reads.

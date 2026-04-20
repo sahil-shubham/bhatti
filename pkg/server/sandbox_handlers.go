@@ -456,6 +456,12 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Handle exec/ws sub-route for piped sessions
+		if sub == "exec/ws" {
+			s.handleSandboxExecWS(w, r, id)
+			return
+		}
+
 		switch sub {
 		case "stop":
 			s.handleSandboxStop(w, r, id)

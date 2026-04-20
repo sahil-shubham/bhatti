@@ -153,6 +153,48 @@ func (e *Engine) ShellAttach(ctx context.Context, id, sessionID string, ifDetach
 	return ag.SessionAttach(ctx, sessionID, ifDetached)
 }
 
+// PipedSession creates a non-TTY session with scrollback and reattach.
+// Implements engine.PipedSessionEngine.
+func (e *Engine) PipedSession(ctx context.Context, id string, cmd []string,
+	env map[string]string, maxIdleSec int) (*proto.SessionInfo, engine.PipedConn, error) {
+
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vm.stateMu.Lock()
+	if vm.Thermal != "hot" {
+		vm.stateMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	ag := vm.Agent
+	vm.stateMu.Unlock()
+
+	return ag.PipedSession(ctx, cmd, env, maxIdleSec)
+}
+
+// PipedSessionAttach reconnects to an existing piped session.
+// Implements engine.PipedSessionEngine.
+func (e *Engine) PipedSessionAttach(ctx context.Context, id, sessionID string,
+	ifDetached bool) (*proto.SessionInfo, engine.PipedConn, error) {
+
+	vm, err := e.getVM(id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vm.stateMu.Lock()
+	if vm.Thermal != "hot" {
+		vm.stateMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
+	}
+	ag := vm.Agent
+	vm.stateMu.Unlock()
+
+	return ag.PipedSessionAttach(ctx, sessionID, ifDetached)
+}
+
 func (e *Engine) ListeningPorts(ctx context.Context, id string) ([]int, error) {
 	vm, err := e.getVM(id)
 	if err != nil {

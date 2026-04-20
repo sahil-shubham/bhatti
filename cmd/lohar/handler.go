@@ -99,6 +99,9 @@ func handleControlConnection(conn net.Conn) {
 		} else if req.TTY != nil && *req.TTY {
 			// Create new TTY session
 			handleTTYSession(conn, req)
+		} else if req.Session != nil && *req.Session {
+			// Non-TTY session with scrollback+reattach (for embedding pi --mode rpc)
+			handlePipedSession(conn, req)
 		} else {
 			// Non-TTY exec (one-shot, blocks until done)
 			handlePipedExec(conn, req)

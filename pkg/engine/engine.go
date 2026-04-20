@@ -148,6 +148,25 @@ type ShellSessioner interface {
 	ShellSession(ctx context.Context, id string) (string, TerminalConn, error)
 }
 
+// PipedConn is a bidirectional frame-level connection for piped sessions.
+// Unlike TerminalConn (byte-stream), PipedConn exposes the underlying
+// frame protocol so callers can distinguish STDOUT, EXIT, and ERROR frames.
+type PipedConn interface {
+	ReadFrame() (msgType byte, payload []byte, err error)
+	WriteStdin(data []byte) error
+	Kill() error
+	Close() error
+}
+
+// PipedSessionEngine is optionally implemented by engines that support
+// non-TTY persistent sessions with scrollback and reattach.
+type PipedSessionEngine interface {
+	PipedSession(ctx context.Context, id string, cmd []string,
+		env map[string]string, maxIdleSec int) (*proto.SessionInfo, PipedConn, error)
+	PipedSessionAttach(ctx context.Context, id, sessionID string,
+		ifDetached bool) (*proto.SessionInfo, PipedConn, error)
+}
+
 // Engine is the sandbox lifecycle interface.
 type Engine interface {
 	Create(ctx context.Context, spec SandboxSpec) (SandboxInfo, error)

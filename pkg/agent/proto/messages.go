@@ -13,6 +13,7 @@ type ExecRequest struct {
 	IfDetached *bool             `json:"if_detached,omitempty"`    // attach only if session is detached
 	Detach     *bool             `json:"detach,omitempty"`         // fire-and-forget: start and return PID immediately
 	OutputFile *string           `json:"output_file,omitempty"`    // detach: redirect stdout/stderr to this file
+	Session    *bool             `json:"session,omitempty"`        // non-TTY session with scrollback+reattach (piped)
 }
 
 // ActivityInfo reports the agent's activity state.
