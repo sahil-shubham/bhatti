@@ -610,7 +610,7 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 	}
 }
 
-// registerTierImages ensures the built-in rootfs tiers (minimal, browser, docker)
+// registerTierImages ensures the built-in rootfs tiers (minimal, browser, docker, computer)
 // are registered in the images table as admin images (user_id=''). This allows
 // users to specify --image browser or --image minimal on create.
 func registerTierImages(cfg *pkg.Config, st *store.Store) {
@@ -623,7 +623,7 @@ func registerTierImages(cfg *pkg.Config, st *store.Store) {
 		}
 	}
 
-	tiers := []string{"minimal", "browser", "docker"}
+	tiers := []string{"minimal", "browser", "docker", "computer"}
 	for _, tier := range tiers {
 		path := filepath.Join(cfg.DataDir, "images", fmt.Sprintf("rootfs-%s-%s.ext4", tier, arch))
 		info, err := os.Stat(path)
