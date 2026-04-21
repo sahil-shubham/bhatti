@@ -79,15 +79,27 @@ func TestPublishDuplicatePort(t *testing.T) {
 	_, ts := setup(t)
 	sb := createSandbox(t, ts, uniqueName(t, "pub"))
 
-	doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/publish", map[string]interface{}{
+	resp1 := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/publish", map[string]interface{}{
 		"port": 3000, "alias": "first",
 	})
+	var rule1 map[string]interface{}
+	decodeJSON(t, resp1, &rule1)
+
+	// Duplicate port on same sandbox — idempotent, returns existing rule
 	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/publish", map[string]interface{}{
 		"port": 3000, "alias": "second",
 	})
 	defer resp.Body.Close()
-	if resp.StatusCode != 409 {
-		t.Fatalf("expected 409, got %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 (idempotent), got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Bhatti-Existing") != "true" {
+		t.Error("missing X-Bhatti-Existing header")
+	}
+	var rule2 map[string]interface{}
+	decodeJSON(t, resp, &rule2)
+	if rule2["alias"] != "first" {
+		t.Errorf("expected original alias 'first', got %v", rule2["alias"])
 	}
 }
 

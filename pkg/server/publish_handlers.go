@@ -134,6 +134,24 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID
 	if err := s.store.CreatePublishRule(rule); err != nil {
 		if strings.Contains(err.Error(), "already taken") ||
 			strings.Contains(err.Error(), "already published") {
+			// Idempotent: return the existing rule instead of 409
+			existing, lerr := s.store.ListPublishRules(sb.ID)
+			if lerr == nil {
+				for _, r := range existing {
+					if r.Port == req.Port {
+						w.Header().Set("X-Bhatti-Existing", "true")
+						writeJSON(w, 200, map[string]interface{}{
+							"id":         r.ID,
+							"sandbox_id": sb.ID,
+							"port":       r.Port,
+							"alias":      r.Alias,
+							"url":        publishedURL(r.Alias, s.proxyZone, s.publicProxyAddr),
+							"created_at": r.CreatedAt,
+						})
+						return
+					}
+				}
+			}
 			errResp(w, 409, err.Error())
 		} else {
 			errResp(w, 500, err.Error())
