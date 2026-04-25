@@ -1,10 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/spf13/cobra"
 )
 
@@ -72,9 +78,56 @@ Use --tiers to install additional rootfs tiers during the update.`,
 
 // --- version ---
 
+const githubRepo = "sahil-shubham/bhatti"
+
+// checkLatestRelease queries GitHub for the latest release tag.
+// Returns empty string on any failure (timeout, network, parse error).
+// Caches the result to ~/.bhatti/.latest-version for 1 hour.
+func checkLatestRelease() string {
+	cacheDir := pkg.DefaultDataDir()
+	cachePath := filepath.Join(cacheDir, ".latest-version")
+
+	// Check cache (format: "v1.6.5\n1713980400" = version + unix timestamp)
+	if data, err := os.ReadFile(cachePath); err == nil {
+		parts := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+		if len(parts) == 2 {
+			var ts int64
+			fmt.Sscanf(parts[1], "%d", &ts)
+			if time.Now().Unix()-ts < 3600 { // 1 hour TTL
+				return parts[0]
+			}
+		}
+	}
+
+	// Fetch from GitHub (2s timeout)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/" + githubRepo + "/releases/latest")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil || release.TagName == "" {
+		return ""
+	}
+
+	// Write cache
+	os.MkdirAll(cacheDir, 0700)
+	content := fmt.Sprintf("%s\n%d", release.TagName, time.Now().Unix())
+	os.WriteFile(cachePath, []byte(content), 0600)
+
+	return release.TagName
+}
+
 var versionCmd = &cobra.Command{
 	Use:   "version",
-	Short: "Print version and API endpoint",
+	Short: "Print version and check for updates",
 	Example: `  bhatti version
   bhatti version --json`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -85,6 +138,12 @@ var versionCmd = &cobra.Command{
 			serverVer = resp.Header.Get("X-Bhatti-Version")
 		}
 
+		// Check latest release (cached, 2s timeout)
+		latestVer := ""
+		if version != "dev" {
+			latestVer = checkLatestRelease()
+		}
+
 		if isJSON(cmd) {
 			out := map[string]string{
 				"version": version,
@@ -93,13 +152,34 @@ var versionCmd = &cobra.Command{
 			if serverVer != "" {
 				out["server_version"] = serverVer
 			}
+			if latestVer != "" {
+				out["latest_version"] = latestVer
+			}
 			outputJSON(out)
 		} else {
 			fmt.Printf("bhatti %s\n", version)
 			fmt.Printf("api: %s\n", apiURL)
 			if serverVer != "" && serverVer != "dev" {
 				fmt.Printf("server: %s\n", serverVer)
-				if version != "dev" && compareVersions(version, serverVer) < 0 {
+			}
+
+			// Show update notices
+			if version != "dev" && latestVer != "" {
+				normVersion := "v" + strings.TrimPrefix(version, "v")
+				normLatest := "v" + strings.TrimPrefix(latestVer, "v")
+				normServer := ""
+				if serverVer != "" && serverVer != "dev" {
+					normServer = "v" + strings.TrimPrefix(serverVer, "v")
+				}
+
+				if compareVersions(normVersion, normLatest) < 0 {
+					fmt.Printf("\nUpdate available: %s \u2192 %s (bhatti update)\n", normVersion, normLatest)
+				} else if normServer != "" && compareVersions(normServer, normLatest) < 0 {
+					fmt.Printf("\nUpdate available for server: %s \u2192 %s (sudo bhatti update)\n", normServer, normLatest)
+				}
+			} else if version != "dev" && serverVer != "" && serverVer != "dev" {
+				// Fallback: no GitHub info, compare CLI vs server (existing behavior)
+				if compareVersions(version, serverVer) < 0 {
 					fmt.Printf("\nUpdate available: %s \u2192 %s (bhatti update)\n", version, serverVer)
 				}
 			}
