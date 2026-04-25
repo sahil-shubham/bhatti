@@ -30,9 +30,9 @@ GREEN='\033[32m'
 RED='\033[31m'
 RESET='\033[0m'
 
-info()    { printf "  ${DIM}%s${RESET}\n" "$*"; }
-heading() { printf "\n${BOLD}==> %s${RESET}\n" "$*"; }
-success() { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
+info()    { [ "${QUIET:-}" = "1" ] && return; printf "  ${DIM}%s${RESET}\n" "$*"; }
+heading() { [ "${QUIET:-}" = "1" ] && return; printf "\n${BOLD}==> %s${RESET}\n" "$*"; }
+success() { [ "${QUIET:-}" = "1" ] && return; printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
 
 die() {
     printf "\n${RED}error: %s${RESET}\n" "$1" >&2
@@ -744,6 +744,12 @@ main() {
 
                     case "$mode" in
                         server)
+                            # Check root BEFORE asking for tier
+                            [ "$(id -u)" -eq 0 ] || die "server installation requires root" \
+                                                        "Re-run with:" \
+                                                        "  sudo bhatti update" \
+                                                        "  curl -fsSL bhatti.sh/install | sudo bash"
+
                             local tier="${BHATTI_TIER:-}"
 
                             if [ -z "$tier" ]; then
@@ -779,7 +785,55 @@ main() {
     esac
 }
 
+# ── Flag parsing ──────────────────────────────────────
+# Flags override env vars. Parsed before main() so they work
+# both when run directly and via curl|bash -s -- --flags.
+
+usage() {
+    cat <<EOF
+Usage: install.sh [flags]
+
+Flags:
+  --tier <name>       Tier for fresh install (minimal, browser, docker, computer)
+  --tiers <list|all>  Additional tiers to install on update (comma-separated or "all")
+  --mode <cli|server> Skip install type prompt
+  --force             Skip major version upgrade confirmation
+  --quiet             Suppress output (exit code only, for CI)
+  --verbose           Enable debug output (set -x)
+  -h, --help          Show this help
+
+Environment variables (equivalent, for piped installs):
+  BHATTI_TIER, BHATTI_TIERS, BHATTI_MODE, BHATTI_FORCE=1
+
+Examples:
+  curl -fsSL bhatti.sh/install | bash                             # CLI (auto-detected)
+  curl -fsSL bhatti.sh/install | sudo bash                        # server (prompted)
+  curl -fsSL bhatti.sh/install | sudo bash -s -- --tiers all      # flags via pipe
+  sudo ./scripts/install.sh --tier computer                       # server, computer tier
+  sudo ./scripts/install.sh --tiers all                           # update + pull all tiers
+EOF
+}
+
+parse_flags() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tier)    BHATTI_TIER="$2"; shift 2 ;;
+            --tier=*)  BHATTI_TIER="${1#--tier=}"; shift ;;
+            --tiers)   BHATTI_TIERS="$2"; shift 2 ;;
+            --tiers=*) BHATTI_TIERS="${1#--tiers=}"; shift ;;
+            --mode)    BHATTI_MODE="$2"; shift 2 ;;
+            --mode=*)  BHATTI_MODE="${1#--mode=}"; shift ;;
+            --force)   BHATTI_FORCE=1; shift ;;
+            --quiet)   QUIET=1; shift ;;
+            --verbose) VERBOSE=1; set -x; shift ;;
+            --help|-h) usage; exit 0 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+}
+
 # Allow sourcing for tests without executing main
 if [ "${BHATTI_TEST:-}" != "1" ]; then
+    parse_flags "$@"
     main
 fi

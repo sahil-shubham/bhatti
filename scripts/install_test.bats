@@ -204,3 +204,58 @@ EOF
     result=$(major_version 12.0.0)
     [ "$result" = "12" ]
 }
+
+# ── Flag parsing ─────────────────────────────────────
+
+@test "parse_flags: --tier browser sets BHATTI_TIER" {
+    BHATTI_TIER=""
+    parse_flags --tier browser
+    [ "$BHATTI_TIER" = "browser" ]
+}
+
+@test "parse_flags: --tier=browser (equals syntax)" {
+    BHATTI_TIER=""
+    parse_flags --tier=browser
+    [ "$BHATTI_TIER" = "browser" ]
+}
+
+@test "parse_flags: --tiers all sets BHATTI_TIERS" {
+    BHATTI_TIERS=""
+    parse_flags --tiers all
+    [ "$BHATTI_TIERS" = "all" ]
+}
+
+@test "parse_flags: --tiers computer,browser" {
+    BHATTI_TIERS=""
+    parse_flags --tiers computer,browser
+    [ "$BHATTI_TIERS" = "computer,browser" ]
+}
+
+@test "parse_flags: --force sets BHATTI_FORCE" {
+    BHATTI_FORCE=""
+    parse_flags --force
+    [ "$BHATTI_FORCE" = "1" ]
+}
+
+@test "parse_flags: --quiet sets QUIET" {
+    QUIET=""
+    parse_flags --quiet
+    [ "$QUIET" = "1" ]
+}
+
+@test "parse_flags: unknown flag exits non-zero" {
+    run parse_flags --bogus
+    [ "$status" -ne 0 ]
+}
+
+@test "parse_flags: flags override env vars" {
+    BHATTI_TIER="minimal"
+    parse_flags --tier browser
+    [ "$BHATTI_TIER" = "browser" ]
+}
+
+@test "parse_flags: --help exits 0" {
+    run parse_flags --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
+}
