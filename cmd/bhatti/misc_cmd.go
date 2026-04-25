@@ -12,8 +12,36 @@ import (
 
 var updateCmd = &cobra.Command{
 	Use:   "update",
-	Short: "Update bhatti CLI to the latest version",
+	Short: "Update bhatti to the latest version",
+	Long: `Update bhatti to the latest release. On a server, updates all
+components (bhatti, Firecracker, lohar, kernel, rootfs). On a CLI-only
+machine, updates just the binary.
+
+Use --cli-only to update only the binary on a server.
+Use --tiers to install additional rootfs tiers during the update.`,
+	Example: `  bhatti update                   # auto-detect CLI vs server
+  sudo bhatti update               # server update (requires root)
+  sudo bhatti update --tiers all   # server update + pull all tiers
+  bhatti update --cli-only         # binary only, even on a server`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cliOnly, _ := cmd.Flags().GetBool("cli-only")
+		tiers, _ := cmd.Flags().GetString("tiers")
+
+		// Detect if this is a server by checking for config file
+		isServer := false
+		for _, p := range []string{"/etc/bhatti/config.yaml", "/var/lib/bhatti/config.yaml"} {
+			if _, err := os.Stat(p); err == nil {
+				isServer = true
+				break
+			}
+		}
+
+		// Fail fast: server update requires root, don't download the
+		// install script just to fail inside it.
+		if !cliOnly && isServer && os.Getuid() != 0 {
+			return fmt.Errorf("server update requires root\n  Re-run with: sudo bhatti update")
+		}
+
 		fmt.Printf("Current version: %s\n", version)
 
 		// Find a shell to run the installer
@@ -26,7 +54,18 @@ var updateCmd = &cobra.Command{
 		install := exec.Command(shellBin, "-c", "curl -fsSL bhatti.sh/install | bash")
 		install.Stdout = os.Stdout
 		install.Stderr = os.Stderr
-		install.Env = append(os.Environ(), "BHATTI_MODE=cli")
+
+		// Build env: let install.sh auto-detect server vs CLI.
+		// Only force CLI mode if --cli-only is set.
+		env := os.Environ()
+		if cliOnly {
+			env = append(env, "BHATTI_MODE=cli")
+		}
+		if tiers != "" {
+			env = append(env, "BHATTI_TIERS="+tiers)
+		}
+		install.Env = env
+
 		return install.Run()
 	},
 }

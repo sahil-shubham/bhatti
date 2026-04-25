@@ -103,6 +103,8 @@ func init() {
 	rootCmd.AddCommand(userCmd)
 	rootCmd.AddCommand(adminCmd)
 	rootCmd.AddCommand(setupCmd)
+	updateCmd.Flags().Bool("cli-only", false, "Update only the CLI binary, even on a server")
+	updateCmd.Flags().String("tiers", "", "Install additional rootfs tiers (comma-separated or \"all\")")
 	rootCmd.AddCommand(updateCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(completionCmd)

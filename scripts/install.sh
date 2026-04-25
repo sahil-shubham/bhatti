@@ -475,6 +475,7 @@ do_server_install() {
 
     [ "$(id -u)" -eq 0 ] || die "server installation requires root" \
                                 "Re-run with:" \
+                                "  sudo bhatti update" \
                                 "  curl -fsSL bhatti.sh/install | sudo bash"
 
     # Preflight
@@ -534,6 +535,7 @@ do_server_install() {
 do_server_update() {
     [ "$(id -u)" -eq 0 ] || die "server update requires root" \
                                 "Re-run with:" \
+                                "  sudo bhatti update" \
                                 "  curl -fsSL bhatti.sh/install | sudo bash"
 
     local tier current
