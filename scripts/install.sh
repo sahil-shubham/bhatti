@@ -684,8 +684,13 @@ do_server_install() {
     echo "    sudo bhatti user create --name alice"
     echo "    sudo bhatti user list"
     echo ""
-    echo "  ⚠  BACK UP: $DATA_DIR/age.key"
-    echo "     If lost, all encrypted secrets become unrecoverable."
+    if [ -f "$DATA_DIR/age.key" ]; then
+        echo "  ⚠  BACK UP: $DATA_DIR/age.key"
+        echo "     If lost, all encrypted secrets become unrecoverable."
+    else
+        echo "  ⚠  When you first use 'bhatti secret set', an encryption"
+        echo "     key is created at $DATA_DIR/age.key — back it up."
+    fi
     echo ""
     # Hint about other available tiers
     local other_tiers=""

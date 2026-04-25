@@ -238,7 +238,7 @@ var startCmd = &cobra.Command{
 		if isJSON(cmd) {
 			outputJSON(sb)
 		} else {
-			fmt.Printf("started (%s)\n", sb["status"])
+			fmt.Println("started")
 		}
 		return nil
 	},

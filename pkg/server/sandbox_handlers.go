@@ -603,7 +603,12 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 		Type: "sandbox.stopped", UserID: user.ID, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": "api"},
 	})
-	updated, _ := s.store.GetSandboxByID(sb.ID)
+	updated, err := s.store.GetSandboxByID(sb.ID)
+	if err != nil {
+		sb.Status = "stopped"
+		writeJSON(w, 200, sb)
+		return
+	}
 	writeJSON(w, 200, updated)
 }
 
@@ -634,6 +639,13 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 		Type: "sandbox.started", UserID: user.ID, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": "api"},
 	})
-	updated, _ := s.store.GetSandboxByID(id)
+	updated, err := s.store.GetSandboxByID(id)
+	if err != nil {
+		// Start succeeded but DB refresh failed — return the original sandbox
+		// with updated status rather than null.
+		sb.Status = "running"
+		writeJSON(w, 200, sb)
+		return
+	}
 	writeJSON(w, 200, updated)
 }
