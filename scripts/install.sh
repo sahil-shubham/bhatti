@@ -59,8 +59,11 @@ _err_trap() {
 }
 trap '_err_trap $LINENO' ERR
 
-# Clean up temp files on any exit
-_cleanup() { rm -f /tmp/bhatti.tmp; }
+# Clean up temp files on any exit (including staged downloads)
+_cleanup() {
+    rm -f /tmp/bhatti.tmp
+    rm -f /usr/local/bin/bhatti.tmp.$$ 2>/dev/null || true
+}
 trap '_cleanup' EXIT
 
 # ── Platform detection ────────────────────────────────
@@ -84,12 +87,21 @@ download() {
     local url="$1" dest="$2"
     local http_code
 
-    http_code=$(curl -fsSL -w '%{http_code}' -o "$dest" "$url") || {
+    # Don't use -f (fail fast) — it causes curl to exit before writing
+    # the -w output, so $http_code would be empty in the error path.
+    http_code=$(curl -sSL -w '%{http_code}' -o "$dest" "$url") || {
         rm -f "$dest"
         die "download failed: $url" \
-            "HTTP status: ${http_code:-unknown}" \
+            "curl error (network issue or invalid URL)" \
             "Check your network connection and try again."
     }
+
+    if [ "$http_code" -ge 400 ] 2>/dev/null; then
+        rm -f "$dest"
+        die "download failed: $url" \
+            "HTTP status: $http_code" \
+            "Check your network connection and try again."
+    fi
 
     if [ ! -s "$dest" ]; then
         rm -f "$dest"
@@ -205,12 +217,17 @@ detect_tier() {
         fi
     fi
     # Fallback: glob (for fresh installs where config doesn't exist yet)
+    # Prefer "minimal" as the safest default if multiple tiers exist.
+    local found_tier=""
     for f in "$DATA_DIR/images/rootfs-"*"-${ARCH}.ext4"; do
         [ -f "$f" ] || continue
-        basename "$f" | sed "s/rootfs-//;s/-${ARCH}\.ext4//"
-        return 0
+        local t
+        t=$(basename "$f" | sed "s/rootfs-//;s/-${ARCH}\.ext4//")
+        [ "$t" = "minimal" ] && { echo "minimal"; return 0; }
+        found_tier="$t"
     done
-    echo "minimal"
+    # No minimal found — return first available, or default
+    echo "${found_tier:-minimal}"
 }
 
 # ── Version queries ───────────────────────────────────
@@ -237,13 +254,44 @@ installed_fc_version() {
 
 install_bhatti_binary() {
     local binary="bhatti-${OS}-${ARCH}"
-    download "${RELEASE_URL}/${binary}" /tmp/bhatti.tmp
-    chmod +x /tmp/bhatti.tmp
+    local dest="/usr/local/bin/bhatti"
+    local tmp="${dest}.tmp.$$"
+
+    # Stage to same filesystem as destination — mv is atomic rename.
+    # Cross-filesystem mv (e.g. /tmp → /usr/local/bin) falls back to
+    # copy+delete which is not atomic.
+    if [ -w "/usr/local/bin" ]; then
+        download "${RELEASE_URL}/${binary}" "$tmp"
+    else
+        sudo touch "$tmp" 2>/dev/null || true
+        download "${RELEASE_URL}/${binary}" "$tmp"
+    fi
+    chmod +x "$tmp"
+
+    # Verify the binary actually executes (catches HTML error pages,
+    # wrong-arch binaries, truncated downloads)
+    if ! "$tmp" version >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "downloaded binary failed to execute" \
+            "This usually means the download was corrupted or" \
+            "the wrong platform binary was downloaded." \
+            "Expected: ${OS}/${ARCH}"
+    fi
+
+    # macOS: remove quarantine attribute to prevent Gatekeeper dialog
+    if [ "$OS" = "darwin" ]; then
+        xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
+    fi
+
+    # Backup previous binary for manual rollback
+    if [ -f "$dest" ]; then
+        cp "$dest" "${dest}.old" 2>/dev/null || true
+    fi
 
     if [ -w "/usr/local/bin" ]; then
-        mv /tmp/bhatti.tmp /usr/local/bin/bhatti
+        mv "$tmp" "$dest"
     else
-        sudo mv /tmp/bhatti.tmp /usr/local/bin/bhatti
+        sudo mv "$tmp" "$dest"
     fi
 }
 
@@ -630,6 +678,10 @@ do_server_update() {
         mv "$DATA_DIR/config.yaml" /etc/bhatti/config.yaml
         info "Migrated config to /etc/bhatti/config.yaml"
     fi
+    # INVARIANT: do_server_update NEVER overwrites /etc/bhatti/config.yaml.
+    # The operator's config is preserved across updates. Only
+    # do_server_install generates a fresh config. If the config schema
+    # changes, handle it via migration logic, not regeneration.
     # admin user is PRESERVED
 
     if [ "$was_running" = true ]; then
