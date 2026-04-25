@@ -577,6 +577,17 @@ do_server_install() {
     echo ""
     echo "  ⚠  BACK UP: $DATA_DIR/age.key"
     echo "     If lost, all encrypted secrets become unrecoverable."
+    echo ""
+    # Hint about other available tiers
+    local other_tiers=""
+    for t in minimal browser docker computer; do
+        [ "$t" = "$tier" ] && continue
+        other_tiers="${other_tiers:+$other_tiers, }$t"
+    done
+    if [ -n "$other_tiers" ]; then
+        echo "  Other tiers available: ${other_tiers}"
+        echo "  Install with: sudo bhatti update --tiers all"
+    fi
     echo "============================================"
 }
 
@@ -698,8 +709,17 @@ do_server_update() {
     if [ "$was_running" = true ]; then
         echo "  systemd service: restarted"
     else
-        echo ""
-        echo "  Restart the daemon to use the new version."
+        # Detect non-systemd bhatti serve process
+        local serve_pid
+        serve_pid=$(pgrep -x bhatti 2>/dev/null | head -1 || true)
+        if [ -n "$serve_pid" ]; then
+            echo ""
+            echo "  ⚠  bhatti serve is running (PID ${serve_pid})"
+            echo "     Restart it to use ${VERSION}"
+        else
+            echo ""
+            echo "  Restart the daemon to use the new version."
+        fi
     fi
     echo "============================================"
 }

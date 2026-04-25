@@ -151,6 +151,6 @@ else
     echo "  Config preserved: /etc/bhatti/config.yaml"
     echo ""
     echo "  To reinstall:"
-    echo "    sudo ./scripts/install.sh --systemd"
+    echo "    curl -fsSL bhatti.sh/install | sudo bash"
 fi
 echo "============================================"
