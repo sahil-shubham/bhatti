@@ -97,7 +97,20 @@ The script detects Linux, prompts for self-host, and asks which rootfs tier you 
 ============================================
 ```
 
-Re-running the same command updates all components to the latest version.
+### Updating
+
+```bash
+bhatti update                   # CLI: updates the binary
+sudo bhatti update              # Server: updates all components
+sudo bhatti update --tiers all  # Server: also pull additional tiers
+```
+
+Or re-run the install command directly:
+
+```bash
+curl -fsSL bhatti.sh/install | bash         # CLI
+curl -fsSL bhatti.sh/install | sudo bash    # server
+```
 
 ### Start the daemon
 

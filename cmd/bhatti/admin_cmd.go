@@ -59,8 +59,17 @@ func adminStatusHuman(st *store.Store) error {
 	users, _ := st.ListUsers()
 	sandboxes, _ := st.ListAllSandboxes()
 
-	// Header
+	// Header + update check
 	fmt.Printf("Bhatti %s\n", version)
+	if version != "dev" {
+		if latestVer := checkLatestRelease(); latestVer != "" {
+			normVersion := "v" + strings.TrimPrefix(version, "v")
+			normLatest := "v" + strings.TrimPrefix(latestVer, "v")
+			if compareVersions(normVersion, normLatest) < 0 {
+				fmt.Printf("Update available: %s \u2192 %s (sudo bhatti update)\n", normVersion, normLatest)
+			}
+		}
+	}
 	if latest.HostLoad1m > 0 || latest.HostMemTotalMB > 0 {
 		fmt.Printf("Host: %.2f load, %.1f / %.1f GB memory\n",
 			latest.HostLoad1m,

@@ -706,6 +706,16 @@ do_server_update() {
     echo "============================================"
     echo "  bhatti updated to ${VERSION}"
     echo "  tiers: $(echo $tiers_to_install | tr ' ' ', ')"
+    # Hint about tiers not installed locally
+    local missing_tiers=""
+    for t in $ALL_KNOWN_TIERS; do
+        [ -f "$DATA_DIR/images/rootfs-${t}-${ARCH}.ext4" ] && continue
+        missing_tiers="${missing_tiers:+$missing_tiers, }$t"
+    done
+    if [ -n "$missing_tiers" ]; then
+        echo "  other tiers available: ${missing_tiers}"
+        echo "  install with: sudo bhatti update --tiers all"
+    fi
     if [ "$was_running" = true ]; then
         echo "  systemd service: restarted"
     else
@@ -720,6 +730,10 @@ do_server_update() {
             echo ""
             echo "  Restart the daemon to use the new version."
         fi
+    fi
+    if [ -f /usr/local/bin/bhatti.old ]; then
+        echo ""
+        echo "  Rollback: sudo mv /usr/local/bin/bhatti.old /usr/local/bin/bhatti"
     fi
     echo "============================================"
 }
