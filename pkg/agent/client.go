@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -344,23 +345,40 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
+	start := time.Now()
+	attempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("agent not ready: %w", err)
 		}
 
 		// Try a lightweight exec. If the agent responds, it's ready.
+		attempt++
+		attemptStart := time.Now()
 		execCtx, execCancel := context.WithTimeout(ctx, 2*time.Second)
 		result, err := c.Exec(execCtx, []string{"true"}, nil, "")
 		execCancel()
 
 		if err == nil && result.ExitCode == 0 {
+			slog.Debug("wait_ready.success",
+				"attempt", attempt,
+				"attempt_ms", time.Since(attemptStart).Milliseconds(),
+				"total_ms", time.Since(start).Milliseconds(),
+				"addr", c.tcpAddr)
 			return nil
 		}
 
+		slog.Debug("wait_ready.attempt_failed",
+			"attempt", attempt,
+			"attempt_ms", time.Since(attemptStart).Milliseconds(),
+			"total_ms", time.Since(start).Milliseconds(),
+			"error", err,
+			"addr", c.tcpAddr)
+
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("agent not ready: %w", ctx.Err())
+			return fmt.Errorf("agent not ready after %d attempts (%dms): %w",
+				attempt, time.Since(start).Milliseconds(), ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

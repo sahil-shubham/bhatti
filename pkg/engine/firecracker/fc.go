@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -64,6 +65,12 @@ func (e *Engine) startFCBare(socketPath string) (*fcProcess, error) {
 // startFCJailed launches FC inside a jailer chroot with UID drop, PID namespace,
 // and cgroup limits.
 func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess, error) {
+	jailStart := time.Now()
+	jailPhase := func(name string) {
+		slog.Debug("fc_jail.phase", "sandbox", opts.id, "phase", name,
+			"elapsed_ms", time.Since(jailStart).Milliseconds())
+	}
+
 	chrootBase := filepath.Join(e.cfg.DataDir, "jails")
 	jailRoot := filepath.Join(chrootBase, "firecracker", opts.id, "root")
 	// Clean stale jail from previous run (e.g. stop/start cycle).
@@ -73,6 +80,7 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 	if err := os.MkdirAll(jailRoot, 0700); err != nil {
 		return nil, fmt.Errorf("create jail root: %w", err)
 	}
+	jailPhase("mkdir_done")
 
 	// Hard-link all files FC needs into the chroot.
 	// Hard-links are instant (same filesystem) and FC writes go to the
@@ -89,6 +97,8 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 		}
 	}
 
+	jailPhase("hardlink_done")
+
 	// chown the chroot tree to the jail user so FC can write
 	uid, gid := e.cfg.JailUID, e.cfg.JailGID
 	filepath.Walk(jailRoot, func(path string, info os.FileInfo, err error) error {
@@ -97,6 +107,8 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 		}
 		return nil
 	})
+
+	jailPhase("chown_done")
 
 	// The API socket path as seen from inside the chroot.
 	// Must be short to stay under the 108-byte Unix socket limit.
@@ -138,6 +150,7 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 	// Everything after "--" is forwarded to firecracker
 	args = append(args, "--", "--api-sock", internalSock)
 
+	jailPhase("jailer_cmd_built")
 	cmd := exec.CommandContext(vmCtx, e.cfg.JailerBinary, args...)
 	cmd.Stderr = stderrBuf
 	if err := cmd.Start(); err != nil {
@@ -145,6 +158,7 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 		os.RemoveAll(filepath.Join(chrootBase, "firecracker", opts.id))
 		return nil, fmt.Errorf("start jailer: %w", err)
 	}
+	jailPhase("jailer_started")
 
 	// Wait for the API socket. Check process liveness via /proc to
 	// detect early death without calling cmd.Wait() (which can only
@@ -152,6 +166,7 @@ func (e *Engine) startFCJailed(socketPath string, opts startFCOpts) (*fcProcess,
 	socketReady := false
 	for i := 0; i < 100; i++ {
 		if _, err := os.Stat(hostSock); err == nil {
+			jailPhase("socket_ready")
 			socketReady = true
 			break
 		}

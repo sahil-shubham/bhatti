@@ -21,6 +21,12 @@ import (
 // --- Create ---
 
 func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engine.SandboxInfo, err error) {
+	createStart := time.Now()
+	phase := func(name string) {
+		slog.Debug("create.phase", "sandbox", spec.Name, "phase", name,
+			"elapsed_ms", time.Since(createStart).Milliseconds())
+	}
+
 	id := generateID()
 	sandboxDir := filepath.Join(e.cfg.DataDir, "sandboxes", id)
 	os.MkdirAll(sandboxDir, 0700)
@@ -61,6 +67,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}()
 
 	// 1. Copy rootfs (from resolved image path or default base)
+	phase("rootfs_copy_start")
 	baseImage := e.cfg.BaseRootfs
 	if spec.BaseImage != "" {
 		baseImage = spec.BaseImage
@@ -69,25 +76,31 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	if err = copyRootfs(baseImage, rootfsPath); err != nil {
 		return info, fmt.Errorf("copy rootfs: %w", err)
 	}
+	phase("rootfs_copy_done")
 
 	// 1b. Re-inject lohar into rootfs to prevent protocol drift.
 	// Saved images / OCI images may have an older lohar that doesn't
 	// understand new config drive fields (e.g. ReadOnly). Without this,
 	// the read_only JSON key is silently ignored → data corruption.
+	phase("lohar_inject_start")
 	if err = injectLoharIntoRootfs(rootfsPath, e.cfg.DataDir); err != nil {
 		slog.Warn("lohar injection failed", "error", err)
 		// Non-fatal — image's lohar may work, but warn loudly
 	}
+	phase("lohar_inject_done")
 
 	// 1c. Resize rootfs if requested
 	if spec.DiskSizeMB > 0 {
+		phase("resize_start")
 		exec.Command("e2fsck", "-f", "-y", rootfsPath).Run() // best effort
+		phase("e2fsck_done")
 		if err = exec.Command("truncate", "-s", fmt.Sprintf("%dM", spec.DiskSizeMB), rootfsPath).Run(); err != nil {
 			return info, fmt.Errorf("resize rootfs: %w", err)
 		}
 		if err = exec.Command("resize2fs", rootfsPath).Run(); err != nil {
 			return info, fmt.Errorf("resize2fs: %w", err)
 		}
+		phase("resize_done")
 	}
 
 	// 2. Allocate CID and paths
@@ -96,6 +109,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	vsockPath := filepath.Join(sandboxDir, "vsock.sock")
 
 	// 3. Get or create user's network, allocate IP, create TAP
+	phase("network_start")
 	userNet := e.getOrCreateUserNetwork(spec.UserID, spec.SubnetIndex)
 	if err = ensureUserBridge(userNet); err != nil {
 		return info, fmt.Errorf("setup user bridge: %w", err)
@@ -115,6 +129,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// gets a fresh MAC, so the host sends TCP SYNs to the old MAC —
 	// which no longer exists on any TAP. WaitReady times out at 30s.
 	exec.Command("ip", "neigh", "del", guestIP, "dev", userNet.BridgeName).Run() // best-effort
+	phase("network_done")
 
 	// 4. Compute VM config
 	vcpuCount := int64(spec.CPUs)
@@ -188,6 +203,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		name = id
 	}
 
+	phase("config_drive_start")
 	if err = createConfigDrive(configDrivePath, SandboxConfig{
 		SandboxID: id,
 		Hostname:  name,
@@ -201,8 +217,10 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}); err != nil {
 		return info, fmt.Errorf("create config drive: %w", err)
 	}
+	phase("config_drive_done")
 
 	// 5. Build path resolver for FC API calls
+	phase("resolve_paths")
 	jp := newJailPaths(e.cfg.jailed())
 
 	// Resolve ALL paths FC will reference — must happen before startFC
@@ -226,12 +244,14 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 
 	// Start Firecracker process
+	phase("fc_start_begin")
 	fcProc, err := e.startFC(socketPath, startFCOpts{
 		id: id, vcpus: vcpuCount, memMB: memMB, files: jp.files,
 	})
 	if err != nil {
 		return info, err
 	}
+	phase("fc_start_done")
 	fcCmd = fcProc.cmd
 	vmCancel = fcProc.cancel
 	stderrBuf := fcProc.stderrBuf
@@ -243,6 +263,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 
 	// 6. Configure via HTTP API
+	phase("fc_api_start")
 	client := fcAPIClient(apiSocket)
 
 	// FC logger and metrics must be set before any other configuration.
@@ -352,15 +373,19 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 
 	// 7. Boot
+	phase("instance_start")
 	if err = fcPut(ctx, client, "/actions", `{"action_type":"InstanceStart"}`); err != nil {
 		return info, fmt.Errorf("start instance: %w", err)
 	}
+	phase("instance_started")
 
 	// 8. Wait for agent via TCP (kernel ip= already configured eth0).
+	phase("wait_ready_start")
 	agentClient := agent.NewTCPClientWithAuth(guestIP, token)
 	if err = agentClient.WaitReady(ctx, 30*time.Second); err != nil {
 		return info, fmt.Errorf("agent not ready: %w", err)
 	}
+	phase("wait_ready_done")
 
 	vm := &VM{
 		ID: id, Name: name, UserID: spec.UserID,
@@ -374,9 +399,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		stderrBuf: stderrBuf, jailRoot: fcProc.jailRoot,
 	}
 
+	phase("mu_lock_wait")
 	e.mu.Lock()
 	e.vms[id] = vm
 	e.mu.Unlock()
+	phase("create_complete")
 
 	return engine.SandboxInfo{
 		ID: id, Name: name, Status: "running",

@@ -79,11 +79,18 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, enriched)
 	case http.MethodPost:
+		handlerStart := time.Now()
+		handlerPhase := func(name string) {
+			slog.Debug("create.handler", "phase", name,
+				"elapsed_ms", time.Since(handlerStart).Milliseconds())
+		}
+
 		var req createSandboxReq
 		if err := readJSON(r, &req); err != nil {
 			errResp(w, 400, "invalid json: "+err.Error())
 			return
 		}
+		handlerPhase("request_parsed")
 
 		// Enforce per-user sandbox count limit
 		count, _ := s.store.CountUserSandboxes(user.ID)
@@ -254,6 +261,8 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			spec.BaseImage = img.FilePath
 		}
 
+		handlerPhase("spec_built")
+
 		// Generate a sandbox ID for volume attachment tracking (before engine.Create)
 		sbID := genID()
 
@@ -359,7 +368,10 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			spec.ResolvedVolumes = resolvedVolumes
 		}
 
+		handlerPhase("volumes_resolved")
+		handlerPhase("engine_create_start")
 		info, err := s.engine.Create(r.Context(), spec)
+		handlerPhase("engine_create_done")
 		if err != nil {
 			// Rollback persistent volume attachments on engine failure
 			if len(resolvedVolumes) > 0 {
@@ -412,6 +424,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 		// Persist Firecracker VM state
 		s.saveVMState(sbID, info.EngineID)
+		handlerPhase("db_store_done")
 
 		slog.Info("sandbox.created",
 			"sandbox_id", sb.ID, "name", sb.Name, "user", user.Name,

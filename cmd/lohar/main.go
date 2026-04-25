@@ -34,6 +34,14 @@ func main() {
 	}
 
 	// --- PID 1 init ---
+	bootStart := time.Now()
+	var bootLog strings.Builder
+	bp := func(name string) {
+		line := fmt.Sprintf("+%dms %s\n", time.Since(bootStart).Milliseconds(), name)
+		fmt.Fprint(os.Stderr, "lohar: boot "+line)
+		bootLog.WriteString(line)
+	}
+	bp("start")
 
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	os.Setenv("HOME", "/root")
@@ -55,6 +63,7 @@ func main() {
 	// and any process using shm_open(3). Harmless when unused.
 	os.MkdirAll("/dev/shm", 0755)
 	mustMount("tmpfs", "/dev/shm", "tmpfs", 0, "")
+	bp("mounts_done")
 
 	// cgroups v2 — required by Docker for resource isolation.
 	// Mount unconditionally: zero overhead when unused, avoids
@@ -68,6 +77,7 @@ func main() {
 		[]byte("+cpu +memory +io +pids"), 0644)
 
 	bringUpInterface("lo")
+	bp("lo_up")
 
 	// Try to load config drive (/dev/vdb)
 	cfg := loadConfigDrive()
@@ -89,6 +99,7 @@ func main() {
 		configEnv = cfg.Env
 		writeConfigFiles(cfg.Files)
 		mountVolumes(cfg.Volumes)
+		bp("config_applied")
 
 		// Unmount config drive — it contains the agent token and env vars
 		// in plaintext JSON. No reason to keep it accessible after boot.
@@ -102,6 +113,7 @@ func main() {
 	}
 
 	setupNetworking()
+	bp("network_done")
 	installSignalHandlers()
 
 	// Listen on vsock (works for cold boot, broken after snapshot/restore).
@@ -134,6 +146,11 @@ func main() {
 	} else {
 		go acceptLoop(tcpForward, handleForwardConnection)
 	}
+
+	bp("tcp_listen")
+
+	// Write boot timing to a file readable via `bhatti file read`
+	os.WriteFile("/tmp/boot-timing.txt", []byte(bootLog.String()), 0644)
 
 	fmt.Fprintln(os.Stderr, "lohar: ready")
 
