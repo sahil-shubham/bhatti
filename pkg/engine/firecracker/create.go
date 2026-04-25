@@ -109,6 +109,13 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		return info, fmt.Errorf("create tap: %w", err)
 	}
 
+	// Flush stale ARP entry for this IP. When a sandbox is destroyed and
+	// a new one reuses the same IP, the host ARP cache still maps the IP
+	// to the old sandbox's MAC (STALE, gc_stale_time=60s). The new VM
+	// gets a fresh MAC, so the host sends TCP SYNs to the old MAC —
+	// which no longer exists on any TAP. WaitReady times out at 30s.
+	exec.Command("ip", "neigh", "del", guestIP, "dev", userNet.BridgeName).Run() // best-effort
+
 	// 4. Compute VM config
 	vcpuCount := int64(spec.CPUs)
 	if vcpuCount < 1 {
