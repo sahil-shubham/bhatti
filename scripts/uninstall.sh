@@ -114,6 +114,11 @@ if [[ "$PURGE" == "true" ]]; then
         rm -rf "$DATA_DIR"
     fi
 
+    if [[ -d /etc/bhatti ]]; then
+        echo "==> Removing /etc/bhatti"
+        rm -rf /etc/bhatti
+    fi
+
     # Remove CLI configs
     for cfg in /root/.bhatti; do
         if [[ -d "$cfg" ]]; then

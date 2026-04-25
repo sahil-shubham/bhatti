@@ -741,11 +741,6 @@ do_server_install() {
     echo "  bhatti ${VERSION} installed (${elapsed}s)"
     echo "  tier: ${tier}"
     echo ""
-    if [ -n "${ADMIN_KEY:-}" ]; then
-        echo "  Admin API key: ${ADMIN_KEY}"
-        echo "  (saved to ~/.bhatti/config.yaml)"
-        echo ""
-    fi
     echo "  Manage users:"
     echo "    sudo bhatti user create --name alice"
     echo "    sudo bhatti user list"
@@ -773,17 +768,46 @@ do_server_install() {
     echo "    curl -fsSL bhatti.sh/uninstall | sudo bash"
     echo "============================================"
 
-    # Offer to start the service (interactive only)
-    if command -v systemctl >/dev/null 2>&1 && [ -t 0 ] && [ "${QUIET:-}" != "1" ]; then
+    # Always start the service on fresh install. There's no reason to
+    # leave it stopped — the user just installed everything. If they
+    # want to run `bhatti serve` manually, they can disable the service.
+    if command -v systemctl >/dev/null 2>&1; then
         echo ""
-        printf "  Start bhatti now? [Y/n]: "
-        read -r start_choice < /dev/tty 2>/dev/null || start_choice="y"
-        case "${start_choice:-y}" in
-            n|N|no|NO) echo "  Skipped. Start later with: sudo systemctl enable --now bhatti" ;;
-            *) systemctl enable --now bhatti && success "bhatti service started" ;;
-        esac
-    else
-        info "Start with: sudo systemctl enable --now bhatti"
+        if systemctl enable --now bhatti 2>/dev/null; then
+            # Verify the service is actually healthy
+            local healthy=false
+            for i in 1 2 3 4 5; do
+                if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+                    healthy=true
+                    break
+                fi
+                sleep 1
+            done
+            if [ "$healthy" = true ]; then
+                success "bhatti service started and healthy"
+            else
+                printf "  ${RED}⚠  Service started but not responding on :8080${RESET}\n"
+                echo "  Check logs:"
+                echo "    sudo journalctl -u bhatti --no-pager -n 20"
+                echo ""
+                journalctl -u bhatti --no-pager -n 5 2>/dev/null || true
+            fi
+        else
+            printf "  ${RED}⚠  Failed to start bhatti service${RESET}\n"
+            echo "  Check logs:"
+            echo "    sudo journalctl -u bhatti --no-pager -n 20"
+            echo ""
+            journalctl -u bhatti --no-pager -n 5 2>/dev/null || true
+        fi
+    fi
+
+    # Print API key last so it's visible and not buried
+    if [ -n "${ADMIN_KEY:-}" ]; then
+        echo ""
+        echo "  ┌────────────────────────────────────────────────┐"
+        echo "  │  Admin API key (save this — shown only once):  │"
+        echo "  │  ${ADMIN_KEY}  │"
+        echo "  └────────────────────────────────────────────────┘"
     fi
 }
 
@@ -891,10 +915,13 @@ do_server_update() {
     # changes, handle it via migration logic, not regeneration.
     # admin user is PRESERVED
 
+    # Always update the systemd unit and ensure service is enabled
+    cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
+    systemctl daemon-reload
+    systemctl enable bhatti 2>/dev/null || true
+
     if [ "$was_running" = true ]; then
         heading "Restarting bhatti service"
-        cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
-        systemctl daemon-reload
         systemctl start bhatti
     fi
 
@@ -925,7 +952,7 @@ do_server_update() {
             echo "     Restart it to use ${VERSION}"
         else
             echo ""
-            echo "  Restart the daemon to use the new version."
+            echo "  Service enabled. Start with: sudo systemctl start bhatti"
         fi
     fi
     if [ -f /usr/local/bin/bhatti.old ]; then
@@ -962,17 +989,35 @@ main() {
                     local mode="${BHATTI_MODE:-}"
 
                     if [ -z "$mode" ]; then
-                        echo ""
-                        echo "  Install bhatti as:"
-                        echo "    1) CLI — connect to a remote bhatti server"
-                        echo "    2) Self-host — run bhatti on this machine (requires root + KVM)"
-                        echo ""
-                        printf "  Choice [1]: "
-                        read -r mode_choice < /dev/tty 2>/dev/null || mode_choice="1"
-                        case "${mode_choice:-1}" in
-                            2) mode="server" ;;
-                            *) mode="cli" ;;
-                        esac
+                        # Auto-detect: root + KVM = server, otherwise CLI
+                        if [ "$(id -u)" -eq 0 ] && [ -e /dev/kvm ]; then
+                            # Root with KVM — default to server. The user ran
+                            # `curl | sudo bash` on a machine with KVM, they
+                            # almost certainly want a server install.
+                            echo ""
+                            echo "  Install bhatti as:"
+                            echo "    1) Self-host — run bhatti on this machine"
+                            echo "    2) CLI only — connect to a remote bhatti server"
+                            echo ""
+                            printf "  Choice [1]: "
+                            read -r mode_choice < /dev/tty 2>/dev/null || mode_choice="1"
+                            case "${mode_choice:-1}" in
+                                2) mode="cli" ;;
+                                *) mode="server" ;;
+                            esac
+                        else
+                            echo ""
+                            echo "  Install bhatti as:"
+                            echo "    1) CLI — connect to a remote bhatti server"
+                            echo "    2) Self-host — run bhatti on this machine (requires root + KVM)"
+                            echo ""
+                            printf "  Choice [1]: "
+                            read -r mode_choice < /dev/tty 2>/dev/null || mode_choice="1"
+                            case "${mode_choice:-1}" in
+                                2) mode="server" ;;
+                                *) mode="cli" ;;
+                            esac
+                        fi
                     fi
 
                     case "$mode" in
