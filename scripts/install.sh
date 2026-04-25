@@ -725,4 +725,7 @@ main() {
     esac
 }
 
-main
+# Allow sourcing for tests without executing main
+if [ "${BHATTI_TEST:-}" != "1" ]; then
+    main
+fi
