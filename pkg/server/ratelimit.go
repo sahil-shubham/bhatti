@@ -23,9 +23,9 @@ const maxRateLimitEntries = 10_000
 
 type userBuckets struct {
 	mu         sync.Mutex  // per-user lock — no global contention
-	create     *tokenBucket // sandbox creation: 10/min
-	exec       *tokenBucket // exec, file ops: 120/min
-	read       *tokenBucket // list, get, ports: 600/min
+	create     *tokenBucket // sandbox creation: 30/min
+	exec       *tokenBucket // exec, file ops: 600/min
+	read       *tokenBucket // list, get, ports: 1200/min
 	lastAccess time.Time
 }
 
@@ -94,9 +94,9 @@ func (rl *rateLimiter) getUserBuckets(userID string) *userBuckets {
 	}
 
 	ub := &userBuckets{
-		create:     newTokenBucket(10, 10),   // 10/min, burst of 10
-		exec:       newTokenBucket(30, 120),  // 120/min, burst of 30
-		read:       newTokenBucket(60, 600),  // 600/min, burst of 60
+		create:     newTokenBucket(10, 30),   // 30/min, burst of 10
+		exec:       newTokenBucket(30, 600),  // 600/min, burst of 30
+		read:       newTokenBucket(60, 1200), // 1200/min, burst of 60
 		lastAccess: time.Now(),
 	}
 	rl.buckets[userID] = ub
