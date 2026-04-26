@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -428,12 +429,16 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 		destroyTapDevice(vm.TapDevice)
 	}
 
-	// Release IP back to the user's pool
+	// Release IP back to the user's pool and clean up the permanent ARP
+	// entry that Create set for fast boot (nud permanent). Without this,
+	// entries accumulate on the bridge until it's destroyed.
 	userID := vm.UserID
 	if vm.GuestIP != "" {
 		e.mu.RLock()
 		if net, ok := e.userNetworks[userID]; ok {
 			net.Pool.Release(vm.GuestIP)
+			exec.Command("ip", "neigh", "del", vm.GuestIP,
+				"dev", net.BridgeName).Run() // best-effort
 		}
 		e.mu.RUnlock()
 	}

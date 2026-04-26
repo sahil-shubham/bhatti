@@ -85,7 +85,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// the common path for stock images after a clean install/upgrade.
 	// For non-stamped images (saved, imported, manual), inject as fallback.
 	phase("lohar_inject_start")
-	if loharNeedsInjection(baseImage, e.cfg.DataDir) {
+	if loharNeedsInjection(baseImage, e.cfg.DataDir, e.loharHash) {
 		if err = injectLoharIntoRootfs(rootfsPath, e.cfg.DataDir); err != nil {
 			slog.Warn("lohar injection failed", "error", err)
 			// Non-fatal — image's lohar may work, but warn loudly

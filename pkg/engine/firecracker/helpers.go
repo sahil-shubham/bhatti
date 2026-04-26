@@ -279,20 +279,23 @@ func generateMAC() string {
 // post-install. After an upgrade that ships a new lohar, this re-injects
 // into each base image so reflink copies in Create already have the right
 // agent without per-create mount+cp+umount.
-func ensureImagesHaveCurrentLohar(dataDir string) {
+//
+// Returns the SHA-256 hash of the current lohar binary for caching in the
+// Engine struct (avoids re-hashing the ~4MB binary on every Create).
+func ensureImagesHaveCurrentLohar(dataDir string) string {
 	loharSrc := filepath.Join(dataDir, "lohar")
 	if _, err := os.Stat(loharSrc); err != nil {
-		return // no lohar binary (dev mode)
+		return "" // no lohar binary (dev mode)
 	}
 	currentHash := sha256File(loharSrc)
 	if currentHash == "" {
-		return
+		return ""
 	}
 
 	imagesDir := filepath.Join(dataDir, "images")
 	entries, err := os.ReadDir(imagesDir)
 	if err != nil {
-		return
+		return currentHash // no images dir yet, hash is still valid
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ext4") || !strings.HasPrefix(e.Name(), "rootfs-") {
@@ -310,22 +313,26 @@ func ensureImagesHaveCurrentLohar(dataDir string) {
 		os.WriteFile(stampPath, []byte(currentHash), 0644)
 		slog.Info("injected lohar into base image", "image", e.Name())
 	}
+	return currentHash
 }
 
 // loharNeedsInjection reports whether a base image needs per-create lohar
 // injection. Returns false when the stamp matches the current lohar binary
 // (the common case after ensureImagesHaveCurrentLohar ran at startup).
-func loharNeedsInjection(baseImage, dataDir string) bool {
-	loharSrc := filepath.Join(dataDir, "lohar")
-	if _, err := os.Stat(loharSrc); err != nil {
-		return false // no lohar binary (dev mode)
+//
+// cachedHash is the SHA-256 of the current lohar binary, computed once at
+// engine init. Avoids re-hashing the ~4MB binary on every Create call.
+func loharNeedsInjection(baseImage, dataDir, cachedHash string) bool {
+	if cachedHash == "" {
+		// No lohar binary (dev mode) or hash failed at init.
+		return false
 	}
 	stampPath := baseImage + ".lohar-sha256"
 	stored, err := os.ReadFile(stampPath)
 	if err != nil {
 		return true // no stamp → inject
 	}
-	return strings.TrimSpace(string(stored)) != sha256File(loharSrc)
+	return strings.TrimSpace(string(stored)) != cachedHash
 }
 
 // injectLoharIntoImage mounts an ext4 image and overwrites /usr/local/bin/lohar.
@@ -364,7 +371,9 @@ func sha256File(path string) string {
 	}
 	defer f.Close()
 	h := sha256.New()
-	io.Copy(h, f)
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 

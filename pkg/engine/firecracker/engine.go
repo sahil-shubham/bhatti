@@ -57,6 +57,7 @@ type Engine struct {
 	cfg          Config
 	nextCID      uint32
 	userNetworks map[string]*UserNetwork // userID → network
+	loharHash    string                  // SHA-256 of current lohar binary, cached at init
 }
 
 // VolumeAttachmentInfo records a volume attached to a running VM.
@@ -152,7 +153,7 @@ func New(cfg Config) (*Engine, error) {
 	// Injecting here (once per image per lohar version) means every
 	// reflink copy during Create already has the right agent — skipping
 	// the per-create mount+cp+umount (~80ms).
-	ensureImagesHaveCurrentLohar(cfg.DataDir)
+	eng.loharHash = ensureImagesHaveCurrentLohar(cfg.DataDir)
 
 	// NOTE: Do NOT clean up TAP devices here. recoverVMs hasn't run yet,
 	// so we can't distinguish orphaned TAPs from ones needed by snapshotted
