@@ -340,6 +340,15 @@ func (c *AgentClient) Forward(ctx context.Context, port uint16) (io.ReadWriteClo
 
 // WaitReady polls the agent until it responds or the context expires.
 // Used during VM boot to wait for the agent to start listening.
+//
+// The per-attempt timeout starts short (100ms) and escalates. This avoids
+// the 1-second ARP retransmit penalty: the first probe triggers an ARP
+// request for the guest IP, but the guest can't reply yet (kernel still
+// booting). Linux's default retrans_time_ms is 1000ms, so the host waits
+// a full second before re-probing. By timing out at 100ms, closing the
+// socket, and opening a fresh one, we send a new SYN that lands after the
+// guest is ready — typically within 2-3 attempts (~150ms total) instead
+// of one long ARP wait (~1005ms).
 func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -355,7 +364,19 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 		// Try a lightweight exec. If the agent responds, it's ready.
 		attempt++
 		attemptStart := time.Now()
-		execCtx, execCancel := context.WithTimeout(ctx, 2*time.Second)
+
+		// Escalating timeout: 100ms (×3) → 250ms (×3) → 500ms (×4) → 2s.
+		dialTimeout := 100 * time.Millisecond
+		switch {
+		case attempt > 10:
+			dialTimeout = 2 * time.Second
+		case attempt > 6:
+			dialTimeout = 500 * time.Millisecond
+		case attempt > 3:
+			dialTimeout = 250 * time.Millisecond
+		}
+
+		execCtx, execCancel := context.WithTimeout(ctx, dialTimeout)
 		result, err := c.Exec(execCtx, []string{"true"}, nil, "")
 		execCancel()
 
@@ -375,11 +396,14 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 			"error", err,
 			"addr", c.tcpAddr)
 
+		// Brief pause before retry. The dial timeout provides the main
+		// pacing — this just prevents a tight spin when the guest sends
+		// RST ("connection refused", returns instantly).
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("agent not ready after %d attempts (%dms): %w",
 				attempt, time.Since(start).Milliseconds(), ctx.Err())
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }

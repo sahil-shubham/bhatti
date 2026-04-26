@@ -380,6 +380,16 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	phase("instance_started")
 
 	// 8. Wait for agent via TCP (kernel ip= already configured eth0).
+	//
+	// Pre-populate ARP with the guest's MAC so the first TCP SYN is sent
+	// immediately without waiting for ARP resolution. Without this, the
+	// host sends an ARP request that the guest can't answer yet (kernel
+	// still booting), and Linux's ARP retransmit timer (retrans_time_ms
+	// = 1000ms) adds a full second before the next ARP probe. We already
+	// know the MAC — we generated it above.
+	exec.Command("ip", "neigh", "replace", guestIP, "lladdr", mac,
+		"dev", userNet.BridgeName, "nud", "permanent").Run() // best-effort
+
 	phase("wait_ready_start")
 	agentClient := agent.NewTCPClientWithAuth(guestIP, token)
 	if err = agentClient.WaitReady(ctx, 30*time.Second); err != nil {
