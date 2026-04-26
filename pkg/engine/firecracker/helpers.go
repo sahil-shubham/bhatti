@@ -5,11 +5,15 @@ package firecracker
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent"
@@ -268,22 +272,71 @@ func generateMAC() string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
-// injectLoharIntoRootfs mounts the rootfs and overwrites /usr/local/bin/lohar
-// with the current binary from DataDir. This ensures every sandbox uses the
-// latest guest agent, preventing protocol drift after daemon upgrades.
-// Adds ~50ms to sandbox creation (mount + cp + umount).
-func injectLoharIntoRootfs(rootfsPath, dataDir string) error {
+// ensureImagesHaveCurrentLohar injects the current lohar binary into all
+// rootfs images under dataDir/images/ that don't already have it. A stamp
+// file (image.ext4.lohar-sha256) tracks which lohar version was injected.
+// Called once at engine startup — typically a no-op after the first boot
+// post-install. After an upgrade that ships a new lohar, this re-injects
+// into each base image so reflink copies in Create already have the right
+// agent without per-create mount+cp+umount.
+func ensureImagesHaveCurrentLohar(dataDir string) {
 	loharSrc := filepath.Join(dataDir, "lohar")
 	if _, err := os.Stat(loharSrc); err != nil {
-		return nil // no lohar binary to inject (dev mode)
+		return // no lohar binary (dev mode)
 	}
+	currentHash := sha256File(loharSrc)
+	if currentHash == "" {
+		return
+	}
+
+	imagesDir := filepath.Join(dataDir, "images")
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ext4") || !strings.HasPrefix(e.Name(), "rootfs-") {
+			continue
+		}
+		imgPath := filepath.Join(imagesDir, e.Name())
+		stampPath := imgPath + ".lohar-sha256"
+		if stored, err := os.ReadFile(stampPath); err == nil && strings.TrimSpace(string(stored)) == currentHash {
+			continue
+		}
+		if err := injectLoharIntoImage(imgPath, loharSrc); err != nil {
+			slog.Warn("failed to inject lohar into base image", "image", e.Name(), "error", err)
+			continue
+		}
+		os.WriteFile(stampPath, []byte(currentHash), 0644)
+		slog.Info("injected lohar into base image", "image", e.Name())
+	}
+}
+
+// loharNeedsInjection reports whether a base image needs per-create lohar
+// injection. Returns false when the stamp matches the current lohar binary
+// (the common case after ensureImagesHaveCurrentLohar ran at startup).
+func loharNeedsInjection(baseImage, dataDir string) bool {
+	loharSrc := filepath.Join(dataDir, "lohar")
+	if _, err := os.Stat(loharSrc); err != nil {
+		return false // no lohar binary (dev mode)
+	}
+	stampPath := baseImage + ".lohar-sha256"
+	stored, err := os.ReadFile(stampPath)
+	if err != nil {
+		return true // no stamp → inject
+	}
+	return strings.TrimSpace(string(stored)) != sha256File(loharSrc)
+}
+
+// injectLoharIntoImage mounts an ext4 image and overwrites /usr/local/bin/lohar.
+func injectLoharIntoImage(imagePath, loharSrc string) error {
 	mnt, err := os.MkdirTemp("", "bhatti-inject-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(mnt)
-	if err := exec.Command("mount", "-o", "loop", rootfsPath, mnt).Run(); err != nil {
-		return fmt.Errorf("mount rootfs for lohar injection: %w", err)
+	if err := exec.Command("mount", "-o", "loop", imagePath, mnt).Run(); err != nil {
+		return fmt.Errorf("mount: %w", err)
 	}
 	defer exec.Command("umount", mnt).Run()
 	dst := filepath.Join(mnt, "usr/local/bin/lohar")
@@ -291,6 +344,28 @@ func injectLoharIntoRootfs(rootfsPath, dataDir string) error {
 		return fmt.Errorf("copy lohar: %w", err)
 	}
 	return os.Chmod(dst, 0755)
+}
+
+// injectLoharIntoRootfs is the per-create fallback — called only when the
+// base image's stamp doesn't match (non-stock images, first create after
+// manual lohar replacement, etc.).
+func injectLoharIntoRootfs(rootfsPath, dataDir string) error {
+	loharSrc := filepath.Join(dataDir, "lohar")
+	if _, err := os.Stat(loharSrc); err != nil {
+		return nil // no lohar binary to inject (dev mode)
+	}
+	return injectLoharIntoImage(rootfsPath, loharSrc)
+}
+
+func sha256File(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	io.Copy(h, f)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // verifySnapshotArtifacts performs lightweight sanity checks on snapshot files.

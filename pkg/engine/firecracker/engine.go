@@ -146,6 +146,14 @@ func New(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("setup firewall: %w", err)
 	}
 
+	// Ensure all base images in images/ have the current lohar binary.
+	// The install script ships rootfs images with whatever lohar was baked
+	// in at build time, which may lag the installed lohar after upgrades.
+	// Injecting here (once per image per lohar version) means every
+	// reflink copy during Create already has the right agent — skipping
+	// the per-create mount+cp+umount (~80ms).
+	ensureImagesHaveCurrentLohar(cfg.DataDir)
+
 	// NOTE: Do NOT clean up TAP devices here. recoverVMs hasn't run yet,
 	// so we can't distinguish orphaned TAPs from ones needed by snapshotted
 	// VMs. Call CleanupOrphanedTaps() after recovery instead.

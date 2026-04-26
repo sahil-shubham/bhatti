@@ -78,14 +78,18 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	}
 	phase("rootfs_copy_done")
 
-	// 1b. Re-inject lohar into rootfs to prevent protocol drift.
-	// Saved images / OCI images may have an older lohar that doesn't
-	// understand new config drive fields (e.g. ReadOnly). Without this,
-	// the read_only JSON key is silently ignored → data corruption.
+	// 1b. Ensure rootfs has the current lohar to prevent protocol drift.
+	// The install script injects lohar into base images and writes a stamp
+	// file. If the stamp matches, the reflink copy already has the right
+	// binary and we skip the expensive mount+cp+umount (~80ms). This is
+	// the common path for stock images after a clean install/upgrade.
+	// For non-stamped images (saved, imported, manual), inject as fallback.
 	phase("lohar_inject_start")
-	if err = injectLoharIntoRootfs(rootfsPath, e.cfg.DataDir); err != nil {
-		slog.Warn("lohar injection failed", "error", err)
-		// Non-fatal — image's lohar may work, but warn loudly
+	if loharNeedsInjection(baseImage, e.cfg.DataDir) {
+		if err = injectLoharIntoRootfs(rootfsPath, e.cfg.DataDir); err != nil {
+			slog.Warn("lohar injection failed", "error", err)
+			// Non-fatal — image's lohar may work, but warn loudly
+		}
 	}
 	phase("lohar_inject_done")
 
