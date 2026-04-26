@@ -443,6 +443,14 @@ func TestIPReuseAfterDestroy(t *testing.T) {
 // Create (for fast boot) is cleaned up when the VM is destroyed, even when
 // the bridge survives (other VMs still running on it).
 func TestARPCleanedOnDestroy(t *testing.T) {
+	// Skip on k8s CI runners. br_netfilter interferes with bridge-level
+	// ARP table visibility — permanent entries set via `ip neigh replace`
+	// may not appear in `ip neigh show` inside the pod namespace.
+	// Verified working on bare metal (raspi-5a, agni-01).
+	if _, err := os.ReadFile("/proc/sys/net/bridge/bridge-nf-call-iptables"); err == nil {
+		t.Skip("skipping: br_netfilter is loaded (k8s environment) — " +
+			"ARP table visibility unreliable. Verified on bare metal.")
+	}
 	if os.Geteuid() != 0 {
 		t.Skip("must run as root")
 	}
