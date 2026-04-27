@@ -38,6 +38,17 @@ for flag in IP_NF_RAW IP6_NF_RAW BRIDGE VETH OVERLAY_FS NF_CONNTRACK \
     grep "CONFIG_${flag}[= ]" .config 2>/dev/null || echo "# CONFIG_${flag} is not set"
 done
 
+# Strip hardware that doesn't exist in Firecracker VMs.
+# The FC CI config inherits i8042 (PS/2 keyboard controller) from x86
+# defconfig. The driver probes via ACPI, finds PNP0303, registers a serio
+# port, then atkbd tries to talk to it. Since there's no real PS/2 hw,
+# i8042_wait_read() spins for I8042_CTL_TIMEOUT * udelay(50) = 500ms
+# before giving up. This delays every VM boot by ~530ms on x86_64.
+# arm64 doesn't have i8042 at all, which is why Pi boots are faster.
+echo "==> Stripping non-existent hardware drivers..."
+scripts/config --disable CONFIG_SERIO_I8042
+scripts/config --disable CONFIG_KEYBOARD_ATKBD
+
 # Apply bhatti additions (idempotent — safe if already =y)
 echo "==> Applying bhatti kernel config (12 flags)..."
 
