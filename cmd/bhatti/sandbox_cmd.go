@@ -116,7 +116,7 @@ func init() {
 	createCmd.Flags().String("name", "", "Sandbox name")
 	createCmd.Flags().String("image", "", "Rootfs image name")
 	createCmd.Flags().Float64("cpus", 1, "Number of vCPUs")
-	createCmd.Flags().Int("memory", 0, "Memory in MB (0 = server default: 2048)")
+	createCmd.Flags().Int("memory", 0, "Memory in MB (0 = server default: 1024)")
 	createCmd.Flags().Int("disk-size", 0, "Rootfs disk size in MB (0 = use image size)")
 	createCmd.Flags().String("env", "", "Environment variables (K=V,K=V)")
 	createCmd.Flags().String("init", "", "Init script")

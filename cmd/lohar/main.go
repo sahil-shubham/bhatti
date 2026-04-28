@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,53 +32,29 @@ func main() {
 		return
 	}
 
-	// --- PID 1 init ---
+	runAgent()
+}
+
+// runAgent runs lohar as a systemd service. systemd has already mounted
+// filesystems, brought up loopback, and started the network. We handle:
+// config drive, listeners, boot profile, init session.
+func runAgent() {
 	bootStart := time.Now()
 	var bootLog strings.Builder
 	bp := func(name string) {
 		line := fmt.Sprintf("+%dms %s\n", time.Since(bootStart).Milliseconds(), name)
-		fmt.Fprint(os.Stderr, "lohar: boot "+line)
+		fmt.Fprint(os.Stderr, "lohar: "+line)
 		bootLog.WriteString(line)
 	}
 	bp("start")
 
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	os.Setenv("HOME", "/root")
 
-	// Mount essential filesystems.
-	mustMount("proc", "/proc", "proc", 0, "")
-	mustMount("sysfs", "/sys", "sysfs", 0, "")
-	mustMount("devtmpfs", "/dev", "devtmpfs", 0, "")
-	// FUSE: devtmpfs creates /dev/fuse as 0600 but FUSE clients running as
-	// uid 1000 need read-write access. chmod to 0666 (matching the kernel
-	// driver's intent — fs/fuse/inode.c registers with S_IRUGO|S_IWUGO).
+	// /dev/fuse: devtmpfs creates it as 0600. Without udev (masked),
+	// nobody chmods it. FUSE clients running as uid 1000 need rw access.
 	os.Chmod("/dev/fuse", 0666)
-	os.MkdirAll("/dev/pts", 0755)
-	mustMount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666")
-	mustMount("tmpfs", "/tmp", "tmpfs", 0, "")
-	mustMount("tmpfs", "/run", "tmpfs", 0, "")
 
-	// /dev/shm — required by Chromium (shared memory), Docker containers,
-	// and any process using shm_open(3). Harmless when unused.
-	os.MkdirAll("/dev/shm", 0755)
-	mustMount("tmpfs", "/dev/shm", "tmpfs", 0, "")
-	bp("mounts_done")
-
-	// cgroups v2 — required by Docker for resource isolation.
-	// Mount unconditionally: zero overhead when unused, avoids
-	// tier-specific logic in lohar.
-	os.MkdirAll("/sys/fs/cgroup", 0755)
-	if err := syscall.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: mount cgroup2: %v\n", err)
-	}
-	// Enable cgroup controllers for Docker.
-	os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control",
-		[]byte("+cpu +memory +io +pids"), 0644)
-
-	bringUpInterface("lo")
-	bp("lo_up")
-
-	// Try to load config drive (/dev/vdb)
+	// Load config drive (/dev/vdb) — hostname, DNS, env, files, volumes.
 	cfg := loadConfigDrive()
 	if cfg != nil {
 		hostname := "bhatti"
@@ -87,7 +62,6 @@ func main() {
 			hostname = cfg.Hostname
 		}
 		syscall.Sethostname([]byte(hostname))
-		// Write /etc/hosts so sudo and other tools can resolve the hostname.
 		os.WriteFile("/etc/hosts", []byte(
 			"127.0.0.1 localhost "+hostname+"\n::1 localhost "+hostname+"\n"), 0644)
 		if len(cfg.DNS) > 0 {
@@ -99,12 +73,9 @@ func main() {
 		configEnv = cfg.Env
 		writeConfigFiles(cfg.Files)
 		mountVolumes(cfg.Volumes)
-		bp("config_applied")
-
-		// Unmount config drive — it contains the agent token and env vars
-		// in plaintext JSON. No reason to keep it accessible after boot.
 		syscall.Unmount("/run/bhatti/config", 0)
 		os.RemoveAll("/run/bhatti/config")
+		bp("config_applied")
 	} else {
 		syscall.Sethostname([]byte("bhatti"))
 		os.WriteFile("/etc/hosts", []byte(
@@ -114,13 +85,11 @@ func main() {
 
 	setupNetworking()
 	bp("network_done")
-	installSignalHandlers()
 
-	// Listen on vsock (works for cold boot, broken after snapshot/restore).
+	// Vsock listeners (work for cold boot, broken after snapshot/restore).
 	lnControl, err := listenVsock(proto.VsockPortControl)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: vsock control: %v\n", err)
-		// Non-fatal: TCP listeners below are the primary channel.
 	} else {
 		go acceptLoop(lnControl, handleControlConnection)
 	}
@@ -131,9 +100,7 @@ func main() {
 		go acceptLoop(lnForward, handleForwardConnection)
 	}
 
-	// Listen on TCP (survives snapshot/restore since virtio-net is reliable).
-	// The guest IP is configured by the kernel's ip= cmdline parameter
-	// before init runs, so the interface is already up.
+	// TCP listeners (survive snapshot/restore — virtio-net is reliable).
 	tcpControl, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", proto.VsockPortControl))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: tcp control: %v\n", err)
@@ -146,18 +113,16 @@ func main() {
 	} else {
 		go acceptLoop(tcpForward, handleForwardConnection)
 	}
-
 	bp("tcp_listen")
 
-	// Write boot timing to a file readable via `bhatti file read`
-	os.WriteFile("/tmp/boot-timing.txt", []byte(bootLog.String()), 0644)
+	// Write boot timing to /run/bhatti/ (not /tmp/ — avoids tmpfiles-clean race).
+	os.MkdirAll("/run/bhatti", 0755)
+	os.WriteFile("/run/bhatti/boot-timing.txt", []byte(bootLog.String()), 0644)
 
 	fmt.Fprintln(os.Stderr, "lohar: ready")
 
 	// Run boot profile if present. Runs AFTER listeners so the VM is
 	// reachable via bhatti exec even if the boot profile hangs.
-	// 30-second hard timeout — if dockerd or chromium can't start in 30s,
-	// something is broken. Don't block forever.
 	if _, err := os.Stat("/etc/bhatti/init.sh"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		cmd := exec.CommandContext(ctx, "/bin/sh", "/etc/bhatti/init.sh")
@@ -189,20 +154,13 @@ func main() {
 		}
 	}
 
-	// Init script runs as a TTY session (can be attached to via session ID "init")
+	// Init script runs as a TTY session (attachable via session ID "init").
 	if cfg != nil && cfg.Init != "" {
 		go runInitSession(cfg.Init, cfg.User)
 	}
 
-	// PID 1 must never exit.
+	// Block forever. systemd manages our lifecycle.
 	select {}
-}
-
-func mustMount(source, target, fstype string, flags uintptr, data string) {
-	os.MkdirAll(target, 0755)
-	if err := syscall.Mount(source, target, fstype, flags, data); err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: mount %s on %s: %v\n", source, target, err)
-	}
 }
 
 func ensureResolvConf() {
@@ -328,20 +286,4 @@ func mountVolumes(volumes []VolumeMountConfig) {
 		}
 		fmt.Fprintf(os.Stderr, "lohar: mounted %s → %s (ro=%v)\n", v.Device, v.Mount, v.ReadOnly)
 	}
-}
-
-func installSignalHandlers() {
-	// Note: we do NOT install a SIGCHLD handler. Go's runtime manages
-	// SIGCHLD for processes started via exec.Command. A manual Wait4(-1)
-	// reaper would race with cmd.Wait() and corrupt exit codes.
-	// Orphan zombies (from grandchild processes) are acceptable for now.
-
-	// SIGTERM/SIGINT: clean shutdown.
-	sigterm := make(chan os.Signal, 1)
-	signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-sigterm
-		syscall.Sync()
-		syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
-	}()
 }

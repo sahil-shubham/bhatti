@@ -226,7 +226,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				spec.CPUs = 1
 			}
 			if spec.MemoryMB == 0 {
-				spec.MemoryMB = 2048
+				spec.MemoryMB = 1024
 			}
 			if spec.Name == "" {
 				spec.Name = "sandbox-" + genID()[:6]

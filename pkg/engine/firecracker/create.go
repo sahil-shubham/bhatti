@@ -284,8 +284,9 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	// Boot args include ip= for kernel-level network configuration.
 	// Uses the user's bridge gateway instead of a hardcoded IP.
+	// init=/sbin/init — all rootfs tiers use systemd.
 	bootArgs := fmt.Sprintf(
-		"reboot=k panic=1 pci=off 8250.nr_uarts=0 init=/usr/local/bin/lohar quiet loglevel=0 ip=%s::%s:255.255.255.0::eth0:off:1.1.1.1:8.8.8.8:",
+		"reboot=k panic=1 pci=off 8250.nr_uarts=0 init=/sbin/init quiet loglevel=0 ip=%s::%s:255.255.255.0::eth0:off:1.1.1.1:8.8.8.8:",
 		guestIP, userNet.GatewayIP)
 
 	if err = fcPut(ctx, client, "/boot-source", fmt.Sprintf(
