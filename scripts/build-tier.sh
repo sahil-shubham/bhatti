@@ -30,7 +30,7 @@ fi
 
 # Tier-specific defaults
 case "$TIER" in
-    minimal)  SIZE_MB="${SIZE_MB:-512}" ;;
+    minimal)  SIZE_MB="${SIZE_MB:-1024}" ;;
     browser)  SIZE_MB="${SIZE_MB:-2048}" ;;
     docker)   SIZE_MB="${SIZE_MB:-2048}" ;;
     computer) SIZE_MB="${SIZE_MB:-4096}" ;;
