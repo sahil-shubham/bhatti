@@ -187,7 +187,9 @@ func normalizeName(name string) string {
 }
 
 // findServiceFile locates the .service file for a unit.
+// Also resolves aliases (e.g. sshd -> ssh via Alias=sshd.service).
 func findServiceFile(name string) string {
+	// Direct match first.
 	for _, dir := range serviceDirs {
 		path := filepath.Join(dir, name+".service")
 		if target, err := os.Readlink(path); err == nil {
@@ -197,6 +199,23 @@ func findServiceFile(name string) string {
 		}
 		if _, err := os.Stat(path); err == nil {
 			return path
+		}
+	}
+	// Check aliases — scan service files for Alias=<name>.service.
+	for _, dir := range serviceDirs {
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".service") {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			svc := parseServiceFile(path)
+			for _, alias := range svc.getAll("Install", "Alias") {
+				alias = strings.TrimSuffix(alias, ".service")
+				if alias == name {
+					return path
+				}
+			}
 		}
 	}
 	return ""
@@ -239,22 +258,31 @@ func svcStart(name string) error {
 
 	svc := parseServiceFile(path)
 
-	// Create RuntimeDirectory.
+	// Create RuntimeDirectory with optional mode.
 	if rd := svc.get("Service", "RuntimeDirectory"); rd != "" {
 		dir := "/run/" + rd
-		os.MkdirAll(dir, 0755)
+		mode := os.FileMode(0755)
+		if m := svc.get("Service", "RuntimeDirectoryMode"); m != "" {
+			if parsed, err := strconv.ParseUint(m, 8, 32); err == nil {
+				mode = os.FileMode(parsed)
+			}
+		}
+		os.MkdirAll(dir, mode)
+		os.Chmod(dir, mode) // MkdirAll doesn't set mode on existing dirs
 		if u := svc.get("Service", "User"); u != "" {
-			// best-effort chown
 			exec.Command("chown", u, dir).Run()
 		}
 	}
 
-	// ExecStartPre
-	for _, cmd := range svc.getAll("Service", "ExecStartPre") {
-		cmd = strings.TrimLeft(cmd, "-") // leading - means ignore failure
-		if err := runServiceCommand(cmd, svc); err != nil {
-			fmt.Fprintf(os.Stderr, "ExecStartPre failed: %v\n", err)
-			// Continue — some ExecStartPre commands are optional
+	// ExecStartPre — leading '-' means ignore failure.
+	for _, cmdLine := range svc.getAll("Service", "ExecStartPre") {
+		ignoreErr := strings.HasPrefix(cmdLine, "-")
+		if err := runServiceCommand(cmdLine, svc); err != nil {
+			if ignoreErr {
+				fmt.Fprintf(os.Stderr, "ExecStartPre (ignored): %v\n", err)
+			} else {
+				return fmt.Errorf("ExecStartPre failed: %w", err)
+			}
 		}
 	}
 
@@ -601,11 +629,6 @@ func startEnabledServices() {
 }
 
 // --- Helpers ---
-
-func splitCommand(s string) []string {
-	s = strings.TrimLeft(s, "-!+:@") // strip systemd exec prefixes
-	return strings.Fields(s)
-}
 
 func runServiceCommand(cmdLine string, svc serviceFile) error {
 	cmdLine = strings.TrimLeft(cmdLine, "-!+:@")

@@ -61,4 +61,15 @@ exit 0
 POLICY
 chmod 755 "$MOUNT/usr/sbin/policy-rc.d"
 
+# runlevel shim — invoke-rc.d calls /sbin/runlevel to determine the
+# current runlevel. Without this, it prints "could not determine current
+# runlevel" and may skip starting services during package install.
+# Report runlevel 5 (multi-user with networking) which is the standard
+# operational state.
+cat > "$MOUNT/sbin/runlevel" << 'RUNLEVEL'
+#!/bin/sh
+echo "N 5"
+RUNLEVEL
+chmod 755 "$MOUNT/sbin/runlevel"
+
 echo "==> Minimal tier done."
