@@ -160,3 +160,7 @@ jobs:
           files: release/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') }}
+          # Draft first so assets upload before publish (required for
+          # repos with immutable releases). Manual publish from GitHub
+          # UI after verifying artifacts.
+          draft: true
