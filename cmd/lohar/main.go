@@ -30,6 +30,9 @@ func main() {
 	case "systemctl":
 		runSystemctl(os.Args[1:])
 		return
+	case "journalctl":
+		runJournalctl(os.Args[1:])
+		return
 	}
 
 	if os.Getenv("LOHAR_TEST") == "1" {

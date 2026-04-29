@@ -44,10 +44,11 @@ EOF
 cp "$AGENT" "$MOUNT/usr/local/bin/lohar"
 chmod 755 "$MOUNT/usr/local/bin/lohar"
 
-# systemctl shim — lohar handles systemctl commands via busybox pattern.
-# Package postinst scripts call systemctl enable/start/stop; this symlink
-# routes those calls to lohar's built-in service manager.
+# systemctl + journalctl shims — lohar handles these via busybox pattern.
+# Package postinst scripts call systemctl enable/start/stop; these symlinks
+# route those calls to lohar's built-in service manager.
 ln -sf /usr/local/bin/lohar "$MOUNT/usr/bin/systemctl"
+ln -sf /usr/local/bin/lohar "$MOUNT/usr/bin/journalctl"
 
 # Target wants directory — deb-systemd-helper creates enable symlinks here.
 mkdir -p "$MOUNT/etc/systemd/system/multi-user.target.wants"
