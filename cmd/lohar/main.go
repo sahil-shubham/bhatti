@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,10 +24,14 @@ import (
 // every exec request's environment.
 var configEnv map[string]string
 
-// TCP port constants reuse the vsock port numbers for simplicity.
-// The agent listens on both vsock AND TCP on the same port numbers.
-
 func main() {
+	// Busybox pattern: check how we were invoked.
+	switch filepath.Base(os.Args[0]) {
+	case "systemctl":
+		runSystemctl(os.Args[1:])
+		return
+	}
+
 	if os.Getenv("LOHAR_TEST") == "1" {
 		runTestMode()
 		return
@@ -35,26 +40,57 @@ func main() {
 	runAgent()
 }
 
-// runAgent runs lohar as a systemd service. systemd has already mounted
-// filesystems, brought up loopback, and started the network. We handle:
-// config drive, listeners, boot profile, init session.
+// runAgent is the main init + agent loop. lohar runs as PID 1:
+// mounts filesystems, configures the system, starts listeners,
+// starts enabled services, then handles exec/shell/file requests.
 func runAgent() {
 	bootStart := time.Now()
 	var bootLog strings.Builder
 	bp := func(name string) {
 		line := fmt.Sprintf("+%dms %s\n", time.Since(bootStart).Milliseconds(), name)
-		fmt.Fprint(os.Stderr, "lohar: "+line)
+		fmt.Fprint(os.Stderr, "lohar: boot "+line)
 		bootLog.WriteString(line)
 	}
 	bp("start")
 
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	os.Setenv("HOME", "/root")
 
-	// /dev/fuse: devtmpfs creates it as 0600. Without udev (masked),
-	// nobody chmods it. FUSE clients running as uid 1000 need rw access.
+	// --- PID 1 init duties ---
+
+	mustMount("proc", "/proc", "proc", 0, "")
+	mustMount("sysfs", "/sys", "sysfs", 0, "")
+	mustMount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	os.Chmod("/dev/fuse", 0666)
+	os.MkdirAll("/dev/pts", 0755)
+	mustMount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666")
+	mustMount("tmpfs", "/tmp", "tmpfs", 0, "")
+	mustMount("tmpfs", "/run", "tmpfs", 0, "")
+	os.MkdirAll("/dev/shm", 0755)
+	mustMount("tmpfs", "/dev/shm", "tmpfs", 0, "")
+	bp("mounts_done")
 
-	// Load config drive (/dev/vdb) — hostname, DNS, env, files, volumes.
+	// cgroups v2 — required by Docker for resource isolation.
+	os.MkdirAll("/sys/fs/cgroup", 0755)
+	if err := syscall.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: mount cgroup2: %v\n", err)
+	}
+	os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control",
+		[]byte("+cpu +memory +io +pids"), 0644)
+
+	bringUpInterface("lo")
+	bp("lo_up")
+
+	// Create runtime directories.
+	// /run/systemd/system: deb-systemd-helper checks for this to decide
+	// whether to use the systemctl enable/disable path. Without it,
+	// package installs silently skip service enablement.
+	// /run/bhatti/services: PID files for services managed by the shim.
+	os.MkdirAll("/run/systemd/system", 0755)
+	os.MkdirAll("/run/bhatti/services", 0755)
+
+	// --- Config drive ---
+
 	cfg := loadConfigDrive()
 	if cfg != nil {
 		hostname := "bhatti"
@@ -86,7 +122,13 @@ func runAgent() {
 	setupNetworking()
 	bp("network_done")
 
-	// Vsock listeners (work for cold boot, broken after snapshot/restore).
+	// --- Signal handlers + zombie reaping ---
+
+	installSignalHandlers()
+	go reapZombies()
+
+	// --- Listeners ---
+
 	lnControl, err := listenVsock(proto.VsockPortControl)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: vsock control: %v\n", err)
@@ -100,7 +142,6 @@ func runAgent() {
 		go acceptLoop(lnForward, handleForwardConnection)
 	}
 
-	// TCP listeners (survive snapshot/restore — virtio-net is reliable).
 	tcpControl, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", proto.VsockPortControl))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: tcp control: %v\n", err)
@@ -115,14 +156,20 @@ func runAgent() {
 	}
 	bp("tcp_listen")
 
-	// Write boot timing to /run/bhatti/ (not /tmp/ — avoids tmpfiles-clean race).
-	os.MkdirAll("/run/bhatti", 0755)
-	os.WriteFile("/run/bhatti/boot-timing.txt", []byte(bootLog.String()), 0644)
+	// --- Boot timing ---
 
+	os.WriteFile("/run/bhatti/boot-timing.txt", []byte(bootLog.String()), 0644)
 	fmt.Fprintln(os.Stderr, "lohar: ready")
 
-	// Run boot profile if present. Runs AFTER listeners so the VM is
-	// reachable via bhatti exec even if the boot profile hangs.
+	// --- Start enabled services ---
+	// Read /etc/systemd/system/multi-user.target.wants/ and start each
+	// service. This replaces systemd's multi-user.target activation.
+
+	startEnabledServices()
+	bp("services_started")
+
+	// --- Boot profile ---
+
 	if _, err := os.Stat("/etc/bhatti/init.sh"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		cmd := exec.CommandContext(ctx, "/bin/sh", "/etc/bhatti/init.sh")
@@ -139,10 +186,8 @@ func runAgent() {
 		cancel()
 	}
 
-	// Read supplementary env from /run/bhatti/env.
-	// Tier boot profiles write runtime env vars here (e.g., DISPLAY=:99
-	// for the computer tier). Merged into configEnv so every subsequent
-	// exec inherits them without requiring --env flags.
+	// --- Supplementary env ---
+
 	if data, err := os.ReadFile("/run/bhatti/env"); err == nil {
 		if configEnv == nil {
 			configEnv = make(map[string]string)
@@ -154,18 +199,25 @@ func runAgent() {
 		}
 	}
 
-	// Init script runs as a TTY session (attachable via session ID "init").
+	// --- Init session ---
+
 	if cfg != nil && cfg.Init != "" {
 		go runInitSession(cfg.Init, cfg.User)
 	}
 
-	// Block forever. systemd manages our lifecycle.
+	// PID 1 must never exit.
 	select {}
+}
+
+func mustMount(source, target, fstype string, flags uintptr, data string) {
+	os.MkdirAll(target, 0755)
+	if err := syscall.Mount(source, target, fstype, flags, data); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: mount %s on %s: %v\n", source, target, err)
+	}
 }
 
 func ensureResolvConf() {
 	const path = "/etc/resolv.conf"
-	// Remove any broken symlink (e.g. from systemd-resolved stub)
 	os.Remove(path)
 	if err := os.WriteFile(path, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: write resolv.conf: %v\n", err)
@@ -182,26 +234,48 @@ func acceptLoop(ln net.Listener, handler func(net.Conn)) {
 	}
 }
 
-// --- Config drive ---
-
-// VolumeMountConfig maps a block device to a mount point inside the guest.
-// This type mirrors the engine-side VolumeMountConfig — the config drive
-// JSON is the contract between them. The ReadOnly field controls MS_RDONLY.
-type VolumeMountConfig struct {
-	Device   string `json:"device"`    // e.g. "/dev/vdc"
-	Mount    string `json:"mount"`     // e.g. "/workspace"
-	FS       string `json:"fs"`        // e.g. "ext4"
-	ReadOnly bool   `json:"read_only"` // mount with MS_RDONLY
+func installSignalHandlers() {
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigterm
+		syscall.Sync()
+		syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
+	}()
 }
 
-// SandboxConfig mirrors the config drive JSON structure.
+// reapZombies reaps orphaned child processes. As PID 1, lohar is
+// responsible for waiting on all orphans to prevent zombie accumulation.
+// Go's runtime handles SIGCHLD for processes started via exec.Command,
+// but grandchild processes (e.g. services started by the systemctl shim,
+// daemons that double-fork) need explicit reaping.
+func reapZombies() {
+	for {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+		if err != nil || pid <= 0 {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+	}
+}
+
+// --- Config drive ---
+
+type VolumeMountConfig struct {
+	Device   string `json:"device"`
+	Mount    string `json:"mount"`
+	FS       string `json:"fs"`
+	ReadOnly bool   `json:"read_only"`
+}
+
 type SandboxConfig struct {
 	SandboxID string            `json:"sandbox_id"`
 	Hostname  string            `json:"hostname"`
 	Token     string            `json:"token"`
 	Env       map[string]string `json:"env"`
 	Files     map[string]struct {
-		Content string `json:"content"` // base64-encoded
+		Content string `json:"content"`
 		Mode    string `json:"mode"`
 	} `json:"files"`
 	Volumes []VolumeMountConfig `json:"volumes"`
@@ -210,8 +284,6 @@ type SandboxConfig struct {
 	User    string              `json:"user"`
 }
 
-// loadConfigDrive mounts /dev/vdb and reads config.json.
-// Returns nil if /dev/vdb doesn't exist (backward compatible).
 func loadConfigDrive() *SandboxConfig {
 	if _, err := os.Stat("/dev/vdb"); err != nil {
 		return nil
@@ -264,7 +336,6 @@ func writeConfigFiles(files map[string]struct {
 			fmt.Fprintf(os.Stderr, "lohar: write file %s: %v\n", path, err)
 			continue
 		}
-		// chown to lohar user (uid 1000)
 		os.Chown(path, 1000, 1000)
 		os.Chown(filepath.Dir(path), 1000, 1000)
 	}
