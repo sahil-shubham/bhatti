@@ -63,8 +63,8 @@ type SandboxSpec struct {
 	MemoryMB   int                  `json:"memory_mb"`
 	DiskSizeMB int                  `json:"disk_size_mb"`
 	Env        map[string]string    `json:"env"`
-	Labels     map[string]string    `json:"labels"`
-	UserData   string               `json:"userdata"`
+	Labels     map[string]string    `json:"labels,omitempty"`     // deprecated: only used by template path
+	UserData   string               `json:"userdata,omitempty"`   // deprecated: only used by template path
 	Volumes    []VolumeMount        `json:"volumes,omitempty"`
 	Secrets    []SecretRef          `json:"secrets,omitempty"`
 	Files      map[string]FileSpec  `json:"files,omitempty"` // path → content

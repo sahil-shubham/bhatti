@@ -86,6 +86,7 @@ func init() {
 
 	rootCmd.AddCommand(createCmd)
 	rootCmd.AddCommand(editCmd)
+	listCmd.Flags().StringP("output", "o", "", "Output format (wide)")
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(destroyCmd)
 	rootCmd.AddCommand(stopCmd)
@@ -95,6 +96,7 @@ func init() {
 	rootCmd.AddCommand(shellCmd)
 	shellCmd.Flags().Bool("new", false, "Force a new session (don't reattach)")
 	rootCmd.AddCommand(psCmd)
+	rootCmd.AddCommand(portsCmd)
 	rootCmd.AddCommand(fileCmd)
 	rootCmd.AddCommand(secretCmd)
 	rootCmd.AddCommand(volumeCmd)
@@ -191,12 +193,45 @@ func apiJSON(method, path string, body any, result any) error {
 			Error string `json:"error"`
 		}
 		json.NewDecoder(resp.Body).Decode(&errBody)
-		return fmt.Errorf("%s: %s", resp.Status, errBody.Error)
+		return &apiError{status: resp.Status, message: errBody.Error}
 	}
 	if result != nil {
 		return json.NewDecoder(resp.Body).Decode(result)
 	}
 	return nil
+}
+
+// apiError wraps server errors with actionable recovery hints (B3).
+type apiError struct {
+	status  string
+	message string
+}
+
+func (e *apiError) Error() string {
+	base := fmt.Sprintf("%s: %s", e.status, e.message)
+	hint := errorHint(e.message)
+	if hint != "" {
+		return base + "\n\n" + hint
+	}
+	return base
+}
+
+// errorHint returns a recovery suggestion for known error patterns.
+func errorHint(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "not running"):
+		return "  Resume it first:\n    bhatti start <sandbox>"
+	case strings.Contains(lower, "not found"):
+		return "  Check sandbox name:\n    bhatti ls"
+	case strings.Contains(lower, "already exists"):
+		return "  Use a different name or destroy the existing one:\n    bhatti destroy <sandbox>"
+	case strings.Contains(lower, "use 'bhatti start --force'"):
+		return "  Retry with force:\n    bhatti start --force <sandbox>"
+	case strings.Contains(lower, "limit") || strings.Contains(lower, "max sandbox"):
+		return "  Destroy unused sandboxes to free capacity:\n    bhatti ls\n    bhatti destroy <sandbox>"
+	}
+	return ""
 }
 
 // versionChecked prevents duplicate update messages within a single

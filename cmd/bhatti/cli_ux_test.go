@@ -27,7 +27,6 @@ import (
 // --- Tier 1: Must-have for launch ---
 
 func TestCLICreateVerboseOutput(t *testing.T) {
-	t.Skip("requires B1")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-verbose-%d", time.Now().UnixNano()%100000)
@@ -54,7 +53,6 @@ func TestCLICreateVerboseOutput(t *testing.T) {
 }
 
 func TestCLICreateIdempotent(t *testing.T) {
-	t.Skip("requires B1")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-idemp-%d", time.Now().UnixNano()%100000)
@@ -75,7 +73,6 @@ func TestCLICreateIdempotent(t *testing.T) {
 }
 
 func TestCLIStreamingExecNDJSON(t *testing.T) {
-	t.Skip("requires B2")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-stream-%d", time.Now().UnixNano()%100000)
@@ -104,7 +101,6 @@ func TestCLIStreamingExecNDJSON(t *testing.T) {
 }
 
 func TestCLIErrorExecOnStopped(t *testing.T) {
-	t.Skip("requires B3")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-errstop-%d", time.Now().UnixNano()%100000)
@@ -126,7 +122,6 @@ func TestCLIErrorExecOnStopped(t *testing.T) {
 }
 
 func TestCLIStopStartConfirmVerbs(t *testing.T) {
-	t.Skip("requires B3")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-verbs-%d", time.Now().UnixNano()%100000)
@@ -204,7 +199,6 @@ func TestCLIStopStartRoundTrip(t *testing.T) {
 }
 
 func TestCLIInspectRichOutput(t *testing.T) {
-	t.Skip("requires B4")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-inspect-%d", time.Now().UnixNano()%100000)
@@ -255,7 +249,6 @@ func TestCLIInspectRichOutput(t *testing.T) {
 }
 
 func TestCLIPorts(t *testing.T) {
-	t.Skip("requires B5")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-ports-%d", time.Now().UnixNano()%100000)
@@ -288,7 +281,6 @@ func TestCLIPorts(t *testing.T) {
 }
 
 func TestCLIListCleanDefault(t *testing.T) {
-	t.Skip("requires B6")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-listclean-%d", time.Now().UnixNano()%100000)
@@ -314,7 +306,6 @@ func TestCLIListCleanDefault(t *testing.T) {
 }
 
 func TestCLIListWideMode(t *testing.T) {
-	t.Skip("requires B6")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-listwide-%d", time.Now().UnixNano()%100000)
@@ -347,7 +338,6 @@ func TestCLIListWideMode(t *testing.T) {
 }
 
 func TestCLIForceStart(t *testing.T) {
-	t.Skip("requires B7")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-force-%d", time.Now().UnixNano()%100000)
@@ -371,7 +361,6 @@ func TestCLIForceStart(t *testing.T) {
 // --- Tier 2: Important polish ---
 
 func TestCLIDetachedExec(t *testing.T) {
-	t.Skip("requires B9")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-detach-%d", time.Now().UnixNano()%100000)
@@ -391,7 +380,6 @@ func TestCLIDetachedExec(t *testing.T) {
 }
 
 func TestCLIHugepagesFlag(t *testing.T) {
-	t.Skip("requires B10")
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-huge-%d", time.Now().UnixNano()%100000)
@@ -411,7 +399,6 @@ func TestCLIHugepagesFlag(t *testing.T) {
 }
 
 func TestCLIVolumeClone(t *testing.T) {
-	t.Skip("requires B11")
 	c := setupCLITest(t)
 
 	src := fmt.Sprintf("cli-clsrc-%d", time.Now().UnixNano()%100000)
@@ -447,7 +434,6 @@ func TestCLIVolumeClone(t *testing.T) {
 }
 
 func TestCLICreateWithSecret(t *testing.T) {
-	t.Skip("requires B15")
 	c := setupCLITest(t)
 
 	secretName := fmt.Sprintf("cli-sec-%d", time.Now().UnixNano()%100000)
@@ -478,7 +464,6 @@ func TestCLICreateWithSecret(t *testing.T) {
 }
 
 func TestCLICreateWithFile(t *testing.T) {
-	t.Skip("requires B15")
 	c := setupCLITest(t)
 
 	sbName := fmt.Sprintf("cli-fileinj-%d", time.Now().UnixNano()%100000)
@@ -550,7 +535,6 @@ func TestCLIExitCodeContract(t *testing.T) {
 }
 
 func TestCLIJSONCreateInspectListPorts(t *testing.T) {
-	t.Skip("requires B4") // inspect needs B4 fields
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-jsonall-%d", time.Now().UnixNano()%100000)
@@ -853,7 +837,6 @@ func TestCLIExecTimeout(t *testing.T) {
 }
 
 func TestCLICreateAllFlags(t *testing.T) {
-	t.Skip("requires B15") // needs --secret + --file
 	c := setupCLITest(t)
 
 	name := fmt.Sprintf("cli-allflags-%d", time.Now().UnixNano()%100000)

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -134,8 +135,20 @@ the image and converts it to an ext4 rootfs for 'bhatti create --image'.`,
 
 		fmt.Printf("pulling %s as %q (task: %s)\n", ref, name, result.TaskID)
 
+		// B8: trap Ctrl+C — pull continues on server
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt)
+		defer signal.Stop(sigCh)
+
 		// Poll for completion
 		for {
+			select {
+			case <-sigCh:
+				fmt.Fprintf(os.Stderr, "\nInterrupted. Pull continues on server.\n")
+				fmt.Fprintf(os.Stderr, "  Check status: bhatti image list\n")
+				return nil
+			default:
+			}
 			time.Sleep(2 * time.Second)
 			var task struct {
 				Status   string `json:"status"`

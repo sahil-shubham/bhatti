@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -130,19 +131,47 @@ with its own kernel, filesystem, and network.`,
 			req["persistent_volumes"] = pvols
 		}
 
-		var sb struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-			IP   string `json:"ip"`
-		}
-		if err := apiJSON("POST", "/sandboxes", req, &sb); err != nil {
+		var sb map[string]any
+		resp, err := apiRequest("POST", "/sandboxes", req)
+		if err != nil {
 			return err
 		}
-		addToCompletionCache(sb.Name)
+		defer resp.Body.Close()
+		checkServerVersion(resp)
+		if resp.StatusCode >= 400 {
+			var errBody struct{ Error string `json:"error"` }
+			json.NewDecoder(resp.Body).Decode(&errBody)
+			return fmt.Errorf("%s: %s", resp.Status, errBody.Error)
+		}
+		json.NewDecoder(resp.Body).Decode(&sb)
+
+		sbName, _ := sb["name"].(string)
+		addToCompletionCache(sbName)
+
+		existing := resp.Header.Get("X-Bhatti-Existing") == "true"
+
 		if isJSON(cmd) {
 			outputJSON(sb)
+		} else if existing {
+			fmt.Printf("sandbox/%s unchanged (already exists)\n", sbName)
 		} else {
-			fmt.Printf("%s\t%s\t%s\n", sb.ID, sb.Name, sb.IP)
+			// B1: verbose create output
+			cpuVal, _ := sb["cpus"].(float64)
+			if cpuVal == 0 {
+				cpuVal = 1
+			}
+			memVal, _ := sb["memory_mb"].(float64)
+			if memVal == 0 {
+				memVal = 1024
+			}
+			diskVal, _ := sb["disk_size_mb"].(float64)
+			ipVal, _ := sb["ip"].(string)
+			fmt.Printf("sandbox/%s created (%g vCPU, %.0f MB, %.0f MB disk)\n",
+				sbName, cpuVal, memVal, diskVal)
+			if ipVal != "" {
+				fmt.Printf("  IP:    %s\n", ipVal)
+			}
+			fmt.Printf("  Shell: bhatti shell %s\n", sbName)
 		}
 		return nil
 	},
@@ -250,7 +279,7 @@ var stopCmd = &cobra.Command{
 		if isJSON(cmd) {
 			outputJSON(sb)
 		} else {
-			fmt.Println("stopped")
+			fmt.Printf("sandbox/%s stopped\n", args[0])
 		}
 		return nil
 	},
@@ -286,7 +315,7 @@ Use --force to retry after a failed restore.`,
 		if isJSON(cmd) {
 			outputJSON(sb)
 		} else {
-			fmt.Println("started")
+			fmt.Printf("sandbox/%s started\n", args[0])
 		}
 		return nil
 	},
@@ -317,16 +346,55 @@ var inspectCmd = &cobra.Command{
 			outputJSON(sb)
 			return nil
 		}
+
+		// B4: kubectl-describe style output
 		fmt.Printf("Name:       %s\n", sb["name"])
 		fmt.Printf("ID:         %s\n", sb["id"])
 		fmt.Printf("Status:     %s\n", sb["status"])
-		fmt.Printf("IP:         %s\n", sb["ip"])
+		if t, ok := sb["thermal"]; ok && t != nil && t != "" {
+			fmt.Printf("Thermal:    %s\n", t)
+		}
+		if img, ok := sb["image"]; ok && img != nil && img != "" {
+			fmt.Printf("Image:      %s\n", img)
+		}
 		fmt.Printf("Created:    %s\n", sb["created_at"])
+		if stopped, ok := sb["stopped_at"]; ok && stopped != nil {
+			fmt.Printf("Stopped:    %s\n", stopped)
+		}
 		if t, ok := sb["template_id"]; ok && t != nil && t != "" {
 			fmt.Printf("Template:   %s\n", t)
 		}
-		if stopped, ok := sb["stopped_at"]; ok && stopped != nil {
-			fmt.Printf("Stopped:    %s\n", stopped)
+
+		fmt.Println()
+		fmt.Println("Resources:")
+		cpus, _ := sb["cpus"].(float64)
+		if cpus == 0 {
+			cpus = 1
+		}
+		fmt.Printf("  CPUs:     %g\n", cpus)
+		memMB, _ := sb["memory_mb"].(float64)
+		if memMB == 0 {
+			memMB = 1024
+		}
+		fmt.Printf("  Memory:   %.0f MB\n", memMB)
+		diskMB, _ := sb["disk_size_mb"].(float64)
+		if disk, ok := sb["disk_usage"]; ok && disk != nil {
+			// Server provided live disk usage
+			du, _ := disk.(map[string]any)
+			usedMB, _ := du["used_mb"].(float64)
+			freeMB, _ := du["free_mb"].(float64)
+			fmt.Printf("  Disk:     %.0f MB (%.0f MB used, %.0f MB free)\n", diskMB, usedMB, freeMB)
+		} else if diskMB > 0 {
+			fmt.Printf("  Disk:     %.0f MB\n", diskMB)
+		}
+
+		fmt.Println()
+		fmt.Println("Network:")
+		fmt.Printf("  IP:       %s\n", sb["ip"])
+
+		if kh, ok := sb["keep_hot"]; ok && kh == true {
+			fmt.Println()
+			fmt.Println("  keep_hot: true")
 		}
 		return nil
 	},
@@ -340,18 +408,23 @@ var listCmd = &cobra.Command{
 	Short:   "List sandboxes",
 	Example: `  bhatti list
   bhatti ls            # alias
-  bhatti ls --json`,
+  bhatti ls --json
+  bhatti ls -o wide    # show resources and image`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		setupTiming(cmd)
 		defer printTiming()
 
 		var sandboxes []struct {
-			ID      string   `json:"id"`
-			Name    string   `json:"name"`
-			Status  string   `json:"status"`
-			Thermal string   `json:"thermal"`
-			IP      string   `json:"ip"`
-			URLs    []string `json:"urls"`
+			ID         string   `json:"id"`
+			Name       string   `json:"name"`
+			Status     string   `json:"status"`
+			Thermal    string   `json:"thermal"`
+			IP         string   `json:"ip"`
+			URLs       []string `json:"urls"`
+			CPUs       float64  `json:"cpus"`
+			MemoryMB   float64  `json:"memory_mb"`
+			DiskSizeMB float64  `json:"disk_size_mb"`
+			Image      string   `json:"image"`
 		}
 		if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
 			return err
@@ -364,10 +437,37 @@ var listCmd = &cobra.Command{
 		}
 		os.WriteFile(completionCachePath(), []byte(strings.Join(names, "\n")), 0600)
 
+		output, _ := cmd.Flags().GetString("output")
+		wide := output == "wide"
+
 		if isJSON(cmd) {
 			outputJSON(sandboxes)
+		} else if wide {
+			// B6: wide mode with resources and image
+			fmt.Printf("%-20s %-10s %-8s %-16s %-6s %-8s %-8s %s\n",
+				"NAME", "STATUS", "THERMAL", "IP", "CPUS", "MEMORY", "DISK", "IMAGE")
+			for _, sb := range sandboxes {
+				thermal := sb.Thermal
+				if thermal == "" {
+					thermal = "-"
+				}
+				cpus := sb.CPUs
+				if cpus == 0 {
+					cpus = 1
+				}
+				mem := sb.MemoryMB
+				if mem == 0 {
+					mem = 1024
+				}
+				img := sb.Image
+				if img == "" {
+					img = "minimal"
+				}
+				fmt.Printf("%-20s %-10s %-8s %-16s %-6g %-8.0f %-8.0f %s\n",
+					sb.Name, sb.Status, thermal, sb.IP, cpus, mem, sb.DiskSizeMB, img)
+			}
 		} else {
-			// Show URL column only if any sandbox has published URLs
+			// B6: clean default — no ID column
 			hasURLs := false
 			for _, sb := range sandboxes {
 				if len(sb.URLs) > 0 {
@@ -375,11 +475,10 @@ var listCmd = &cobra.Command{
 					break
 				}
 			}
-
 			if hasURLs {
-				fmt.Printf("%-20s %-20s %-10s %-8s %-16s %s\n", "ID", "NAME", "STATUS", "THERMAL", "IP", "URL")
+				fmt.Printf("%-20s %-10s %-8s %-16s %s\n", "NAME", "STATUS", "THERMAL", "IP", "URL")
 			} else {
-				fmt.Printf("%-20s %-20s %-10s %-8s %-16s\n", "ID", "NAME", "STATUS", "THERMAL", "IP")
+				fmt.Printf("%-20s %-10s %-8s %-16s\n", "NAME", "STATUS", "THERMAL", "IP")
 			}
 			for _, sb := range sandboxes {
 				thermal := sb.Thermal
@@ -391,9 +490,9 @@ var listCmd = &cobra.Command{
 					if len(sb.URLs) > 0 {
 						url = sb.URLs[0]
 					}
-					fmt.Printf("%-20s %-20s %-10s %-8s %-16s %s\n", sb.ID, sb.Name, sb.Status, thermal, sb.IP, url)
+					fmt.Printf("%-20s %-10s %-8s %-16s %s\n", sb.Name, sb.Status, thermal, sb.IP, url)
 				} else {
-					fmt.Printf("%-20s %-20s %-10s %-8s %-16s\n", sb.ID, sb.Name, sb.Status, thermal, sb.IP)
+					fmt.Printf("%-20s %-10s %-8s %-16s\n", sb.Name, sb.Status, thermal, sb.IP)
 				}
 			}
 		}
@@ -432,7 +531,7 @@ Persistent volumes are detached but not deleted.`,
 		if isJSON(cmd) {
 			outputJSON(map[string]string{"status": "destroyed"})
 		} else {
-			fmt.Println("destroyed")
+			fmt.Printf("sandbox/%s destroyed\n", args[0])
 		}
 		return nil
 	},

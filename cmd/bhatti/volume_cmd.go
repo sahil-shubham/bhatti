@@ -134,11 +134,39 @@ func init() {
 	volumeDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	volumeCmd.AddCommand(volumeDeleteCmd)
 	volumeCmd.AddCommand(volumeResizeCmd)
+	volumeCloneCmd.Flags().String("name", "", "Name for the cloned volume (required)")
+	volumeCmd.AddCommand(volumeCloneCmd)
 	volumeCmd.AddCommand(volumeBackupCmd)
 	volumeCmd.AddCommand(volumeBackupListCmd)
 	volumeCmd.AddCommand(volumeRestoreCmd)
 	volumeBackupDeleteCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
 	volumeCmd.AddCommand(volumeBackupDeleteCmd)
+}
+
+// --- volume clone (B11) ---
+
+var volumeCloneCmd = &cobra.Command{
+	Use:   "clone <source-volume> --name <new-name>",
+	Short: "Clone a volume (point-in-time copy)",
+	Example: `  bhatti volume clone workspace --name workspace-backup`,
+	Args: exactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		name, _ := cmd.Flags().GetString("name")
+		if name == "" {
+			return fmt.Errorf("--name is required")
+		}
+		var result map[string]any
+		if err := apiJSON("POST", "/volumes/"+args[0]+"/snapshot",
+			map[string]string{"name": name}, &result); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(result)
+		} else {
+			fmt.Printf("Cloned %s → %s\n", args[0], name)
+		}
+		return nil
+	},
 }
 
 var volumeBackupCmd = &cobra.Command{

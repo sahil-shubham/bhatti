@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +18,25 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
+
+// apiRequestWithAccept sends an HTTP request with a custom Accept header.
+func apiRequestWithAccept(method, path string, body any, accept string) (*http.Response, error) {
+	var r io.Reader
+	if body != nil {
+		data, _ := json.Marshal(body)
+		r = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, apiURL+path, r)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", accept)
+	if apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+apiToken)
+	}
+	return httpClient().Do(req)
+}
 
 func init() {
 	destroyCmd.Flags().BoolP("yes", "y", false, "Skip confirmation")
@@ -52,15 +73,72 @@ Sleeping sandboxes wake automatically.`,
 		}
 
 		timeout, _ := cmd.Flags().GetInt("timeout")
+		detach, _ := cmd.Flags().GetBool("detach")
+
 		reqBody := map[string]any{"cmd": cmdArgs}
 		if timeout > 0 {
 			reqBody["timeout_sec"] = timeout
 		}
+		if detach {
+			reqBody["detach"] = true
+		}
 
+		// B2: stream when stdout is a TTY (or BHATTI_FORCE_STREAM=1)
+		stream := (term.IsTerminal(int(os.Stdout.Fd())) || os.Getenv("BHATTI_FORCE_STREAM") == "1") &&
+			!isJSON(cmd) && !detach
+
+		if stream {
+			// Streaming NDJSON path
+			resp, err := apiRequestWithAccept("POST", "/sandboxes/"+id+"/exec", reqBody, "application/x-ndjson")
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			checkServerVersion(resp)
+			if resp.StatusCode >= 400 {
+				var errBody struct{ Error string `json:"error"` }
+				json.NewDecoder(resp.Body).Decode(&errBody)
+				return &apiError{status: resp.Status, message: errBody.Error}
+			}
+
+			exitCode := 0
+			dec := json.NewDecoder(resp.Body)
+			for dec.More() {
+				var event struct {
+					Type     string `json:"type"`
+					Data     string `json:"data"`
+					ExitCode *int   `json:"exit_code"`
+				}
+				if err := dec.Decode(&event); err != nil {
+					break
+				}
+				switch event.Type {
+				case "stdout":
+					os.Stdout.WriteString(event.Data)
+				case "stderr":
+					os.Stderr.WriteString(event.Data)
+				case "exit":
+					if event.ExitCode != nil {
+						exitCode = *event.ExitCode
+					}
+				case "error":
+					fmt.Fprintf(os.Stderr, "exec error: %s\n", event.Data)
+					exitCode = 1
+				}
+			}
+			printTiming()
+			os.Exit(exitCode)
+			return nil
+		}
+
+		// Buffered JSON path (piped, --json, or --detach)
 		var result struct {
-			ExitCode int    `json:"exit_code"`
-			Stdout   string `json:"stdout"`
-			Stderr   string `json:"stderr"`
+			ExitCode   int    `json:"exit_code"`
+			Stdout     string `json:"stdout"`
+			Stderr     string `json:"stderr"`
+			PID        int    `json:"pid"`
+			OutputFile string `json:"output_file"`
+			Detached   bool   `json:"detached"`
 		}
 		if err := apiJSON("POST", "/sandboxes/"+id+"/exec", reqBody, &result); err != nil {
 			return err
@@ -68,6 +146,9 @@ Sleeping sandboxes wake automatically.`,
 
 		if isJSON(cmd) {
 			outputJSON(result)
+		} else if result.Detached {
+			fmt.Printf("pid: %d\noutput: %s\n", result.PID, result.OutputFile)
+			return nil
 		} else {
 			os.Stdout.WriteString(result.Stdout)
 			os.Stderr.WriteString(result.Stderr)
@@ -81,6 +162,7 @@ Sleeping sandboxes wake automatically.`,
 
 func init() {
 	execCmd.Flags().Int("timeout", 0, "Exec timeout in seconds (default: 300, max: 3600)")
+	execCmd.Flags().Bool("detach", false, "Run in background, return PID immediately")
 }
 
 // --- shell ---
@@ -300,6 +382,44 @@ var psCmd = &cobra.Command{
 			for _, s := range sessions {
 				fmt.Printf("%-10s %-40s %-8v %-8v\n",
 					s.SessionID, s.Argv, s.Running, s.Attached)
+			}
+		}
+		return nil
+	},
+}
+
+// --- ports (B5) ---
+
+var portsCmd = &cobra.Command{
+	Use:   "ports <sandbox>",
+	Short: "List listening ports in a sandbox",
+	Example: `  bhatti ports dev
+  bhatti ports dev --json`,
+	Args:              exactArgs(1),
+	ValidArgsFunction: completeSandboxNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		id, err := resolveID(args[0])
+		if err != nil {
+			return err
+		}
+		var ports []struct {
+			Port  int    `json:"port"`
+			Proto string `json:"proto"`
+			Proxy string `json:"proxy"`
+		}
+		if err := apiJSON("GET", "/sandboxes/"+id+"/ports", nil, &ports); err != nil {
+			return err
+		}
+		if isJSON(cmd) {
+			outputJSON(ports)
+		} else {
+			fmt.Printf("%-8s %-8s %s\n", "PORT", "PROTO", "PROXY")
+			for _, p := range ports {
+				proto := p.Proto
+				if proto == "" {
+					proto = "tcp"
+				}
+				fmt.Printf("%-8d %-8s %s\n", p.Port, proto, p.Proxy)
 			}
 		}
 		return nil
