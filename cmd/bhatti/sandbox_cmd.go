@@ -166,8 +166,15 @@ with its own kernel, filesystem, and network.`,
 			}
 			diskVal, _ := sb["disk_size_mb"].(float64)
 			ipVal, _ := sb["ip"].(string)
-			fmt.Printf("sandbox/%s created (%g vCPU, %.0f MB, %.0f MB disk)\n",
-				sbName, cpuVal, memVal, diskVal)
+
+			// Only show disk in summary if user explicitly set it
+			if diskVal > 0 {
+				fmt.Printf("sandbox/%s created (%g vCPU, %.0f MB, %.0f MB disk)\n",
+					sbName, cpuVal, memVal, diskVal)
+			} else {
+				fmt.Printf("sandbox/%s created (%g vCPU, %.0f MB)\n",
+					sbName, cpuVal, memVal)
+			}
 			if ipVal != "" {
 				fmt.Printf("  IP:    %s\n", ipVal)
 			}
@@ -377,15 +384,34 @@ var inspectCmd = &cobra.Command{
 			memMB = 1024
 		}
 		fmt.Printf("  Memory:   %.0f MB\n", memMB)
-		diskMB, _ := sb["disk_size_mb"].(float64)
-		if disk, ok := sb["disk_usage"]; ok && disk != nil {
-			// Server provided live disk usage
-			du, _ := disk.(map[string]any)
-			usedMB, _ := du["used_mb"].(float64)
-			freeMB, _ := du["free_mb"].(float64)
-			fmt.Printf("  Disk:     %.0f MB (%.0f MB used, %.0f MB free)\n", diskMB, usedMB, freeMB)
-		} else if diskMB > 0 {
-			fmt.Printf("  Disk:     %.0f MB\n", diskMB)
+
+		// Live disk usage from df (running VMs only)
+		status, _ := sb["status"].(string)
+		if status == "running" {
+			var dfResult struct {
+				Stdout string `json:"stdout"`
+			}
+			if err := apiJSON("POST", "/sandboxes/"+id+"/exec",
+				map[string]any{"cmd": []string{"df", "-m", "/"}}, &dfResult); err == nil {
+				lines := strings.Split(dfResult.Stdout, "\n")
+				if len(lines) >= 2 {
+					fields := strings.Fields(lines[1])
+					if len(fields) >= 4 {
+						var totalMB, usedMB, freeMB int
+						fmt.Sscanf(fields[1], "%d", &totalMB)
+						fmt.Sscanf(fields[2], "%d", &usedMB)
+						fmt.Sscanf(fields[3], "%d", &freeMB)
+						fmt.Printf("  Disk:     %d MB (%d MB used, %d MB free)\n", totalMB, usedMB, freeMB)
+					}
+				}
+			}
+		} else {
+			diskMB, _ := sb["disk_size_mb"].(float64)
+			if diskMB > 0 {
+				fmt.Printf("  Disk:     %.0f MB\n", diskMB)
+			} else {
+				fmt.Printf("  Disk:     — (stopped)\n")
+			}
 		}
 
 		fmt.Println()

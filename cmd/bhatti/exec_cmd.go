@@ -403,9 +403,8 @@ var portsCmd = &cobra.Command{
 			return err
 		}
 		var ports []struct {
-			Port  int    `json:"port"`
-			Proto string `json:"proto"`
-			Proxy string `json:"proxy"`
+			Port  int    `json:"container_port"`
+			Proxy string `json:"proxy_url"`
 		}
 		if err := apiJSON("GET", "/sandboxes/"+id+"/ports", nil, &ports); err != nil {
 			return err
@@ -413,13 +412,13 @@ var portsCmd = &cobra.Command{
 		if isJSON(cmd) {
 			outputJSON(ports)
 		} else {
-			fmt.Printf("%-8s %-8s %s\n", "PORT", "PROTO", "PROXY")
-			for _, p := range ports {
-				proto := p.Proto
-				if proto == "" {
-					proto = "tcp"
+			if len(ports) == 0 {
+				fmt.Println("No listening ports detected.")
+			} else {
+				fmt.Printf("%-8s %s\n", "PORT", "PROXY")
+				for _, p := range ports {
+					fmt.Printf("%-8d %s\n", p.Port, p.Proxy)
 				}
-				fmt.Printf("%-8d %-8s %s\n", p.Port, proto, p.Proxy)
 			}
 		}
 		return nil

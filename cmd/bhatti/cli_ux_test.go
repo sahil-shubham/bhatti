@@ -46,7 +46,7 @@ func TestCLICreateVerboseOutput(t *testing.T) {
 	if !strings.Contains(stdout, "Shell:") {
 		t.Errorf("expected Shell hint line, got:\n%s", stdout)
 	}
-	// Must show resources
+	// Must show resources (vCPU + memory, disk only if explicitly set)
 	if !strings.Contains(stdout, "vCPU") || !strings.Contains(stdout, "MB") {
 		t.Errorf("expected resource summary (vCPU, MB), got:\n%s", stdout)
 	}
@@ -274,8 +274,8 @@ func TestCLIPorts(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ports --json exit %d", code)
 	}
-	var ports []map[string]interface{}
-	if err := json.Unmarshal([]byte(stdout), &ports); err != nil {
+	var portsJSON []map[string]interface{}
+	if err := json.Unmarshal([]byte(stdout), &portsJSON); err != nil {
 		t.Fatalf("json parse: %v\nraw: %s", err, stdout)
 	}
 }
