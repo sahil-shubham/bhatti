@@ -28,6 +28,12 @@ var serviceDirs = []string{
 	"/lib/systemd/system",
 }
 
+// etcSystemdDir is where enable/disable creates wants/ symlinks and where
+// mask creates the /dev/null symlink. Always /etc/systemd/system in production;
+// overridable in tests so we don't have to run as root or clobber the host's
+// real systemd state.
+var etcSystemdDir = "/etc/systemd/system"
+
 const (
 	pidDir = "/run/bhatti/services"
 	logDir = "/var/log/bhatti"
@@ -46,6 +52,10 @@ var alwaysActiveTargets = map[string]bool{
 }
 
 // runSystemctl is the entry point when invoked as /usr/bin/systemctl.
+// A fresh Registry is created per invocation; for command-line use
+// this is fine because each systemctl process resolves only the units
+// it operates on. PID-1 lohar uses a long-lived Registry that's
+// shared with the syslog receiver and journalctl (see C5).
 func runSystemctl(args []string) {
 	var command string
 	var units []string
@@ -100,6 +110,8 @@ func runSystemctl(args []string) {
 		}
 	}
 
+	reg := NewRegistry()
+
 	// Resolve .socket units to their associated .service for RUNTIME commands
 	// (start/stop/restart/is-active/reload/kill). Socket activation is not
 	// supported — we start the service directly.
@@ -120,81 +132,118 @@ func runSystemctl(args []string) {
 
 	_ = quiet // TODO: suppress stdout when set
 
+	// resolveOrFatal looks up a unit name through the registry. For not-found
+	// units the behaviour matches what the old free-function dispatch did:
+	// some commands (status, show, is-active, is-enabled) are tolerant of
+	// missing units and report a sensible "inactive/not-found" line; others
+	// (start, restart, reload) exit with the systemd convention of code 5.
+	resolveOrTolerate := func(raw string) (*Unit, string) {
+		u, err := reg.Resolve(raw)
+		if err != nil {
+			return nil, raw
+		}
+		return u, raw
+	}
+	resolveOrFatal := func(raw, op string) *Unit {
+		u, err := reg.Resolve(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to %s %s: Unit %s not found.\n", op, raw, raw)
+			os.Exit(5)
+		}
+		return u
+	}
+
 	switch command {
 	case "start":
-		for _, u := range units {
-			if err := svcStart(normalizeName(u)); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to start %s: %v\n", u, err)
+		for _, raw := range units {
+			u := resolveOrFatal(raw, "start")
+			if err := svcStart(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to start %s: %v\n", raw, err)
 				os.Exit(1)
 			}
 		}
 	case "stop":
-		for _, u := range units {
-			if err := svcStop(normalizeName(u)); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to stop %s: %v\n", u, err)
+		for _, raw := range units {
+			u, _ := resolveOrTolerate(raw)
+			if u == nil {
+				continue // stopping a nonexistent unit is not an error
+			}
+			if err := svcStop(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to stop %s: %v\n", raw, err)
 				os.Exit(1)
 			}
 		}
 	case "restart":
-		for _, u := range units {
-			name := normalizeName(u)
-			svcStop(name)
-			if err := svcStart(name); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to restart %s: %v\n", u, err)
+		for _, raw := range units {
+			u := resolveOrFatal(raw, "restart")
+			svcStop(u)
+			if err := svcStart(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to restart %s: %v\n", raw, err)
 				os.Exit(1)
 			}
 		}
 	case "try-restart":
-		// Restart only if already running.
-		for _, u := range units {
-			name := normalizeName(u)
-			if svcIsActive(name) {
-				svcStop(name)
-				if err := svcStart(name); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to restart %s: %v\n", u, err)
-					os.Exit(1)
-				}
+		for _, raw := range units {
+			u, _ := resolveOrTolerate(raw)
+			if u == nil || !svcIsActive(u) {
+				continue
+			}
+			svcStop(u)
+			if err := svcStart(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to restart %s: %v\n", raw, err)
+				os.Exit(1)
 			}
 		}
 	case "reload":
-		for _, u := range units {
-			if err := svcReload(normalizeName(u)); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to reload %s: %v\n", u, err)
+		for _, raw := range units {
+			u := resolveOrFatal(raw, "reload")
+			if err := svcReload(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to reload %s: %v\n", raw, err)
 				os.Exit(1)
 			}
 		}
 	case "reload-or-restart":
-		for _, u := range units {
-			name := normalizeName(u)
-			if err := svcReload(name); err != nil {
-				svcStop(name)
-				if err := svcStart(name); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to restart %s: %v\n", u, err)
+		for _, raw := range units {
+			u := resolveOrFatal(raw, "reload-or-restart")
+			if err := svcReload(u); err != nil {
+				svcStop(u)
+				if err := svcStart(u); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to restart %s: %v\n", raw, err)
 					os.Exit(1)
 				}
 			}
 		}
 	case "enable":
-		for _, u := range units {
-			name := normalizeName(u)
-			suffix := unitSuffix(u)
-			if err := svcEnableUnit(name, suffix); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to enable %s: %v\n", u, err)
+		for _, raw := range units {
+			u, _ := resolveOrTolerate(raw)
+			if u == nil {
+				// enable on a missing unit is silently tolerated to match
+				// the old behaviour — packages may enable services whose
+				// files aren't installed yet.
+				continue
+			}
+			if err := svcEnable(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to enable %s: %v\n", raw, err)
 				os.Exit(1)
 			}
 			if nowFlag {
-				svcStart(name)
+				svcStart(u)
 			}
 		}
 	case "disable":
-		for _, u := range units {
-			name := normalizeName(u)
-			suffix := unitSuffix(u)
-			if nowFlag {
-				svcStop(name)
+		for _, raw := range units {
+			u, _ := resolveOrTolerate(raw)
+			if u == nil {
+				// Glob-based disable still works without a registry hit:
+				// remove any wants/ symlinks matching the raw name.
+				svcDisableByName(normalizeName(raw), unitSuffix(raw))
+				continue
 			}
-			if err := svcDisableUnit(name, suffix); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to disable %s: %v\n", u, err)
+			if nowFlag {
+				svcStop(u)
+			}
+			if err := svcDisable(u); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to disable %s: %v\n", raw, err)
 				os.Exit(1)
 			}
 		}
@@ -202,7 +251,13 @@ func runSystemctl(args []string) {
 		if len(units) == 0 {
 			os.Exit(1)
 		}
-		if svcIsActive(normalizeName(units[0])) {
+		active := false
+		if isTarget(normalizeName(units[0])) {
+			active = true
+		} else if u, _ := resolveOrTolerate(units[0]); u != nil {
+			active = svcIsActive(u)
+		}
+		if active {
 			if !quiet {
 				fmt.Println("active")
 			}
@@ -216,7 +271,13 @@ func runSystemctl(args []string) {
 		if len(units) == 0 {
 			os.Exit(1)
 		}
-		if svcIsEnabled(normalizeName(units[0])) {
+		enabled := false
+		if u, _ := resolveOrTolerate(units[0]); u != nil {
+			enabled = svcIsEnabled(u)
+		} else {
+			enabled = svcIsEnabledByName(normalizeName(units[0]))
+		}
+		if enabled {
 			if !quiet {
 				fmt.Println("enabled")
 			}
@@ -231,27 +292,30 @@ func runSystemctl(args []string) {
 			fmt.Println("running")
 			return
 		}
-		svcStatus(normalizeName(units[0]))
+		u, raw := resolveOrTolerate(units[0])
+		svcStatus(u, raw)
 	case "show":
 		if len(units) == 0 {
 			return
 		}
-		svcShow(normalizeName(units[0]), showProp, showValue)
+		u, raw := resolveOrTolerate(units[0])
+		svcShow(u, raw, showProp, showValue)
 	case "cat":
 		if len(units) == 0 {
 			os.Exit(1)
 		}
-		svcCat(normalizeName(units[0]))
+		u, raw := resolveOrTolerate(units[0])
+		svcCat(u, raw)
 	case "mask":
-		for _, u := range units {
-			if err := svcMask(normalizeName(u)); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to mask %s: %v\n", u, err)
+		for _, raw := range units {
+			if err := svcMaskName(normalizeName(raw)); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to mask %s: %v\n", raw, err)
 			}
 		}
 	case "unmask":
-		for _, u := range units {
-			if err := svcUnmask(normalizeName(u)); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to unmask %s: %v\n", u, err)
+		for _, raw := range units {
+			if err := svcUnmaskName(normalizeName(raw)); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to unmask %s: %v\n", raw, err)
 			}
 		}
 	case "kill":
@@ -261,23 +325,31 @@ func runSystemctl(args []string) {
 		} else if signalName == "HUP" || signalName == "SIGHUP" {
 			sig = syscall.SIGHUP
 		}
-		for _, u := range units {
-			if pid, err := readPID(normalizeName(u)); err == nil {
+		for _, raw := range units {
+			u, _ := resolveOrTolerate(raw)
+			if u == nil {
+				continue
+			}
+			if pid, err := u.ReadPID(); err == nil {
 				syscall.Kill(-pid, sig)
 			}
 		}
 	case "daemon-reload", "daemon-reexec", "reset-failed":
 		// no-op
 	case "preset":
-		for _, u := range units {
-			svcEnableUnit(normalizeName(u), unitSuffix(u))
+		for _, raw := range units {
+			u, _ := resolveOrTolerate(raw)
+			if u == nil {
+				continue
+			}
+			svcEnable(u)
 		}
 	case "is-system-running":
 		fmt.Println("running")
 	case "list-units":
-		svcListUnits(stateFilter, typeFilter, noLegend)
+		svcListUnits(reg, stateFilter, typeFilter, noLegend)
 	case "list-unit-files":
-		svcListUnitFiles(noLegend)
+		svcListUnitFiles(reg, noLegend)
 	default:
 		// Unknown command — succeed silently. Package scripts sometimes
 		// call obscure systemctl subcommands; failing breaks installs.
@@ -287,7 +359,13 @@ func runSystemctl(args []string) {
 	}
 }
 
-// --- Name resolution ---
+// --- Name resolution helpers ---
+//
+// Unit identity (canonical name, alias merge, drop-in loading) lives in
+// unit.go. The helpers here are small utilities that operate on raw
+// argv strings before resolution, plus the socket->service hop for
+// runtime commands. Anything that touches *Unit state (pidfile, logfile,
+// is-running) belongs on the Unit type.
 
 // unitSuffix returns the suffix (.service, .socket, etc.) or defaults to .service.
 func unitSuffix(name string) string {
@@ -319,9 +397,11 @@ func isTarget(name string) bool {
 
 // resolveSocketToService finds the .service associated with a .socket unit.
 // Checks the Service= directive in the .socket file, falls back to name match.
+// This runs before registry resolution because the dispatch needs a .service
+// name to look up. We don't (yet) implement socket activation — the .service
+// is started directly.
 func resolveSocketToService(name string) string {
 	base := normalizeName(name)
-	// Look for the .socket file and check Service= directive.
 	for _, dir := range serviceDirs {
 		path := filepath.Join(dir, base+".socket")
 		if _, err := os.Stat(path); err == nil {
@@ -331,155 +411,33 @@ func resolveSocketToService(name string) string {
 			}
 		}
 	}
-	// Default: ssh.socket -> ssh.service
 	return base
 }
 
-// resolveTemplateName handles @ template units.
-// postgresql@16-main -> finds postgresql@.service, instance=16-main
-func resolveTemplateName(name string) (templateFile string, instance string) {
-	idx := strings.Index(name, "@")
-	if idx < 0 {
-		return "", ""
-	}
-	prefix := name[:idx]
-	instance = name[idx+1:]
-	// Look for the template file: prefix@.service
-	for _, dir := range serviceDirs {
-		path := filepath.Join(dir, prefix+"@.service")
-		if _, err := os.Stat(path); err == nil {
-			return path, instance
-		}
-	}
-	return "", instance
-}
-
-// expandTemplateSpecifiers replaces %i and %I in service file values.
-func expandTemplateSpecifiers(value, instance string) string {
-	value = strings.ReplaceAll(value, "%i", instance)
-	// %I replaces - with /
-	value = strings.ReplaceAll(value, "%I", strings.ReplaceAll(instance, "-", "/"))
-	return value
-}
-
-// findServiceFile locates the .service file for a unit.
-// Handles: direct name, aliases, socket->service resolution, @ templates.
-func findServiceFile(name string) string {
-	// Direct match.
-	for _, dir := range serviceDirs {
-		path := filepath.Join(dir, name+".service")
-		if target, err := os.Readlink(path); err == nil {
-			if target == "/dev/null" {
-				return "" // masked
-			}
-		}
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	// Template match: postgresql@16-main -> postgresql@.service
-	if strings.Contains(name, "@") {
-		if tmplPath, _ := resolveTemplateName(name); tmplPath != "" {
-			return tmplPath
-		}
-	}
-	// Alias match.
-	for _, dir := range serviceDirs {
-		entries, _ := os.ReadDir(dir)
-		for _, e := range entries {
-			if !strings.HasSuffix(e.Name(), ".service") {
-				continue
-			}
-			path := filepath.Join(dir, e.Name())
-			svc := parseServiceFile(path)
-			for _, alias := range svc.getAll("Install", "Alias") {
-				if normalizeName(alias) == name {
-					return path
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// findUnitFile locates any unit file (.service, .socket, .target).
-func findUnitFile(name string, suffix string) string {
-	for _, dir := range serviceDirs {
-		path := filepath.Join(dir, name+suffix)
-		if target, err := os.Readlink(path); err == nil {
-			if target == "/dev/null" {
-				return ""
-			}
-		}
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	return ""
-}
-
-// isMasked checks if a unit is masked (symlinked to /dev/null).
-func isMasked(name string) bool {
-	for _, suffix := range []string{".service", ".socket"} {
-		for _, dir := range serviceDirs {
-			path := filepath.Join(dir, name+suffix)
-			if target, err := os.Readlink(path); err == nil && target == "/dev/null" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// --- PID + process management ---
-
-func pidFile(name string) string {
-	return filepath.Join(pidDir, name+".pid")
-}
-
-func readPID(name string) (int, error) {
-	data, err := os.ReadFile(pidFile(name))
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
-}
-
+// processAlive is the only PID helper that doesn't belong on Unit — it
+// operates on a raw PID, not a unit identity.
 func processAlive(pid int) bool {
 	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
 	return err == nil
 }
 
-func serviceLogPath(name string) string {
-	return filepath.Join(logDir, name+".log")
-}
-
 // --- Service operations ---
+//
+// Every operation takes a *Unit instead of a name string. State (pidfile,
+// logfile, enabled-marker glob) is keyed by Unit.Canonical, so any name
+// the unit answers to (canonical or alias) sees the same state. This is
+// the heart of C1: it's why `systemctl status sshd` and `systemctl status
+// ssh` can no longer disagree.
 
-func svcStart(name string) error {
-	if pid, err := readPID(name); err == nil && processAlive(pid) {
+func svcStart(u *Unit) error {
+	if u.Masked {
+		return fmt.Errorf("unit %s is masked", u.FullName())
+	}
+	if u.IsRunning() {
 		return nil // already running
 	}
 
-	path := findServiceFile(name)
-	if path == "" {
-		fmt.Fprintf(os.Stderr, "Unit %s.service not found.\n", name)
-		os.Exit(5) // systemd convention: unit not found
-		return nil
-	}
-
-	svc := parseServiceFile(path)
-
-	// Template specifier expansion: %i and %I for @ units.
-	if strings.Contains(name, "@") {
-		if _, instance := resolveTemplateName(name); instance != "" {
-			for section := range svc.sections {
-				for i, kv := range svc.sections[section] {
-					svc.sections[section][i].value = expandTemplateSpecifiers(kv.value, instance)
-				}
-			}
-		}
-	}
+	svc := u.Sections
 
 	// RuntimeDirectory
 	if rd := svc.get("Service", "RuntimeDirectory"); rd != "" {
@@ -492,8 +450,8 @@ func svcStart(name string) error {
 		}
 		os.MkdirAll(dir, mode)
 		os.Chmod(dir, mode)
-		if u := svc.get("Service", "User"); u != "" {
-			exec.Command("chown", u, dir).Run()
+		if user := svc.get("Service", "User"); user != "" {
+			exec.Command("chown", user, dir).Run()
 		}
 	}
 
@@ -511,7 +469,7 @@ func svcStart(name string) error {
 
 	execStart := svc.get("Service", "ExecStart")
 	if execStart == "" {
-		return fmt.Errorf("no ExecStart in %s", path)
+		return fmt.Errorf("no ExecStart in %s", u.Path)
 	}
 
 	svcType := svc.get("Service", "Type")
@@ -523,14 +481,14 @@ func svcStart(name string) error {
 	case "oneshot":
 		return runServiceCommand(execStart, svc)
 	case "forking":
-		return startForking(name, execStart, svc)
+		return startForking(u, execStart, svc)
 	default:
 		// simple, exec, notify, dbus — all treated as simple daemons.
-		return startDaemon(name, execStart, svc)
+		return startDaemon(u, execStart, svc)
 	}
 }
 
-func startDaemon(name, execStart string, svc serviceFile) error {
+func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 	execStart = strings.TrimLeft(execStart, "-!+:@")
 	if execStart == "" {
 		return fmt.Errorf("empty ExecStart")
@@ -544,7 +502,7 @@ func startDaemon(name, execStart string, svc serviceFile) error {
 
 	// Capture stdout/stderr to log file for debugging.
 	os.MkdirAll(logDir, 0755)
-	logFile, err := os.OpenFile(serviceLogPath(name),
+	logFile, err := os.OpenFile(u.LogPath(),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err == nil {
 		cmd.Stdout = logFile
@@ -563,13 +521,12 @@ func startDaemon(name, execStart string, svc serviceFile) error {
 		logFile.Close()
 	}
 
-	os.MkdirAll(pidDir, 0755)
-	os.WriteFile(pidFile(name), []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
+	u.WritePID(cmd.Process.Pid)
 	cmd.Process.Release()
 	return nil
 }
 
-func startForking(name, execStart string, svc serviceFile) error {
+func startForking(u *Unit, execStart string, svc serviceFile) error {
 	execStart = strings.TrimLeft(execStart, "-!+:@")
 	if execStart == "" {
 		return fmt.Errorf("empty ExecStart")
@@ -587,114 +544,104 @@ func startForking(name, execStart string, svc serviceFile) error {
 	if pf := svc.get("Service", "PIDFile"); pf != "" {
 		if data, err := os.ReadFile(pf); err == nil {
 			os.MkdirAll(pidDir, 0755)
-			os.WriteFile(pidFile(name), data, 0644)
+			os.WriteFile(u.PidPath(), data, 0644)
 		}
 	}
 	return nil
 }
 
-func svcStop(name string) error {
-	pid, err := readPID(name)
+func svcStop(u *Unit) error {
+	pid, err := u.ReadPID()
 	if err != nil || !processAlive(pid) {
-		os.Remove(pidFile(name))
+		u.RemovePID()
 		return nil
 	}
 
-	// ExecStop if defined
-	if path := findServiceFile(name); path != "" {
-		svc := parseServiceFile(path)
-		if execStop := svc.get("Service", "ExecStop"); execStop != "" {
-			runServiceCommand(execStop, svc)
-			time.Sleep(500 * time.Millisecond)
-			if !processAlive(pid) {
-				os.Remove(pidFile(name))
-				return nil
-			}
+	svc := u.Sections
+	if execStop := svc.get("Service", "ExecStop"); execStop != "" {
+		runServiceCommand(execStop, svc)
+		time.Sleep(500 * time.Millisecond)
+		if !processAlive(pid) {
+			u.RemovePID()
+			return nil
 		}
 	}
 
 	syscall.Kill(-pid, syscall.SIGTERM)
 	for i := 0; i < 50; i++ {
 		if !processAlive(pid) {
-			os.Remove(pidFile(name))
+			u.RemovePID()
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	syscall.Kill(-pid, syscall.SIGKILL)
-	os.Remove(pidFile(name))
+	u.RemovePID()
 	return nil
 }
 
-func svcReload(name string) error {
-	pid, err := readPID(name)
+func svcReload(u *Unit) error {
+	pid, err := u.ReadPID()
 	if err != nil || !processAlive(pid) {
-		return fmt.Errorf("%s is not running", name)
+		return fmt.Errorf("%s is not running", u.Canonical)
 	}
 
-	// Use ExecReload if defined, otherwise SIGHUP.
-	if path := findServiceFile(name); path != "" {
-		svc := parseServiceFile(path)
-		if execReload := svc.get("Service", "ExecReload"); execReload != "" {
-			return runServiceCommand(execReload, svc)
-		}
+	svc := u.Sections
+	if execReload := svc.get("Service", "ExecReload"); execReload != "" {
+		return runServiceCommand(execReload, svc)
 	}
 	return syscall.Kill(pid, syscall.SIGHUP)
 }
 
-// svcEnable enables a .service unit (convenience wrapper).
-func svcEnable(name string) error {
-	return svcEnableUnit(name, ".service")
-}
-
-// svcEnableUnit enables a unit with the given suffix (.service, .socket, etc.).
-func svcEnableUnit(name, suffix string) error {
-	// Find the unit file.
-	var path string
-	if suffix == ".service" {
-		path = findServiceFile(name)
-	} else {
-		path = findUnitFile(name, suffix)
+// svcEnable creates the enable-symlinks for a unit. C3 will extend this
+// to honour [Install] Alias= directives by creating alias symlinks; for
+// C1 we keep the existing WantedBy/RequiredBy behaviour unchanged.
+func svcEnable(u *Unit) error {
+	if u.Masked {
+		return fmt.Errorf("unit %s is masked", u.FullName())
 	}
-	if path == "" {
-		// Not found — not an error for enable (package may not have the unit yet).
-		return nil
+	if u.Path == "" {
+		return nil // package may not have shipped the file yet
 	}
+	svc := u.Sections
 
-	svc := parseServiceFile(path)
-
-	// WantedBy: create symlink in <target>.wants/
 	wantedBy := svc.get("Install", "WantedBy")
 	if wantedBy == "" {
 		wantedBy = "multi-user.target"
 	}
-	wantsDir := filepath.Join("/etc/systemd/system", wantedBy+".wants")
+	wantsDir := filepath.Join(etcSystemdDir, wantedBy+".wants")
 	os.MkdirAll(wantsDir, 0755)
-	link := filepath.Join(wantsDir, name+suffix)
+	link := filepath.Join(wantsDir, u.FullName())
 	os.Remove(link)
-	if err := os.Symlink(path, link); err != nil {
+	if err := os.Symlink(u.Path, link); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", link, path)
+	fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", link, u.Path)
 
-	// RequiredBy: create symlink in <unit>.requires/
-	// e.g. ssh.socket has RequiredBy=ssh.service → creates
-	// ssh.service.requires/ssh.socket
 	for _, reqBy := range svc.getAll("Install", "RequiredBy") {
-		reqDir := filepath.Join("/etc/systemd/system", reqBy+".requires")
+		reqDir := filepath.Join(etcSystemdDir, reqBy+".requires")
 		os.MkdirAll(reqDir, 0755)
-		reqLink := filepath.Join(reqDir, name+suffix)
+		reqLink := filepath.Join(reqDir, u.FullName())
 		os.Remove(reqLink)
-		os.Symlink(path, reqLink)
-		fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", reqLink, path)
+		os.Symlink(u.Path, reqLink)
+		fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", reqLink, u.Path)
 	}
 
 	return nil
 }
 
-// svcDisableUnit disables a unit with the given suffix.
-func svcDisableUnit(name, suffix string) error {
-	pattern := "/etc/systemd/system/*.wants/" + name + suffix
+// svcDisable removes the enable-symlinks for a unit. Falls back to a
+// glob over the canonical name; alias symlinks (created in C3) will be
+// removed when C3 lands.
+func svcDisable(u *Unit) error {
+	return svcDisableByName(u.Canonical, u.Suffix)
+}
+
+// svcDisableByName is the no-Unit fallback used when disable is called
+// for a name that doesn't resolve through the registry. Same glob logic
+// as before.
+func svcDisableByName(name, suffix string) error {
+	pattern := filepath.Join(etcSystemdDir, "*.wants", name+suffix)
 	matches, _ := filepath.Glob(pattern)
 	for _, m := range matches {
 		os.Remove(m)
@@ -703,23 +650,34 @@ func svcDisableUnit(name, suffix string) error {
 	return nil
 }
 
-func svcIsActive(name string) bool {
-	// Well-known targets are always active.
-	if isTarget(name) {
-		return true
-	}
-	pid, err := readPID(name)
-	if err != nil {
-		return false
-	}
-	return processAlive(pid)
+func svcIsActive(u *Unit) bool {
+	return u.IsRunning()
 }
 
-func svcIsEnabled(name string) bool {
-	// Check both .service and .socket symlinks.
+func svcIsEnabled(u *Unit) bool {
+	// Glob across both .service and .socket: when a unit answers to both
+	// (e.g. ssh.service + ssh.socket), enabling either is "enabled".
+	names := []string{u.Canonical}
+	for alias := range u.Aliases {
+		names = append(names, alias)
+	}
 	for _, suffix := range []string{".service", ".socket"} {
-		pattern := "/etc/systemd/system/*.wants/" + name + suffix
-		matches, _ := filepath.Glob(pattern)
+		for _, name := range names {
+			pattern := filepath.Join(etcSystemdDir, "*.wants", name+suffix)
+			matches, _ := filepath.Glob(pattern)
+			if len(matches) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// svcIsEnabledByName is the no-Unit fallback. Used for unresolved names
+// (where Resolve failed) so `is-enabled` can still report disabled.
+func svcIsEnabledByName(name string) bool {
+	for _, suffix := range []string{".service", ".socket"} {
+		matches, _ := filepath.Glob(filepath.Join(etcSystemdDir, "*.wants", name+suffix))
 		if len(matches) > 0 {
 			return true
 		}
@@ -727,14 +685,18 @@ func svcIsEnabled(name string) bool {
 	return false
 }
 
-func svcMask(name string) error {
-	target := filepath.Join("/etc/systemd/system", name+".service")
+// svcMaskName creates the /dev/null mask symlink. Naming-by-string is
+// correct here — mask is a filesystem operation that doesn't need a
+// resolved unit (you can mask a unit that doesn't exist yet).
+func svcMaskName(name string) error {
+	target := filepath.Join(etcSystemdDir, name+".service")
+	os.MkdirAll(filepath.Dir(target), 0755)
 	os.Remove(target)
 	return os.Symlink("/dev/null", target)
 }
 
-func svcUnmask(name string) error {
-	target := filepath.Join("/etc/systemd/system", name+".service")
+func svcUnmaskName(name string) error {
+	target := filepath.Join(etcSystemdDir, name+".service")
 	link, err := os.Readlink(target)
 	if err == nil && link == "/dev/null" {
 		return os.Remove(target)
@@ -742,21 +704,27 @@ func svcUnmask(name string) error {
 	return nil
 }
 
-func svcStatus(name string) {
+// svcStatus prints the kubectl-describe-style status block. The header
+// line uses the user-supplied query name (matches systemd's behaviour),
+// but the underlying state (pidfile, logfile) is read from the resolved
+// Unit so an alias query and a canonical query agree.
+func svcStatus(u *Unit, displayName string) {
+	displayName = normalizeName(displayName)
 	active := "inactive"
 	pid := 0
-	if p, err := readPID(name); err == nil && processAlive(p) {
-		active = "active"
-		pid = p
+	if u != nil {
+		if p, err := u.ReadPID(); err == nil && processAlive(p) {
+			active = "active"
+			pid = p
+		}
 	}
-	desc := name
-	if path := findServiceFile(name); path != "" {
-		svc := parseServiceFile(path)
-		if d := svc.get("Unit", "Description"); d != "" {
+	desc := displayName
+	if u != nil {
+		if d := u.Sections.get("Unit", "Description"); d != "" {
 			desc = d
 		}
 	}
-	fmt.Printf("● %s.service - %s\n", name, desc)
+	fmt.Printf("● %s.service - %s\n", displayName, desc)
 	fmt.Printf("     Active: %s", active)
 	if pid > 0 {
 		fmt.Printf(" (running, PID %d)", pid)
@@ -764,39 +732,37 @@ func svcStatus(name string) {
 	fmt.Println()
 
 	// Show last few lines of log if available.
-	if logPath := serviceLogPath(name); fileExists(logPath) {
-		fmt.Println()
-		showLastLines(logPath, 5)
+	if u != nil {
+		if logPath := u.LogPath(); fileExists(logPath) {
+			fmt.Println()
+			showLastLines(logPath, 5)
+		}
 	}
 }
 
-func svcShow(name string, prop string, valueOnly bool) {
-	// Synthesized properties that invoke-rc.d checks.
+func svcShow(u *Unit, displayName string, prop string, valueOnly bool) {
 	synth := map[string]string{}
-
-	path := findServiceFile(name)
-	if path != "" {
-		synth["SourcePath"] = path
+	if u != nil && !u.Masked {
+		synth["SourcePath"] = u.Path
 		synth["LoadState"] = "loaded"
-		svc := parseServiceFile(path)
-		if svc.get("Service", "ExecReload") != "" {
+		if u.Sections.get("Service", "ExecReload") != "" {
 			synth["CanReload"] = "yes"
 		} else {
 			synth["CanReload"] = "no"
 		}
-		// Include all file properties.
 		for _, section := range []string{"Unit", "Service", "Install"} {
-			for _, kv := range svc.sections[section] {
+			for _, kv := range u.Sections.sections[section] {
 				if _, exists := synth[kv.key]; !exists {
 					synth[kv.key] = kv.value
 				}
 			}
 		}
-	} else if isMasked(name) {
+	} else if u != nil && u.Masked {
 		synth["LoadState"] = "masked"
 	} else {
 		synth["LoadState"] = "not-found"
 	}
+	_ = displayName
 
 	if prop != "" {
 		val := synth[prop]
@@ -812,22 +778,21 @@ func svcShow(name string, prop string, valueOnly bool) {
 	}
 }
 
-func svcCat(name string) {
-	path := findServiceFile(name)
-	if path == "" {
-		fmt.Fprintf(os.Stderr, "No files found for %s.service.\n", name)
+func svcCat(u *Unit, displayName string) {
+	if u == nil || u.Path == "" {
+		fmt.Fprintf(os.Stderr, "No files found for %s.service.\n", normalizeName(displayName))
 		os.Exit(1)
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(u.Path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", path, err)
+		fmt.Fprintf(os.Stderr, "Failed to read %s: %v\n", u.Path, err)
 		os.Exit(1)
 	}
-	fmt.Printf("# %s\n", path)
+	fmt.Printf("# %s\n", u.Path)
 	os.Stdout.Write(data)
 }
 
-func svcListUnits(stateFilter, typeFilter string, noLegend bool) {
+func svcListUnits(reg *Registry, stateFilter, typeFilter string, noLegend bool) {
 	if typeFilter != "" && typeFilter != "service" {
 		return
 	}
@@ -843,8 +808,12 @@ func svcListUnits(stateFilter, typeFilter string, noLegend bool) {
 			}
 			seen[e.Name()] = true
 			name := strings.TrimSuffix(e.Name(), ".service")
+			u, err := reg.Resolve(name)
+			if err != nil {
+				continue
+			}
 			active := "inactive"
-			if svcIsActive(name) {
+			if svcIsActive(u) {
 				active = "active"
 			}
 			if stateFilter == "running" && active != "active" {
@@ -854,11 +823,8 @@ func svcListUnits(stateFilter, typeFilter string, noLegend bool) {
 				continue
 			}
 			desc := name
-			if path := findServiceFile(name); path != "" {
-				svc := parseServiceFile(path)
-				if d := svc.get("Unit", "Description"); d != "" {
-					desc = d
-				}
+			if d := u.Sections.get("Unit", "Description"); d != "" {
+				desc = d
 			}
 			fmt.Printf("%-40s %-10s %-10s %s\n",
 				e.Name(), "loaded", active, desc)
@@ -866,7 +832,7 @@ func svcListUnits(stateFilter, typeFilter string, noLegend bool) {
 	}
 }
 
-func svcListUnitFiles(noLegend bool) {
+func svcListUnitFiles(reg *Registry, noLegend bool) {
 	if !noLegend {
 		fmt.Printf("%-50s %s\n", "UNIT FILE", "STATE")
 	}
@@ -880,11 +846,13 @@ func svcListUnitFiles(noLegend bool) {
 			seen[e.Name()] = true
 			name := strings.TrimSuffix(e.Name(), ".service")
 			state := "disabled"
-			if svcIsEnabled(name) {
-				state = "enabled"
-			}
-			if isMasked(name) {
-				state = "masked"
+			u, err := reg.Resolve(name)
+			if err == nil {
+				if u.Masked {
+					state = "masked"
+				} else if svcIsEnabled(u) {
+					state = "enabled"
+				}
 			}
 			fmt.Printf("%-50s %s\n", e.Name(), state)
 		}
@@ -892,19 +860,26 @@ func svcListUnitFiles(noLegend bool) {
 }
 
 // startEnabledServices starts all services in multi-user.target.wants.
-// Called at boot by lohar (PID 1).
+// Called at boot by lohar (PID 1). Each name is resolved through the
+// registry so aliases share state with their canonical units.
 func startEnabledServices() {
 	wantsDir := "/etc/systemd/system/multi-user.target.wants"
 	entries, err := os.ReadDir(wantsDir)
 	if err != nil {
 		return
 	}
+	reg := NewRegistry()
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".service") {
 			continue
 		}
 		name := strings.TrimSuffix(e.Name(), ".service")
-		if err := svcStart(name); err != nil {
+		u, err := reg.Resolve(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "lohar: cannot resolve %s: %v\n", name, err)
+			continue
+		}
+		if err := svcStart(u); err != nil {
 			fmt.Fprintf(os.Stderr, "lohar: failed to start %s: %v\n", name, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "lohar: started %s\n", name)
@@ -963,8 +938,19 @@ func runJournalctl(args []string) {
 		return
 	}
 
-	unit = strings.TrimSuffix(unit, ".service")
-	logPath := serviceLogPath(unit)
+	// Resolve the unit through the registry so journalctl -u sshd and
+	// journalctl -u ssh read the same file when ssh has Alias=sshd.
+	reg := NewRegistry()
+	u, _ := reg.Resolve(unit)
+	var logPath string
+	if u != nil {
+		logPath = u.LogPath()
+	} else {
+		// Fallback: file might exist for a unit we couldn't resolve
+		// (e.g. a custom log written by the syslog receiver under an
+		// arbitrary tag).
+		logPath = filepath.Join(logDir, strings.TrimSuffix(unit, ".service")+".log")
+	}
 
 	if follow {
 		// tail -f equivalent

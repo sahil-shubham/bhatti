@@ -127,37 +127,43 @@ func TestIsTarget(t *testing.T) {
 }
 
 func TestSvcIsActiveTargets(t *testing.T) {
-	// Well-known targets must always report active.
-	if !svcIsActive("sysinit") {
-		t.Error("sysinit.target should be active")
+	// Targets are handled by isTarget() before the registry; svcIsActive
+	// itself only operates on resolved Units (services).
+	if !isTarget("sysinit") {
+		t.Error("sysinit.target should be a target")
 	}
-	if !svcIsActive("multi-user") {
-		t.Error("multi-user.target should be active")
+	if !isTarget("multi-user") {
+		t.Error("multi-user.target should be a target")
 	}
 }
 
-func TestFindServiceFile(t *testing.T) {
+func TestRegistryResolveDirect(t *testing.T) {
 	dir := t.TempDir()
-
-	// Override serviceDirs for this test.
 	origDirs := serviceDirs
 	serviceDirs = []string{dir}
 	defer func() { serviceDirs = origDirs }()
 
-	// Create a service file.
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	if got := findServiceFile("test"); got != svcPath {
-		t.Errorf("findServiceFile(test) = %q, want %q", got, svcPath)
+	reg := NewRegistry()
+	u, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatalf("Resolve(test): %v", err)
+	}
+	if u.Canonical != "test" || u.Suffix != ".service" || u.Path != svcPath {
+		t.Errorf("got Unit{%q, %q, %q}, want test/.service/%s", u.Canonical, u.Suffix, u.Path, svcPath)
 	}
 
-	if got := findServiceFile("nonexistent"); got != "" {
-		t.Errorf("findServiceFile(nonexistent) = %q, want empty", got)
+	if _, err := reg.Resolve("nonexistent"); err == nil {
+		t.Error("Resolve(nonexistent) should return error")
 	}
 }
 
-func TestFindServiceFileAlias(t *testing.T) {
+func TestRegistryAliasResolution(t *testing.T) {
+	// The Fastidious bug regression test: ssh.service with Alias=sshd.service.
+	// Resolve("ssh") and Resolve("sshd") must return the SAME Unit pointer,
+	// so that pidfile/logfile state is shared between the two names.
 	dir := t.TempDir()
 	origDirs := serviceDirs
 	serviceDirs = []string{dir}
@@ -166,81 +172,194 @@ func TestFindServiceFileAlias(t *testing.T) {
 	svcPath := filepath.Join(dir, "ssh.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
 
-	// Find by canonical name.
-	if got := findServiceFile("ssh"); got != svcPath {
-		t.Errorf("findServiceFile(ssh) = %q, want %q", got, svcPath)
+	reg := NewRegistry()
+	canon, err := reg.Resolve("ssh")
+	if err != nil {
+		t.Fatalf("Resolve(ssh): %v", err)
 	}
-	// Find by alias.
-	if got := findServiceFile("sshd"); got != svcPath {
-		t.Errorf("findServiceFile(sshd) = %q, want %q", got, svcPath)
+	alias, err := reg.Resolve("sshd")
+	if err != nil {
+		t.Fatalf("Resolve(sshd): %v", err)
+	}
+	if canon != alias {
+		t.Fatalf("Resolve(ssh) and Resolve(sshd) returned different *Unit pointers: %p vs %p", canon, alias)
+	}
+	if canon.Canonical != "ssh" {
+		t.Errorf("Canonical = %q, want ssh", canon.Canonical)
+	}
+	if _, ok := canon.Aliases["sshd"]; !ok {
+		t.Errorf("Aliases = %v, want sshd present", canon.Aliases)
+	}
+
+	// State paths must use the canonical name regardless of which alias
+	// was queried. This is the bug fix.
+	wantPid := filepath.Join(pidDir, "ssh.pid")
+	if canon.PidPath() != wantPid || alias.PidPath() != wantPid {
+		t.Errorf("PidPath canon=%q alias=%q, both want %q",
+			canon.PidPath(), alias.PidPath(), wantPid)
 	}
 }
 
-func TestFindServiceFileMasked(t *testing.T) {
+func TestRegistryAliasInReverse(t *testing.T) {
+	// Resolve by alias FIRST, then by canonical — must still produce one Unit.
 	dir := t.TempDir()
 	origDirs := serviceDirs
 	serviceDirs = []string{dir}
 	defer func() { serviceDirs = origDirs }()
 
-	svcPath := filepath.Join(dir, "masked.service")
-	os.Symlink("/dev/null", svcPath)
+	os.WriteFile(filepath.Join(dir, "ssh.service"),
+		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
 
-	if got := findServiceFile("masked"); got != "" {
-		t.Errorf("findServiceFile(masked) should return empty for masked, got %q", got)
+	reg := NewRegistry()
+	alias, err := reg.Resolve("sshd")
+	if err != nil {
+		t.Fatalf("Resolve(sshd): %v", err)
+	}
+	canon, err := reg.Resolve("ssh")
+	if err != nil {
+		t.Fatalf("Resolve(ssh): %v", err)
+	}
+	if canon != alias {
+		t.Fatalf("alias-first resolution should still produce identical pointers, got %p vs %p", alias, canon)
+	}
+	if canon.Canonical != "ssh" {
+		t.Errorf("Canonical = %q, want ssh (the file basename, not the queried alias)", canon.Canonical)
 	}
 }
 
-func TestIsMasked(t *testing.T) {
+func TestRegistrySymlinkAlias(t *testing.T) {
+	// Two unit-file paths pointing at the same inode (symlink) resolve
+	// to the same Unit through inode dedup.
+	dir := t.TempDir()
+	origDirs := serviceDirs
+	serviceDirs = []string{dir}
+	defer func() { serviceDirs = origDirs }()
+
+	realPath := filepath.Join(dir, "foo.service")
+	os.WriteFile(realPath, []byte("[Service]\nExecStart=/bin/true\n"), 0644)
+	linkPath := filepath.Join(dir, "bar.service")
+	os.Symlink(realPath, linkPath)
+
+	reg := NewRegistry()
+	foo, err := reg.Resolve("foo")
+	if err != nil {
+		t.Fatalf("Resolve(foo): %v", err)
+	}
+	bar, err := reg.Resolve("bar")
+	if err != nil {
+		t.Fatalf("Resolve(bar): %v", err)
+	}
+	if foo != bar {
+		t.Fatalf("symlinked-alias should resolve to same Unit, got %p vs %p", foo, bar)
+	}
+}
+
+func TestRegistryMasked(t *testing.T) {
 	dir := t.TempDir()
 	origDirs := serviceDirs
 	serviceDirs = []string{dir}
 	defer func() { serviceDirs = origDirs }()
 
 	os.Symlink("/dev/null", filepath.Join(dir, "masked.service"))
-	os.WriteFile(filepath.Join(dir, "normal.service"), []byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	if !isMasked("masked") {
-		t.Error("masked.service should be masked")
+	reg := NewRegistry()
+	u, err := reg.Resolve("masked")
+	if err != nil {
+		t.Fatalf("Resolve(masked) should succeed with Masked=true, got err=%v", err)
 	}
-	if isMasked("normal") {
-		t.Error("normal.service should not be masked")
-	}
-	if isMasked("nonexistent") {
-		t.Error("nonexistent should not be masked")
+	if !u.Masked {
+		t.Errorf("Resolve(masked).Masked = false, want true")
 	}
 }
 
-func TestSvcEnableDisable(t *testing.T) {
+func TestRegistryTemplateInstance(t *testing.T) {
+	// postgresql@16-main resolves against postgresql@.service, with
+	// %i / %I expanded in the parsed sections.
 	dir := t.TempDir()
 	origDirs := serviceDirs
 	serviceDirs = []string{dir}
 	defer func() { serviceDirs = origDirs }()
 
+	os.WriteFile(filepath.Join(dir, "postgresql@.service"),
+		[]byte("[Service]\nExecStart=/usr/bin/postgres --cluster %i\nWorkingDirectory=/var/lib/%I\n"), 0644)
+
+	reg := NewRegistry()
+	u, err := reg.Resolve("postgresql@16-main")
+	if err != nil {
+		t.Fatalf("Resolve(postgresql@16-main): %v", err)
+	}
+	if u.Instance != "16-main" {
+		t.Errorf("Instance = %q, want 16-main", u.Instance)
+	}
+	if u.Template != "postgresql" {
+		t.Errorf("Template = %q, want postgresql", u.Template)
+	}
+	if got := u.Sections.get("Service", "ExecStart"); got != "/usr/bin/postgres --cluster 16-main" {
+		t.Errorf("%%i not expanded: %q", got)
+	}
+	if got := u.Sections.get("Service", "WorkingDirectory"); got != "/var/lib/16/main" {
+		t.Errorf("%%I not expanded (- should become /): %q", got)
+	}
+}
+
+func TestUnitStateUnification(t *testing.T) {
+	// The whole point of C1: pidfile + logfile paths are keyed by
+	// canonical name, so any alias query observes the same state.
+	dir := t.TempDir()
+	origDirs := serviceDirs
+	serviceDirs = []string{dir}
+	defer func() { serviceDirs = origDirs }()
+
+	os.WriteFile(filepath.Join(dir, "ssh.service"),
+		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
+
+	reg := NewRegistry()
+	canon, _ := reg.Resolve("ssh")
+	alias, _ := reg.Resolve("sshd")
+
+	if canon.PidPath() != alias.PidPath() {
+		t.Errorf("PidPath: canon=%q alias=%q", canon.PidPath(), alias.PidPath())
+	}
+	if canon.LogPath() != alias.LogPath() {
+		t.Errorf("LogPath: canon=%q alias=%q", canon.LogPath(), alias.LogPath())
+	}
+}
+
+func TestSvcEnableDisable(t *testing.T) {
+	dir := t.TempDir()
+	etcDir := t.TempDir()
+	origDirs := serviceDirs
+	origEtc := etcSystemdDir
+	serviceDirs = []string{dir, etcDir}
+	etcSystemdDir = etcDir
+	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n"), 0644)
 
-	// Create the wants directory where enable will create symlinks.
-	wantsDir := "/etc/systemd/system/multi-user.target.wants"
-	os.MkdirAll(wantsDir, 0755)
-	defer os.RemoveAll("/etc/systemd/system/multi-user.target.wants")
+	reg := NewRegistry()
+	u, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatalf("Resolve(test): %v", err)
+	}
 
-	if svcIsEnabled("test") {
+	if svcIsEnabled(u) {
 		t.Error("should not be enabled before enable")
 	}
 
-	if err := svcEnable("test"); err != nil {
+	if err := svcEnable(u); err != nil {
 		t.Fatalf("enable: %v", err)
 	}
 
-	if !svcIsEnabled("test") {
+	if !svcIsEnabled(u) {
 		t.Error("should be enabled after enable")
 	}
 
-	if err := svcDisableUnit("test", ".service"); err != nil {
+	if err := svcDisable(u); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
 
-	if svcIsEnabled("test") {
+	if svcIsEnabled(u) {
 		t.Error("should not be enabled after disable")
 	}
 }
@@ -266,12 +385,15 @@ ExecReload=/bin/kill -HUP $MAINPID
 		{"SourcePath", "false", "SourcePath=" + svcPath},
 	}
 
+	reg := NewRegistry()
+	u, _ := reg.Resolve("test")
+
 	for _, tt := range tests {
 		old := os.Stdout
 		r, w, _ := os.Pipe()
 		os.Stdout = w
 
-		svcShow("test", tt.prop, tt.valueOnly == "true")
+		svcShow(u, "test", tt.prop, tt.valueOnly == "true")
 
 		w.Close()
 		os.Stdout = old
@@ -287,11 +409,13 @@ ExecReload=/bin/kill -HUP $MAINPID
 	// Test with a service that has no ExecReload.
 	svcPath2 := filepath.Join(dir, "noreload.service")
 	os.WriteFile(svcPath2, []byte("[Service]\nExecStart=/usr/bin/test\n"), 0644)
+	ureg := NewRegistry()
+	unoreload, _ := ureg.Resolve("noreload")
 
 	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	svcShow("noreload", "CanReload", false)
+	svcShow(unoreload, "noreload", "CanReload", false)
 	w.Close()
 	os.Stdout = old
 	buf := make([]byte, 1024)
@@ -311,10 +435,13 @@ func TestSvcShowValueOnly(t *testing.T) {
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/bin/test\n"), 0644)
 
+	reg := NewRegistry()
+	u, _ := reg.Resolve("test")
+
 	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	svcShow("test", "SourcePath", true)
+	svcShow(u, "test", "SourcePath", true)
 	w.Close()
 	os.Stdout = old
 	buf := make([]byte, 1024)
@@ -336,10 +463,13 @@ func TestSvcShowNotFound(t *testing.T) {
 	serviceDirs = []string{dir}
 	defer func() { serviceDirs = origDirs }()
 
+	reg := NewRegistry()
+	u, _ := reg.Resolve("nonexistent") // err is non-nil; u is nil
+
 	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	svcShow("nonexistent", "LoadState", false)
+	svcShow(u, "nonexistent", "LoadState", false)
 	w.Close()
 	os.Stdout = old
 	buf := make([]byte, 1024)
@@ -405,29 +535,36 @@ func TestBuildServiceEnvMissingFile(t *testing.T) {
 
 func TestMaskUnmask(t *testing.T) {
 	dir := t.TempDir()
+	etcDir := t.TempDir()
 	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
+	origEtc := etcSystemdDir
+	// etcDir is searched FIRST so the mask symlink overrides the real file.
+	serviceDirs = []string{etcDir, dir}
+	etcSystemdDir = etcDir
+	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
 
 	// Create a normal service file first.
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	// Mask it — creates /etc/systemd/system/test.service -> /dev/null
-	etcDir := "/etc/systemd/system"
-	os.MkdirAll(etcDir, 0755)
-	defer os.Remove(filepath.Join(etcDir, "test.service"))
-
-	if err := svcMask("test"); err != nil {
+	if err := svcMaskName("test"); err != nil {
 		t.Fatalf("mask: %v", err)
+	}
+	reg := NewRegistry()
+	isMasked := func(name string) bool {
+		u, err := reg.Resolve(name)
+		return err == nil && u.Masked
 	}
 	if !isMasked("test") {
 		t.Error("should be masked after mask")
 	}
 
-	if err := svcUnmask("test"); err != nil {
+	if err := svcUnmaskName("test"); err != nil {
 		t.Fatalf("unmask: %v", err)
 	}
+	// Reset registry: mask state is cached at resolution time, so a fresh
+	// registry is needed to observe the post-unmask state.
+	reg = NewRegistry()
 	if isMasked("test") {
 		t.Error("should not be masked after unmask")
 	}
