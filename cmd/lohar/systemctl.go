@@ -1100,15 +1100,25 @@ func parseServiceFile(path string) serviceFile {
 	return sf
 }
 
+// get returns the LAST value for the given section/key. systemd's behaviour:
+// for scalar directives, a later assignment overrides an earlier one. This is
+// what makes drop-in overrides work — the fragment supplies the initial value
+// and the drop-in supplies the override; the drop-in loads after, so its
+// value is the one returned here.
 func (sf serviceFile) get(section, key string) string {
+	var val string
 	for _, kv := range sf.sections[section] {
 		if kv.key == key {
-			return kv.value
+			val = kv.value
 		}
 	}
-	return ""
+	return val
 }
 
+// getAll returns every value for the given section/key in order. Used for
+// list-typed directives like ExecStartPre, Environment, EnvironmentFile.
+// Reset markers (empty values) are filtered out by merge() before this is
+// called, so callers don't need to handle them.
 func (sf serviceFile) getAll(section, key string) []string {
 	var vals []string
 	for _, kv := range sf.sections[section] {
@@ -1117,4 +1127,43 @@ func (sf serviceFile) getAll(section, key string) []string {
 		}
 	}
 	return vals
+}
+
+// merge appends another serviceFile's directives onto this one, implementing
+// systemd's drop-in merge semantics:
+//
+//   - List-valued directives (ExecStartPre, Environment, etc.) accumulate —
+//     a later directive is appended to the list returned by getAll().
+//   - Scalar directives (ExecStart, Type, User) effectively override because
+//     get() returns the LAST value.
+//   - **Reset semantics**: an empty assignment (e.g. `ExecStart=`) clears
+//     every prior entry for that key in that section. This is the
+//     conventional way drop-ins replace a fragment's directive cleanly:
+//
+//         [Service]
+//         ExecStart=
+//         ExecStart=/usr/bin/foo --new-args
+//
+//     The empty marker itself is dropped after the reset; only the
+//     subsequent assignment(s) remain.
+func (sf *serviceFile) merge(other serviceFile) {
+	if sf.sections == nil {
+		sf.sections = map[string][]kvPair{}
+	}
+	for section, kvs := range other.sections {
+		for _, kv := range kvs {
+			if kv.value == "" {
+				// Reset: drop every prior entry for this key in this section.
+				filtered := sf.sections[section][:0]
+				for _, existing := range sf.sections[section] {
+					if existing.key != kv.key {
+						filtered = append(filtered, existing)
+					}
+				}
+				sf.sections[section] = filtered
+				continue // don't keep the reset marker itself
+			}
+			sf.sections[section] = append(sf.sections[section], kv)
+		}
+	}
 }

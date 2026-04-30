@@ -7,11 +7,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 )
+
+// dropInDirs is the search path for unit drop-in directories. Listed in
+// LOWEST-priority-first order so that later loads override earlier ones —
+// matches systemd's unit_file_find_dropin_paths. /etc/ wins over /run/
+// wins over /usr/lib/.
+var dropInDirs = []string{
+	"/usr/lib/systemd/system",
+	"/lib/systemd/system",
+	"/run/systemd/system",
+	"/etc/systemd/system",
+}
 
 // Unit is the resolved identity of a systemd-style unit.
 //
@@ -248,6 +260,10 @@ func (r *Registry) resolveDirect(base, suffix string) (*Unit, error) {
 			if existing, ok := r.byInode[inode]; ok {
 				existing.Aliases[base] = struct{}{}
 				r.byKey[base] = existing
+				// Late-arriving alias: load drop-ins under the new name
+				// so e.g. /etc/systemd/system/sshd.service.d/*.conf applies
+				// even if Resolve("ssh") happened first.
+				loadDropIns(existing, base, suffix)
 				return existing, nil
 			}
 		}
@@ -287,11 +303,13 @@ func (r *Registry) resolveByAliasScan(base, suffix string) (*Unit, error) {
 					if existing, ok := r.byKey[canonical]; ok && existing.Suffix == suffix {
 						existing.Aliases[base] = struct{}{}
 						r.byKey[base] = existing
+						loadDropIns(existing, base, suffix)
 						return existing, nil
 					}
 					u := r.buildUnit(canonical, suffix, realPath)
 					u.Aliases[base] = struct{}{}
 					r.byKey[base] = u
+					loadDropIns(u, base, suffix)
 					return u, nil
 				}
 			}
@@ -338,6 +356,12 @@ func (r *Registry) resolveTemplateInstance(base, suffix string) (*Unit, error) {
 			Sections:  parseServiceFile(realPath),
 		}
 		expandTemplateSpecifiersInUnit(u)
+		// Drop-ins for instance units come from two sources, both
+		// supported by real systemd:
+		//   - foo@.service.d/*.conf (template-wide; applies to every instance)
+		//   - foo@bar.service.d/*.conf (instance-specific)
+		loadDropIns(u, templateName, suffix)
+		loadDropIns(u, base, suffix)
 		r.byKey[base] = u
 		return u, nil
 	}
@@ -348,6 +372,11 @@ func (r *Registry) resolveTemplateInstance(base, suffix string) (*Unit, error) {
 // responsible for inode bookkeeping; this just parses + registers.
 // Aliases declared in [Install] Alias= are added to the Unit and indexed
 // in byKey so subsequent lookups by alias name return this same pointer.
+//
+// Drop-in directories are loaded after the fragment so their directives
+// override (scalar) or extend (list) the fragment's. Drop-ins for every
+// known alias are loaded too — an admin who places a config under either
+// name (canonical or alias) sees it applied.
 func (r *Registry) buildUnit(canonical, suffix, realPath string) *Unit {
 	u := &Unit{
 		Canonical: canonical,
@@ -367,7 +396,42 @@ func (r *Registry) buildUnit(canonical, suffix, realPath string) *Unit {
 		u.Aliases[aliasBase] = struct{}{}
 		r.byKey[aliasBase] = u
 	}
+
+	loadDropIns(u, canonical, suffix)
+	for alias := range u.Aliases {
+		loadDropIns(u, alias, suffix)
+	}
 	return u
+}
+
+// loadDropIns merges every <name><suffix>.d/*.conf file from the search
+// path into u.Sections. Directories are walked in lowest-priority-first
+// order; within a directory, files are loaded alphabetically by basename.
+// The end result is that high-priority dirs and lexically-later files
+// override / extend lower-priority earlier ones — matching what real
+// systemd does in src/core/load-dropin.c.
+//
+// Called by buildUnit for the canonical name and every alias known at the
+// time. Also called when a new alias is discovered later (inode dedup,
+// Alias= scan hits) so the late-arriving alias's drop-ins are picked up too.
+func loadDropIns(u *Unit, name, suffix string) {
+	for _, dir := range dropInDirs {
+		overlay := filepath.Join(dir, name+suffix+".d")
+		entries, err := os.ReadDir(overlay)
+		if err != nil {
+			continue
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".conf") {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			u.Sections.merge(parseServiceFile(filepath.Join(overlay, n)))
+		}
+	}
 }
 
 // splitSuffix separates a unit name into its base and suffix.

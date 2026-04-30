@@ -302,6 +302,151 @@ func TestRegistryTemplateInstance(t *testing.T) {
 	}
 }
 
+// dropInTestSetup wires up serviceDirs + dropInDirs against tempdirs and
+// returns the path of the drop-in dir that takes highest priority. Caller
+// gets a cleanup func via t.Cleanup.
+func dropInTestSetup(t *testing.T) (svcDir, etcDropInDir string) {
+	t.Helper()
+	svcDir = t.TempDir()
+	etcDropInDir = t.TempDir()
+	origSvc := serviceDirs
+	origDrop := dropInDirs
+	serviceDirs = []string{svcDir}
+	// Highest-priority dir is last in dropInDirs (matches systemd order).
+	dropInDirs = []string{etcDropInDir}
+	t.Cleanup(func() {
+		serviceDirs = origSvc
+		dropInDirs = origDrop
+	})
+	return svcDir, etcDropInDir
+}
+
+func TestDropInScalarOverride(t *testing.T) {
+	// Fragment says ExecStart=/bin/old. Drop-in says ExecStart=/bin/new.
+	// After resolution, get("Service", "ExecStart") returns the drop-in's
+	// value because get() returns the LAST assignment (matching systemd).
+	svcDir, dropDir := dropInTestSetup(t)
+	os.WriteFile(filepath.Join(svcDir, "foo.service"),
+		[]byte("[Service]\nExecStart=/bin/old\n"), 0644)
+	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
+	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "override.conf"),
+		[]byte("[Service]\nExecStart=/bin/new\n"), 0644)
+
+	reg := NewRegistry()
+	u, err := reg.Resolve("foo")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := u.Sections.get("Service", "ExecStart"); got != "/bin/new" {
+		t.Errorf("ExecStart = %q, want /bin/new", got)
+	}
+}
+
+func TestDropInListAccumulate(t *testing.T) {
+	// ExecStartPre is a list directive: drop-in entries APPEND to the
+	// fragment's entries.
+	svcDir, dropDir := dropInTestSetup(t)
+	os.WriteFile(filepath.Join(svcDir, "foo.service"),
+		[]byte("[Service]\nExecStartPre=/bin/a\nExecStart=/bin/main\n"), 0644)
+	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
+	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "extra.conf"),
+		[]byte("[Service]\nExecStartPre=/bin/b\n"), 0644)
+
+	reg := NewRegistry()
+	u, _ := reg.Resolve("foo")
+	pres := u.Sections.getAll("Service", "ExecStartPre")
+	if len(pres) != 2 || pres[0] != "/bin/a" || pres[1] != "/bin/b" {
+		t.Errorf("ExecStartPre = %v, want [/bin/a /bin/b]", pres)
+	}
+}
+
+func TestDropInResetSemantics(t *testing.T) {
+	// systemd's drop-in idiom for replacing a list: empty assignment
+	// resets the list, subsequent values establish the new contents.
+	//   [Service]
+	//   ExecStartPre=
+	//   ExecStartPre=/bin/c
+	// After reset, only /bin/c remains.
+	svcDir, dropDir := dropInTestSetup(t)
+	os.WriteFile(filepath.Join(svcDir, "foo.service"),
+		[]byte("[Service]\nExecStartPre=/bin/a\nExecStartPre=/bin/b\nExecStart=/bin/main\n"), 0644)
+	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
+	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "reset.conf"),
+		[]byte("[Service]\nExecStartPre=\nExecStartPre=/bin/c\n"), 0644)
+
+	reg := NewRegistry()
+	u, _ := reg.Resolve("foo")
+	pres := u.Sections.getAll("Service", "ExecStartPre")
+	if len(pres) != 1 || pres[0] != "/bin/c" {
+		t.Errorf("ExecStartPre = %v, want [/bin/c]", pres)
+	}
+}
+
+func TestDropInAlphaOrder(t *testing.T) {
+	// Multiple drop-ins in the same dir load alphabetically. The lexically
+	// later file wins for scalar directives.
+	svcDir, dropDir := dropInTestSetup(t)
+	os.WriteFile(filepath.Join(svcDir, "foo.service"),
+		[]byte("[Unit]\nDescription=fragment\n[Service]\nExecStart=/bin/x\n"), 0644)
+	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
+	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "00-first.conf"),
+		[]byte("[Unit]\nDescription=zero\n"), 0644)
+	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "99-last.conf"),
+		[]byte("[Unit]\nDescription=ninetynine\n"), 0644)
+
+	reg := NewRegistry()
+	u, _ := reg.Resolve("foo")
+	if got := u.Sections.get("Unit", "Description"); got != "ninetynine" {
+		t.Errorf("Description = %q, want ninetynine (lexically last drop-in)", got)
+	}
+}
+
+func TestDropInForAlias(t *testing.T) {
+	// ssh.service has Alias=sshd.service. A drop-in placed under the
+	// alias name (sshd.service.d/*.conf) is loaded into the resolved
+	// Unit — admins use either name interchangeably.
+	svcDir, dropDir := dropInTestSetup(t)
+	os.WriteFile(filepath.Join(svcDir, "ssh.service"),
+		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
+	os.MkdirAll(filepath.Join(dropDir, "sshd.service.d"), 0755)
+	os.WriteFile(filepath.Join(dropDir, "sshd.service.d", "port.conf"),
+		[]byte("[Service]\nExecStart=\nExecStart=/usr/sbin/sshd -p 2222\n"), 0644)
+
+	reg := NewRegistry()
+	// Resolve by canonical name, but the drop-in lives under the alias.
+	u, err := reg.Resolve("ssh")
+	if err != nil {
+		t.Fatalf("Resolve(ssh): %v", err)
+	}
+	if got := u.Sections.get("Service", "ExecStart"); got != "/usr/sbin/sshd -p 2222" {
+		t.Errorf("ExecStart = %q, want sshd with -p 2222 (alias drop-in applied)", got)
+	}
+}
+
+func TestDropInLateAlias(t *testing.T) {
+	// When an alias is discovered AFTER the canonical Unit was built
+	// (e.g. via inode dedup or alias-scan), drop-ins under that alias's
+	// name should still be applied to the existing Unit. Tests the
+	// loadDropIns call inside the late-alias paths.
+	svcDir, dropDir := dropInTestSetup(t)
+	realPath := filepath.Join(svcDir, "foo.service")
+	os.WriteFile(realPath, []byte("[Service]\nExecStart=/bin/x\nEnvironment=A=1\n"), 0644)
+	os.Symlink(realPath, filepath.Join(svcDir, "bar.service"))
+
+	os.MkdirAll(filepath.Join(dropDir, "bar.service.d"), 0755)
+	os.WriteFile(filepath.Join(dropDir, "bar.service.d", "add.conf"),
+		[]byte("[Service]\nEnvironment=B=2\n"), 0644)
+
+	reg := NewRegistry()
+	_, _ = reg.Resolve("foo")  // canonical first — no bar drop-in loaded yet
+	u, _ := reg.Resolve("bar") // alias — inode dedup; should also pick up bar.d/
+
+	envs := u.Sections.getAll("Service", "Environment")
+	if len(envs) != 2 || envs[0] != "A=1" || envs[1] != "B=2" {
+		t.Errorf("Environment = %v, want [A=1 B=2] (late alias drop-in not loaded)", envs)
+	}
+}
+
 func TestUnitStateUnification(t *testing.T) {
 	// The whole point of C1: pidfile + logfile paths are keyed by
 	// canonical name, so any alias query observes the same state.
