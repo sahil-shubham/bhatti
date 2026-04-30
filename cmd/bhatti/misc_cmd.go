@@ -57,7 +57,22 @@ Use --tiers to install additional rootfs tiers during the update.`,
 		}
 
 		fmt.Println("Downloading latest version...")
-		install := exec.Command(shellBin, "-c", "curl -fsSL bhatti.sh/install | bash")
+
+		// Download install script to a temp file first, then run it.
+		// "curl | bash" breaks sudo inside the script — curl and sudo
+		// both read from stdin, so the password prompt collides with
+		// the piped script data. Running from a file keeps stdin free.
+		scriptPath := filepath.Join(os.TempDir(), "bhatti-install.sh")
+		dl := exec.Command("curl", "-fsSL", "-o", scriptPath, "bhatti.sh/install")
+		dl.Stdout = os.Stdout
+		dl.Stderr = os.Stderr
+		if err := dl.Run(); err != nil {
+			return fmt.Errorf("download install script: %w", err)
+		}
+		defer os.Remove(scriptPath)
+
+		install := exec.Command(shellBin, scriptPath)
+		install.Stdin = os.Stdin // sudo can read password
 		install.Stdout = os.Stdout
 		install.Stderr = os.Stderr
 
