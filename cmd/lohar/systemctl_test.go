@@ -447,6 +447,103 @@ func TestDropInLateAlias(t *testing.T) {
 	}
 }
 
+func TestEnableCreatesAliasSymlink(t *testing.T) {
+	// C3: when ssh.service has Alias=sshd.service, `systemctl enable ssh`
+	// must create /etc/systemd/system/sshd.service as a symlink to the
+	// fragment. Real systemd does this so the alias becomes a real
+	// filesystem entity that other tools can find by globbing.
+	dir := t.TempDir()
+	etcDir := t.TempDir()
+	origDirs := serviceDirs
+	origEtc := etcSystemdDir
+	serviceDirs = []string{dir, etcDir}
+	etcSystemdDir = etcDir
+	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+
+	svcPath := filepath.Join(dir, "ssh.service")
+	os.WriteFile(svcPath,
+		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nWantedBy=multi-user.target\nAlias=sshd.service\n"),
+		0644)
+
+	reg := NewRegistry()
+	u, err := reg.Resolve("ssh")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := svcEnable(u); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+
+	aliasLink := filepath.Join(etcDir, "sshd.service")
+	target, err := os.Readlink(aliasLink)
+	if err != nil {
+		t.Fatalf("alias symlink %s missing: %v", aliasLink, err)
+	}
+	if target != svcPath {
+		t.Errorf("alias symlink target = %q, want %q", target, svcPath)
+	}
+
+	// Disable should remove both the wants/ symlink AND the alias symlink.
+	if err := svcDisable(u); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if _, err := os.Lstat(aliasLink); !os.IsNotExist(err) {
+		t.Errorf("alias symlink still present after disable: %v", err)
+	}
+	wantsLink := filepath.Join(etcDir, "multi-user.target.wants", "ssh.service")
+	if _, err := os.Lstat(wantsLink); !os.IsNotExist(err) {
+		t.Errorf("wants symlink still present after disable: %v", err)
+	}
+}
+
+func TestEnableAliasMakesColdResolutionWork(t *testing.T) {
+	// After enable creates the alias symlink, a fresh Registry (cold load)
+	// should resolve the alias name through the symlink-by-inode path —
+	// without re-parsing the [Install] Alias= directive. This is what
+	// makes the alias visible across reboots and to anything that just
+	// scans the directory.
+	dir := t.TempDir()
+	etcDir := t.TempDir()
+	origDirs := serviceDirs
+	origEtc := etcSystemdDir
+	// etcDir is searched FIRST so its symlinks are preferred.
+	serviceDirs = []string{etcDir, dir}
+	etcSystemdDir = etcDir
+	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+
+	svcPath := filepath.Join(dir, "ssh.service")
+	os.WriteFile(svcPath,
+		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"),
+		0644)
+
+	reg1 := NewRegistry()
+	u, _ := reg1.Resolve("ssh")
+	if err := svcEnable(u); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+
+	// Strip the [Install] Alias= directive from the fragment to prove
+	// cold resolution is using the symlink-by-inode path, not re-parsing
+	// the directive. (After enable on real systemd, you can edit the
+	// fragment to remove Alias= and the alias still works because the
+	// symlink is now the source of truth.)
+	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/sbin/sshd\n"), 0644)
+
+	// Fresh registry: no memoisation from reg1.
+	reg2 := NewRegistry()
+	canon, err := reg2.Resolve("ssh")
+	if err != nil {
+		t.Fatalf("Resolve(ssh): %v", err)
+	}
+	alias, err := reg2.Resolve("sshd")
+	if err != nil {
+		t.Fatalf("Resolve(sshd): %v", err)
+	}
+	if canon != alias {
+		t.Fatalf("cold resolution should unify via symlink inode, got %p vs %p", canon, alias)
+	}
+}
+
 func TestUnitStateUnification(t *testing.T) {
 	// The whole point of C1: pidfile + logfile paths are keyed by
 	// canonical name, so any alias query observes the same state.

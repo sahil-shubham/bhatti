@@ -627,23 +627,76 @@ func svcEnable(u *Unit) error {
 		fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", reqLink, u.Path)
 	}
 
+	// [Install] Alias= entries become symlinks at the top level of
+	// /etc/systemd/system/, e.g. ssh.service with Alias=sshd.service
+	// produces /etc/systemd/system/sshd.service -> <fragment path>.
+	// Real systemd does this in install.c. The reason: the alias name
+	// becomes a real on-disk filename, so anything globbing the dir
+	// (including our own svcIsEnabled, distro tooling, dependency
+	// resolvers in other unit files) sees both names.
+	os.MkdirAll(etcSystemdDir, 0755)
+	for _, alias := range svc.getAll("Install", "Alias") {
+		aliasName := strings.TrimSpace(alias)
+		if aliasName == "" {
+			continue
+		}
+		aliasLink := filepath.Join(etcSystemdDir, aliasName)
+		os.Remove(aliasLink)
+		if err := os.Symlink(u.Path, aliasLink); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: alias symlink %s: %v\n", aliasLink, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", aliasLink, u.Path)
+	}
+
 	return nil
 }
 
-// svcDisable removes the enable-symlinks for a unit. Falls back to a
-// glob over the canonical name; alias symlinks (created in C3) will be
-// removed when C3 lands.
+// svcDisable removes every enable-time artefact for a unit: the wants/
+// symlink (under any target), the requires/ symlinks, and the alias
+// symlinks at the top of /etc/systemd/system/. Mirrors what real systemd
+// does when undoing what svcEnable created.
 func svcDisable(u *Unit) error {
-	return svcDisableByName(u.Canonical, u.Suffix)
+	if err := svcDisableByName(u.Canonical, u.Suffix); err != nil {
+		return err
+	}
+	// Remove [Install] Alias= symlinks created by svcEnable. Each alias
+	// is recorded both in u.Sections (the source of truth from the file
+	// + drop-ins) and u.Aliases (the resolution-time set, which may
+	// include inode-discovered aliases that we should NOT remove because
+	// we didn't create them). So we trust [Install] Alias= here.
+	for _, alias := range u.Sections.getAll("Install", "Alias") {
+		aliasName := strings.TrimSpace(alias)
+		if aliasName == "" {
+			continue
+		}
+		aliasLink := filepath.Join(etcSystemdDir, aliasName)
+		// Only remove if it's a symlink we plausibly created (points back
+		// to the unit's fragment path). Don't blindly delete a regular
+		// file an admin might have placed there.
+		if target, err := os.Readlink(aliasLink); err == nil && target == u.Path {
+			os.Remove(aliasLink)
+			fmt.Fprintf(os.Stderr, "Removed %s.\n", aliasLink)
+		}
+	}
+	return nil
 }
 
 // svcDisableByName is the no-Unit fallback used when disable is called
 // for a name that doesn't resolve through the registry. Same glob logic
-// as before.
+// as before — covers the wants/ and requires/ symlinks; alias symlinks
+// at the top of /etc/systemd/system/ are left intact in this path because
+// we don't know which they are without a Unit to consult.
 func svcDisableByName(name, suffix string) error {
 	pattern := filepath.Join(etcSystemdDir, "*.wants", name+suffix)
 	matches, _ := filepath.Glob(pattern)
 	for _, m := range matches {
+		os.Remove(m)
+		fmt.Fprintf(os.Stderr, "Removed %s.\n", m)
+	}
+	reqPattern := filepath.Join(etcSystemdDir, "*.requires", name+suffix)
+	reqMatches, _ := filepath.Glob(reqPattern)
+	for _, m := range reqMatches {
 		os.Remove(m)
 		fmt.Fprintf(os.Stderr, "Removed %s.\n", m)
 	}
