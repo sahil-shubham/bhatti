@@ -517,6 +517,20 @@ func TestSystemctlThermalCycles(t *testing.T) {
 }
 
 // --- Test helpers ---
+//
+// execCmd / execOrFail / assertExecOutput take a SHELL-LIKE string but
+// split it via strings.Fields() before passing to eng.Exec. This means:
+//
+//   - simple word-separated commands work:    "systemctl is-active ssh"
+//   - flags work:                              "apt-get install -y curl"
+//   - shell pipes / redirects DO NOT work:    "cmd | other" mangles
+//   - quotes DO NOT work as in a shell:       "echo 'hello world'" splits
+//   - heredocs DO NOT work at all:            "cat <<EOF\n...\nEOF" loses newlines
+//
+// For anything more complex than space-separated argv, call eng.Exec
+// directly with []string{"sh", "-c", "<one shell command>"} so the
+// shell parses pipes/redirects/quotes inside the VM. The writeFile
+// helper above is the canonical pattern for multi-line file writes.
 
 func execCmd(t *testing.T, eng *Engine, id, cmd string) struct {
 	Stdout   string
