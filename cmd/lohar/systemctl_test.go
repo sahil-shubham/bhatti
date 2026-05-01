@@ -9,6 +9,25 @@ import (
 	"testing"
 )
 
+// testRegistry constructs a Registry whose Config has ServiceDirs set to
+// dir and the rest of the paths defaulted to fresh tempdirs. Tests that
+// need different setups (multiple service dirs, specific EtcSystemdDir,
+// drop-in dirs) construct NewRegistry(Config{...}) inline.
+//
+// All the test-time path overrides used to be package-level globals that
+// tests rewrote in setup and restored in cleanup. Moving them onto
+// Registry.Config makes the immutability that was implied by convention
+// into a structural guarantee, and removes the -race finding around
+// watcher goroutines reading paths concurrent with cleanup writes.
+func testRegistry(t *testing.T, dir string) *Registry {
+	t.Helper()
+	return NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+}
+
 func TestParseServiceFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.service")
@@ -57,18 +76,14 @@ Alias=testd.service
 		}
 	}
 
-	// getAll for multi-value keys
 	pres := svc.getAll("Service", "ExecStartPre")
 	if len(pres) != 1 || pres[0] != "-/usr/bin/test-pre" {
 		t.Errorf("getAll ExecStartPre = %v, want [-/usr/bin/test-pre]", pres)
 	}
-
 	envs := svc.getAll("Service", "Environment")
 	if len(envs) != 1 || envs[0] != `"FOO=bar"` {
 		t.Errorf("getAll Environment = %v", envs)
 	}
-
-	// Missing key
 	if got := svc.get("Service", "NoSuchKey"); got != "" {
 		t.Errorf("missing key returned %q", got)
 	}
@@ -139,14 +154,10 @@ func TestSvcIsActiveTargets(t *testing.T) {
 
 func TestRegistryResolveDirect(t *testing.T) {
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	u, err := reg.Resolve("test")
 	if err != nil {
 		t.Fatalf("Resolve(test): %v", err)
@@ -165,14 +176,10 @@ func TestRegistryAliasResolution(t *testing.T) {
 	// Resolve("ssh") and Resolve("sshd") must return the SAME Unit pointer,
 	// so that pidfile/logfile state is shared between the two names.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	svcPath := filepath.Join(dir, "ssh.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	canon, err := reg.Resolve("ssh")
 	if err != nil {
 		t.Fatalf("Resolve(ssh): %v", err)
@@ -193,7 +200,7 @@ func TestRegistryAliasResolution(t *testing.T) {
 
 	// State paths must use the canonical name regardless of which alias
 	// was queried. This is the bug fix.
-	wantPid := filepath.Join(pidDir, "ssh.pid")
+	wantPid := filepath.Join(reg.Config.PidDir, "ssh.pid")
 	if canon.PidPath() != wantPid || alias.PidPath() != wantPid {
 		t.Errorf("PidPath canon=%q alias=%q, both want %q",
 			canon.PidPath(), alias.PidPath(), wantPid)
@@ -201,16 +208,12 @@ func TestRegistryAliasResolution(t *testing.T) {
 }
 
 func TestRegistryAliasInReverse(t *testing.T) {
-	// Resolve by alias FIRST, then by canonical — must still produce one Unit.
+	// Resolve by alias FIRST, then by canonical -- must still produce one Unit.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	os.WriteFile(filepath.Join(dir, "ssh.service"),
 		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	alias, err := reg.Resolve("sshd")
 	if err != nil {
 		t.Fatalf("Resolve(sshd): %v", err)
@@ -231,16 +234,12 @@ func TestRegistrySymlinkAlias(t *testing.T) {
 	// Two unit-file paths pointing at the same inode (symlink) resolve
 	// to the same Unit through inode dedup.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	realPath := filepath.Join(dir, "foo.service")
 	os.WriteFile(realPath, []byte("[Service]\nExecStart=/bin/true\n"), 0644)
 	linkPath := filepath.Join(dir, "bar.service")
 	os.Symlink(realPath, linkPath)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	foo, err := reg.Resolve("foo")
 	if err != nil {
 		t.Fatalf("Resolve(foo): %v", err)
@@ -256,13 +255,9 @@ func TestRegistrySymlinkAlias(t *testing.T) {
 
 func TestRegistryMasked(t *testing.T) {
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	os.Symlink("/dev/null", filepath.Join(dir, "masked.service"))
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	u, err := reg.Resolve("masked")
 	if err != nil {
 		t.Fatalf("Resolve(masked) should succeed with Masked=true, got err=%v", err)
@@ -276,14 +271,10 @@ func TestRegistryTemplateInstance(t *testing.T) {
 	// postgresql@16-main resolves against postgresql@.service, with
 	// %i / %I expanded in the parsed sections.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	os.WriteFile(filepath.Join(dir, "postgresql@.service"),
 		[]byte("[Service]\nExecStart=/usr/bin/postgres --cluster %i\nWorkingDirectory=/var/lib/%I\n"), 0644)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	u, err := reg.Resolve("postgresql@16-main")
 	if err != nil {
 		t.Fatalf("Resolve(postgresql@16-main): %v", err)
@@ -302,37 +293,34 @@ func TestRegistryTemplateInstance(t *testing.T) {
 	}
 }
 
-// dropInTestSetup wires up serviceDirs + dropInDirs against tempdirs and
-// returns the path of the drop-in dir that takes highest priority. Caller
-// gets a cleanup func via t.Cleanup.
-func dropInTestSetup(t *testing.T) (svcDir, etcDropInDir string) {
+// dropInTestSetup returns a service-dir and a Registry whose Config has
+// the drop-in path pointing at a tempdir. Caller writes its drop-in
+// .conf files under that tempdir and resolves through the returned reg.
+func dropInTestSetup(t *testing.T) (svcDir, dropInDir string, reg *Registry) {
 	t.Helper()
 	svcDir = t.TempDir()
-	etcDropInDir = t.TempDir()
-	origSvc := serviceDirs
-	origDrop := dropInDirs
-	serviceDirs = []string{svcDir}
-	// Highest-priority dir is last in dropInDirs (matches systemd order).
-	dropInDirs = []string{etcDropInDir}
-	t.Cleanup(func() {
-		serviceDirs = origSvc
-		dropInDirs = origDrop
+	dropInDir = t.TempDir()
+	reg = NewRegistry(Config{
+		ServiceDirs: []string{svcDir},
+		// Highest-priority dir is last in DropInDirs (matches systemd order).
+		DropInDirs: []string{dropInDir},
+		PidDir:     t.TempDir(),
+		LogDir:     t.TempDir(),
 	})
-	return svcDir, etcDropInDir
+	return svcDir, dropInDir, reg
 }
 
 func TestDropInScalarOverride(t *testing.T) {
 	// Fragment says ExecStart=/bin/old. Drop-in says ExecStart=/bin/new.
 	// After resolution, get("Service", "ExecStart") returns the drop-in's
 	// value because get() returns the LAST assignment (matching systemd).
-	svcDir, dropDir := dropInTestSetup(t)
+	svcDir, dropDir, reg := dropInTestSetup(t)
 	os.WriteFile(filepath.Join(svcDir, "foo.service"),
 		[]byte("[Service]\nExecStart=/bin/old\n"), 0644)
 	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
 	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "override.conf"),
 		[]byte("[Service]\nExecStart=/bin/new\n"), 0644)
 
-	reg := NewRegistry()
 	u, err := reg.Resolve("foo")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -345,14 +333,13 @@ func TestDropInScalarOverride(t *testing.T) {
 func TestDropInListAccumulate(t *testing.T) {
 	// ExecStartPre is a list directive: drop-in entries APPEND to the
 	// fragment's entries.
-	svcDir, dropDir := dropInTestSetup(t)
+	svcDir, dropDir, reg := dropInTestSetup(t)
 	os.WriteFile(filepath.Join(svcDir, "foo.service"),
 		[]byte("[Service]\nExecStartPre=/bin/a\nExecStart=/bin/main\n"), 0644)
 	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
 	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "extra.conf"),
 		[]byte("[Service]\nExecStartPre=/bin/b\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("foo")
 	pres := u.Sections.getAll("Service", "ExecStartPre")
 	if len(pres) != 2 || pres[0] != "/bin/a" || pres[1] != "/bin/b" {
@@ -367,14 +354,13 @@ func TestDropInResetSemantics(t *testing.T) {
 	//   ExecStartPre=
 	//   ExecStartPre=/bin/c
 	// After reset, only /bin/c remains.
-	svcDir, dropDir := dropInTestSetup(t)
+	svcDir, dropDir, reg := dropInTestSetup(t)
 	os.WriteFile(filepath.Join(svcDir, "foo.service"),
 		[]byte("[Service]\nExecStartPre=/bin/a\nExecStartPre=/bin/b\nExecStart=/bin/main\n"), 0644)
 	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
 	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "reset.conf"),
 		[]byte("[Service]\nExecStartPre=\nExecStartPre=/bin/c\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("foo")
 	pres := u.Sections.getAll("Service", "ExecStartPre")
 	if len(pres) != 1 || pres[0] != "/bin/c" {
@@ -385,7 +371,7 @@ func TestDropInResetSemantics(t *testing.T) {
 func TestDropInAlphaOrder(t *testing.T) {
 	// Multiple drop-ins in the same dir load alphabetically. The lexically
 	// later file wins for scalar directives.
-	svcDir, dropDir := dropInTestSetup(t)
+	svcDir, dropDir, reg := dropInTestSetup(t)
 	os.WriteFile(filepath.Join(svcDir, "foo.service"),
 		[]byte("[Unit]\nDescription=fragment\n[Service]\nExecStart=/bin/x\n"), 0644)
 	os.MkdirAll(filepath.Join(dropDir, "foo.service.d"), 0755)
@@ -394,7 +380,6 @@ func TestDropInAlphaOrder(t *testing.T) {
 	os.WriteFile(filepath.Join(dropDir, "foo.service.d", "99-last.conf"),
 		[]byte("[Unit]\nDescription=ninetynine\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("foo")
 	if got := u.Sections.get("Unit", "Description"); got != "ninetynine" {
 		t.Errorf("Description = %q, want ninetynine (lexically last drop-in)", got)
@@ -404,16 +389,14 @@ func TestDropInAlphaOrder(t *testing.T) {
 func TestDropInForAlias(t *testing.T) {
 	// ssh.service has Alias=sshd.service. A drop-in placed under the
 	// alias name (sshd.service.d/*.conf) is loaded into the resolved
-	// Unit — admins use either name interchangeably.
-	svcDir, dropDir := dropInTestSetup(t)
+	// Unit -- admins use either name interchangeably.
+	svcDir, dropDir, reg := dropInTestSetup(t)
 	os.WriteFile(filepath.Join(svcDir, "ssh.service"),
 		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
 	os.MkdirAll(filepath.Join(dropDir, "sshd.service.d"), 0755)
 	os.WriteFile(filepath.Join(dropDir, "sshd.service.d", "port.conf"),
 		[]byte("[Service]\nExecStart=\nExecStart=/usr/sbin/sshd -p 2222\n"), 0644)
 
-	reg := NewRegistry()
-	// Resolve by canonical name, but the drop-in lives under the alias.
 	u, err := reg.Resolve("ssh")
 	if err != nil {
 		t.Fatalf("Resolve(ssh): %v", err)
@@ -423,12 +406,48 @@ func TestDropInForAlias(t *testing.T) {
 	}
 }
 
+func TestDropInPriorityAcrossDirs(t *testing.T) {
+	// systemd's drop-in dirs have a precedence order: /etc/ wins over
+	// /run/ wins over /usr/lib/. The same .conf basename in multiple
+	// dirs gets all loaded (in lowest-priority-first order, so
+	// high-priority loads last and overrides). This is what users rely
+	// on for distro-overrides workflows: drop a file under /etc/ to
+	// override the package-shipped one in /usr/lib/.
+	svcDir := t.TempDir()
+	lowDir := t.TempDir()  // simulates /usr/lib
+	highDir := t.TempDir() // simulates /etc
+
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{svcDir},
+		// Lowest-priority FIRST so the high-priority one loads last.
+		DropInDirs: []string{lowDir, highDir},
+		PidDir:     t.TempDir(),
+		LogDir:     t.TempDir(),
+	})
+
+	os.WriteFile(filepath.Join(svcDir, "foo.service"),
+		[]byte("[Service]\nExecStart=/bin/fragment\n"), 0644)
+
+	// Same basename in both dirs. The /etc-equivalent should win.
+	os.MkdirAll(filepath.Join(lowDir, "foo.service.d"), 0755)
+	os.WriteFile(filepath.Join(lowDir, "foo.service.d", "override.conf"),
+		[]byte("[Service]\nExecStart=\nExecStart=/bin/from-usr-lib\n"), 0644)
+	os.MkdirAll(filepath.Join(highDir, "foo.service.d"), 0755)
+	os.WriteFile(filepath.Join(highDir, "foo.service.d", "override.conf"),
+		[]byte("[Service]\nExecStart=\nExecStart=/bin/from-etc\n"), 0644)
+
+	u, _ := reg.Resolve("foo")
+	if got := u.Sections.get("Service", "ExecStart"); got != "/bin/from-etc" {
+		t.Errorf("ExecStart = %q, want /bin/from-etc (high-priority dir should win)", got)
+	}
+}
+
 func TestDropInLateAlias(t *testing.T) {
 	// When an alias is discovered AFTER the canonical Unit was built
 	// (e.g. via inode dedup or alias-scan), drop-ins under that alias's
 	// name should still be applied to the existing Unit. Tests the
 	// loadDropIns call inside the late-alias paths.
-	svcDir, dropDir := dropInTestSetup(t)
+	svcDir, dropDir, reg := dropInTestSetup(t)
 	realPath := filepath.Join(svcDir, "foo.service")
 	os.WriteFile(realPath, []byte("[Service]\nExecStart=/bin/x\nEnvironment=A=1\n"), 0644)
 	os.Symlink(realPath, filepath.Join(svcDir, "bar.service"))
@@ -437,9 +456,8 @@ func TestDropInLateAlias(t *testing.T) {
 	os.WriteFile(filepath.Join(dropDir, "bar.service.d", "add.conf"),
 		[]byte("[Service]\nEnvironment=B=2\n"), 0644)
 
-	reg := NewRegistry()
-	_, _ = reg.Resolve("foo")  // canonical first — no bar drop-in loaded yet
-	u, _ := reg.Resolve("bar") // alias — inode dedup; should also pick up bar.d/
+	_, _ = reg.Resolve("foo")  // canonical first -- no bar drop-in loaded yet
+	u, _ := reg.Resolve("bar") // alias -- inode dedup; should also pick up bar.d/
 
 	envs := u.Sections.getAll("Service", "Environment")
 	if len(envs) != 2 || envs[0] != "A=1" || envs[1] != "B=2" {
@@ -454,18 +472,18 @@ func TestEnableCreatesAliasSymlink(t *testing.T) {
 	// filesystem entity that other tools can find by globbing.
 	dir := t.TempDir()
 	etcDir := t.TempDir()
-	origDirs := serviceDirs
-	origEtc := etcSystemdDir
-	serviceDirs = []string{dir, etcDir}
-	etcSystemdDir = etcDir
-	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+	reg := NewRegistry(Config{
+		ServiceDirs:   []string{dir, etcDir},
+		EtcSystemdDir: etcDir,
+		PidDir:        t.TempDir(),
+		LogDir:        t.TempDir(),
+	})
 
 	svcPath := filepath.Join(dir, "ssh.service")
 	os.WriteFile(svcPath,
 		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nWantedBy=multi-user.target\nAlias=sshd.service\n"),
 		0644)
 
-	reg := NewRegistry()
 	u, err := reg.Resolve("ssh")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -498,25 +516,26 @@ func TestEnableCreatesAliasSymlink(t *testing.T) {
 
 func TestEnableAliasMakesColdResolutionWork(t *testing.T) {
 	// After enable creates the alias symlink, a fresh Registry (cold load)
-	// should resolve the alias name through the symlink-by-inode path —
+	// should resolve the alias name through the symlink-by-inode path --
 	// without re-parsing the [Install] Alias= directive. This is what
 	// makes the alias visible across reboots and to anything that just
 	// scans the directory.
 	dir := t.TempDir()
 	etcDir := t.TempDir()
-	origDirs := serviceDirs
-	origEtc := etcSystemdDir
-	// etcDir is searched FIRST so its symlinks are preferred.
-	serviceDirs = []string{etcDir, dir}
-	etcSystemdDir = etcDir
-	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+	cfg := Config{
+		// etcDir searched FIRST so its symlinks are preferred.
+		ServiceDirs:   []string{etcDir, dir},
+		EtcSystemdDir: etcDir,
+		PidDir:        t.TempDir(),
+		LogDir:        t.TempDir(),
+	}
 
 	svcPath := filepath.Join(dir, "ssh.service")
 	os.WriteFile(svcPath,
 		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"),
 		0644)
 
-	reg1 := NewRegistry()
+	reg1 := NewRegistry(cfg)
 	u, _ := reg1.Resolve("ssh")
 	if err := svcEnable(u); err != nil {
 		t.Fatalf("enable: %v", err)
@@ -529,8 +548,8 @@ func TestEnableAliasMakesColdResolutionWork(t *testing.T) {
 	// symlink is now the source of truth.)
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/sbin/sshd\n"), 0644)
 
-	// Fresh registry: no memoisation from reg1.
-	reg2 := NewRegistry()
+	// Fresh registry against the same Config: no memoisation from reg1.
+	reg2 := NewRegistry(cfg)
 	canon, err := reg2.Resolve("ssh")
 	if err != nil {
 		t.Fatalf("Resolve(ssh): %v", err)
@@ -548,14 +567,10 @@ func TestUnitStateUnification(t *testing.T) {
 	// The whole point of C1: pidfile + logfile paths are keyed by
 	// canonical name, so any alias query observes the same state.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	os.WriteFile(filepath.Join(dir, "ssh.service"),
 		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"), 0644)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	canon, _ := reg.Resolve("ssh")
 	alias, _ := reg.Resolve("sshd")
 
@@ -570,16 +585,16 @@ func TestUnitStateUnification(t *testing.T) {
 func TestSvcEnableDisable(t *testing.T) {
 	dir := t.TempDir()
 	etcDir := t.TempDir()
-	origDirs := serviceDirs
-	origEtc := etcSystemdDir
-	serviceDirs = []string{dir, etcDir}
-	etcSystemdDir = etcDir
-	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+	reg := NewRegistry(Config{
+		ServiceDirs:   []string{dir, etcDir},
+		EtcSystemdDir: etcDir,
+		PidDir:        t.TempDir(),
+		LogDir:        t.TempDir(),
+	})
 
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n"), 0644)
 
-	reg := NewRegistry()
 	u, err := reg.Resolve("test")
 	if err != nil {
 		t.Fatalf("Resolve(test): %v", err)
@@ -588,19 +603,15 @@ func TestSvcEnableDisable(t *testing.T) {
 	if svcIsEnabled(u) {
 		t.Error("should not be enabled before enable")
 	}
-
 	if err := svcEnable(u); err != nil {
 		t.Fatalf("enable: %v", err)
 	}
-
 	if !svcIsEnabled(u) {
 		t.Error("should be enabled after enable")
 	}
-
 	if err := svcDisable(u); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
-
 	if svcIsEnabled(u) {
 		t.Error("should not be enabled after disable")
 	}
@@ -608,17 +619,12 @@ func TestSvcEnableDisable(t *testing.T) {
 
 func TestSvcShowProperties(t *testing.T) {
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte(`[Service]
 ExecStart=/usr/bin/test
 ExecReload=/bin/kill -HUP $MAINPID
 `), 0644)
 
-	// Capture svcShow output.
 	tests := []struct {
 		prop, valueOnly, wantContains string
 	}{
@@ -627,7 +633,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 		{"SourcePath", "false", "SourcePath=" + svcPath},
 	}
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	u, _ := reg.Resolve("test")
 
 	for _, tt := range tests {
@@ -651,7 +657,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 	// Test with a service that has no ExecReload.
 	svcPath2 := filepath.Join(dir, "noreload.service")
 	os.WriteFile(svcPath2, []byte("[Service]\nExecStart=/usr/bin/test\n"), 0644)
-	ureg := NewRegistry()
+	ureg := testRegistry(t, dir)
 	unoreload, _ := ureg.Resolve("noreload")
 
 	old := os.Stdout
@@ -670,14 +676,10 @@ ExecReload=/bin/kill -HUP $MAINPID
 
 func TestSvcShowValueOnly(t *testing.T) {
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/bin/test\n"), 0644)
 
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	u, _ := reg.Resolve("test")
 
 	old := os.Stdout
@@ -690,7 +692,7 @@ func TestSvcShowValueOnly(t *testing.T) {
 	n, _ := r.Read(buf)
 	got := strings.TrimSpace(string(buf[:n]))
 
-	// --value should print JUST the path, not SourcePath=<path>
+	// --value should print JUST the path, not SourcePath=<path>.
 	if strings.Contains(got, "=") {
 		t.Errorf("--value mode should not contain '=', got %q", got)
 	}
@@ -701,11 +703,7 @@ func TestSvcShowValueOnly(t *testing.T) {
 
 func TestSvcShowNotFound(t *testing.T) {
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
-
-	reg := NewRegistry()
+	reg := testRegistry(t, dir)
 	u, _ := reg.Resolve("nonexistent") // err is non-nil; u is nil
 
 	old := os.Stdout
@@ -737,7 +735,6 @@ func TestBuildServiceEnv(t *testing.T) {
 	}}
 
 	env := buildServiceEnv(svc)
-
 	has := func(needle string) bool {
 		for _, e := range env {
 			if e == needle {
@@ -768,7 +765,7 @@ func TestBuildServiceEnvMissingFile(t *testing.T) {
 		},
 	}}
 
-	// Should not panic or error — leading '-' means ignore if missing.
+	// Should not panic or error -- leading '-' means ignore if missing.
 	env := buildServiceEnv(svc)
 	if len(env) == 0 {
 		t.Error("expected at least inherited env vars")
@@ -778,36 +775,37 @@ func TestBuildServiceEnvMissingFile(t *testing.T) {
 func TestMaskUnmask(t *testing.T) {
 	dir := t.TempDir()
 	etcDir := t.TempDir()
-	origDirs := serviceDirs
-	origEtc := etcSystemdDir
-	// etcDir is searched FIRST so the mask symlink overrides the real file.
-	serviceDirs = []string{etcDir, dir}
-	etcSystemdDir = etcDir
-	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+	cfg := Config{
+		// etcDir searched FIRST so the mask symlink overrides the real file.
+		ServiceDirs:   []string{etcDir, dir},
+		EtcSystemdDir: etcDir,
+		PidDir:        t.TempDir(),
+		LogDir:        t.TempDir(),
+	}
+	reg := NewRegistry(cfg)
 
 	// Create a normal service file first.
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath, []byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	if err := svcMaskName("test"); err != nil {
+	if err := reg.svcMaskName("test"); err != nil {
 		t.Fatalf("mask: %v", err)
 	}
-	reg := NewRegistry()
-	isMasked := func(name string) bool {
-		u, err := reg.Resolve(name)
+	isMasked := func(r *Registry, name string) bool {
+		u, err := r.Resolve(name)
 		return err == nil && u.Masked
 	}
-	if !isMasked("test") {
+	if !isMasked(reg, "test") {
 		t.Error("should be masked after mask")
 	}
 
-	if err := svcUnmaskName("test"); err != nil {
+	if err := reg.svcUnmaskName("test"); err != nil {
 		t.Fatalf("unmask: %v", err)
 	}
-	// Reset registry: mask state is cached at resolution time, so a fresh
-	// registry is needed to observe the post-unmask state.
-	reg = NewRegistry()
-	if isMasked("test") {
+	// Mask state is cached at resolution time, so a fresh registry
+	// (against the same Config) is needed to observe post-unmask state.
+	reg2 := NewRegistry(cfg)
+	if isMasked(reg2, "test") {
 		t.Error("should not be masked after unmask")
 	}
 }

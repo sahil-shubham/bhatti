@@ -95,26 +95,21 @@ func TestKillModeFor(t *testing.T) {
 // t.TempDir(). Most cgroup operations work on regular dirs (mkdir,
 // writes), so the tests exercise the real code paths without needing
 // root or a real cgroup mount. KillCgroup is the exception (writes "1"
-// to a file, which won't actually kill anything in a fake tree) \u2014 those
+// to a file which won't actually kill anything in a fake tree) -- those
 // tests are gated separately.
+//
+// Cleanup waits for any watcher goroutines spawned by the test before
+// allowing tempdir teardown.
 func cgroupTestSetup(t *testing.T) *Unit {
 	t.Helper()
 	dir := t.TempDir()
-	root := t.TempDir()
-	origDirs := serviceDirs
-	origRoot := cgroupRoot
-	origPid := pidDir
-	origLog := logDir
-	serviceDirs = []string{dir}
-	cgroupRoot = root
-	pidDir = t.TempDir()
-	logDir = t.TempDir()
-	t.Cleanup(func() {
-		serviceDirs = origDirs
-		cgroupRoot = origRoot
-		pidDir = origPid
-		logDir = origLog
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		CgroupRoot:  t.TempDir(),
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
 	})
+	t.Cleanup(reg.WaitForWatchers)
 
 	os.WriteFile(filepath.Join(dir, "test.service"), []byte(`
 [Service]
@@ -123,7 +118,6 @@ MemoryMax=512M
 TasksMax=128
 CPUQuota=50%
 `), 0644)
-	reg := NewRegistry()
 	u, err := reg.Resolve("test")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -133,7 +127,7 @@ CPUQuota=50%
 
 func TestCgroupPath(t *testing.T) {
 	u := cgroupTestSetup(t)
-	want := filepath.Join(cgroupRoot, "system.slice", "test.service")
+	want := filepath.Join(u.reg.Config.CgroupRoot, "system.slice", "test.service")
 	if got := u.CgroupPath(); got != want {
 		t.Errorf("CgroupPath = %q, want %q", got, want)
 	}
@@ -230,17 +224,15 @@ func TestCgroupKillIntegration(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	origPid := pidDir
-	origLog := logDir
-	serviceDirs = []string{dir}
-	pidDir = t.TempDir()
-	logDir = t.TempDir()
-	defer func() {
-		serviceDirs = origDirs
-		pidDir = origPid
-		logDir = origLog
-	}()
+	// Real kernel test: production cgroup root, but tempdirs for the
+	// shim's own state.
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		CgroupRoot:  "/sys/fs/cgroup",
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
 
 	// Create a unit whose ExecStart spawns a child that intentionally
 	// daemonises (setsid + fork) to escape the parent's PGID. Without
@@ -250,7 +242,6 @@ func TestCgroupKillIntegration(t *testing.T) {
 [Service]
 ExecStart=/bin/sh -c "( /bin/sleep 60 & ) ; /bin/sleep 60"
 `), 0644)
-	reg := NewRegistry()
 	u, _ := reg.Resolve("fork-bomb")
 
 	if err := svcStart(u); err != nil {
@@ -275,10 +266,98 @@ ExecStart=/bin/sh -c "( /bin/sleep 60 & ) ; /bin/sleep 60"
 	}
 }
 
+// TestCgroupMemoryMaxEnforcement is the real-kernel test that the
+// MemoryMax= directive actually causes the kernel to OOM-kill a process
+// that allocates beyond the limit. Without this test, our F1 unit tests
+// only verify that we wrote a number to memory.max -- not that the
+// kernel enforces it. This is the user-visible promise of F1: a
+// misbehaving redis can't OOM nginx.
+//
+// Approach: spawn a unit whose ExecStart is a tiny shell script that
+// allocates memory by repeatedly doubling a string. MemoryMax=10M, so
+// the kernel's OOM-killer terminates it. The watcher (C6) then writes
+// the failed marker; we observe it.
+//
+// Requires root + real cgroup v2 + working memory controller.
+func TestCgroupMemoryMaxEnforcement(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root for real cgroup operations")
+	}
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
+		t.Skip("requires cgroup v2 mounted at /sys/fs/cgroup")
+	}
+	rootCtrl, _ := os.ReadFile("/sys/fs/cgroup/cgroup.subtree_control")
+	if !strings.Contains(string(rootCtrl), "memory") {
+		t.Skip("memory controller not enabled in /sys/fs/cgroup/cgroup.subtree_control")
+	}
+	// Memory controller must also be enabled on system.slice for our
+	// child cgroups to inherit it.
+	os.MkdirAll("/sys/fs/cgroup/system.slice", 0755)
+	os.WriteFile("/sys/fs/cgroup/system.slice/cgroup.subtree_control",
+		[]byte("+memory"), 0644)
+
+	dir := t.TempDir()
+	// Real cgroup root (the kernel must enforce limits), but tempdirs
+	// for shim state.
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		CgroupRoot:  "/sys/fs/cgroup",
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
+
+	// A tiny memory hog: bash variable doubling. 30 iterations of
+	// doubling a string blows well past 10MB. Restart=no so we don't
+	// loop after the kernel kills it.
+	unit := `
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'a=x; for i in $(seq 1 30); do a="$a$a$a$a$a$a$a"; done; echo done'
+MemoryMax=10M
+Restart=no
+`
+	os.WriteFile(filepath.Join(dir, "memhog.service"), []byte(unit), 0644)
+
+	u, err := reg.Resolve("memhog")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	defer u.RemoveCgroup()
+
+	if err := svcStart(u); err != nil {
+		t.Fatalf("svcStart: %v", err)
+	}
+
+	// Wait for the watcher to observe the OOM-kill (or the script
+	// exiting via memory error) and write the failed marker. Typical
+	// time from spawn to OOM is well under a second.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if u.IsFailed() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !u.IsFailed() {
+		peak, _ := os.ReadFile(filepath.Join(u.CgroupPath(), "memory.peak"))
+		current, _ := os.ReadFile(filepath.Join(u.CgroupPath(), "memory.current"))
+		t.Fatalf("memhog not marked failed after MemoryMax=10M; memory.peak=%s memory.current=%s",
+			strings.TrimSpace(string(peak)), strings.TrimSpace(string(current)))
+	}
+
+	// Exit code: 137 (128 + SIGKILL) when OOM-kill fires; 1 if the
+	// shell errors out before allocating enough. Either way, non-zero.
+	if code := u.LastExitCode(); code == 0 {
+		t.Errorf("LastExitCode = 0; expected non-zero from OOM-kill or shell error")
+	}
+}
+
 // TestSvcStopUsesCgroupKillIfAvailable exercises the svcStop path that
 // writes to cgroup.kill. We can't fake the kernel side, so we use a
 // non-root path: a tempdir cgroup tree where cgroup.kill is just a
-// regular file \u2014 the WRITE succeeds (no actual kill happens) and svcStop
+// regular file -- the WRITE succeeds (no actual kill happens) and svcStop
 // proceeds through its drain+remove cleanup.
 func TestSvcStopUsesCgroupKillPathWhenFileExists(t *testing.T) {
 	u := cgroupTestSetup(t)
@@ -331,6 +410,81 @@ func TestSvcStopUsesCgroupKillPathWhenFileExists(t *testing.T) {
 	}
 	if strings.TrimSpace(string(data)) != "1" {
 		t.Errorf("cgroup.kill contents = %q, want 1 (svcStop didn't take the control-group path)", string(data))
+	}
+}
+
+// TestSvcStopKillModeProcessTakesPGIDPath verifies that when a unit
+// declares KillMode=process, svcStop uses the legacy PGID-kill path
+// (kill -TERM -<pid>) and NOT the cgroup.kill primitive. This is the
+// opt-out path for services that explicitly want only the main
+// process killed, not the whole cgroup. The default (control-group)
+// kills everything; KillMode=process keeps the daemon's own children
+// alive after stop, which a few historical Type=forking services rely
+// on.
+//
+// We verify by setting up a fake cgroup with a cgroup.kill file and
+// pointing the pidfile at a real spawned sleep we own. After svcStop,
+// cgroup.kill should still be EMPTY (svcStop didn't take that path);
+// the sleep should be gone (svcStop took the PGID path instead).
+func TestSvcStopKillModeProcessTakesPGIDPath(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		CgroupRoot:  t.TempDir(),
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
+
+	os.WriteFile(filepath.Join(dir, "legacy.service"),
+		[]byte("[Service]\nExecStart=/bin/sleep 30\nKillMode=process\n"), 0644)
+
+	u, _ := reg.Resolve("legacy")
+
+	// Spawn a real sleep we own, in its own session so PGID kill works.
+	cmd := exec.Command("/bin/sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	waitDone := make(chan struct{})
+	go func() { cmd.Wait(); close(waitDone) }()
+	defer func() {
+		select {
+		case <-waitDone:
+		case <-time.After(2 * time.Second):
+			cmd.Process.Kill()
+			<-waitDone
+		}
+	}()
+
+	// Set up a fake cgroup with cgroup.kill so we can detect whether
+	// svcStop wrote to it (which would indicate it took the wrong path).
+	u.CreateCgroup()
+	os.WriteFile(filepath.Join(u.CgroupPath(), "cgroup.kill"), []byte{}, 0644)
+
+	u.WritePID(cmd.Process.Pid)
+
+	if err := svcStop(u); err != nil {
+		t.Errorf("svcStop: %v", err)
+	}
+
+	// The sleep should have been killed by the PGID path.
+	select {
+	case <-waitDone:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Errorf("sleep didn't exit within 2s; svcStop didn't kill it via the PGID path")
+	}
+
+	// cgroup.kill should still be empty -- svcStop must NOT have taken
+	// the control-group path.
+	data, err := os.ReadFile(filepath.Join(u.CgroupPath(), "cgroup.kill"))
+	if err != nil {
+		t.Fatalf("read cgroup.kill: %v", err)
+	}
+	if strings.TrimSpace(string(data)) == "1" {
+		t.Errorf("cgroup.kill = %q; svcStop wrote to it but KillMode=process should have taken the PGID path", string(data))
 	}
 }
 

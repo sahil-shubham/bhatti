@@ -49,18 +49,20 @@ func TestDispatchPrivilegedOpEnable(t *testing.T) {
 	// svcEnable and that exit codes flow correctly without os.Exit.
 	dir := t.TempDir()
 	etcDir := t.TempDir()
-	origDirs := serviceDirs
-	origEtc := etcSystemdDir
-	serviceDirs = []string{dir, etcDir}
-	etcSystemdDir = etcDir
-	defer func() { serviceDirs = origDirs; etcSystemdDir = origEtc }()
+	reg := NewRegistry(Config{
+		ServiceDirs:   []string{dir, etcDir},
+		EtcSystemdDir: etcDir,
+		PidDir:        t.TempDir(),
+		LogDir:        t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
 
 	svcPath := filepath.Join(dir, "test.service")
 	os.WriteFile(svcPath,
 		[]byte("[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n"),
 		0644)
 
-	code := dispatchPrivilegedOp(proto.SystemctlRequest{
+	code := dispatchPrivilegedOp(reg, proto.SystemctlRequest{
 		Op: "enable", Units: []string{"test"},
 	})
 	if code != 0 {
@@ -77,11 +79,14 @@ func TestDispatchPrivilegedOpStartNotFound(t *testing.T) {
 	// Starting a missing unit returns 5 (systemd convention) without
 	// calling os.Exit (which would kill the daemon).
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	serviceDirs = []string{dir}
-	defer func() { serviceDirs = origDirs }()
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
 
-	code := dispatchPrivilegedOp(proto.SystemctlRequest{
+	code := dispatchPrivilegedOp(reg, proto.SystemctlRequest{
 		Op: "start", Units: []string{"nonexistent"},
 	})
 	if code != 5 {
@@ -96,16 +101,16 @@ func TestSvcStopStalePidfile(t *testing.T) {
 	// runs every time a service crashes and the admin runs `systemctl
 	// stop` to clean state.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	origPid := pidDir
-	serviceDirs = []string{dir}
-	pidDir = t.TempDir()
-	defer func() { serviceDirs = origDirs; pidDir = origPid }()
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
 
 	os.WriteFile(filepath.Join(dir, "ghost.service"),
 		[]byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	reg := NewRegistry()
 	u, err := reg.Resolve("ghost")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -133,16 +138,16 @@ func TestSvcStopRefusesPID1(t *testing.T) {
 	// this test pointed at PID 1 to exercise EPERM and rebooted the Pi5
 	// it was running on.)
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	origPid := pidDir
-	serviceDirs = []string{dir}
-	pidDir = t.TempDir()
-	defer func() { serviceDirs = origDirs; pidDir = origPid }()
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
 
 	os.WriteFile(filepath.Join(dir, "corrupt.service"),
 		[]byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("corrupt")
 
 	for _, badPID := range []string{"0", "1"} {
@@ -173,16 +178,16 @@ func TestSvcStopErrorPropagatesViaSpawnedChild(t *testing.T) {
 	// which is the architectural fix that makes EPERM unreachable in
 	// production.
 	dir := t.TempDir()
-	origDirs := serviceDirs
-	origPid := pidDir
-	serviceDirs = []string{dir}
-	pidDir = t.TempDir()
-	defer func() { serviceDirs = origDirs; pidDir = origPid }()
+	reg := NewRegistry(Config{
+		ServiceDirs: []string{dir},
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
+	})
+	t.Cleanup(reg.WaitForWatchers)
 
 	os.WriteFile(filepath.Join(dir, "sleeper.service"),
 		[]byte("[Service]\nExecStart=/bin/sleep 30\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("sleeper")
 
 	// Spawn a sleep we own, in its own session so kill(-pgid) reaches it.

@@ -31,6 +31,18 @@ jobs:
       - name: Test
         run: go test $(go list ./... | grep -v cmd/lohar) -count=1 -timeout=120s
 
+      # The systemctl/journalctl/syslog/cgroup shim tests in cmd/lohar are
+      # tempdir-sandboxed unit tests that don't need a real Firecracker
+      # VM. Run them here with -race to catch concurrency bugs in the
+      # Registry mutex, the IPC dispatch's captureOutputMu, and the
+      # watcher's restartBurst map. The agent/session tests need a real
+      # sandbox (PID 1 dirs, vsock, etc.) so they're skipped here and
+      # left to the integration workflow.
+      - name: Test lohar shim (with -race)
+        run: |
+          go test -race -count=1 -timeout=120s ./cmd/lohar/ \
+            -skip '^(TestAgent|TestHelperAgent|TestSession|TestPipedSession)'
+
   shellcheck:
     name: Shellcheck
     runs-on: ubuntu-latest

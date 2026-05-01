@@ -10,24 +10,26 @@ import (
 	"time"
 )
 
-// failedStateTestSetup sandboxes serviceDirs and pidDir into tempdirs so
-// the .failed marker can be written and read without root or clobbering
-// the host's /run/bhatti.
-func failedStateTestSetup(t *testing.T) (svcDir string) {
+// failedStateTestSetup returns a fresh service-dir + Registry pair with
+// all paths sandboxed to tempdirs. The Registry has its own Config (paths)
+// and watcher coordination state, so tests don't share package-level
+// globals -- which is what made -race flag the watcher reading paths
+// while another test was concurrently rewriting them.
+//
+// Cleanup waits for spawned watcher goroutines to return so the test's
+// tempdirs can be cleaned up without an in-flight watcher reading them.
+// Without this Wait, t.Cleanup's tempdir removal could race with the
+// watcher's path-reading methods.
+func failedStateTestSetup(t *testing.T) (svcDir string, reg *Registry) {
 	t.Helper()
 	svcDir = t.TempDir()
-	origDirs := serviceDirs
-	origPid := pidDir
-	origLog := logDir
-	serviceDirs = []string{svcDir}
-	pidDir = t.TempDir()
-	logDir = t.TempDir()
-	t.Cleanup(func() {
-		serviceDirs = origDirs
-		pidDir = origPid
-		logDir = origLog
+	reg = NewRegistry(Config{
+		ServiceDirs: []string{svcDir},
+		PidDir:      t.TempDir(),
+		LogDir:      t.TempDir(),
 	})
-	return svcDir
+	t.Cleanup(reg.WaitForWatchers)
+	return svcDir, reg
 }
 
 func TestShouldRestart(t *testing.T) {
@@ -81,11 +83,10 @@ func TestParseRestartSec(t *testing.T) {
 func TestFailedMarker(t *testing.T) {
 	// MarkFailed writes the exit code; IsFailed reads it; ClearFailed
 	// removes it. The whole machinery underlying systemctl is-failed.
-	dir := failedStateTestSetup(t)
+	dir, reg := failedStateTestSetup(t)
 	os.WriteFile(filepath.Join(dir, "test.service"),
 		[]byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("test")
 
 	if u.IsFailed() {
@@ -106,15 +107,9 @@ func TestFailedMarker(t *testing.T) {
 
 func TestRestartOnFailure(t *testing.T) {
 	// Real lifecycle test: a service with Restart=on-failure that exits
-	// non-zero should be auto-restarted by the watcher. Use a unit whose
-	// ExecStart fails fast; assert the failed marker eventually appears
-	// and the watcher tried to restart (we observe restart attempts via
-	// the burst-history map).
-	//
-	// We use Restart=on-failure with /bin/false, which exits 1 immediately.
-	// StartLimitBurst=2 so the watcher gives up after 2 attempts and the
-	// test doesn't loop forever.
-	dir := failedStateTestSetup(t)
+	// non-zero should be auto-restarted by the watcher. /bin/false exits
+	// 1 immediately; StartLimitBurst=2 stops the loop after 2 attempts.
+	dir, reg := failedStateTestSetup(t)
 	os.WriteFile(filepath.Join(dir, "crasher.service"), []byte(`
 [Service]
 Type=simple
@@ -125,22 +120,19 @@ StartLimitBurst=2
 StartLimitIntervalSec=10
 `), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("crasher")
 
-	// Start the service. The watcher will see /bin/false exit with code
-	// 1, mark failed, and try to restart per Restart=on-failure.
 	if err := svcStart(u); err != nil {
 		t.Fatalf("svcStart: %v", err)
 	}
 
-	// Wait for the burst limit to be hit. With RestartSec=10ms and
-	// burst=2, we need ~20ms of attempts plus the final mark-failed.
+	// Wait for burst limit to be hit. With RestartSec=10ms and burst=2,
+	// we need ~20ms of attempts plus the final mark-failed.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		restartBurst.Lock()
-		count := len(restartBurst.history[u.Canonical])
-		restartBurst.Unlock()
+		reg.coordMu.Lock()
+		count := len(reg.restartBurst[u.Canonical])
+		reg.coordMu.Unlock()
 		if count >= 2 {
 			break
 		}
@@ -156,28 +148,21 @@ StartLimitIntervalSec=10
 	if u.LastExitCode() != 1 {
 		t.Errorf("LastExitCode = %d, want 1 (/bin/false's exit code)", u.LastExitCode())
 	}
-
-	// Reset state for any subsequent tests in the same process.
-	restartBurst.Lock()
-	delete(restartBurst.history, u.Canonical)
-	restartBurst.Unlock()
 }
 
 func TestRestartNoSuppressesAutoRestart(t *testing.T) {
 	// Restart=no (the default) means a crashing service stays dead.
 	// The watcher writes the failed marker but doesn't loop.
-	dir := failedStateTestSetup(t)
+	dir, reg := failedStateTestSetup(t)
 	os.WriteFile(filepath.Join(dir, "diehard.service"),
 		[]byte("[Service]\nType=simple\nExecStart=/bin/false\nRestart=no\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("diehard")
 
 	if err := svcStart(u); err != nil {
 		t.Fatalf("svcStart: %v", err)
 	}
 
-	// Give the watcher time to observe the exit and mark failed.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if u.IsFailed() {
@@ -190,10 +175,10 @@ func TestRestartNoSuppressesAutoRestart(t *testing.T) {
 		t.Fatal("diehard.service should be marked failed after exit")
 	}
 
-	// And the burst history should NOT have entries (no restart was attempted).
-	restartBurst.Lock()
-	count := len(restartBurst.history[u.Canonical])
-	restartBurst.Unlock()
+	// Burst history must be empty -- no restart was attempted.
+	reg.coordMu.Lock()
+	count := len(reg.restartBurst[u.Canonical])
+	reg.coordMu.Unlock()
 	if count != 0 {
 		t.Errorf("burst history = %d, want 0 (Restart=no should not attempt restart)", count)
 	}
@@ -201,57 +186,55 @@ func TestRestartNoSuppressesAutoRestart(t *testing.T) {
 
 func TestStopSuppressesRestart(t *testing.T) {
 	// Even with Restart=always, an explicit svcStop must NOT trigger a
-	// restart \u2014 the admin asked for the service to stop. The watcher
-	// reads the stopRequested flag and bails out.
-	dir := failedStateTestSetup(t)
+	// restart -- the admin asked for the service to stop. The watcher
+	// reads stopReqs (per-Registry) and bails out.
+	dir, reg := failedStateTestSetup(t)
 	os.WriteFile(filepath.Join(dir, "loopy.service"),
 		[]byte("[Service]\nType=simple\nExecStart=/bin/sleep 30\nRestart=always\nRestartSec=10ms\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("loopy")
 
 	if err := svcStart(u); err != nil {
 		t.Fatalf("svcStart: %v", err)
 	}
-	// Process is sleeping; svcStop should kill it AND prevent the restart.
 	if err := svcStop(u); err != nil {
 		t.Fatalf("svcStop: %v", err)
 	}
 
-	// Give the watcher time to react (it reads stopRequested after Wait).
+	// Give the watcher time to react (it reads stopReqs after Wait).
 	time.Sleep(200 * time.Millisecond)
 
-	// No new pidfile (no restart).
 	if _, err := os.Stat(u.PidPath()); !os.IsNotExist(err) {
 		t.Errorf("pidfile reappeared after stop; restart was not suppressed")
 	}
-	// Not failed (clean stop, not a crash).
 	if u.IsFailed() {
 		t.Error("svcStop after a Restart=always service should not leave the failed marker")
 	}
 }
 
 func TestResetFailed(t *testing.T) {
-	// `systemctl reset-failed` clears the .failed marker. Tested via the
-	// dispatch path the IPC server uses.
-	dir := failedStateTestSetup(t)
+	// `systemctl reset-failed` clears the .failed marker. The marker is
+	// on disk, so a fresh Registry resolving the same name sees the same
+	// state -- this is what makes the marker visible across systemctl
+	// invocations.
+	dir, reg := failedStateTestSetup(t)
 	os.WriteFile(filepath.Join(dir, "errored.service"),
 		[]byte("[Service]\nExecStart=/bin/true\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("errored")
 	u.MarkFailed(7)
 	if !u.IsFailed() {
 		t.Fatal("setup: should be failed before reset-failed")
 	}
 
-	// Re-resolve through a fresh registry like the IPC server does, then
-	// clear the marker.
-	reg2 := NewRegistry()
+	// Build a separate Registry pointing at the same Config (same paths)
+	// to simulate what the IPC server does: each request resolves
+	// through whatever Registry is reachable. Since the marker lives on
+	// disk under PidDir, both registries see it.
+	reg2 := NewRegistry(reg.Config)
 	u2, _ := reg2.Resolve("errored")
 	u2.ClearFailed()
 
-	// First Unit should also see the cleared state \u2014 the marker is on disk.
 	if u.IsFailed() {
 		t.Error("after ClearFailed, IsFailed should return false (marker is on disk, not in memory)")
 	}
@@ -259,12 +242,11 @@ func TestResetFailed(t *testing.T) {
 
 func TestStatusShowsFailed(t *testing.T) {
 	// status should print "Active: failed" with the exit code when the
-	// failed marker is present. Captures the stdout for assertion.
-	dir := failedStateTestSetup(t)
+	// failed marker is present.
+	dir, reg := failedStateTestSetup(t)
 	os.WriteFile(filepath.Join(dir, "boom.service"),
 		[]byte("[Unit]\nDescription=Boom service\n[Service]\nExecStart=/bin/true\n"), 0644)
 
-	reg := NewRegistry()
 	u, _ := reg.Resolve("boom")
 	u.MarkFailed(99)
 

@@ -12,17 +12,78 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
-// dropInDirs is the search path for unit drop-in directories. Listed in
-// LOWEST-priority-first order so that later loads override earlier ones —
-// matches systemd's unit_file_find_dropin_paths. /etc/ wins over /run/
-// wins over /usr/lib/.
-var dropInDirs = []string{
-	"/usr/lib/systemd/system",
-	"/lib/systemd/system",
-	"/run/systemd/system",
-	"/etc/systemd/system",
+// Config holds the filesystem locations the shim reads and writes. It's
+// constructed once — by runAgent for PID-1 lohar, by runSystemctl for
+// short-lived client invocations, by tests for their sandboxed view —
+// and never mutated thereafter. That immutability is the structural
+// reason watcher goroutines can read paths concurrently with everything
+// else without races: there's no shared mutable state to race on.
+//
+// Before this struct existed, the same values lived as package-level
+// vars that tests rewrote. -race flagged the resulting concurrency
+// (test cleanup writing pidDir while a watcher goroutine read it).
+// Moving paths onto Config closes that whole class of bug.
+type Config struct {
+	// ServiceDirs is the search path for unit fragment files,
+	// highest-priority first. Production: /etc/systemd/system,
+	// /usr/lib/systemd/system, /lib/systemd/system.
+	ServiceDirs []string
+
+	// EtcSystemdDir is where enable/disable creates wants/ symlinks and
+	// where mask creates the /dev/null symlink. Production:
+	// /etc/systemd/system.
+	EtcSystemdDir string
+
+	// PidDir holds runtime pidfiles + .failed markers. Production:
+	// /run/bhatti/services.
+	PidDir string
+
+	// LogDir holds per-unit log files. Production: /var/log/bhatti.
+	LogDir string
+
+	// CgroupRoot is the cgroup v2 hierarchy root. Production:
+	// /sys/fs/cgroup. Unit cgroups live under <CgroupRoot>/system.slice/.
+	CgroupRoot string
+
+	// DropInDirs is the search path for <unit>.service.d/*.conf
+	// directories, in LOWEST-priority-first order so later loads
+	// override earlier ones (matches systemd's unit_file_find_dropin_paths
+	// in src/core/load-dropin.c).
+	DropInDirs []string
+
+	// SyslogSocketPath is the unix datagram socket the syslog receiver
+	// binds. Production: /dev/log (libc's syslog(3) writes here). Tests
+	// point at a tempdir socket to exercise the receiver without
+	// clobbering the host's real /dev/log.
+	SyslogSocketPath string
+}
+
+// ProductionConfig returns the Config that PID-1 lohar uses inside a
+// real bhatti VM. The same values were package-level globals before
+// the Config refactor; preserving the literal paths here matches
+// existing on-disk state (pidfiles in /run/bhatti/services, etc.).
+func ProductionConfig() Config {
+	return Config{
+		ServiceDirs: []string{
+			"/etc/systemd/system",
+			"/usr/lib/systemd/system",
+			"/lib/systemd/system",
+		},
+		EtcSystemdDir: "/etc/systemd/system",
+		PidDir:        "/run/bhatti/services",
+		LogDir:        "/var/log/bhatti",
+		CgroupRoot:    "/sys/fs/cgroup",
+		DropInDirs: []string{
+			"/usr/lib/systemd/system",
+			"/lib/systemd/system",
+			"/run/systemd/system",
+			"/etc/systemd/system",
+		},
+		SyslogSocketPath: "/dev/log",
+	}
 }
 
 // Unit is the resolved identity of a systemd-style unit.
@@ -37,6 +98,13 @@ var dropInDirs = []string{
 // one canonical id and a set of aliases, with the manager hashmap
 // pre-populating every name as a key pointing at the same Unit*.
 type Unit struct {
+	// reg is the back-pointer to the Registry that owns this Unit. The
+	// Registry holds the Config (paths) and watcher coordination state
+	// (stopReqs, restartBurst, watcherWG). Methods that compute paths or
+	// touch coordination state walk through reg; that's how Unit avoids
+	// reading any package-level mutable global.
+	reg *Registry
+
 	// Canonical is the primary unit name without suffix.
 	// For instance units, this includes the instance: "postgresql@16-main".
 	Canonical string
@@ -73,26 +141,27 @@ func (u *Unit) FullName() string {
 	return u.Canonical + u.Suffix
 }
 
-// PidPath returns /run/bhatti/services/<canonical>.pid.
-// All state-keyed paths use the canonical name regardless of which
-// alias the caller queried by — that's the whole point of Unit identity.
+// PidPath returns <PidDir>/<canonical>.pid. All state-keyed paths use
+// the canonical name regardless of which alias the caller queried by —
+// that's the whole point of Unit identity. Reads u.reg.Config.PidDir;
+// no package-level globals.
 func (u *Unit) PidPath() string {
-	return filepath.Join(pidDir, u.Canonical+".pid")
+	return filepath.Join(u.reg.Config.PidDir, u.Canonical+".pid")
 }
 
-// LogPath returns /var/log/bhatti/<canonical>.log.
+// LogPath returns <LogDir>/<canonical>.log.
 func (u *Unit) LogPath() string {
-	return filepath.Join(logDir, u.Canonical+".log")
+	return filepath.Join(u.reg.Config.LogDir, u.Canonical+".log")
 }
 
 // WantsLink returns the path of the symlink in <target>.wants/ that
 // would be created by `systemctl enable`, e.g.
 // /etc/systemd/system/multi-user.target.wants/ssh.service.
 func (u *Unit) WantsLink(target string) string {
-	return filepath.Join("/etc/systemd/system", target+".wants", u.FullName())
+	return filepath.Join(u.reg.Config.EtcSystemdDir, target+".wants", u.FullName())
 }
 
-// FailedMarkerPath returns /run/bhatti/services/<canonical>.failed.
+// FailedMarkerPath returns <PidDir>/<canonical>.failed.
 //
 // The presence of this file means the unit's last run terminated with a
 // non-zero exit code; the file's contents are the integer exit code
@@ -103,12 +172,12 @@ func (u *Unit) WantsLink(target string) string {
 // client invocations — each one creates a fresh Registry, so in-memory
 // state on a *Unit is only visible to the watcher that wrote it.
 func (u *Unit) FailedMarkerPath() string {
-	return filepath.Join(pidDir, u.Canonical+".failed")
+	return filepath.Join(u.reg.Config.PidDir, u.Canonical+".failed")
 }
 
 // MarkFailed writes the failed marker with the given exit code.
 func (u *Unit) MarkFailed(exitCode int) {
-	os.MkdirAll(pidDir, 0755)
+	os.MkdirAll(u.reg.Config.PidDir, 0755)
 	os.WriteFile(u.FailedMarkerPath(), []byte(fmt.Sprintf("%d", exitCode)), 0644)
 }
 
@@ -146,9 +215,8 @@ func (u *Unit) ReadPID() (int, error) {
 }
 
 // WritePID stores the PID for this unit in the canonical pidfile.
-// Caller is responsible for ensuring pidDir exists (cheap, idempotent).
 func (u *Unit) WritePID(pid int) error {
-	os.MkdirAll(pidDir, 0755)
+	os.MkdirAll(u.reg.Config.PidDir, 0755)
 	return os.WriteFile(u.PidPath(), []byte(strconv.Itoa(pid)), 0644)
 }
 
@@ -179,40 +247,92 @@ func (u *Unit) HasName(name string) bool {
 
 // Registry is the n:1 map from any unit name (canonical, alias, symlinked
 // alternate filename, template instance) to a *Unit. Lookups by any name
-// the unit answers to return the same pointer.
+// the unit answers to return the same pointer. Holds the Config (paths,
+// immutable after construction) and watcher coordination state
+// (stopReqs, restartBurst, watcherWG) that used to live as package-level
+// globals.
 //
-// A Registry is created per process invocation; for the systemctl shim it
-// lives for the duration of one command, for PID-1 lohar it's long-lived
-// and shared with the syslog receiver and journalctl invocations.
+// A Registry is created per process invocation; for the systemctl shim
+// it lives for the duration of one command, for PID-1 lohar it's
+// long-lived and shared with the syslog receiver and journalctl
+// invocations.
 type Registry struct {
-	mu    sync.Mutex
-	byKey map[string]*Unit // every name (incl. suffix-stripped aliases) -> Unit
-	// byInode dedupes units reachable through symlinks: the same physical
-	// file resolved through two paths returns the same *Unit.
-	byInode map[uint64]*Unit
-	// notFound caches names we already tried to resolve and couldn't find,
-	// keyed by base+suffix. Without this, the syslog receiver would re-scan
-	// every unit file for every kernel/cron/login message tagged with
-	// something that doesn't match a unit. Invalidated on Reload (TODO C6+).
+	Config Config // immutable after NewRegistry returns
+
+	mu      sync.Mutex
+	byKey   map[string]*Unit // every name (incl. suffix-stripped aliases) -> Unit
+	byInode map[uint64]*Unit // dedupes inode-equivalent symlinks to one Unit
+	// notFound caches names we already tried to resolve and couldn't find.
+	// Without this, the syslog receiver would re-scan every unit file for
+	// every kernel/cron/login message tagged with something that doesn't
+	// match a unit.
 	notFound map[string]struct{}
+
+	// --- Watcher coordination state (was package-level pre-refactor) ---
+
+	// coordMu protects stopReqs and restartBurst. Held briefly during
+	// flag set/clear and burst-history append; never held while waiting.
+	coordMu sync.Mutex
+
+	// stopReqs marks units that an admin asked to stop, so the watcher
+	// suppresses the auto-restart that Restart=on-failure would
+	// otherwise trigger. Indexed by canonical name.
+	stopReqs map[string]bool
+
+	// restartBurst is the per-unit history of recent restart attempts,
+	// used to enforce StartLimitBurst / StartLimitIntervalSec.
+	restartBurst map[string][]time.Time
+
+	// watcherWG tracks live watcher goroutines spawned by startDaemon.
+	// Tests Wait on it before letting their cleanup run; production
+	// never calls Wait because PID 1 lives forever.
+	watcherWG sync.WaitGroup
 }
 
-// NewRegistry returns a fresh, empty registry.
-func NewRegistry() *Registry {
+// NewRegistry returns a fresh registry bound to the given Config. The
+// Config is captured by value and never mutated by the Registry; that's
+// the structural guarantee that makes Unit methods reading u.reg.Config.X
+// safe to call from any goroutine without synchronisation.
+func NewRegistry(cfg Config) *Registry {
 	return &Registry{
-		byKey:    make(map[string]*Unit),
-		byInode:  make(map[uint64]*Unit),
-		notFound: make(map[string]struct{}),
+		Config:       cfg,
+		byKey:        make(map[string]*Unit),
+		byInode:      make(map[uint64]*Unit),
+		notFound:     make(map[string]struct{}),
+		stopReqs:     make(map[string]bool),
+		restartBurst: make(map[string][]time.Time),
 	}
 }
 
+// markStopRequested, clearStopRequested, isStopRequested are called by
+// svcStop and the watcher goroutine. They share state via coordMu.
+func (r *Registry) markStopRequested(canonical string) {
+	r.coordMu.Lock()
+	r.stopReqs[canonical] = true
+	r.coordMu.Unlock()
+}
+func (r *Registry) clearStopRequested(canonical string) {
+	r.coordMu.Lock()
+	delete(r.stopReqs, canonical)
+	r.coordMu.Unlock()
+}
+func (r *Registry) isStopRequested(canonical string) bool {
+	r.coordMu.Lock()
+	defer r.coordMu.Unlock()
+	return r.stopReqs[canonical]
+}
+
+// WaitForWatchers blocks until every watcher goroutine spawned via this
+// Registry's startDaemon has returned. Test-only helper. Production
+// code never calls this because PID-1 lohar lives forever.
+func (r *Registry) WaitForWatchers() { r.watcherWG.Wait() }
+
 // globalRegistry is the long-lived Registry used by PID-1 lohar's syslog
 // receiver, target-wants service activation, and IPC handler. Created in
-// runAgent at boot and shared across the goroutines that need to map names
-// to units.
+// runAgent at boot via NewRegistry(ProductionConfig()).
 //
-// For the systemctl client (busybox-dispatched, short-lived process), a
-// fresh Registry per invocation is still appropriate — see runSystemctl.
+// Short-lived systemctl client invocations construct their own local
+// Registry with the same ProductionConfig() — see runSystemctl.
 var globalRegistry *Registry
 
 // ErrUnitNotFound is returned by Resolve when no unit file exists for the
@@ -256,6 +376,7 @@ func (r *Registry) Resolve(name string) (*Unit, error) {
 	// Mask check: any service dir with <base><suffix> -> /dev/null.
 	if r.checkMasked(base, suffix) {
 		u := &Unit{
+			reg:       r,
 			Canonical: base,
 			Suffix:    suffix,
 			Aliases:   map[string]struct{}{},
@@ -292,7 +413,7 @@ func (r *Registry) Resolve(name string) (*Unit, error) {
 // service dir. This must precede direct-match because os.Stat would
 // follow the symlink and fail.
 func (r *Registry) checkMasked(base, suffix string) bool {
-	for _, dir := range serviceDirs {
+	for _, dir := range r.Config.ServiceDirs {
 		path := filepath.Join(dir, base+suffix)
 		if target, err := os.Readlink(path); err == nil && target == "/dev/null" {
 			return true
@@ -306,7 +427,7 @@ func (r *Registry) checkMasked(base, suffix string) bool {
 // already-loaded units so that two names linking to the same fragment
 // share one *Unit.
 func (r *Registry) resolveDirect(base, suffix string) (*Unit, error) {
-	for _, dir := range serviceDirs {
+	for _, dir := range r.Config.ServiceDirs {
 		path := filepath.Join(dir, base+suffix)
 		st, err := os.Stat(path)
 		if err != nil {
@@ -327,7 +448,7 @@ func (r *Registry) resolveDirect(base, suffix string) (*Unit, error) {
 				// Late-arriving alias: load drop-ins under the new name
 				// so e.g. /etc/systemd/system/sshd.service.d/*.conf applies
 				// even if Resolve("ssh") happened first.
-				loadDropIns(existing, base, suffix)
+				r.loadDropIns(existing, base, suffix)
 				return existing, nil
 			}
 		}
@@ -347,7 +468,7 @@ func (r *Registry) resolveDirect(base, suffix string) (*Unit, error) {
 // (or symlink) exists on disk.
 func (r *Registry) resolveByAliasScan(base, suffix string) (*Unit, error) {
 	wantedAlias := base + suffix
-	for _, dir := range serviceDirs {
+	for _, dir := range r.Config.ServiceDirs {
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
 			if !strings.HasSuffix(e.Name(), suffix) {
@@ -367,13 +488,13 @@ func (r *Registry) resolveByAliasScan(base, suffix string) (*Unit, error) {
 					if existing, ok := r.byKey[canonical]; ok && existing.Suffix == suffix {
 						existing.Aliases[base] = struct{}{}
 						r.byKey[base] = existing
-						loadDropIns(existing, base, suffix)
+						r.loadDropIns(existing, base, suffix)
 						return existing, nil
 					}
 					u := r.buildUnit(canonical, suffix, realPath)
 					u.Aliases[base] = struct{}{}
 					r.byKey[base] = u
-					loadDropIns(u, base, suffix)
+					r.loadDropIns(u, base, suffix)
 					return u, nil
 				}
 			}
@@ -394,7 +515,7 @@ func (r *Registry) resolveTemplateInstance(base, suffix string) (*Unit, error) {
 	instance := base[idx+1:]
 	templateName := prefix + "@"
 
-	for _, dir := range serviceDirs {
+	for _, dir := range r.Config.ServiceDirs {
 		path := filepath.Join(dir, templateName+suffix)
 		st, err := os.Stat(path)
 		if err != nil {
@@ -411,6 +532,7 @@ func (r *Registry) resolveTemplateInstance(base, suffix string) (*Unit, error) {
 		// inode here because postgresql@16-main and postgresql@17-main
 		// resolve to the same template file but are independent units.
 		u := &Unit{
+			reg:       r,
 			Canonical: base,
 			Suffix:    suffix,
 			Aliases:   map[string]struct{}{},
@@ -424,8 +546,8 @@ func (r *Registry) resolveTemplateInstance(base, suffix string) (*Unit, error) {
 		// supported by real systemd:
 		//   - foo@.service.d/*.conf (template-wide; applies to every instance)
 		//   - foo@bar.service.d/*.conf (instance-specific)
-		loadDropIns(u, templateName, suffix)
-		loadDropIns(u, base, suffix)
+		r.loadDropIns(u, templateName, suffix)
+		r.loadDropIns(u, base, suffix)
 		r.byKey[base] = u
 		return u, nil
 	}
@@ -443,6 +565,7 @@ func (r *Registry) resolveTemplateInstance(base, suffix string) (*Unit, error) {
 // name (canonical or alias) sees it applied.
 func (r *Registry) buildUnit(canonical, suffix, realPath string) *Unit {
 	u := &Unit{
+		reg:       r,
 		Canonical: canonical,
 		Suffix:    suffix,
 		Aliases:   map[string]struct{}{},
@@ -461,9 +584,9 @@ func (r *Registry) buildUnit(canonical, suffix, realPath string) *Unit {
 		r.byKey[aliasBase] = u
 	}
 
-	loadDropIns(u, canonical, suffix)
+	r.loadDropIns(u, canonical, suffix)
 	for alias := range u.Aliases {
-		loadDropIns(u, alias, suffix)
+		r.loadDropIns(u, alias, suffix)
 	}
 	return u
 }
@@ -478,8 +601,8 @@ func (r *Registry) buildUnit(canonical, suffix, realPath string) *Unit {
 // Called by buildUnit for the canonical name and every alias known at the
 // time. Also called when a new alias is discovered later (inode dedup,
 // Alias= scan hits) so the late-arriving alias's drop-ins are picked up too.
-func loadDropIns(u *Unit, name, suffix string) {
-	for _, dir := range dropInDirs {
+func (r *Registry) loadDropIns(u *Unit, name, suffix string) {
+	for _, dir := range r.Config.DropInDirs {
 		overlay := filepath.Join(dir, name+suffix+".d")
 		entries, err := os.ReadDir(overlay)
 		if err != nil {

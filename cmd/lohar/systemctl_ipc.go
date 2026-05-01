@@ -184,7 +184,7 @@ func handleSystemctlConnection(conn net.Conn) {
 		return
 	}
 
-	resp := executePrivilegedOp(req)
+	resp := executePrivilegedOp(globalRegistry, req)
 	writeResp(conn, resp)
 }
 
@@ -224,7 +224,7 @@ var captureOutputMu sync.Mutex
 // The op functions still call fmt.Print/Fprintln to stdout/stderr as they
 // always have \u2014 we don't change them. We just redirect those streams for
 // the duration of the call.
-func executePrivilegedOp(req proto.SystemctlRequest) proto.SystemctlResponse {
+func executePrivilegedOp(reg *Registry, req proto.SystemctlRequest) proto.SystemctlResponse {
 	captureOutputMu.Lock()
 	defer captureOutputMu.Unlock()
 
@@ -248,7 +248,7 @@ func executePrivilegedOp(req proto.SystemctlRequest) proto.SystemctlResponse {
 	go func() { io.Copy(&stdout, rOut); wg.Done() }()
 	go func() { io.Copy(&stderr, rErr); wg.Done() }()
 
-	exitCode := dispatchPrivilegedOp(req)
+	exitCode := dispatchPrivilegedOp(reg, req)
 
 	wOut.Close()
 	wErr.Close()
@@ -272,8 +272,7 @@ func executePrivilegedOp(req proto.SystemctlRequest) proto.SystemctlResponse {
 // stdout/stderr go to whatever the caller has redirected them to (in the
 // IPC server: pipes that feed bytes.Buffers; in unit tests: real os
 // streams). The caller does the final exit-code propagation.
-func dispatchPrivilegedOp(req proto.SystemctlRequest) int {
-	reg := NewRegistry()
+func dispatchPrivilegedOp(reg *Registry, req proto.SystemctlRequest) int {
 	flags := req.Flags
 	nowFlag := flags["now"] == "1"
 	signalName := flags["signal"]
@@ -372,7 +371,7 @@ func dispatchPrivilegedOp(req proto.SystemctlRequest) int {
 		for _, raw := range req.Units {
 			u, err := reg.Resolve(raw)
 			if err != nil {
-				svcDisableByName(normalizeName(raw), unitSuffix(raw))
+				reg.svcDisableByName(normalizeName(raw), unitSuffix(raw))
 				continue
 			}
 			if nowFlag {
@@ -385,14 +384,14 @@ func dispatchPrivilegedOp(req proto.SystemctlRequest) int {
 		}
 	case "mask":
 		for _, raw := range req.Units {
-			if err := svcMaskName(normalizeName(raw)); err != nil {
+			if err := reg.svcMaskName(normalizeName(raw)); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to mask %s: %v\n", raw, err)
 				return 1
 			}
 		}
 	case "unmask":
 		for _, raw := range req.Units {
-			if err := svcUnmaskName(normalizeName(raw)); err != nil {
+			if err := reg.svcUnmaskName(normalizeName(raw)); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to unmask %s: %v\n", raw, err)
 				return 1
 			}

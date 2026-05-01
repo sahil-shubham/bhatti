@@ -131,13 +131,18 @@ func runAgent() {
 	go reapZombies()
 
 	// Build the long-lived Unit registry shared by the syslog receiver,
-	// service activation, and the IPC handler. Holding it here means a
-	// syslog message tagged "sshd" gets reconciled to the canonical Unit
-	// (ssh.service) on first lookup and cached thereafter — logs land in
-	// the same file regardless of which name the daemon uses internally.
-	globalRegistry = NewRegistry()
+	// service activation, and the IPC handler. Bound to ProductionConfig()
+	// (the real /etc, /run, /var/log paths). Once constructed the Config
+	// is immutable, so watchers and other goroutines can read paths
+	// off it without synchronisation.
+	//
+	// A syslog message tagged "sshd" gets reconciled to the canonical
+	// Unit (ssh.service) on first lookup here and cached thereafter —
+	// logs land in the same file regardless of which name the daemon
+	// uses internally.
+	globalRegistry = NewRegistry(ProductionConfig())
 
-	go startSyslogReceiver()
+	go startSyslogReceiver(globalRegistry)
 
 	// Privileged systemctl operations from in-guest non-root callers go
 	// through this Unix socket. PID 1 lohar runs the op as root and sends
@@ -277,33 +282,32 @@ func reapZombies() {
 	}
 }
 
-// syslogSocketPath is overridable in tests; in production it must be
-// /dev/log because that's where libc's syslog(3) sends. Tests use a
-// tempdir path to avoid clobbering the host's real /dev/log.
-var syslogSocketPath = "/dev/log"
-
-// startSyslogReceiver creates /dev/log and routes syslog messages to
-// /var/log/bhatti/<canonical>.log via the Unit registry: a daemon that
-// logs as "sshd[123]: ..." lands in /var/log/bhatti/ssh.log when
-// ssh.service has Alias=sshd.service — unifying with the stdout/stderr
-// capture in svcStart, which already keys by canonical name.
+// startSyslogReceiver creates the syslog socket and routes datagrams to
+// <LogDir>/<canonical>.log via the Unit registry: a daemon that logs as
+// "sshd[123]: ..." lands in ssh.log when ssh.service has
+// Alias=sshd.service — unifying with the stdout/stderr capture in
+// svcStart, which already keys by canonical name.
 //
 // Tags that don't match any known Unit (kernel, cron, login, custom
-// daemons not managed by the shim) fall back to /var/log/bhatti/<tag>.log
-// so they're still captured and greppable.
+// daemons not managed by the shim) fall back to <LogDir>/<tag>.log so
+// they're still captured and greppable.
 //
 // Services like sshd, postgres, and nginx write to syslog (via libc's
 // openlog/syslog) instead of stdout when daemonised. Without this
 // receiver their logs are lost.
-func startSyslogReceiver() {
-	os.Remove(syslogSocketPath)
-	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: syslogSocketPath, Net: "unixgram"})
+//
+// All paths come from reg.Config; the receiver doesn't read any
+// package-level globals.
+func startSyslogReceiver(reg *Registry) {
+	sockPath := reg.Config.SyslogSocketPath
+	os.Remove(sockPath)
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sockPath, Net: "unixgram"})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: syslog receiver: %v\n", err)
 		return
 	}
-	os.Chmod(syslogSocketPath, 0666)
-	os.MkdirAll(logDir, 0755)
+	os.Chmod(sockPath, 0666)
+	os.MkdirAll(reg.Config.LogDir, 0755)
 
 	buf := make([]byte, 8192)
 	for {
@@ -315,16 +319,9 @@ func startSyslogReceiver() {
 		if tag == "" {
 			tag = "syslog"
 		}
-		logPath := filepath.Join(logDir, tag+".log")
-		// Reconcile the syslog tag to a canonical Unit log path: messages
-		// from a daemon's libc syslog (tagged after the binary, e.g. sshd)
-		// merge with the stdout/stderr captured by svcStart (named after
-		// the unit, e.g. ssh.service). Misses fall back to a tag-keyed
-		// file as before.
-		if globalRegistry != nil {
-			if u, err := globalRegistry.Resolve(tag); err == nil && !u.Masked {
-				logPath = u.LogPath()
-			}
+		logPath := filepath.Join(reg.Config.LogDir, tag+".log")
+		if u, err := reg.Resolve(tag); err == nil && !u.Masked {
+			logPath = u.LogPath()
 		}
 		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
 			f.WriteString(msg + "\n")

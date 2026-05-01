@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -25,25 +24,12 @@ import (
 // (deb-systemd-helper, deb-systemd-invoke, invoke-rc.d) plus
 // interactive use (start, stop, reload, status, logs).
 
-var serviceDirs = []string{
-	"/etc/systemd/system",
-	"/usr/lib/systemd/system",
-	"/lib/systemd/system",
-}
-
-// etcSystemdDir is where enable/disable creates wants/ symlinks and where
-// mask creates the /dev/null symlink. Always /etc/systemd/system in production;
-// overridable in tests so we don't have to run as root or clobber the host's
-// real systemd state.
-var etcSystemdDir = "/etc/systemd/system"
-
-// pidDir and logDir are vars (not consts) so tests can sandbox them. The
-// production values are the real /run and /var/log paths; runAgent ensures
-// /run/bhatti/services exists at boot.
-var (
-	pidDir = "/run/bhatti/services"
-	logDir = "/var/log/bhatti"
-)
+// Path locations were package-level vars that tests rewrote (and that
+// triggered the -race finding around watcher goroutines reading them
+// while test cleanup wrote them). They now live on Registry.Config
+// (see unit.go); production callers construct a Registry with
+// ProductionConfig() and tests construct one with their tempdirs.
+// Nothing in this file reads filesystem paths directly anymore.
 
 // Well-known targets that are always "active" — invoke-rc.d checks
 // sysinit.target to determine runlevel.
@@ -116,7 +102,7 @@ func runSystemctl(args []string) {
 		}
 	}
 
-	reg := NewRegistry()
+	reg := NewRegistry(ProductionConfig())
 
 	// Resolve .socket units to their associated .service for RUNTIME commands
 	// (start/stop/restart/is-active/reload/kill). Socket activation is not
@@ -131,7 +117,7 @@ func runSystemctl(args []string) {
 	if runtimeCommands[command] {
 		for i, u := range units {
 			if isSocketUnit(u) {
-				units[i] = resolveSocketToService(u) + ".service"
+				units[i] = reg.resolveSocketToService(u) + ".service"
 			}
 		}
 	}
@@ -271,7 +257,7 @@ func runSystemctl(args []string) {
 			if u == nil {
 				// Glob-based disable still works without a registry hit:
 				// remove any wants/ symlinks matching the raw name.
-				svcDisableByName(normalizeName(raw), unitSuffix(raw))
+				reg.svcDisableByName(normalizeName(raw), unitSuffix(raw))
 				continue
 			}
 			if nowFlag {
@@ -310,7 +296,7 @@ func runSystemctl(args []string) {
 		if u, _ := resolveOrTolerate(units[0]); u != nil {
 			enabled = svcIsEnabled(u)
 		} else {
-			enabled = svcIsEnabledByName(normalizeName(units[0]))
+			enabled = reg.svcIsEnabledByName(normalizeName(units[0]))
 		}
 		if enabled {
 			if !quiet {
@@ -367,13 +353,13 @@ func runSystemctl(args []string) {
 		svcCat(u, raw)
 	case "mask":
 		for _, raw := range units {
-			if err := svcMaskName(normalizeName(raw)); err != nil {
+			if err := reg.svcMaskName(normalizeName(raw)); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to mask %s: %v\n", raw, err)
 			}
 		}
 	case "unmask":
 		for _, raw := range units {
-			if err := svcUnmaskName(normalizeName(raw)); err != nil {
+			if err := reg.svcUnmaskName(normalizeName(raw)); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to unmask %s: %v\n", raw, err)
 			}
 		}
@@ -463,13 +449,13 @@ func isTarget(name string) bool {
 }
 
 // resolveSocketToService finds the .service associated with a .socket unit.
-// Checks the Service= directive in the .socket file, falls back to name match.
-// This runs before registry resolution because the dispatch needs a .service
-// name to look up. We don't (yet) implement socket activation — the .service
-// is started directly.
-func resolveSocketToService(name string) string {
+// Checks the Service= directive in the .socket file, falls back to name
+// match. Runs before registry Resolve because the dispatch needs a
+// .service name to look up. We don't (yet) implement socket activation —
+// the .service is started directly.
+func (r *Registry) resolveSocketToService(name string) string {
 	base := normalizeName(name)
-	for _, dir := range serviceDirs {
+	for _, dir := range r.Config.ServiceDirs {
 		path := filepath.Join(dir, base+".socket")
 		if _, err := os.Stat(path); err == nil {
 			svc := parseServiceFile(path)
@@ -508,34 +494,14 @@ func humanBytes(n uint64) string {
 	}
 }
 
-// stopRequested tracks units that an admin asked to stop, so the watcher
-// goroutine knows to suppress the auto-restart that Restart=on-failure
-// would otherwise trigger when the daemon exits.
-//
-// In-memory map; lives in PID-1 lohar's address space alongside the
-// watcher goroutines that read it. Both svcStop and the watcher run in
-// the same process when the IPC path is in use (which is always, in
-// production); a sync.Mutex covers the (rare) concurrent access.
-var stopRequested = struct {
-	sync.Mutex
-	set map[string]bool
-}{set: map[string]bool{}}
-
-func markStopRequested(canonical string) {
-	stopRequested.Lock()
-	stopRequested.set[canonical] = true
-	stopRequested.Unlock()
-}
-func clearStopRequested(canonical string) {
-	stopRequested.Lock()
-	delete(stopRequested.set, canonical)
-	stopRequested.Unlock()
-}
-func isStopRequested(canonical string) bool {
-	stopRequested.Lock()
-	defer stopRequested.Unlock()
-	return stopRequested.set[canonical]
-}
+// Watcher coordination state — stopRequested, restart burst history, and
+// the WaitGroup tracking live watchers — lives on *Registry now (see
+// unit.go). It used to be package-level; the audit-pass move into
+// Registry was driven by a -race finding where the watcher goroutine
+// read pidDir while a test was concurrently writing it during cleanup.
+// With state on Registry, paths and coordination are all reachable from
+// the same construction-time-immutable config, removing the race by
+// construction.
 
 // --- Service operations ---
 //
@@ -627,7 +593,7 @@ func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 	cmd.Stdin = nil
 
 	// Capture stdout/stderr to log file for debugging.
-	os.MkdirAll(logDir, 0755)
+	os.MkdirAll(u.reg.Config.LogDir, 0755)
 	logFile, err := os.OpenFile(u.LogPath(),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err == nil {
@@ -666,14 +632,19 @@ func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 	// applies the Restart= policy. cmd.Process.Release() is NOT called
 	// before this — the watcher needs the cmd handle for cmd.Wait().
 	//
+	// Tracked via the Registry's watcherWG so tests can wait for
+	// completion before tearing down. Production code never reads it.
+	//
 	// Snapshot/restore caveat: this goroutine is bound to *os.Process,
-	// which doesn't survive a process restart. If lohar (PID 1) restarts
-	// for any reason, the watcher is gone; daemons that crash thereafter
-	// won't auto-restart until an admin runs `systemctl restart`. In a
-	// Firecracker microVM that snapshot/restores the entire VM atomically,
-	// goroutines pause/resume cleanly so this caveat doesn't apply to the
-	// snapshot lifecycle — only to a hypothetical lohar-only restart.
-	go watchAndMaybeRestart(u, cmd)
+	// which doesn't survive a process restart. In a Firecracker microVM
+	// that snapshot/restores the entire VM atomically, goroutines pause/
+	// resume cleanly so this caveat doesn't apply to the snapshot
+	// lifecycle — only to a hypothetical lohar-only restart.
+	u.reg.watcherWG.Add(1)
+	go func() {
+		defer u.reg.watcherWG.Done()
+		watchAndMaybeRestart(u, cmd)
+	}()
 	return nil
 }
 
@@ -705,8 +676,8 @@ func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd) {
 		u.MarkFailed(exitCode)
 	}
 
-	if isStopRequested(u.Canonical) {
-		clearStopRequested(u.Canonical)
+	if u.reg.isStopRequested(u.Canonical) {
+		u.reg.clearStopRequested(u.Canonical)
 		return
 	}
 
@@ -714,7 +685,7 @@ func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd) {
 	if !shouldRestart(policy, exitCode) {
 		return
 	}
-	if !restartBurstAllowed(u) {
+	if !u.reg.restartBurstAllowed(u) {
 		fmt.Fprintf(os.Stderr, "lohar: %s flapping, giving up after start-limit-burst\n", u.Canonical)
 		return
 	}
@@ -769,16 +740,12 @@ func parseRestartSec(v string) time.Duration {
 	return 100 * time.Millisecond
 }
 
-// restartBurst tracks recent restart attempts per Unit. Flapping services
-// (start, crash, restart, crash, ...) are caught here and given up on,
-// matching systemd's StartLimitBurst / StartLimitIntervalSec defaults
-// (5 attempts in 10 seconds). Per-unit map; protected by its own mutex.
-var restartBurst = struct {
-	sync.Mutex
-	history map[string][]time.Time
-}{history: map[string][]time.Time{}}
-
-func restartBurstAllowed(u *Unit) bool {
+// restartBurstAllowed enforces StartLimitBurst / StartLimitIntervalSec
+// (matching systemd's defaults: 5 attempts in 10 seconds). Per-unit
+// history is kept on the Registry so it's shared between PID-1 lohar's
+// watcher goroutines but isolated per test Registry. Protected by
+// coordMu.
+func (r *Registry) restartBurstAllowed(u *Unit) bool {
 	burst := 5
 	if v := u.Sections.get("Service", "StartLimitBurst"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
@@ -790,11 +757,11 @@ func restartBurstAllowed(u *Unit) bool {
 		interval = parseRestartSec(v)
 	}
 
-	restartBurst.Lock()
-	defer restartBurst.Unlock()
+	r.coordMu.Lock()
+	defer r.coordMu.Unlock()
 	now := time.Now()
 	cutoff := now.Add(-interval)
-	history := restartBurst.history[u.Canonical]
+	history := r.restartBurst[u.Canonical]
 	// Drop attempts older than the interval.
 	fresh := history[:0]
 	for _, t := range history {
@@ -803,11 +770,11 @@ func restartBurstAllowed(u *Unit) bool {
 		}
 	}
 	if len(fresh) >= burst {
-		restartBurst.history[u.Canonical] = fresh
+		r.restartBurst[u.Canonical] = fresh
 		return false
 	}
 	fresh = append(fresh, now)
-	restartBurst.history[u.Canonical] = fresh
+	r.restartBurst[u.Canonical] = fresh
 	return true
 }
 
@@ -828,7 +795,7 @@ func startForking(u *Unit, execStart string, svc serviceFile) error {
 
 	if pf := svc.get("Service", "PIDFile"); pf != "" {
 		if data, err := os.ReadFile(pf); err == nil {
-			os.MkdirAll(pidDir, 0755)
+			os.MkdirAll(u.reg.Config.PidDir, 0755)
 			os.WriteFile(u.PidPath(), data, 0644)
 		}
 	}
@@ -840,14 +807,14 @@ func svcStop(u *Unit) error {
 	// fire after we kill the daemon. Cleared by the watcher when it sees
 	// the flag, or by the deferred clear below if there was nothing to
 	// stop.
-	markStopRequested(u.Canonical)
+	u.reg.markStopRequested(u.Canonical)
 	defer u.ClearFailed() // a clean stop is not a failure
 
 	pid, err := u.ReadPID()
 	if err != nil {
-		clearStopRequested(u.Canonical) // no watcher to consume the flag
-		u.RemoveCgroup()                // best-effort cleanup of empty cgroup
-		return nil                      // not running, nothing to do
+		u.reg.clearStopRequested(u.Canonical) // no watcher to consume the flag
+		u.RemoveCgroup()                      // best-effort cleanup of empty cgroup
+		return nil                            // not running, nothing to do
 	}
 	// Defensive guard: never signal PID ≤ 1.
 	//
@@ -865,7 +832,7 @@ func svcStop(u *Unit) error {
 	if !processAlive(pid) {
 		u.RemovePID()
 		u.RemoveCgroup()
-		clearStopRequested(u.Canonical)
+		u.reg.clearStopRequested(u.Canonical)
 		return nil // pidfile stale
 	}
 
@@ -967,7 +934,7 @@ func svcEnable(u *Unit) error {
 	if wantedBy == "" {
 		wantedBy = "multi-user.target"
 	}
-	wantsDir := filepath.Join(etcSystemdDir, wantedBy+".wants")
+	wantsDir := filepath.Join(u.reg.Config.EtcSystemdDir, wantedBy+".wants")
 	os.MkdirAll(wantsDir, 0755)
 	link := filepath.Join(wantsDir, u.FullName())
 	os.Remove(link)
@@ -977,7 +944,7 @@ func svcEnable(u *Unit) error {
 	fmt.Fprintf(os.Stderr, "Created symlink %s → %s.\n", link, u.Path)
 
 	for _, reqBy := range svc.getAll("Install", "RequiredBy") {
-		reqDir := filepath.Join(etcSystemdDir, reqBy+".requires")
+		reqDir := filepath.Join(u.reg.Config.EtcSystemdDir, reqBy+".requires")
 		os.MkdirAll(reqDir, 0755)
 		reqLink := filepath.Join(reqDir, u.FullName())
 		os.Remove(reqLink)
@@ -992,13 +959,13 @@ func svcEnable(u *Unit) error {
 	// becomes a real on-disk filename, so anything globbing the dir
 	// (including our own svcIsEnabled, distro tooling, dependency
 	// resolvers in other unit files) sees both names.
-	os.MkdirAll(etcSystemdDir, 0755)
+	os.MkdirAll(u.reg.Config.EtcSystemdDir, 0755)
 	for _, alias := range svc.getAll("Install", "Alias") {
 		aliasName := strings.TrimSpace(alias)
 		if aliasName == "" {
 			continue
 		}
-		aliasLink := filepath.Join(etcSystemdDir, aliasName)
+		aliasLink := filepath.Join(u.reg.Config.EtcSystemdDir, aliasName)
 		os.Remove(aliasLink)
 		if err := os.Symlink(u.Path, aliasLink); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: alias symlink %s: %v\n", aliasLink, err)
@@ -1015,7 +982,7 @@ func svcEnable(u *Unit) error {
 // symlinks at the top of /etc/systemd/system/. Mirrors what real systemd
 // does when undoing what svcEnable created.
 func svcDisable(u *Unit) error {
-	if err := svcDisableByName(u.Canonical, u.Suffix); err != nil {
+	if err := u.reg.svcDisableByName(u.Canonical, u.Suffix); err != nil {
 		return err
 	}
 	// Remove [Install] Alias= symlinks created by svcEnable. Each alias
@@ -1028,7 +995,7 @@ func svcDisable(u *Unit) error {
 		if aliasName == "" {
 			continue
 		}
-		aliasLink := filepath.Join(etcSystemdDir, aliasName)
+		aliasLink := filepath.Join(u.reg.Config.EtcSystemdDir, aliasName)
 		// Only remove if it's a symlink we plausibly created (points back
 		// to the unit's fragment path). Don't blindly delete a regular
 		// file an admin might have placed there.
@@ -1041,18 +1008,20 @@ func svcDisable(u *Unit) error {
 }
 
 // svcDisableByName is the no-Unit fallback used when disable is called
-// for a name that doesn't resolve through the registry. Same glob logic
-// as before — covers the wants/ and requires/ symlinks; alias symlinks
-// at the top of /etc/systemd/system/ are left intact in this path because
-// we don't know which they are without a Unit to consult.
-func svcDisableByName(name, suffix string) error {
-	pattern := filepath.Join(etcSystemdDir, "*.wants", name+suffix)
+// for a name that doesn't resolve through the registry. Method on
+// Registry so it has access to Config.EtcSystemdDir without touching
+// any package-level globals. Covers the wants/ and requires/ symlinks;
+// alias symlinks at the top of /etc/systemd/system/ are left intact in
+// this path because we don't know which they are without a Unit to
+// consult.
+func (r *Registry) svcDisableByName(name, suffix string) error {
+	pattern := filepath.Join(r.Config.EtcSystemdDir, "*.wants", name+suffix)
 	matches, _ := filepath.Glob(pattern)
 	for _, m := range matches {
 		os.Remove(m)
 		fmt.Fprintf(os.Stderr, "Removed %s.\n", m)
 	}
-	reqPattern := filepath.Join(etcSystemdDir, "*.requires", name+suffix)
+	reqPattern := filepath.Join(r.Config.EtcSystemdDir, "*.requires", name+suffix)
 	reqMatches, _ := filepath.Glob(reqPattern)
 	for _, m := range reqMatches {
 		os.Remove(m)
@@ -1074,7 +1043,7 @@ func svcIsEnabled(u *Unit) bool {
 	}
 	for _, suffix := range []string{".service", ".socket"} {
 		for _, name := range names {
-			pattern := filepath.Join(etcSystemdDir, "*.wants", name+suffix)
+			pattern := filepath.Join(u.reg.Config.EtcSystemdDir, "*.wants", name+suffix)
 			matches, _ := filepath.Glob(pattern)
 			if len(matches) > 0 {
 				return true
@@ -1084,11 +1053,12 @@ func svcIsEnabled(u *Unit) bool {
 	return false
 }
 
-// svcIsEnabledByName is the no-Unit fallback. Used for unresolved names
-// (where Resolve failed) so `is-enabled` can still report disabled.
-func svcIsEnabledByName(name string) bool {
+// svcIsEnabledByName is the no-Unit fallback used when Resolve failed,
+// so `is-enabled` can still report disabled. Method on Registry for
+// access to Config.EtcSystemdDir.
+func (r *Registry) svcIsEnabledByName(name string) bool {
 	for _, suffix := range []string{".service", ".socket"} {
-		matches, _ := filepath.Glob(filepath.Join(etcSystemdDir, "*.wants", name+suffix))
+		matches, _ := filepath.Glob(filepath.Join(r.Config.EtcSystemdDir, "*.wants", name+suffix))
 		if len(matches) > 0 {
 			return true
 		}
@@ -1098,16 +1068,17 @@ func svcIsEnabledByName(name string) bool {
 
 // svcMaskName creates the /dev/null mask symlink. Naming-by-string is
 // correct here — mask is a filesystem operation that doesn't need a
-// resolved unit (you can mask a unit that doesn't exist yet).
-func svcMaskName(name string) error {
-	target := filepath.Join(etcSystemdDir, name+".service")
+// resolved unit (you can mask a unit that doesn't exist yet). Method on
+// Registry for access to Config.EtcSystemdDir.
+func (r *Registry) svcMaskName(name string) error {
+	target := filepath.Join(r.Config.EtcSystemdDir, name+".service")
 	os.MkdirAll(filepath.Dir(target), 0755)
 	os.Remove(target)
 	return os.Symlink("/dev/null", target)
 }
 
-func svcUnmaskName(name string) error {
-	target := filepath.Join(etcSystemdDir, name+".service")
+func (r *Registry) svcUnmaskName(name string) error {
+	target := filepath.Join(r.Config.EtcSystemdDir, name+".service")
 	link, err := os.Readlink(target)
 	if err == nil && link == "/dev/null" {
 		return os.Remove(target)
@@ -1233,7 +1204,7 @@ func svcListUnits(reg *Registry, stateFilter, typeFilter string, noLegend bool) 
 		fmt.Printf("%-40s %-10s %-10s %s\n", "UNIT", "LOAD", "ACTIVE", "DESCRIPTION")
 	}
 	seen := map[string]bool{}
-	for _, dir := range serviceDirs {
+	for _, dir := range reg.Config.ServiceDirs {
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
 			if !strings.HasSuffix(e.Name(), ".service") || seen[e.Name()] {
@@ -1270,7 +1241,7 @@ func svcListUnitFiles(reg *Registry, noLegend bool) {
 		fmt.Printf("%-50s %s\n", "UNIT FILE", "STATE")
 	}
 	seen := map[string]bool{}
-	for _, dir := range serviceDirs {
+	for _, dir := range reg.Config.ServiceDirs {
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
 			if !strings.HasSuffix(e.Name(), ".service") || seen[e.Name()] {
@@ -1293,15 +1264,19 @@ func svcListUnitFiles(reg *Registry, noLegend bool) {
 }
 
 // startEnabledServices starts all services in multi-user.target.wants.
-// Called at boot by lohar (PID 1). Each name is resolved through the
-// registry so aliases share state with their canonical units.
+// Called at boot by lohar (PID 1). Uses globalRegistry so the same Unit
+// objects (and their watcher coordination) are visible to syslog,
+// journalctl, and the IPC handler that follow.
 func startEnabledServices() {
-	wantsDir := "/etc/systemd/system/multi-user.target.wants"
+	reg := globalRegistry
+	if reg == nil {
+		return
+	}
+	wantsDir := filepath.Join(reg.Config.EtcSystemdDir, "multi-user.target.wants")
 	entries, err := os.ReadDir(wantsDir)
 	if err != nil {
 		return
 	}
-	reg := NewRegistry()
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".service") {
 			continue
@@ -1356,9 +1331,16 @@ func runJournalctl(args []string) {
 		// Ignore: --no-pager, -p/--priority, -q, --boot, etc.
 	}
 
+	// Build a Registry with production paths. journalctl is a short-
+	// lived client process so this Registry just lives for the
+	// invocation; it doesn't need to be globalRegistry. The Config
+	// is what matters — it tells the resolver where unit files live
+	// and where logs are kept.
+	reg := NewRegistry(ProductionConfig())
+
 	if unit == "" {
 		// No unit specified — list available logs.
-		entries, err := os.ReadDir(logDir)
+		entries, err := os.ReadDir(reg.Config.LogDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "No journal files found.")
 			return
@@ -1373,7 +1355,6 @@ func runJournalctl(args []string) {
 
 	// Resolve the unit through the registry so journalctl -u sshd and
 	// journalctl -u ssh read the same file when ssh has Alias=sshd.
-	reg := NewRegistry()
 	u, _ := reg.Resolve(unit)
 	var logPath string
 	if u != nil {
@@ -1382,7 +1363,7 @@ func runJournalctl(args []string) {
 		// Fallback: file might exist for a unit we couldn't resolve
 		// (e.g. a custom log written by the syslog receiver under an
 		// arbitrary tag).
-		logPath = filepath.Join(logDir, strings.TrimSuffix(unit, ".service")+".log")
+		logPath = filepath.Join(reg.Config.LogDir, strings.TrimSuffix(unit, ".service")+".log")
 	}
 
 	if follow {

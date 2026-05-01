@@ -47,7 +47,7 @@ func TestSyslogTagReconciledToCanonicalUnit(t *testing.T) {
 	// has a different canonical name (ssh, with Alias=sshd.service in
 	// [Install]). Without reconciliation, the daemon's syslog output
 	// landed in /var/log/bhatti/sshd.log while svcStart's stdout/stderr
-	// capture wrote to /var/log/bhatti/ssh.log \u2014 same daemon, two log
+	// capture wrote to /var/log/bhatti/ssh.log -- same daemon, two log
 	// files, status -n5 showed the wrong slice.
 	//
 	// After C5: the receiver looks up the tag in the Unit registry. If
@@ -59,27 +59,18 @@ func TestSyslogTagReconciledToCanonicalUnit(t *testing.T) {
 	logDirSandbox := t.TempDir()
 	sock := filepath.Join(t.TempDir(), "log.sock")
 
-	origDirs := serviceDirs
-	origLog := logDir
-	origSock := syslogSocketPath
-	origReg := globalRegistry
-	serviceDirs = []string{dir}
-	logDir = logDirSandbox
-	syslogSocketPath = sock
-	globalRegistry = NewRegistry()
-	defer func() {
-		serviceDirs = origDirs
-		logDir = origLog
-		syslogSocketPath = origSock
-		globalRegistry = origReg
-	}()
+	reg := NewRegistry(Config{
+		ServiceDirs:      []string{dir},
+		LogDir:           logDirSandbox,
+		SyslogSocketPath: sock,
+	})
 
 	// ssh.service with sshd as the alias. This is the real Ubuntu shape.
 	os.WriteFile(filepath.Join(dir, "ssh.service"),
 		[]byte("[Service]\nExecStart=/usr/sbin/sshd\n[Install]\nAlias=sshd.service\n"),
 		0644)
 
-	go startSyslogReceiver()
+	go startSyslogReceiver(reg)
 	// Wait for the socket to appear before sending.
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(sock); err == nil {
@@ -101,35 +92,26 @@ func TestSyslogTagReconciledToCanonicalUnit(t *testing.T) {
 	// And the alias-named file should NOT exist (we routed past it).
 	aliasPath := filepath.Join(logDirSandbox, "sshd.log")
 	if _, err := os.Stat(aliasPath); err == nil {
-		t.Errorf("sshd.log was created \u2014 syslog reconciliation didn't route to canonical (Fastidious-class regression)")
+		t.Errorf("sshd.log was created -- syslog reconciliation didn't route to canonical (Fastidious-class regression)")
 	}
 }
 
 func TestSyslogUnknownTagFallsBack(t *testing.T) {
 	// Tags that don't resolve to any unit (kernel, cron, login, custom
-	// daemons) keep the legacy behaviour: a tag-keyed file under logDir.
+	// daemons) keep the legacy behaviour: a tag-keyed file under LogDir.
 	// This is what makes the receiver useful even for things lohar
 	// doesn't manage.
 	dir := t.TempDir()
 	logDirSandbox := t.TempDir()
 	sock := filepath.Join(t.TempDir(), "log2.sock")
 
-	origDirs := serviceDirs
-	origLog := logDir
-	origSock := syslogSocketPath
-	origReg := globalRegistry
-	serviceDirs = []string{dir}
-	logDir = logDirSandbox
-	syslogSocketPath = sock
-	globalRegistry = NewRegistry()
-	defer func() {
-		serviceDirs = origDirs
-		logDir = origLog
-		syslogSocketPath = origSock
-		globalRegistry = origReg
-	}()
+	reg := NewRegistry(Config{
+		ServiceDirs:      []string{dir},
+		LogDir:           logDirSandbox,
+		SyslogSocketPath: sock,
+	})
 
-	go startSyslogReceiver()
+	go startSyslogReceiver(reg)
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(sock); err == nil {
 			break
@@ -139,7 +121,7 @@ func TestSyslogUnknownTagFallsBack(t *testing.T) {
 
 	sendSyslogMessage(t, sock, "<13>Apr 30 06:50:00 hostname kernel: usb 1-1: new high-speed USB device")
 
-	// No ssh.service, no kernel.service \u2014 falls back to kernel.log.
+	// No ssh.service, no kernel.service -- falls back to kernel.log.
 	fallback := filepath.Join(logDirSandbox, "kernel.log")
 	contents := waitForFile(t, fallback)
 	if !contains(contents, "usb 1-1") {

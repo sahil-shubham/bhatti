@@ -11,15 +11,16 @@ import (
 	"time"
 )
 
-// cgroupRoot is the cgroup v2 hierarchy root. Always /sys/fs/cgroup in
-// production (mounted by runAgent at boot); overridable in tests so we
-// can write under a tempdir without root and without polluting the host's
-// real cgroup tree.
-var cgroupRoot = "/sys/fs/cgroup"
-
 // systemSlice is the parent cgroup under which all unit cgroups live,
 // matching systemd's convention. Created lazily on first unit start.
 const systemSlice = "system.slice"
+
+// The cgroup hierarchy root used to be a package-level var (cgroupRoot).
+// It moved to Config.CgroupRoot during the audit-pass refactor that put
+// all paths on Registry.Config to make them immutable post-construction
+// and remove a -race finding around watcher goroutines. Production
+// reads /sys/fs/cgroup from ProductionConfig(); tests construct a
+// Registry with a tempdir CgroupRoot.
 
 // CgroupPath returns the full filesystem path of this unit's cgroup,
 // e.g. /sys/fs/cgroup/system.slice/ssh.service. The directory may or
@@ -28,7 +29,7 @@ const systemSlice = "system.slice"
 // For instance units (postgresql@16-main.service), each instance gets
 // its own cgroup. They don't share state with the template's cgroup.
 func (u *Unit) CgroupPath() string {
-	return filepath.Join(cgroupRoot, systemSlice, u.FullName())
+	return filepath.Join(u.reg.Config.CgroupRoot, systemSlice, u.FullName())
 }
 
 // CreateCgroup creates the unit's cgroup directory under system.slice,
@@ -42,7 +43,7 @@ func (u *Unit) CgroupPath() string {
 // because a resource controller is missing.
 func (u *Unit) CreateCgroup() error {
 	// Ensure the parent slice exists. Idempotent mkdir.
-	sliceDir := filepath.Join(cgroupRoot, systemSlice)
+	sliceDir := filepath.Join(u.reg.Config.CgroupRoot, systemSlice)
 	if err := os.MkdirAll(sliceDir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", sliceDir, err)
 	}
