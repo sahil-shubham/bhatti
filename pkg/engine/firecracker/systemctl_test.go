@@ -23,7 +23,13 @@ import (
 func writeFile(t *testing.T, eng *Engine, id, path, content string) {
 	t.Helper()
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
-	shellCmd := fmt.Sprintf("echo %s | base64 -d | sudo tee %s >/dev/null", b64, path)
+	// mkdir -p the parent first: minimal-tier rootfs doesn't ship some
+	// directories real systemd installs would create (e.g.
+	// /etc/tmpfiles.d/), so tee would fail with 'no such file'. Doing
+	// mkdir + tee in one shell command keeps the helper a single round
+	// trip.
+	shellCmd := fmt.Sprintf("sudo mkdir -p $(dirname %s) && echo %s | base64 -d | sudo tee %s >/dev/null",
+		path, b64, path)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	r, err := eng.Exec(ctx, id, []string{"sh", "-c", shellCmd})
@@ -568,146 +574,67 @@ ExecStart=/bin/sh -c "echo created > /var/lib/mystate/marker; exec /bin/sleep 30
 	assertExecOutput(t, eng, info.ID,
 		"stat -c %a /var/lib/mystate", "750")
 
-	// And the marker is there -- proves the dir existed before ExecStart.
-	assertExecOutput(t, eng, info.ID,
-		"cat /var/lib/mystate/marker", "created")
+	// And the marker is there -- proves the dir existed before
+	// ExecStart. The daemon ran as root (no User= in unit) so the
+	// marker is owned by root in a 0750 dir; lohar user can't read it
+	// without sudo. (Adding User= to the unit would make it owned by
+	// lohar and readable, but that complicates the test for no real
+	// gain -- we just want to verify that the dir was usable before
+	// ExecStart ran, which the marker existence proves.)
+	r := execCmd(t, eng, info.ID, "sudo cat /var/lib/mystate/marker")
+	if r.ExitCode != 0 {
+		t.Fatalf("read marker: exit %d stderr=%q", r.ExitCode, r.Stderr)
+	}
+	if strings.TrimSpace(r.Stdout) != "created" {
+		t.Errorf("marker contents = %q, want \"created\"", r.Stdout)
+	}
 
 	execOrFail(t, eng, info.ID, "sudo systemctl stop statetest")
 }
 
-// TestSystemctlTmpfilesDir verifies F6 wiring: tmpfiles.d entries
-// run at boot and create the runtime directories they declare. We
-// drop a tmpfiles.d entry, snapshot+restore (which re-runs runAgent),
-// and verify the dir appears.
-func TestSystemctlTmpfilesDir(t *testing.T) {
-	eng := testEngine(t)
-	ctx := context.Background()
+// F6 (tmpfiles.d) integration coverage gap acknowledgement: an
+// earlier version of this file had a TestSystemctlTmpfilesDir that
+// dropped a /etc/tmpfiles.d/test.conf, snapshot+restored, and
+// expected the directive to apply on resume. That's wrong: Firecracker
+// thermal restore preserves the running process tree (and tmpfs
+// contents); runAgent does NOT re-execute on resume. The test
+// couldn't actually trigger applyTmpfiles a second time -- only
+// observe whatever was created at the original fresh-create.
+//
+// Real boot-time coverage of the apply path needs either:
+//   - a separate `lohar tmpfiles --create` admin command (small
+//     follow-up; mirrors systemd-tmpfiles(8))
+//   - a baked-in tmpfiles.d entry in the rootfs that we observe
+//     post-create
+//
+// For v1.11.0 the F6 unit tests in cmd/lohar/tmpfiles_test.go cover
+// the parser + each directive type end-to-end on tempdirs. The boot
+// integration of applyTmpfiles in runAgent is exercised implicitly
+// by every fresh-create VM test below: if applyTmpfiles crashed
+// runAgent at boot, every other test would fail.
 
-	spec := testSpec("sctl-tmpfiles")
-	info, err := eng.Create(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer eng.Destroy(ctx, info.ID)
-
-	// Drop a tmpfiles.d entry that creates /run/tmpfiles-test/.
-	writeFile(t, eng, info.ID, "/etc/tmpfiles.d/test.conf",
-		"d /run/tmpfiles-test 0750 - - -\n")
-
-	// /run is tmpfs so the dir won't exist yet -- it'll be created on
-	// the next runAgent invocation. Snapshot+restore is the cheapest
-	// way to re-run runAgent (lohar boots fresh on cold restore via
-	// the existing PID-1 path).
-	if err := eng.Stop(ctx, info.ID); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if err := eng.Start(ctx, info.ID); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-
-	// Note: thermal-restored Firecracker preserves the running
-	// process tree including the tmpfs contents -- runAgent doesn't
-	// re-execute on resume. So this test as-written may not exercise
-	// the tmpfiles boot path on resume. The real verification path is
-	// a fresh-create scenario, which we already exercise in unit
-	// tests; here we just confirm the directive is parsed and applied
-	// at SOME boot. If we see the dir, we know runAgent ran tmpfiles
-	// at the original create time.
-	assertExecOutput(t, eng, info.ID, "stat -c %a /run/tmpfiles-test", "750")
-}
-
-// TestSystemctlDependencyOrdering verifies F3 wiring: a unit with
-// After= waits for its dependency to be 'active' before its own
-// ExecStart runs. We use Type=notify on the dependency so 'active'
-// has a meaningful gate (not just fork+exec).
-func TestSystemctlDependencyOrdering(t *testing.T) {
-	eng := testEngine(t)
-	ctx := context.Background()
-
-	spec := testSpec("sctl-deps")
-	spec.DiskSizeMB = 2048
-	info, err := eng.Create(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer eng.Destroy(ctx, info.ID)
-
-	execOrFail(t, eng, info.ID, "sudo apt-get update -qq")
-	execOrFail(t, eng, info.ID, "sudo apt-get install -y --no-install-recommends python3")
-
-	// dep.service: Type=notify, sleeps 1s before sending READY=1, then
-	// records its ready time.
-	depHelper := `#!/usr/bin/env python3
-import os, socket, time
-time.sleep(1.0)
-open('/run/dep-ready', 'w').write(str(time.time()))
-s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-s.connect(os.environ['NOTIFY_SOCKET'])
-s.send(b'READY=1\n')
-time.sleep(60)
-`
-	execOrFail(t, eng, info.ID, "sudo mkdir -p /opt/dep-test")
-	writeFile(t, eng, info.ID, "/opt/dep-test/dep.py", depHelper)
-	execOrFail(t, eng, info.ID, "sudo chmod +x /opt/dep-test/dep.py")
-
-	depUnit := `[Unit]
-Description=Dependency
-
-[Service]
-Type=notify
-ExecStart=/opt/dep-test/dep.py
-TimeoutStartSec=10
-`
-	writeFile(t, eng, info.ID, "/etc/systemd/system/dep.service", depUnit)
-
-	// dependent.service: After=dep.service, records its start time.
-	dependentUnit := `[Unit]
-Description=Dependent
-After=dep.service
-
-[Service]
-Type=simple
-ExecStart=/bin/sh -c "date +%s.%N > /run/dependent-started; exec /bin/sleep 30"
-`
-	writeFile(t, eng, info.ID, "/etc/systemd/system/dependent.service", dependentUnit)
-
-	// Enable both, then trigger startEnabledServices via stop+start
-	// (which re-runs the boot path). Faster: just start them in the
-	// right order via systemctl, since startEnabledServices is the
-	// boot-time activator. This test exercises ad-hoc systemctl start
-	// with deps, which doesn't yet recursively start dependencies
-	// (F3.5 follow-up). For now: start dep first manually.
-	//
-	// To actually exercise the dependency-ordering path, we test
-	// startEnabledServices via thermal cycle.
-	execOrFail(t, eng, info.ID, "sudo systemctl enable dep dependent")
-
-	if err := eng.Stop(ctx, info.ID); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if err := eng.Start(ctx, info.ID); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-
-	// Both services should be active after boot's startEnabledServices.
-	assertExecOutput(t, eng, info.ID, "systemctl is-active dep", "active")
-	assertExecOutput(t, eng, info.ID, "systemctl is-active dependent", "active")
-
-	// Verify ordering: dep recorded its ready timestamp BEFORE
-	// dependent recorded its start timestamp. Tolerance: dep should
-	// have written /run/dep-ready first.
-	depReady := execCmd(t, eng, info.ID, "cat /run/dep-ready")
-	dependentStart := execCmd(t, eng, info.ID, "cat /run/dependent-started")
-	if depReady.Stdout == "" || dependentStart.Stdout == "" {
-		t.Fatalf("missing timestamp files: dep=%q dependent=%q",
-			depReady.Stdout, dependentStart.Stdout)
-	}
-	// Both timestamps are floats; just assert dep is earlier.
-	if strings.TrimSpace(depReady.Stdout) >= strings.TrimSpace(dependentStart.Stdout) {
-		t.Errorf("dependency ordering violated: dep ready at %s, dependent started at %s (dep should be earlier)",
-			depReady.Stdout, dependentStart.Stdout)
-	}
-}
+// F3 (dependency ordering) integration coverage gap acknowledgement:
+// an earlier version of this file had a TestSystemctlDependencyOrdering
+// that enabled two units with After= and used snapshot+restore to
+// trigger startEnabledServices on resume. Same bug as the tmpfiles
+// test: thermal restore preserves the running process tree -- the
+// not-started units stay not-started, runAgent doesn't re-run
+// startEnabledServices.
+//
+// Real boot-time coverage of the dep-graph activation needs either:
+//   - a way to trigger startEnabledServices manually after enable
+//     (e.g. an admin command on lohar)
+//   - destroying and recreating the VM after the units are baked
+//     into the rootfs (slow, requires plumbing)
+//
+// For v1.11.0 the F3 unit tests in cmd/lohar/depgraph_test.go cover
+// the topological-sort algorithm exhaustively (linear, parallel,
+// cycle, partial-cycle, missing-dep, mixed-suffixes, multiple After=
+// lines). The wave activation in startEnabledServices is small enough
+// (a sync.WaitGroup loop) that the unit-tested graph + the wave
+// barriers from F2 (svcStart blocks until READY=1 for Type=notify)
+// give us coverage of every interesting failure mode without an
+// integration test that can't actually trigger the boot path.
 
 func TestSystemctlThermalCycles(t *testing.T) {
 	eng := testEngine(t)
