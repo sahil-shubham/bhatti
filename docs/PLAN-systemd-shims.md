@@ -950,13 +950,21 @@ Patch order (rough, can re-order C2–C6 freely):
 
 ## Future architectural work
 
+Target release: **`v1.11.0`** — a single coherent minor release covering F1
+through F6 together, not six separate minor bumps. The framing matters: each
+Fn is individually atomic, but as a set they tell one story — the shim
+graduates from "a process launcher that happens to read .service files" into
+"a process supervisor in the systemd lineage." Six minor releases for one
+architectural arc would make the version history noisy without giving users
+or us anything they couldn't get from the v1.11.0 cut.
+
 The Cn patches above fix bugs and align the data model. They do not, on their
 own, make lohar's shim *behave* like systemd in the ways that distinguish
 systemd from older inits. There are six pieces of real systemd that we don't
 yet implement and whose absence will eventually cost a bhatti user (or me)
-hours of debugging the wrong thing. They're documented here in priority order
-so they don't get lost — each is bigger than a patch, none is needed for the Cn
-patches to land, all are honest candidates for follow-up minor releases.
+hours of debugging the wrong thing. Documented here in priority order so they
+don't get lost — each is bigger than a patch, none is needed for the Cn
+patches to land, all ship together in v1.11.0.
 
 For each item: what systemd does, what we do today, the concrete "hours of
 debugging" failure mode if we ship without it, and rough effort. The point of
