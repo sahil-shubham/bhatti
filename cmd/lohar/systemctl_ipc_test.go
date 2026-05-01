@@ -20,9 +20,16 @@ import (
 func TestRequiresPrivilege(t *testing.T) {
 	// Privileged ops must round-trip to PID 1; read-only ops stay in-process.
 	priv := []string{"start", "stop", "restart", "reload", "enable", "disable",
-		"mask", "unmask", "kill", "preset", "daemon-reload"}
+		"mask", "unmask", "kill", "preset", "reset-failed"}
+	// daemon-reload and daemon-reexec are intentionally exposed to non-root
+	// callers because our shim's implementation of them is a no-op (the
+	// Registry re-reads unit files on every Resolve). Real systemd requires
+	// privilege; we don't because there's nothing privileged to do, and
+	// gating them would break common scripts that call daemon-reload after
+	// editing a user-owned unit file.
 	readOnly := []string{"status", "show", "cat", "is-active", "is-enabled",
-		"is-failed", "list-units", "list-unit-files", "is-system-running"}
+		"is-failed", "list-units", "list-unit-files", "is-system-running",
+		"daemon-reload", "daemon-reexec"}
 
 	for _, op := range priv {
 		if !requiresPrivilege(op) {

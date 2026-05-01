@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,6 +31,13 @@ const systemctlSocketPath = "/run/bhatti/systemctl.sock"
 //
 // The server uses this same set: a non-root caller asking for any of these
 // gets "Access denied".
+// daemon-reload and daemon-reexec are deliberately NOT in this set:
+// in real systemd they require privilege because they actually do
+// something (re-parse all unit files; re-execute PID 1). In our shim
+// they're no-ops — we re-read unit files on every Registry.Resolve —
+// so gating them on root would break the common 'systemctl
+// daemon-reload' invocation that scripts and admins run without
+// thinking, and our no-op path is harmless to expose.
 var privilegedOps = map[string]bool{
 	"start":             true,
 	"stop":              true,
@@ -42,8 +50,6 @@ var privilegedOps = map[string]bool{
 	"mask":              true,
 	"unmask":            true,
 	"kill":              true,
-	"daemon-reload":     true,
-	"daemon-reexec":     true,
 	"reset-failed":      true,
 	"preset":            true,
 }
@@ -157,14 +163,23 @@ func handleSystemctlConnection(conn net.Conn) {
 
 	if uid != 0 {
 		// Match systemd's polkit-rejection wording so existing scripts and
-		// parsers see what they expect.
-		who := req.Op
+		// parsers see what they expect. Format depends on whether the op
+		// targets a specific unit:
+		//   with unit:    "Failed to start ssh.service: Access denied"
+		//   without unit: "Failed to <op>: Access denied"
+		var msg string
 		if len(req.Units) > 0 {
-			who = fmt.Sprintf("%s %s", req.Op, req.Units[0])
+			unit := req.Units[0]
+			if !strings.Contains(unit, ".") {
+				unit += ".service"
+			}
+			msg = fmt.Sprintf("Failed to %s %s: Access denied\n", req.Op, unit)
+		} else {
+			msg = fmt.Sprintf("Failed to %s: Access denied\n", req.Op)
 		}
 		writeResp(conn, proto.SystemctlResponse{
 			ExitCode: 1,
-			Stderr:   fmt.Sprintf("Failed to %s.service: Access denied\n", who),
+			Stderr:   msg,
 		})
 		return
 	}
