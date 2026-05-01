@@ -209,6 +209,20 @@ func runAgent() {
 	// Read /etc/systemd/system/multi-user.target.wants/ and start each
 	// service. This replaces systemd's multi-user.target activation.
 
+	// systemd-tmpfiles equivalent: process /etc/tmpfiles.d/*.conf,
+	// /run/tmpfiles.d/*.conf, and /usr/lib/tmpfiles.d/*.conf to
+	// materialise runtime directories that packages declare
+	// (e.g., openssh-server's /run/sshd). Must run before
+	// startEnabledServices so daemons that depend on these dirs
+	// don't fail to start. (F6)
+	applyTmpfiles([]string{
+		"/usr/lib/tmpfiles.d",
+		"/lib/tmpfiles.d",
+		"/run/tmpfiles.d",
+		"/etc/tmpfiles.d",
+	})
+	bp("tmpfiles_applied")
+
 	startEnabledServices()
 	bp("services_started")
 

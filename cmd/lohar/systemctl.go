@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -519,7 +520,24 @@ func svcStart(u *Unit) error {
 		return nil // already running
 	}
 
+	// Conditions: if any [Unit] Condition*= directive evaluates false,
+	// the unit is silently skipped without an error and without leaving
+	// a failed marker. Matches systemd's semantics: a failed condition
+	// is the admin saying 'don't run this right now,' not a service
+	// failure. (F4)
+	if ok, reason := evaluateConditions(u); !ok {
+		fmt.Fprintf(os.Stderr, "lohar: %s skipped: %s\n", u.Canonical, reason)
+		return nil
+	}
+
 	svc := u.Sections
+
+	// State / Cache / Logs / Configuration directories: created with
+	// the right ownership and mode before ExecStartPre runs, since
+	// ExecStartPre often expects them to exist. (F5)
+	if err := u.ApplyStateDirectories(); err != nil {
+		return fmt.Errorf("state directories: %w", err)
+	}
 
 	// RuntimeDirectory
 	if rd := svc.get("Service", "RuntimeDirectory"); rd != "" {
@@ -1340,6 +1358,20 @@ func svcListUnitFiles(reg *Registry, noLegend bool) {
 // Called at boot by lohar (PID 1). Uses globalRegistry so the same Unit
 // objects (and their watcher coordination) are visible to syslog,
 // journalctl, and the IPC handler that follow.
+// startEnabledServices boots the units in multi-user.target.wants/
+// honouring After=/Before= ordering. Activation happens in waves: each
+// wave's units start in parallel, and the next wave waits until all
+// units in the current wave reach 'active' (per F2: for Type=notify
+// this means READY=1; for Type=simple/forking it's fork+exec; for
+// Type=oneshot it's clean exit). This is what makes multi-service
+// stacks like postgres -> pgbouncer -> webapp boot in the right order
+// instead of racing.
+//
+// Failures within a wave don't abort the wave -- other units in the
+// same wave still try to start. They DO advance the next wave (we
+// don't gate on a previous wave's failures here; failure propagation
+// for Requires= is F3.5). Matches systemd's behaviour where the
+// dependency graph is best-effort under failures.
 func startEnabledServices() {
 	reg := globalRegistry
 	if reg == nil {
@@ -1350,6 +1382,10 @@ func startEnabledServices() {
 	if err != nil {
 		return
 	}
+
+	// Resolve every enabled unit. Drop any we can't find (the wants/
+	// symlink might point at a unit whose file got removed).
+	var enabled []*Unit
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".service") {
 			continue
@@ -1360,11 +1396,26 @@ func startEnabledServices() {
 			fmt.Fprintf(os.Stderr, "lohar: cannot resolve %s: %v\n", name, err)
 			continue
 		}
-		if err := svcStart(u); err != nil {
-			fmt.Fprintf(os.Stderr, "lohar: failed to start %s: %v\n", name, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "lohar: started %s\n", name)
+		enabled = append(enabled, u)
+	}
+
+	// Topologically sort by After=/Before= and activate wave by wave.
+	groups := buildStartGraph(enabled)
+	for groupIdx, group := range groups {
+		var wg sync.WaitGroup
+		for _, u := range group {
+			wg.Add(1)
+			go func(u *Unit) {
+				defer wg.Done()
+				if err := svcStart(u); err != nil {
+					fmt.Fprintf(os.Stderr, "lohar: failed to start %s: %v\n", u.Canonical, err)
+					return
+				}
+				fmt.Fprintf(os.Stderr, "lohar: started %s (wave %d/%d)\n",
+					u.Canonical, groupIdx+1, len(groups))
+			}(u)
 		}
+		wg.Wait()
 	}
 }
 
