@@ -950,28 +950,26 @@ Patch order (rough, can re-order C2–C6 freely):
 
 ## Future architectural work
 
-Target release: **`v1.11.0`** — a single coherent minor release covering F1
-through F6 together, not six separate minor bumps. The framing matters: each
-Fn is individually atomic, but as a set they tell one story — the shim
-graduates from "a process launcher that happens to read .service files" into
-"a process supervisor in the systemd lineage." Six minor releases for one
-architectural arc would make the version history noisy without giving users
-or us anything they couldn't get from the v1.11.0 cut.
+**Status: F1–F6 shipped on `main` and bundled as `v1.11.0`.** What started as
+the deferred follow-up to the C-series (the shim graduating from "a process
+launcher that happens to read .service files" into "a process supervisor in
+the systemd lineage") landed across early May 2026 in two phases per item:
+first a pure-additive new file with unit tests, then the wiring step that
+activated the new code in `svcStart` / `runAgent` / `startEnabledServices`.
+Integration tests on real Firecracker VMs verify each user-visible promise.
 
-The Cn patches above fix bugs and align the data model. They do not, on their
-own, make lohar's shim *behave* like systemd in the ways that distinguish
-systemd from older inits. There are six pieces of real systemd that we don't
-yet implement and whose absence will eventually cost a bhatti user (or me)
-hours of debugging the wrong thing. Documented here in priority order so they
-don't get lost — each is bigger than a patch, none is needed for the Cn
-patches to land, all ship together in v1.11.0.
+The writeups below are kept for reference — the design intent, the failure
+modes the F-items closed, and the decisions about what stayed deferred.
+Follow-up work (F3.5 Requires= failure propagation, F2.5 sd_notify
+WatchdogSec= enforcement) lives at the bottom.
 
-For each item: what systemd does, what we do today, the concrete "hours of
-debugging" failure mode if we ship without it, and rough effort. The point of
-this section is to keep what makes systemd actually systemd in our line of
-sight, not to commit to a timeline.
+For each item: what systemd does, what we did, the failure mode the change
+closed, and where the test coverage lives. The point of this section is to
+keep what makes systemd actually systemd in our line of sight, including the
+parts we already shipped — so the next person reading this knows why we did
+it this way and where the seams live.
 
-### F1. Cgroup-per-unit — the architectural difference between systemd and sysvinit
+### F1. Cgroup-per-unit — the architectural difference between systemd and sysvinit — **shipped**
 
 **What systemd does.** Every unit gets its own cgroup at
 `/sys/fs/cgroup/system.slice/<name>.service/`. `MemoryMax=`, `CPUQuota=`,
@@ -1009,7 +1007,7 @@ is there, we just don't use it.
 parse `MemoryMax=`/`CPUQuota=`/`TasksMax=` into the corresponding cgroup
 files; on `svcStop`, write `1` to `cgroup.kill` (kernel ≥5.14, fine on Pi 5).
 
-### F2. `Type=notify` / sd_notify protocol
+### F2. `Type=notify` / sd_notify protocol — **shipped**
 
 **What systemd does.** Unit declares `Type=notify`. Service `connect()`s to
 `$NOTIFY_SOCKET` (`/run/systemd/notify`) and sends `READY=1\n` when it has
@@ -1039,7 +1037,7 @@ unix dgram at `/run/systemd/notify`, attributes incoming messages to Units
 otherwise), parses `READY=1`/`STATUS=`/`MAINPID=`/`WATCHDOG=1`, transitions
 state.
 
-### F3. Honest dependency ordering (`After=`, `Before=`, `Requires=`, `Wants=`)
+### F3. Honest dependency ordering (`After=`, `Before=`, `Requires=`, `Wants=`) — **shipped**
 
 **What systemd does.** At boot, builds a DAG from these directives across all
 enabled units, runs a topological sort, starts units in waves with barrier
@@ -1065,7 +1063,7 @@ directory-listing order, starts everything in parallel.
 barrier between waves depends on F2 to know when a unit is genuinely active
 (not just fork-exec'd) — so this is most useful after F2 lands.
 
-### F4. `Condition*=` directives
+### F4. `Condition*=` directives — **shipped**
 
 **What systemd does.** Evaluates `ConditionPathExists=`,
 `ConditionDirectoryNotEmpty=`, `ConditionFileNotEmpty=`,
@@ -1090,7 +1088,7 @@ thinks will disable a service has no effect.
 `Condition X failed, skipping` and return success. The other 8 are exotic
 enough to defer until someone asks.
 
-### F5. `StateDirectory=`, `CacheDirectory=`, `LogsDirectory=`, `ConfigurationDirectory=`
+### F5. `StateDirectory=`, `CacheDirectory=`, `LogsDirectory=`, `ConfigurationDirectory=` — **shipped**
 
 **What systemd does.** Auto-creates these directories at start time with the
 unit's `User=`/`Group=` ownership. `systemctl clean` removes them.
@@ -1109,7 +1107,7 @@ unit's `User=`/`Group=` ownership. `systemctl clean` removes them.
 directives, mkdir each as `/var/lib/<dir>`, `/var/cache/<dir>`,
 `/var/log/<dir>`, `/etc/<dir>` respectively, chown to `User=`/`Group=`.
 
-### F6. tmpfiles.d minimal handler
+### F6. tmpfiles.d minimal handler — **shipped**
 
 **What systemd does.** `systemd-tmpfiles --create` runs at boot and reads
 `/usr/lib/tmpfiles.d/*.conf` + `/etc/tmpfiles.d/*.conf` to create runtime
@@ -1137,6 +1135,26 @@ contents). Run during `runAgent` after mounts and before
 `%`-specifier expansion (`%h`, `%t`, `%u`).
 
 ---
+
+### Follow-ups not in v1.11.0
+
+**F2.5 — sd_notify watchdog enforcement (`WatchdogSec=`).** The notify
+receiver parses `WATCHDOG=1` messages already (just doesn't act on them).
+Real-world impact: niche, mostly relevant for daemons that want self-recovery
+on hangs (NetworkManager has it; few others do). Effort: ~80 LOC — per-unit
+goroutine timer, kill the cgroup if the daemon doesn't ping in time, watcher
+restart-policy takes over from there. Promote when a user reports a real
+case.
+
+**F3.5 — `Requires=` failure propagation and recursive ad-hoc start.** The
+F3 minimum-viable cut honoured `After=`/`Before=` for ordering but didn't
+propagate `Requires=` failures: if B fails to start, A (which `Requires=B`)
+still tries. And `systemctl start <unit>` doesn't recursively start the
+unit's dependencies; you have to start them yourself, which is fine for
+boot-time (covered by `startEnabledServices`) but breaks the manual
+workflow. Effort: ~150 LOC. The user-visible cost so far is small (most
+units use `Wants=` for soft pull-in, which already works); promote when
+someone hits the ad-hoc-start case.
 
 ### What's intentionally still out, even long-term
 
