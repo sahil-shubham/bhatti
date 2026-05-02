@@ -1,0 +1,18 @@
+Bench run metadata
+==================
+Timestamp:  2026-05-02T13:27:06Z
+Host:       agni-01 (Hetzner AX102, AMD Ryzen 9, x86_64, btrfs, NVMe)
+Server:     bhatti v1.11.0
+CLI:        bhatti v1.11.0 (same host as daemon, loopback)
+Iterations: 20 (lifecycle/warm/publish-wake: 3-5; concurrent: 10 reps)
+
+Methodology
+-----------
+- All measurements are CLI wall-clock except the "publish_wake_*" rows,
+  which are curl wall-clock against the path-based proxy
+  (/sandboxes/<id>/proxy/<port>/). The path-based proxy uses the same
+  ensureHot machinery as the public *.<zone> proxy.
+- Sleeps inserted between iterations to stay under per-user rate limits.
+  Sleeps don't pollute timings (they're between timings, not inside).
+- Numbers exclude geographic network latency. Add your CLI/HTTP RTT to
+  the daemon to estimate real-world latency from your location.
