@@ -1,37 +1,205 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
 # =============================================================================
-# Bhatti Performance Benchmark Suite
-# Measures real end-to-end latencies against a live bhatti instance.
-# Covers: lifecycle (create/stop/start/destroy), exec, files, API, concurrency
+# Bhatti performance benchmarks.
+#
+# Measures real end-to-end latencies against a live bhatti daemon. Designed
+# to run on the same host as the daemon (loopback) so results don't include
+# geographic network latency.
+#
+# Sections:
+#   lifecycle  — create / stop / start / cold-resume-via-exec / destroy
+#   warm       — warm-resume + exec (35s sleep per sample, opt-in)
+#   exec       — exec ops (true, echo, cat, ls, sha256, env)
+#   files      — file read/write/ls at multiple sizes
+#   api        — list / inspect / curl /health / curl /sandboxes
+#   concurrent — 5/10/20 parallel exec + 30 sequential
+#   network    — TCP connect / TTFB to the API
+#
+# Usage:
+#   ./run.sh [iterations]                # default iterations: 20
+#   SECTIONS=exec,files ./run.sh 30      # subset
+#   TIMEOUT_PER_CALL=10s ./run.sh        # per-bhatti-call timeout
+#   RESULTS_DIR=/tmp/r ./run.sh          # override output directory
+#
+# Robustness:
+#   - Single-instance lock (flock /tmp/bhatti-bench.lock).
+#   - Per-call `timeout` so a hung bhatti invocation doesn't block the suite.
+#   - All created sandboxes tracked and destroyed on EXIT (success, failure,
+#     SIGINT, SIGTERM).
+#   - Unique sandbox names per run (no collisions across simultaneous or
+#     leftover runs).
+#   - Failed iterations logged with n=X (skipped: Y) instead of recording
+#     bogus near-zero values.
 # =============================================================================
 
-SB="perf-bench"
-ITERATIONS=${1:-30}
-# Default to a results/ directory next to this script so the suite works
-# from any machine. Override with RESULTS_DIR=... ./run.sh.
+set -uo pipefail   # NOT -e: a failing iteration shouldn't kill the suite.
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+ITERATIONS="${1:-20}"
+LIFECYCLE_N="${LIFECYCLE_N:-5}"
+WARM_N="${WARM_N:-3}"
+TIMEOUT_PER_CALL="${TIMEOUT_PER_CALL:-30s}"
+SECTIONS="${SECTIONS:-lifecycle,exec,files,api,concurrent,network,publish-wake}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
+
+# Per-user rate limits in pkg/server/ratelimit.go (defaults):
+#   create: 30/min, burst 10
+#   exec/file: 600/min (10/sec), burst 30
+#   read (list/inspect/ports): 1200/min (20/sec), burst 60
+# Each iteration of an exec/file test consumes one token, so bursts deplete
+# in <1s of bench wall-clock. We pace iterations to stay under sustained
+# limits with a small safety margin. Set to 0 to disable (only safe if
+# you've raised the daemon's rate limits).
+SLEEP_PER_EXEC="${SLEEP_PER_EXEC:-0.11}"  # 1/10/sec + 10% margin
+SLEEP_PER_READ="${SLEEP_PER_READ:-0.06}"  # 1/20/sec + 20% margin
+SLEEP_PER_CREATE="${SLEEP_PER_CREATE:-2.1}"  # 1/(30/60s) + margin
+SLEEP_PER_CONCURRENT="${SLEEP_PER_CONCURRENT:-3}"  # rep gap, lets bucket refill
+
+# Run-scoped sandbox names so concurrent runs don't collide and leftover
+# sandboxes from a crashed prior run don't shadow this one.
+RUN_ID="bench-$$-$(date +%s)"
+SB="${RUN_ID}-main"
+LIFECYCLE_SB="${RUN_ID}-lifecycle"
+
+CREATED_SANDBOXES=()
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+    CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
+fi
+
+header()  { echo "${CYAN}${BOLD}━━━ $* ━━━${NC}"; }
+subhead() { echo "  ${YELLOW}$*${NC}"; }
+warn()    { echo "${YELLOW}WARN:${NC} $*" >&2; }
+die()     { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
+
+# ── Single-instance lock ──────────────────────────────────────────────────────
+
+LOCK="/tmp/bhatti-bench.lock"
+exec 200>"$LOCK" || die "cannot open lock file $LOCK"
+flock -n 200 || die "another bench is already running (lock: $LOCK)"
+
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+
+cleanup() {
+    local exit_code=$?
+    trap '' INT TERM   # ignore signals during cleanup
+    echo
+    if (( ${#CREATED_SANDBOXES[@]} > 0 )); then
+        echo "Cleaning up ${#CREATED_SANDBOXES[@]} sandbox(es)..."
+        local s
+        for s in "${CREATED_SANDBOXES[@]}"; do
+            bhatti destroy "$s" -y >/dev/null 2>&1 &
+        done
+        wait
+    fi
+    if (( exit_code != 0 )); then
+        echo "${RED}bench exited with status $exit_code${NC}" >&2
+    else
+        echo "${GREEN}bench complete${NC}"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── Sandbox helpers ───────────────────────────────────────────────────────────
+
+create_sandbox() {
+    local name="$1"; shift
+    if ! timeout 30s bhatti create --name "$name" "$@" >/dev/null 2>&1; then
+        die "create $name failed"
+    fi
+    CREATED_SANDBOXES+=("$name")
+}
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+
+command -v bhatti >/dev/null 2>&1 || die "bhatti not in PATH"
+command -v flock  >/dev/null 2>&1 || die "flock not installed (required for single-instance lock)"
+command -v timeout >/dev/null 2>&1 || die "timeout not installed"
+command -v awk    >/dev/null 2>&1 || die "awk not installed"
+command -v curl   >/dev/null 2>&1 || die "curl not installed"
+
+# Bash 5+ for $EPOCHREALTIME (microsecond precision, zero fork).
+if (( BASH_VERSINFO[0] < 5 )); then
+    die "bash 5+ required (need \$EPOCHREALTIME); current: $BASH_VERSION"
+fi
+
+# Daemon reachable?
+if ! timeout 5s bhatti list >/dev/null 2>&1; then
+    die "cannot reach bhatti daemon (run 'bhatti list' to debug)"
+fi
+
 mkdir -p "$RESULTS_DIR"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+# ── Timing primitive ──────────────────────────────────────────────────────────
 
-header()  { echo -e "\n${CYAN}${BOLD}━━━ $1 ━━━${NC}"; }
-subhead() { echo -e "  ${YELLOW}$1${NC}"; }
+# time_ms: run a command, print elapsed ms to stdout. On failure or timeout,
+# return non-zero so the caller can skip the iteration.
+#
+# Uses bash 5's $EPOCHREALTIME (microseconds since epoch as "secs.usecs"). We
+# strip the dot and treat the value as integer microseconds to avoid awk/python
+# forks per measurement. Earlier versions of this script forked python3 three
+# times per call, adding 150-300ms of overhead and making sub-100ms operations
+# unmeasurable.
+#
+# Set BENCH_DEBUG=1 to log stderr from failed iterations to /tmp/bhatti-bench-fails.log.
+time_ms() {
+    local start_us="${EPOCHREALTIME//.}"
+    local err
+    if [[ -n "${BENCH_DEBUG:-}" ]]; then
+        err=$(timeout "$TIMEOUT_PER_CALL" "$@" 2>&1 >/dev/null)
+        local rc=$?
+        if (( rc != 0 )); then
+            echo "[$(date +%H:%M:%S)] rc=$rc cmd: $* | err: $err" >> /tmp/bhatti-bench-fails.log
+            return 1
+        fi
+    else
+        if ! timeout "$TIMEOUT_PER_CALL" "$@" >/dev/null 2>&1; then
+            return 1
+        fi
+    fi
+    local end_us="${EPOCHREALTIME//.}"
+    local diff=$((end_us - start_us))
+    printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000))
+}
+
+# Run a timed iteration N times. Failures are counted, not crashes.
+# Args: <results-file> <n> <inter-iteration-sleep> <command...>
+collect() {
+    local file="$1" n="$2" sleep_s="$3"; shift 3
+    local fails=0 t i
+    : > "$file"
+    for ((i = 1; i <= n; i++)); do
+        (( i > 1 )) && sleep "$sleep_s"
+        if t=$(time_ms "$@"); then
+            echo "$t" >> "$file"
+        else
+            ((fails++))
+        fi
+    done
+    if (( fails > 0 )); then
+        warn "$(basename "$file"): $fails/$n iteration(s) failed or timed out"
+    fi
+}
 
 percentiles() {
     local file="$1"
+    if [[ ! -s "$file" ]]; then
+        echo "  (no data)"
+        return
+    fi
     sort -n "$file" | awk '
     {a[NR]=$1; sum+=$1}
     END {
-        n=NR
-        if (n==0) { print "  (no data)"; exit }
+        n = NR
         printf "  n=%-3d  min=%8.1f  p50=%8.1f  p95=%8.1f  p99=%8.1f  max=%8.1f  mean=%8.1f ms\n",
             n, a[1],
             a[int(n*0.50)+1],
@@ -42,447 +210,544 @@ percentiles() {
     }'
 }
 
-# Time a command in milliseconds. Uses bash 5+'s $EPOCHREALTIME (microsecond
-# precision, zero fork). Strips the decimal so we can do integer math in
-# pure bash; output is `<ms-integer>.<microseconds-mod-1000>`.
+want_section() {
+    [[ ",$SECTIONS," == *",$1,"* ]]
+}
+
+elapsed_since() {
+    local start_us="$1"
+    local now_us="${EPOCHREALTIME//.}"
+    local diff=$((now_us - start_us))
+    awk -v d="$diff" 'BEGIN { printf "%.1fs", d / 1000000 }'
+}
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+
+START_US="${EPOCHREALTIME//.}"
+
+echo "${BOLD}Bhatti performance benchmark${NC}"
+echo "  Target:        $(bhatti version 2>&1 | head -1)"
+echo "  Iterations:    $ITERATIONS  (lifecycle: $LIFECYCLE_N, warm-resume: $WARM_N)"
+echo "  Timeout/call:  $TIMEOUT_PER_CALL"
+echo "  Sections:      $SECTIONS"
+echo "  Results dir:   $RESULTS_DIR"
+echo "  Run ID:        $RUN_ID"
+echo "  Timestamp:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo
+
+# =============================================================================
+# 1. LIFECYCLE
+# =============================================================================
+
+run_lifecycle() {
+    header "LIFECYCLE"
+
+    # 1a. Create (cold boot)
+    subhead "1a. Create sandbox (full cold boot, 1 vCPU / 512MB)"
+    local file="$RESULTS_DIR/create.txt"
+    : > "$file"
+    local i name t
+    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+        (( i > 1 )) && sleep "$SLEEP_PER_CREATE"
+        name="$RUN_ID-create-$i"
+        if t=$(time_ms bhatti create --name "$name" --cpus 1 --memory 512); then
+            echo "$t" >> "$file"
+            CREATED_SANDBOXES+=("$name")
+            echo "    run $i: ${t}ms"
+        else
+            warn "create $name failed"
+        fi
+    done
+    echo "${YELLOW}Create (cold boot, ms):${NC}"
+    percentiles "$file"
+
+    # Reuse one of the created sandboxes for the rest of the lifecycle tests.
+    # Renaming via stop+start cycle keeps state warm.
+    create_sandbox "$LIFECYCLE_SB" --cpus 1 --memory 512
+    timeout 10s bhatti exec "$LIFECYCLE_SB" -- true >/dev/null 2>&1
+
+    # 1b. Stop (snapshot)
+    subhead "1b. Stop sandbox (snapshot to disk)"
+    file="$RESULTS_DIR/stop.txt"
+    : > "$file"
+    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+        timeout 10s bhatti start "$LIFECYCLE_SB" >/dev/null 2>&1
+        timeout 10s bhatti exec  "$LIFECYCLE_SB" -- true >/dev/null 2>&1
+        sleep 1
+        if t=$(time_ms bhatti stop "$LIFECYCLE_SB"); then
+            echo "$t" >> "$file"
+            echo "    run $i: ${t}ms"
+        else
+            warn "stop iteration $i failed"
+        fi
+    done
+    echo "${YELLOW}Stop / snapshot (ms):${NC}"
+    percentiles "$file"
+
+    # 1c. Cold resume (start)
+    subhead "1c. Start from cold (snapshot resume)"
+    file="$RESULTS_DIR/cold_resume.txt"
+    : > "$file"
+    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+        timeout 10s bhatti stop "$LIFECYCLE_SB" >/dev/null 2>&1
+        sleep 0.5
+        if t=$(time_ms bhatti start "$LIFECYCLE_SB"); then
+            echo "$t" >> "$file"
+            echo "    run $i: ${t}ms"
+        else
+            warn "start iteration $i failed"
+        fi
+    done
+    echo "${YELLOW}Cold resume (ms):${NC}"
+    percentiles "$file"
+
+    # 1d. Cold resume + exec (transparent wake on exec)
+    subhead "1d. Cold resume + exec (transparent wake)"
+    file="$RESULTS_DIR/cold_resume_exec.txt"
+    : > "$file"
+    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+        timeout 10s bhatti stop "$LIFECYCLE_SB" >/dev/null 2>&1
+        sleep 0.5
+        if t=$(time_ms bhatti exec "$LIFECYCLE_SB" -- true); then
+            echo "$t" >> "$file"
+            echo "    run $i: ${t}ms"
+        else
+            warn "cold-resume-exec iteration $i failed"
+        fi
+    done
+    echo "${YELLOW}Cold resume + exec (ms):${NC}"
+    percentiles "$file"
+
+    # 1e. Destroy
+    subhead "1e. Destroy sandbox"
+    file="$RESULTS_DIR/destroy.txt"
+    : > "$file"
+    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+        (( i > 1 )) && sleep "$SLEEP_PER_CREATE"
+        name="$RUN_ID-destroy-$i"
+        timeout 30s bhatti create --name "$name" --cpus 1 --memory 512 >/dev/null 2>&1 || {
+            warn "destroy iteration $i: create failed"; continue
+        }
+        CREATED_SANDBOXES+=("$name")
+        if t=$(time_ms bhatti destroy "$name" -y); then
+            echo "$t" >> "$file"
+            echo "    run $i: ${t}ms"
+            # Already destroyed; remove from cleanup list.
+            CREATED_SANDBOXES=("${CREATED_SANDBOXES[@]/$name}")
+        else
+            warn "destroy iteration $i failed"
+        fi
+    done
+    echo "${YELLOW}Destroy (ms):${NC}"
+    percentiles "$file"
+}
+
+# =============================================================================
+# WARM RESUME — opt-in (35s sleep per sample)
+# =============================================================================
+
+run_warm() {
+    header "WARM RESUME (slow — $((WARM_N * 35))s of waits)"
+
+    # Make sure we have a hot sandbox.
+    create_sandbox "$RUN_ID-warm" --cpus 1 --memory 512
+    timeout 10s bhatti exec "$RUN_ID-warm" -- true >/dev/null 2>&1
+
+    subhead "Warm resume + exec ($WARM_N samples)"
+    local file="$RESULTS_DIR/warm_resume_exec.txt"
+    : > "$file"
+    local i t
+    for ((i = 1; i <= WARM_N; i++)); do
+        echo "    sample $i: waiting 35s for thermal manager to pause sandbox..."
+        sleep 35
+        if t=$(time_ms bhatti exec "$RUN_ID-warm" -- true); then
+            echo "$t" >> "$file"
+            echo "    sample $i: ${t}ms (warm→hot + exec)"
+        else
+            warn "warm-resume sample $i failed"
+        fi
+    done
+    echo "${YELLOW}Warm resume + exec (ms):${NC}"
+    percentiles "$file"
+}
+
+# =============================================================================
+# 2. EXEC OPS (hot sandbox)
+# =============================================================================
+
+ensure_main_sandbox() {
+    if ! timeout 5s bhatti inspect "$SB" >/dev/null 2>&1; then
+        create_sandbox "$SB" --cpus 2 --memory 2048
+    fi
+    timeout 10s bhatti exec "$SB" -- true >/dev/null 2>&1
+}
+
+# Helper: warmup + collect for an exec/file-style test (rate-limited at 600/min).
+# Args: <name-tag> <result-file> <iterations> <command...>
+exec_test() {
+    local label="$1" file="$2" n="$3"; shift 3
+    subhead "$label"
+    # 3 warmup calls (also rate-limited; pace them)
+    local w
+    for w in 1 2 3; do
+        timeout "$TIMEOUT_PER_CALL" "$@" >/dev/null 2>&1 || true
+        sleep "$SLEEP_PER_EXEC"
+    done
+    collect "$file" "$n" "$SLEEP_PER_EXEC" "$@"
+    echo "${YELLOW}$(basename "$file" .txt) (ms):${NC}"
+    percentiles "$file"
+}
+
+# Helper: warmup + collect for a read-style test (rate-limited at 1200/min).
+# Args: <name-tag> <result-file> <iterations> <command...>
+read_test() {
+    local label="$1" file="$2" n="$3"; shift 3
+    subhead "$label"
+    local w
+    for w in 1 2 3; do
+        timeout "$TIMEOUT_PER_CALL" "$@" >/dev/null 2>&1 || true
+        sleep "$SLEEP_PER_READ"
+    done
+    collect "$file" "$n" "$SLEEP_PER_READ" "$@"
+    echo "${YELLOW}$(basename "$file" .txt) (ms):${NC}"
+    percentiles "$file"
+}
+
+run_exec() {
+    header "EXEC OPS (hot sandbox)"
+    ensure_main_sandbox
+
+    exec_test "2a. Exec 'true' (no output)"          "$RESULTS_DIR/exec_true.txt"  "$ITERATIONS" bhatti exec "$SB" -- true
+    exec_test "2b. Exec 'echo hello' (tiny output)"  "$RESULTS_DIR/exec_echo.txt"  "$ITERATIONS" bhatti exec "$SB" -- echo hello
+    exec_test "2c. Exec 'cat /etc/os-release'"       "$RESULTS_DIR/exec_cat.txt"   "$ITERATIONS" bhatti exec "$SB" -- cat /etc/os-release
+    exec_test "2d. Exec 'ls -laR /usr/bin' (~50KB)"  "$RESULTS_DIR/exec_ls.txt"    "$ITERATIONS" bhatti exec "$SB" -- ls -laR /usr/bin
+    exec_test "2e. Exec 'sha256sum /usr/bin/bash'"   "$RESULTS_DIR/exec_sha.txt"   "$ITERATIONS" bhatti exec "$SB" -- sha256sum /usr/bin/bash
+    exec_test "2f. Exec 'sh -c echo \$HOME'"         "$RESULTS_DIR/exec_env.txt"   "$ITERATIONS" bhatti exec "$SB" -- sh -c 'echo $HOME'
+}
+
+# =============================================================================
+# 3. FILE OPS
+# =============================================================================
+
+run_files() {
+    header "FILE OPS"
+    ensure_main_sandbox
+
+    # Prep test files inside the guest (idempotent).
+    local sizes_kb=(1 10 100 1024)
+    local s
+    for s in "${sizes_kb[@]}"; do
+        timeout 30s bhatti exec "$SB" -- sh -c "head -c $((s*1024)) /dev/urandom | base64 > /tmp/bench${s}k.txt" >/dev/null 2>&1
+    done
+
+    # Prep local write payloads in /tmp.
+    local local_writes=(1 10 100)
+    for s in "${local_writes[@]}"; do
+        head -c $((s*1024)) /dev/urandom | base64 > "/tmp/${RUN_ID}.w${s}k.txt"
+    done
+
+    for s in 1 10 100 1024; do
+        local label="${s}KB"
+        [[ $s -eq 1024 ]] && label="1MB"
+        local out="$RESULTS_DIR/file_read_${s}k.txt"
+        [[ $s -eq 1024 ]] && out="$RESULTS_DIR/file_read_1m.txt"
+        # File read goes through /sandboxes/:id/files which is the exec
+        # rate-limit class (writes data through the engine).
+        exec_test "3. File read $label" "$out" "$ITERATIONS" \
+            bhatti file read "$SB" "/tmp/bench${s}k.txt"
+    done
+
+    for s in "${local_writes[@]}"; do
+        local label="${s}KB"
+        subhead "3. File write $label"
+        local out="$RESULTS_DIR/file_write_${s}k.txt"
+        local fails=0 t i
+        : > "$out"
+        # 3 warmup calls (rate-limited)
+        for w in 1 2 3; do
+            timeout "$TIMEOUT_PER_CALL" sh -c "bhatti file write $SB /tmp/benchw${s}k.txt < /tmp/${RUN_ID}.w${s}k.txt" >/dev/null 2>&1 || true
+            sleep "$SLEEP_PER_EXEC"
+        done
+        for ((i = 1; i <= ITERATIONS; i++)); do
+            (( i > 1 )) && sleep "$SLEEP_PER_EXEC"
+            local start_us="${EPOCHREALTIME//.}"
+            if timeout "$TIMEOUT_PER_CALL" sh -c "bhatti file write $SB /tmp/benchw${s}k.txt < /tmp/${RUN_ID}.w${s}k.txt" >/dev/null 2>&1; then
+                local end_us="${EPOCHREALTIME//.}"
+                local diff=$((end_us - start_us))
+                printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000)) >> "$out"
+            else
+                ((fails++))
+            fi
+        done
+        (( fails > 0 )) && warn "file write ${s}k: $fails/$ITERATIONS failed"
+        echo "${YELLOW}File write $label (ms):${NC}"
+        percentiles "$out"
+    done
+
+    # `file ls` is a read op (no engine I/O — just a dir listing).
+    read_test "3. File ls /usr/bin" "$RESULTS_DIR/file_ls.txt" "$ITERATIONS" \
+        bhatti file ls "$SB" /usr/bin
+
+    # Cleanup local payloads
+    rm -f "/tmp/${RUN_ID}.w"*.txt
+}
+
+# =============================================================================
+# 4. API
+# =============================================================================
+
+run_api() {
+    header "API / CONTROL PLANE"
+    ensure_main_sandbox
+
+    # `list` and `inspect` are read-class endpoints (1200/min limit).
+    read_test "4a. List sandboxes"   "$RESULTS_DIR/api_list.txt"     "$ITERATIONS" bhatti list --json
+    read_test "4b. Inspect sandbox"  "$RESULTS_DIR/api_inspect.txt"  "$ITERATIONS" bhatti inspect "$SB" --json
+
+    # curl tests
+    local api_url="${BHATTI_URL:-$(grep -h '^api_url:' ~/.bhatti/config.yaml /etc/bhatti/config.yaml 2>/dev/null | head -1 | awk '{print $2}')}"
+    api_url="${api_url:-http://localhost:8080}"
+    local token="${BHATTI_TOKEN:-$(grep -h '^auth_token:' ~/.bhatti/config.yaml 2>/dev/null | awk '{print $2}')}"
+
+    subhead "4c. GET /health (curl, no auth)"
+    local out="$RESULTS_DIR/api_health.txt"
+    : > "$out"
+    local i t
+    for ((i = 1; i <= ITERATIONS; i++)); do
+        t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_total}' "$api_url/health" 2>/dev/null) || continue
+        awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
+    done
+    echo "${YELLOW}GET /health (ms):${NC}"
+    percentiles "$out"
+
+    if [[ -n "$token" ]]; then
+        subhead "4d. GET /sandboxes (curl, with auth)"
+        out="$RESULTS_DIR/api_sandboxes_curl.txt"
+        : > "$out"
+        for ((i = 1; i <= ITERATIONS; i++)); do
+            t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_total}' \
+                -H "Authorization: Bearer $token" "$api_url/sandboxes" 2>/dev/null) || continue
+            awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
+        done
+        echo "${YELLOW}GET /sandboxes (curl, ms):${NC}"
+        percentiles "$out"
+    else
+        warn "no auth token in ~/.bhatti/config.yaml or BHATTI_TOKEN — skipping 4d"
+    fi
+}
+
+# =============================================================================
+# 5. CONCURRENCY
+# =============================================================================
+
+# Time N parallel execs and report wall-clock.
+concurrent_run() {
+    local count="$1" reps="$2" out="$3"
+    : > "$out"
+    local r i fails=0
+    for ((r = 1; r <= reps; r++)); do
+        # Pace reps so the rate-limit bucket has time to refill between bursts.
+        # With burst=30 and 10/sec refill, 3s between reps gives back ~30 tokens.
+        (( r > 1 )) && sleep "$SLEEP_PER_CONCURRENT"
+        local start_us="${EPOCHREALTIME//.}"
+        local pids=()
+        for ((i = 1; i <= count; i++)); do
+            ( timeout "$TIMEOUT_PER_CALL" bhatti exec "$SB" -- true >/dev/null 2>&1 ) &
+            pids+=("$!")
+        done
+        local rep_ok=1
+        for p in "${pids[@]}"; do
+            wait "$p" || rep_ok=0
+        done
+        if (( rep_ok )); then
+            local end_us="${EPOCHREALTIME//.}"
+            local diff=$((end_us - start_us))
+            printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000)) >> "$out"
+        else
+            ((fails++))
+        fi
+    done
+    (( fails > 0 )) && warn "$(basename "$out"): $fails/$reps reps had a failed exec"
+}
+
+run_concurrent() {
+    header "CONCURRENCY"
+    ensure_main_sandbox
+
+    local n
+    for n in 5 10 20; do
+        subhead "5. $n concurrent execs (10 reps)"
+        concurrent_run "$n" 10 "$RESULTS_DIR/concurrent_${n}.txt"
+        echo "${YELLOW}$n concurrent execs, wall time (ms):${NC}"
+        percentiles "$RESULTS_DIR/concurrent_${n}.txt"
+    done
+
+    subhead "5d. Sequential exec throughput (30 execs, paced)"
+    local start_us="${EPOCHREALTIME//.}"
+    local i fails=0
+    for ((i = 1; i <= 30; i++)); do
+        (( i > 1 )) && sleep "$SLEEP_PER_EXEC"
+        timeout "$TIMEOUT_PER_CALL" bhatti exec "$SB" -- true >/dev/null 2>&1 || ((fails++))
+    done
+    local end_us="${EPOCHREALTIME//.}"
+    local diff=$((end_us - start_us))
+    local total_ms
+    total_ms=$(printf '%d.%03d' $((diff / 1000)) $((diff % 1000)))
+    local per_exec
+    per_exec=$(awk -v t="$diff" 'BEGIN { printf "%.3f", t / 1000 / 30 }')
+    echo "  30 sequential execs: ${total_ms}ms total ($per_exec ms/exec including ${SLEEP_PER_EXEC}s pacing; $fails failed)"
+}
+
+# =============================================================================
+# 7. PUBLISH WAKE — HTTP request triggers wake on a published port.
 #
-# Earlier versions of this script used three python3 invocations per
-# measurement, which added 150-300 ms of fork overhead and made any
-# sub-100ms operation unmeasurable. Watch out if you reintroduce that.
-time_ms() {
-    local start_us="${EPOCHREALTIME//.}"
-    "$@" > /dev/null 2>&1
-    local end_us="${EPOCHREALTIME//.}"
-    local diff=$((end_us - start_us))
-    printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000))
-}
+# Models the real user-facing scenario: someone hits a published URL on a
+# sandbox that has been idle. The path-based proxy (/sandboxes/<id>/proxy/<port>/)
+# uses the same `ensureHot` machinery as the public proxy at <alias>.<zone>,
+# so this measurement is faithful to that path even on hosts not in domain mode.
+#
+# Three states:
+#   hot   — sandbox already running, baseline overhead.
+#   warm  — vCPUs paused (35s idle, thermal manager has paused).
+#   cold  — fully snapshotted to disk (`bhatti stop`).
+# =============================================================================
 
-# Like time_ms but captures output too (for extracting sandbox IDs etc)
-time_ms_out() {
-    local outfile="$1"; shift
-    local start_us="${EPOCHREALTIME//.}"
-    "$@" > "$outfile" 2>&1 || true
-    local end_us="${EPOCHREALTIME//.}"
-    local diff=$((end_us - start_us))
-    printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000))
-}
+run_publish_wake() {
+    header "PUBLISH WAKE (HTTP request triggers wake)"
 
-echo -e "${BOLD}Bhatti Performance Benchmark${NC}"
-echo -e "Target: $(bhatti version 2>&1 | head -1)"
-echo -e "Iterations per test: $ITERATIONS"
-echo -e "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo ""
+    local pub="$RUN_ID-pub"
+    # Use browser tier since the minimal tier has no HTTP server pre-installed.
+    create_sandbox "$pub" --cpus 1 --memory 512 --image browser
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 1: SANDBOX LIFECYCLE                                               ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+    # Tiny in-VM HTTP server (Node, single-line). --detach returns the PID
+    # immediately so the script doesn't block on `exec`.
+    if ! timeout 30s bhatti exec --detach "$pub" -- \
+        node -e 'require("http").createServer((q,r)=>r.end("ok")).listen(3000)' \
+        >/dev/null 2>&1; then
+        warn "failed to start in-VM http server"
+        return
+    fi
+    sleep 2  # let it bind
 
-header "PART 1: SANDBOX LIFECYCLE"
+    local api_url="${BHATTI_URL:-$(grep -h '^api_url:' ~/.bhatti/config.yaml /etc/bhatti/config.yaml 2>/dev/null | head -1 | awk '{print $2}')}"
+    api_url="${api_url:-http://localhost:8080}"
+    local token="${BHATTI_TOKEN:-$(grep -h '^auth_token:' ~/.bhatti/config.yaml 2>/dev/null | awk '{print $2}')}"
+    local proxy_url="$api_url/sandboxes/$pub/proxy/3000/"
 
-# ---- 1a: Full create (cold boot) ----
-subhead "1a. Create sandbox (full cold boot, 1 vCPU / 512MB)"
-FILE="$RESULTS_DIR/create.txt"
-> "$FILE"
-LIFECYCLE_N=5  # fewer iterations — these are slow
-for i in $(seq 1 "$LIFECYCLE_N"); do
-    name="perf-create-$i"
-    t=$(time_ms bhatti create --name "$name" --cpus 1 --memory 512)
-    echo "$t" >> "$FILE"
-    echo -e "    run $i: ${t}ms"
-    # Destroy immediately to not leak sandboxes
-    bhatti destroy "$name" > /dev/null 2>&1 &
-done
-wait
-echo -e "${YELLOW}Create (cold boot, ms):${NC}"
-percentiles "$FILE"
+    # Smoke test the proxy URL
+    if ! timeout 10s curl -sf -H "Authorization: Bearer $token" "$proxy_url" >/dev/null 2>&1; then
+        warn "proxy URL not reachable ($proxy_url) — skipping publish-wake"
+        return
+    fi
 
-# ---- 1b: Stop (snapshot to disk) ----
-subhead "1b. Stop sandbox (full snapshot, hot → cold)"
-# Create a persistent sandbox for stop/start cycling
-bhatti create --name perf-lifecycle --cpus 1 --memory 512 > /dev/null 2>&1 || true
-# Make sure it's hot
-bhatti exec perf-lifecycle -- true > /dev/null 2>&1
+    local i t out
 
-FILE="$RESULTS_DIR/stop.txt"
-> "$FILE"
-for i in $(seq 1 "$LIFECYCLE_N"); do
-    # Ensure hot first
-    bhatti start perf-lifecycle > /dev/null 2>&1 || true
-    bhatti exec perf-lifecycle -- true > /dev/null 2>&1
+    # 7a. Hot — sandbox already running, no wake.
+    subhead "7a. Hot (sandbox running, no wake)"
+    out="$RESULTS_DIR/publish_wake_hot.txt"
+    : > "$out"
+    # Warmup
+    for i in 1 2 3; do
+        timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null || true
+        sleep "$SLEEP_PER_READ"
+    done
+    for ((i = 1; i <= ITERATIONS; i++)); do
+        (( i > 1 )) && sleep "$SLEEP_PER_READ"
+        t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_total}' \
+            -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null) || continue
+        awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
+    done
+    echo "${YELLOW}Hot publish-path TTFB (ms):${NC}"
+    percentiles "$out"
+
+    # 7b. Cold wake — stop, then request triggers full snapshot resume.
+    subhead "7c. Cold wake on request ($LIFECYCLE_N samples + 1 warmup)"
+    out="$RESULTS_DIR/publish_wake_cold.txt"
+    : > "$out"
+    # Warmup cycle — first stop+wake pays setup costs we don't want to measure.
+    timeout 30s bhatti stop "$pub" >/dev/null 2>&1 || true
+    sleep 0.5
+    timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null \
+        -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null || true
     sleep 1
-    t=$(time_ms bhatti stop perf-lifecycle)
-    echo "$t" >> "$FILE"
-    echo -e "    run $i: ${t}ms"
-done
-echo -e "${YELLOW}Stop / snapshot (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 1c: Start from cold (resume from snapshot) ----
-subhead "1c. Start from cold (snapshot resume)"
-FILE="$RESULTS_DIR/cold_resume.txt"
-> "$FILE"
-for i in $(seq 1 "$LIFECYCLE_N"); do
-    # Make sure it's stopped
-    bhatti stop perf-lifecycle > /dev/null 2>&1 || true
-    sleep 0.5
-    t=$(time_ms bhatti start perf-lifecycle)
-    echo "$t" >> "$FILE"
-    echo -e "    run $i: ${t}ms"
-done
-echo -e "${YELLOW}Cold resume (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 1d: Warm resume (exec on warm sandbox — triggers transparent wake) ----
-subhead "1d. Warm resume (exec triggers transparent hot←warm wake)"
-# We need to let the sandbox go warm (30s idle). Instead, we'll measure
-# the exec-on-stopped sandbox which triggers cold resume transparently.
-# For warm, we'd need to wait 30s — let's do it properly with a few samples.
-FILE="$RESULTS_DIR/warm_resume_exec.txt"
-> "$FILE"
-# Make sure sandbox is hot first
-bhatti start perf-lifecycle > /dev/null 2>&1 || true
-bhatti exec perf-lifecycle -- true > /dev/null 2>&1
-WARM_N=3
-echo "    (waiting for sandbox to go warm — 35s idle each...)"
-for i in $(seq 1 "$WARM_N"); do
-    # Wait for thermal manager to pause it (30s + buffer)
-    sleep 35
-    # Now exec — this triggers warm→hot resume transparently
-    t=$(time_ms bhatti exec perf-lifecycle -- true)
-    echo "$t" >> "$FILE"
-    echo -e "    run $i: ${t}ms (includes warm→hot + exec)"
-done
-echo -e "${YELLOW}Warm resume + exec (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 1e: Cold resume via transparent exec ----
-subhead "1e. Cold resume via transparent exec (exec on stopped sandbox)"
-FILE="$RESULTS_DIR/cold_resume_exec.txt"
-> "$FILE"
-for i in $(seq 1 "$LIFECYCLE_N"); do
-    bhatti stop perf-lifecycle > /dev/null 2>&1 || true
-    sleep 0.5
-    t=$(time_ms bhatti exec perf-lifecycle -- true)
-    echo "$t" >> "$FILE"
-    echo -e "    run $i: ${t}ms (cold resume + exec)"
-done
-echo -e "${YELLOW}Cold resume + exec (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 1f: Destroy ----
-subhead "1f. Destroy sandbox"
-FILE="$RESULTS_DIR/destroy.txt"
-> "$FILE"
-for i in $(seq 1 "$LIFECYCLE_N"); do
-    bhatti create --name "perf-destroy-$i" --cpus 1 --memory 512 > /dev/null 2>&1
-    t=$(time_ms bhatti destroy "perf-destroy-$i")
-    echo "$t" >> "$FILE"
-    echo -e "    run $i: ${t}ms"
-done
-echo -e "${YELLOW}Destroy (ms):${NC}"
-percentiles "$FILE"
-
-# Clean up lifecycle sandbox
-bhatti destroy perf-lifecycle > /dev/null 2>&1 || true
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 2: EXEC OPERATIONS (HOT SANDBOX)                                  ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-header "PART 2: EXEC OPERATIONS (hot sandbox)"
-
-# Ensure perf-bench exists and is hot
-bhatti create --name "$SB" --cpus 2 --memory 2048 > /dev/null 2>&1 || true
-bhatti exec "$SB" -- true > /dev/null 2>&1
-
-# ---- 2a: Minimal exec ----
-subhead "2a. Exec 'true' (minimal — no output)"
-FILE="$RESULTS_DIR/exec_true.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti exec "$SB" -- true > /dev/null 2>&1; done  # warmup
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti exec "$SB" -- true)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Exec 'true' (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 2b: Echo ----
-subhead "2b. Exec 'echo hello' (tiny output)"
-FILE="$RESULTS_DIR/exec_echo.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti exec "$SB" -- echo hello > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti exec "$SB" -- echo hello)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Exec 'echo hello' (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 2c: Medium output ----
-subhead "2c. Exec 'cat /etc/os-release' (~400B output)"
-FILE="$RESULTS_DIR/exec_cat.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti exec "$SB" -- cat /etc/os-release > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti exec "$SB" -- cat /etc/os-release)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Exec 'cat /etc/os-release' (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 2d: Larger output ----
-subhead "2d. Exec 'ls -laR /usr/bin' (~50KB output)"
-FILE="$RESULTS_DIR/exec_ls.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti exec "$SB" -- ls -laR /usr/bin > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti exec "$SB" -- ls -laR /usr/bin)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Exec 'ls -laR /usr/bin' (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 2e: CPU-bound command ----
-subhead "2e. Exec 'sha256sum /usr/bin/bash' (CPU-bound)"
-FILE="$RESULTS_DIR/exec_sha.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti exec "$SB" -- sha256sum /usr/bin/bash > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti exec "$SB" -- sha256sum /usr/bin/bash)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Exec 'sha256sum' (ms):${NC}"
-percentiles "$FILE"
-
-# ---- 2f: Exec with env ----
-subhead "2f. Exec with env var"
-FILE="$RESULTS_DIR/exec_env.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti exec "$SB" -- sh -c 'echo $FOO' > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti exec "$SB" -- sh -c 'echo $HOME')
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Exec 'sh -c echo' (ms):${NC}"
-percentiles "$FILE"
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 3: FILE OPERATIONS                                                ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-header "PART 3: FILE OPERATIONS"
-
-# Prep test files in the sandbox
-bhatti exec "$SB" -- sh -c 'head -c 1024 /dev/urandom | base64 > /tmp/bench1k.txt' > /dev/null 2>&1
-bhatti exec "$SB" -- sh -c 'head -c 10240 /dev/urandom | base64 > /tmp/bench10k.txt' > /dev/null 2>&1
-bhatti exec "$SB" -- sh -c 'head -c 102400 /dev/urandom | base64 > /tmp/bench100k.txt' > /dev/null 2>&1
-bhatti exec "$SB" -- sh -c 'head -c 1048576 /dev/urandom | base64 > /tmp/bench1m.txt' > /dev/null 2>&1
-
-# Prep local write files
-head -c 1024 /dev/urandom | base64 > /tmp/bhatti_w1k.txt
-head -c 10240 /dev/urandom | base64 > /tmp/bhatti_w10k.txt
-head -c 102400 /dev/urandom | base64 > /tmp/bhatti_w100k.txt
-
-# ---- 3a-d: File reads ----
-for size_label in "1k:1KB" "10k:10KB" "100k:100KB" "1m:1MB"; do
-    IFS=':' read -r tag label <<< "$size_label"
-    subhead "3. File read $label"
-    FILE="$RESULTS_DIR/file_read_${tag}.txt"
-    > "$FILE"
-    for i in $(seq 1 3); do bhatti file read "$SB" "/tmp/bench${tag}.txt" > /dev/null 2>&1; done
-    for i in $(seq 1 "$ITERATIONS"); do
-        t=$(time_ms bhatti file read "$SB" "/tmp/bench${tag}.txt")
-        echo "$t" >> "$FILE"
+    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+        timeout 30s bhatti stop "$pub" >/dev/null 2>&1 || true
+        sleep 0.5
+        t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_total}' \
+            -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null) || { warn "sample $i failed"; continue; }
+        awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
+        local ms
+        ms=$(awk -v s="$t" 'BEGIN { printf "%.1f", s * 1000 }')
+        echo "    sample $i: ${ms}ms (cold wake + proxy + in-VM server)"
     done
-    echo -e "${YELLOW}File read $label (ms):${NC}"
-    percentiles "$FILE"
-done
+    echo "${YELLOW}Cold wake on request (ms):${NC}"
+    percentiles "$out"
 
-# ---- 3e-g: File writes ----
-for size_label in "1k:1KB" "10k:10KB" "100k:100KB"; do
-    IFS=':' read -r tag label <<< "$size_label"
-    subhead "3. File write $label"
-    FILE="$RESULTS_DIR/file_write_${tag}.txt"
-    > "$FILE"
-    for i in $(seq 1 3); do cat "/tmp/bhatti_w${tag}.txt" | bhatti file write "$SB" "/tmp/benchw${tag}.txt" > /dev/null 2>&1; done
-    for i in $(seq 1 "$ITERATIONS"); do
-        t=$(time_ms bash -c "cat /tmp/bhatti_w${tag}.txt | bhatti file write $SB /tmp/benchw${tag}.txt")
-        echo "$t" >> "$FILE"
+    # 7c. Warm wake — idle 35s so thermal manager pauses vCPUs, then request.
+    subhead "7b. Warm wake on request ($WARM_N samples × 35s idle each)"
+    out="$RESULTS_DIR/publish_wake_warm.txt"
+    : > "$out"
+    # Make sure it's hot first.
+    timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null \
+        -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null || true
+    for ((i = 1; i <= WARM_N; i++)); do
+        echo "    sample $i: waiting 35s for thermal manager to pause sandbox..."
+        sleep 35
+        t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_total}' \
+            -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null) || { warn "sample $i failed"; continue; }
+        awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
+        local ms
+        ms=$(awk -v s="$t" 'BEGIN { printf "%.1f", s * 1000 }')
+        echo "    sample $i: ${ms}ms (warm wake + proxy + in-VM server)"
     done
-    echo -e "${YELLOW}File write $label (ms):${NC}"
-    percentiles "$FILE"
-done
+    echo "${YELLOW}Warm wake on request (ms):${NC}"
+    percentiles "$out"
+}
 
-# ---- 3h: File ls ----
-subhead "3h. File ls /usr/bin"
-FILE="$RESULTS_DIR/file_ls.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti file ls "$SB" /usr/bin > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti file ls "$SB" /usr/bin)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}File ls /usr/bin (ms):${NC}"
-percentiles "$FILE"
+# =============================================================================
+# 6. NETWORK BASELINE
+# =============================================================================
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 4: API / CONTROL PLANE                                            ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+run_network() {
+    header "NETWORK BASELINE (client → server)"
+    local api_url="${BHATTI_URL:-$(grep -h '^api_url:' ~/.bhatti/config.yaml /etc/bhatti/config.yaml 2>/dev/null | head -1 | awk '{print $2}')}"
+    api_url="${api_url:-http://localhost:8080}"
 
-header "PART 4: API / CONTROL PLANE"
-
-subhead "4a. List sandboxes"
-FILE="$RESULTS_DIR/api_list.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti list --json > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti list --json)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}List sandboxes (ms):${NC}"
-percentiles "$FILE"
-
-subhead "4b. Inspect sandbox"
-FILE="$RESULTS_DIR/api_inspect.txt"
-> "$FILE"
-for i in $(seq 1 3); do bhatti inspect "$SB" --json > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms bhatti inspect "$SB" --json)
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}Inspect sandbox (ms):${NC}"
-percentiles "$FILE"
-
-subhead "4c. Raw HTTP (curl to /health — no auth)"
-FILE="$RESULTS_DIR/api_health.txt"
-> "$FILE"
-# Read api_url from the CLI's actual config locations (precedence: env > user > system).
-API_URL="${BHATTI_URL:-$(grep -h '^api_url:' ~/.bhatti/config.yaml /etc/bhatti/config.yaml 2>/dev/null | head -1 | awk '{print $2}')}"
-API_URL="${API_URL:-http://localhost:8080}"
-for i in $(seq 1 3); do curl -sf "$API_URL/health" > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms curl -sf "$API_URL/health")
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}GET /health (ms):${NC}"
-percentiles "$FILE"
-
-subhead "4d. Raw HTTP (curl to /sandboxes — with auth)"
-FILE="$RESULTS_DIR/api_sandboxes_curl.txt"
-> "$FILE"
-TOKEN="${BHATTI_TOKEN:-$(grep -h '^auth_token:' ~/.bhatti/config.yaml 2>/dev/null | awk '{print $2}')}"
-for i in $(seq 1 3); do curl -sf -H "Authorization: Bearer $TOKEN" "$API_URL/sandboxes" > /dev/null 2>&1; done
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(time_ms curl -sf -H "Authorization: Bearer $TOKEN" "$API_URL/sandboxes")
-    echo "$t" >> "$FILE"
-done
-echo -e "${YELLOW}GET /sandboxes (curl, ms):${NC}"
-percentiles "$FILE"
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 5: CONCURRENCY                                                    ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-header "PART 5: CONCURRENCY"
-
-subhead "5a. 5 concurrent execs"
-FILE="$RESULTS_DIR/concurrent_5.txt"
-> "$FILE"
-for run in $(seq 1 10); do
-    start_us="${EPOCHREALTIME//.}"
-    for i in $(seq 1 5); do
-        bhatti exec "$SB" -- true > /dev/null 2>&1 &
+    subhead "6a. TCP connect time"
+    local out="$RESULTS_DIR/network_rtt.txt"
+    : > "$out"
+    local i t
+    for ((i = 1; i <= ITERATIONS; i++)); do
+        t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_connect}' "$api_url/health" 2>/dev/null) || continue
+        awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
     done
-    wait
-    end_us="${EPOCHREALTIME//.}"
-    diff=$((end_us - start_us))
-    printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000)) >> "$FILE"
-done
-echo -e "${YELLOW}5 concurrent execs, wall time (ms):${NC}"
-percentiles "$FILE"
+    echo "${YELLOW}TCP connect (ms):${NC}"
+    percentiles "$out"
 
-subhead "5b. 10 concurrent execs"
-FILE="$RESULTS_DIR/concurrent_10.txt"
-> "$FILE"
-for run in $(seq 1 10); do
-    start_us="${EPOCHREALTIME//.}"
-    for i in $(seq 1 10); do
-        bhatti exec "$SB" -- true > /dev/null 2>&1 &
+    subhead "6b. TTFB to /health"
+    out="$RESULTS_DIR/network_ttfb.txt"
+    : > "$out"
+    for ((i = 1; i <= ITERATIONS; i++)); do
+        t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_starttransfer}' "$api_url/health" 2>/dev/null) || continue
+        awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$out"
     done
-    wait
-    end_us="${EPOCHREALTIME//.}"
-    diff=$((end_us - start_us))
-    printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000)) >> "$FILE"
-done
-echo -e "${YELLOW}10 concurrent execs, wall time (ms):${NC}"
-percentiles "$FILE"
+    echo "${YELLOW}TTFB /health (ms):${NC}"
+    percentiles "$out"
+}
 
-subhead "5c. 20 concurrent execs"
-FILE="$RESULTS_DIR/concurrent_20.txt"
-> "$FILE"
-for run in $(seq 1 10); do
-    start_us="${EPOCHREALTIME//.}"
-    for i in $(seq 1 20); do
-        bhatti exec "$SB" -- true > /dev/null 2>&1 &
-    done
-    wait
-    end_us="${EPOCHREALTIME//.}"
-    diff=$((end_us - start_us))
-    printf '%d.%03d\n' $((diff / 1000)) $((diff % 1000)) >> "$FILE"
-done
-echo -e "${YELLOW}20 concurrent execs, wall time (ms):${NC}"
-percentiles "$FILE"
+# =============================================================================
+# Driver
+# =============================================================================
 
-subhead "5d. Sequential exec throughput (30 execs back-to-back)"
-FILE="$RESULTS_DIR/sequential_throughput.txt"
-> "$FILE"
-start_us="${EPOCHREALTIME//.}"
-for i in $(seq 1 30); do
-    bhatti exec "$SB" -- true > /dev/null 2>&1
-done
-end_us="${EPOCHREALTIME//.}"
-diff=$((end_us - start_us))
-total_ms=$(printf '%d.%03d' $((diff / 1000)) $((diff % 1000)))
-per_exec=$(awk -v t="$diff" 'BEGIN { printf "%.3f", t / 1000 / 30 }')
-echo -e "  30 sequential execs: ${total_ms}ms total, ${per_exec}ms/exec"
+want_section lifecycle    && run_lifecycle
+want_section warm         && run_warm
+want_section exec         && run_exec
+want_section files        && run_files
+want_section api          && run_api
+want_section concurrent   && run_concurrent
+want_section network      && run_network
+want_section publish-wake && run_publish_wake
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 6: NETWORK LATENCY BASELINE                                       ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-header "PART 6: NETWORK BASELINE (client → server RTT)"
-
-subhead "6a. TLS handshake + TCP RTT"
-FILE="$RESULTS_DIR/network_rtt.txt"
-> "$FILE"
-for i in $(seq 1 "$ITERATIONS"); do
-    # Use curl with timing to measure just the TLS connection setup
-    t=$(curl -sf -o /dev/null -w '%{time_connect}' "$API_URL/health" 2>/dev/null)
-    awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$FILE"
-done
-echo -e "${YELLOW}TCP connect time (ms):${NC}"
-percentiles "$FILE"
-
-FILE="$RESULTS_DIR/network_ttfb.txt"
-> "$FILE"
-for i in $(seq 1 "$ITERATIONS"); do
-    t=$(curl -sf -o /dev/null -w '%{time_starttransfer}' "$API_URL/health" 2>/dev/null)
-    awk -v s="$t" 'BEGIN { printf "%.3f\n", s * 1000 }' >> "$FILE"
-done
-echo -e "${YELLOW}TTFB /health (ms):${NC}"
-percentiles "$FILE"
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  SUMMARY                                                                ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-header "DONE — Results in $RESULTS_DIR"
-echo ""
-echo -e "${BOLD}Quick summary:${NC}"
-echo -e "  Exec 'true':        $(sort -n $RESULTS_DIR/exec_true.txt | awk '{a[NR]=$1} END {printf "p50=%.0fms p99=%.0fms", a[int(NR*0.5)+1], a[int(NR*0.99)+1]}')"
-echo -e "  File read 1KB:      $(sort -n $RESULTS_DIR/file_read_1k.txt | awk '{a[NR]=$1} END {printf "p50=%.0fms p99=%.0fms", a[int(NR*0.5)+1], a[int(NR*0.99)+1]}')"
-echo -e "  File write 1KB:     $(sort -n $RESULTS_DIR/file_write_1k.txt | awk '{a[NR]=$1} END {printf "p50=%.0fms p99=%.0fms", a[int(NR*0.5)+1], a[int(NR*0.99)+1]}')"
-echo -e "  Cold resume+exec:   $(sort -n $RESULTS_DIR/cold_resume_exec.txt | awk '{a[NR]=$1} END {printf "p50=%.0fms p99=%.0fms", a[int(NR*0.5)+1], a[int(NR*0.99)+1]}')"
-echo -e "  Create (cold boot): $(sort -n $RESULTS_DIR/create.txt | awk '{a[NR]=$1} END {printf "p50=%.0fms p99=%.0fms", a[int(NR*0.5)+1], a[int(NR*0.99)+1]}')"
-echo -e "  Network RTT:        $(sort -n $RESULTS_DIR/network_rtt.txt | awk '{a[NR]=$1} END {printf "p50=%.0fms p99=%.0fms", a[int(NR*0.5)+1], a[int(NR*0.99)+1]}')"
+echo
+header "DONE in $(elapsed_since "$START_US")"
+echo "Results: $RESULTS_DIR/"
