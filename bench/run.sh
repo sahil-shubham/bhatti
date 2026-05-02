@@ -9,7 +9,10 @@ set -euo pipefail
 
 SB="perf-bench"
 ITERATIONS=${1:-30}
-RESULTS_DIR="/Users/sahil/Projects/bhatti/bench/results"
+# Default to a results/ directory next to this script so the suite works
+# from any machine. Override with RESULTS_DIR=... ./run.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
 mkdir -p "$RESULTS_DIR"
 
 RED='\033[0;31m'
