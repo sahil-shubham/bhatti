@@ -36,9 +36,30 @@ set -uo pipefail   # NOT -e: a failing iteration shouldn't kill the suite.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-ITERATIONS="${1:-20}"
-LIFECYCLE_N="${LIFECYCLE_N:-5}"
-WARM_N="${WARM_N:-3}"
+# Default sample sizes are sized so p99 is statistically meaningful where
+# the cost permits, and as large as we can afford where it doesn't. Tune
+# down via env vars for quick smoke-tests during development.
+#
+#   ITERATIONS              — cheap-per-call tests (exec/file/api/network).
+#                             n=100 means p99 = index 99/100, a real
+#                             99th-percentile estimate, not just "max - 1".
+#                             Cost: ~12s per sub-test.
+#   LIFECYCLE_N             — lifecycle ops (create/stop/start/destroy) where
+#                             each iteration is 1–3s and creates hit the
+#                             30/min rate limit. n=15 fits in ~4 min while
+#                             tightening p50 vs the previous n=5.
+#   WARM_N                  — warm-resume tests, bound by 35s sleep per
+#                             sample. n=10 = ~6 min of sleep per row;
+#                             not cheap, but n=3 had outliers dominating.
+#   PUBLISH_WAKE_COLD_N     — publish-wake-cold via curl. ~1.5s per sample
+#                             (stop + curl), so n=100 fits in ~2.5 min.
+#   CONCURRENT_REPS         — number of repeated wall-clock measurements
+#                             at each parallelism level (5/10/20).
+ITERATIONS="${1:-100}"
+LIFECYCLE_N="${LIFECYCLE_N:-15}"
+WARM_N="${WARM_N:-10}"
+PUBLISH_WAKE_COLD_N="${PUBLISH_WAKE_COLD_N:-100}"
+CONCURRENT_REPS="${CONCURRENT_REPS:-30}"
 TIMEOUT_PER_CALL="${TIMEOUT_PER_CALL:-30s}"
 SECTIONS="${SECTIONS:-lifecycle,exec,files,api,concurrent,network,publish-wake}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -227,9 +248,11 @@ START_US="${EPOCHREALTIME//.}"
 
 echo "${BOLD}Bhatti performance benchmark${NC}"
 echo "  Target:        $(bhatti version 2>&1 | head -1)"
-echo "  Iterations:    $ITERATIONS  (lifecycle: $LIFECYCLE_N, warm-resume: $WARM_N)"
-echo "  Timeout/call:  $TIMEOUT_PER_CALL"
 echo "  Sections:      $SECTIONS"
+echo "  Sample sizes:  exec/file/api/network/publish-wake-hot=$ITERATIONS"
+echo "                 lifecycle=$LIFECYCLE_N  warm=$WARM_N (35s sleep each)"
+echo "                 publish-wake-cold=$PUBLISH_WAKE_COLD_N  concurrent=$CONCURRENT_REPS reps"
+echo "  Timeout/call:  $TIMEOUT_PER_CALL"
 echo "  Results dir:   $RESULTS_DIR"
 echo "  Run ID:        $RUN_ID"
 echo "  Timestamp:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -576,8 +599,8 @@ run_concurrent() {
 
     local n
     for n in 5 10 20; do
-        subhead "5. $n concurrent execs (10 reps)"
-        concurrent_run "$n" 10 "$RESULTS_DIR/concurrent_${n}.txt"
+        subhead "5. $n concurrent execs ($CONCURRENT_REPS reps)"
+        concurrent_run "$n" "$CONCURRENT_REPS" "$RESULTS_DIR/concurrent_${n}.txt"
         echo "${YELLOW}$n concurrent execs, wall time (ms):${NC}"
         percentiles "$RESULTS_DIR/concurrent_${n}.txt"
     done
@@ -661,7 +684,7 @@ run_publish_wake() {
     percentiles "$out"
 
     # 7b. Cold wake — stop, then request triggers full snapshot resume.
-    subhead "7c. Cold wake on request ($LIFECYCLE_N samples + 1 warmup)"
+    subhead "7c. Cold wake on request ($PUBLISH_WAKE_COLD_N samples + 1 warmup)"
     out="$RESULTS_DIR/publish_wake_cold.txt"
     : > "$out"
     # Warmup cycle — first stop+wake pays setup costs we don't want to measure.
@@ -670,7 +693,7 @@ run_publish_wake() {
     timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null \
         -H "Authorization: Bearer $token" "$proxy_url" 2>/dev/null || true
     sleep 1
-    for ((i = 1; i <= LIFECYCLE_N; i++)); do
+    for ((i = 1; i <= PUBLISH_WAKE_COLD_N; i++)); do
         timeout 30s bhatti stop "$pub" >/dev/null 2>&1 || true
         sleep 0.5
         t=$(timeout "$TIMEOUT_PER_CALL" curl -sf -o /dev/null -w '%{time_total}' \
