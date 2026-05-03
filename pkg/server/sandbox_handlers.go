@@ -163,10 +163,29 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Resolve secrets from template — decrypt before injecting
-			secretEnv := make(map[string]string)
-			secretFiles := make(map[string]engine.FileSpec)
-			for _, secretName := range tmpl.Secrets {
+			// B2: Build env from request env, then add secrets. Secrets are the
+			// union of tmpl.Secrets and req.Secrets (dedup, template names first
+			// for deterministic error ordering). Secrets override env for the
+			// same name, matching the direct-creation branch.
+			env := make(map[string]string)
+			for k, v := range req.Env {
+				env[k] = v
+			}
+			seenSecret := make(map[string]bool, len(tmpl.Secrets)+len(req.Secrets))
+			secretNames := make([]string, 0, len(tmpl.Secrets)+len(req.Secrets))
+			for _, name := range tmpl.Secrets {
+				if !seenSecret[name] {
+					secretNames = append(secretNames, name)
+					seenSecret[name] = true
+				}
+			}
+			for _, name := range req.Secrets {
+				if !seenSecret[name] {
+					secretNames = append(secretNames, name)
+					seenSecret[name] = true
+				}
+			}
+			for _, secretName := range secretNames {
 				ciphertext, err := s.store.GetSecretValue(user.ID, secretName)
 				if err != nil {
 					errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
@@ -177,16 +196,29 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 					errResp(w, 500, fmt.Sprintf("decrypt secret %q failed", secretName))
 					return
 				}
-				secretEnv[secretName] = string(plaintext)
+				env[secretName] = string(plaintext)
 			}
 
-			// Merge request env overrides
-			env := make(map[string]string)
-			for k, v := range secretEnv {
-				env[k] = v
-			}
-			for k, v := range req.Env {
-				env[k] = v
+			// B2: Resolve files from request (templates have no files of their own).
+			var files map[string]engine.FileSpec
+			if len(req.Files) > 0 {
+				files = make(map[string]engine.FileSpec, len(req.Files))
+				for _, f := range req.Files {
+					if f.GuestPath == "" {
+						errResp(w, 400, "file guest_path required")
+						return
+					}
+					content, err := base64.StdEncoding.DecodeString(f.Content)
+					if err != nil {
+						errResp(w, 400, fmt.Sprintf("file %q: invalid base64 content", f.GuestPath))
+						return
+					}
+					mode := f.Mode
+					if mode == "" {
+						mode = "0644"
+					}
+					files[f.GuestPath] = engine.FileSpec{Content: content, Mode: mode}
+				}
 			}
 
 			// Apply request overrides on template defaults
@@ -209,7 +241,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				UserData:          tmpl.UserData,
 				Env:               env,
 				Init:              req.Init,
-				Files:             secretFiles,
+				Files:             files,
 				Volumes:           volumes,
 				PersistentVolumes: req.PersistentVolumes,
 				Hugepages:         req.Hugepages,

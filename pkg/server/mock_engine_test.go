@@ -28,6 +28,10 @@ type mockEngine struct {
 	StopErr        error
 	ActivityResult *proto.ActivityInfo
 	ActivityErr    error
+
+	// LastCreateSpec is the spec from the most recent successful Create call,
+	// for tests that want to verify what got passed downstream.
+	LastCreateSpec engine.SandboxSpec
 }
 
 func newMockEngine() *mockEngine {
@@ -59,6 +63,7 @@ func (m *mockEngine) Create(_ context.Context, spec engine.SandboxSpec) (engine.
 	}
 	m.mu.Lock()
 	m.sandboxes[id] = &info
+	m.LastCreateSpec = spec
 	m.mu.Unlock()
 	return info, nil
 }
