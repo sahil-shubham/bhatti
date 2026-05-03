@@ -57,6 +57,11 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 				}
 			}
 
+			// Tolerate trailing slashes — we concatenate paths like
+			// "/sandboxes" later, and "http://x//sandboxes" works on most
+			// servers but breaks strict ones (and looks wrong in logs).
+			endpoint = strings.TrimRight(endpoint, "/")
+
 			if setupToken != "" {
 				key = strings.TrimSpace(setupToken)
 			} else {
@@ -74,9 +79,13 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 			return fmt.Errorf("API key is required (pass --token or enter at the prompt)")
 		}
 
-		// Write config
+		// Write config to the *invoking* user's home, even if we're running
+		// under sudo. pkg.DefaultDataDir() honors SUDO_USER, so this resolves
+		// to the same path that a later non-sudo `bhatti list` will read.
 		cfgDir := pkg.DefaultDataDir()
-		os.MkdirAll(cfgDir, 0700)
+		if err := os.MkdirAll(cfgDir, 0700); err != nil {
+			return fmt.Errorf("create config dir %s: %w", cfgDir, err)
+		}
 		cfgPath := filepath.Join(cfgDir, "config.yaml")
 
 		var cfgContent string
@@ -90,6 +99,17 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 
 		if err := os.WriteFile(cfgPath, []byte(cfgContent), 0600); err != nil {
 			return fmt.Errorf("write config: %w", err)
+		}
+
+		// If we're root via sudo, hand the dir+file back to the real user.
+		// Otherwise the next non-sudo `bhatti` invocation will hit EACCES
+		// on a root-owned ~/.bhatti and the user will (incorrectly) reach
+		// for sudo again — the loop we're trying to break.
+		pkg.EnsureUserOwnedPath(cfgDir, cfgPath)
+		if os.Getenv("SUDO_USER") != "" && os.Getenv("SUDO_USER") != "root" {
+			fmt.Fprintf(os.Stderr, "note: you don't need sudo for `bhatti setup` —\n"+
+				"      saved config for user %q so it works without sudo next time.\n",
+				os.Getenv("SUDO_USER"))
 		}
 		fmt.Printf("Saved to %s\n", cfgPath)
 
@@ -126,6 +146,14 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 		case strings.HasSuffix(shell, "/fish"):
 			fmt.Println("\nEnable completions:")
 			fmt.Println("  bhatti completion fish > ~/.config/fish/completions/bhatti.fish")
+		case os.Getenv("PSModulePath") != "":
+			// PowerShell exports PSModulePath into every child process on
+			// Windows, macOS, and Linux. SHELL is unset on Windows and on
+			// *nix points at the user's login shell (usually zsh/bash), so
+			// this branch only fires when the previous cases didn't match
+			// — i.e. native Windows or someone running `pwsh` directly.
+			fmt.Println("\nEnable completions:")
+			fmt.Println("  bhatti completion powershell >> $PROFILE")
 		}
 		return nil
 	},

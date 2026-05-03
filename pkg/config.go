@@ -6,7 +6,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
@@ -70,10 +72,97 @@ type DomainConfig struct {
 	TLSKey    string `yaml:"tls_key"`    // wildcard key path
 }
 
-// DefaultDataDir returns ~/.bhatti.
+// DefaultDataDir returns ~/.bhatti for the *invoking* user.
+//
+// When the process is running under sudo, os.UserHomeDir() returns
+// /var/root (macOS) or /root (Linux), which is almost never what the
+// user wants — their CLI config lives in their real home directory.
+// We honor SUDO_USER so that `sudo bhatti setup` writes the same file
+// `bhatti list` later reads, and we don't leave token configs scattered
+// across /root/.bhatti and ~/.bhatti.
+//
+// Daemon callers (`bhatti serve` under systemd) are unaffected: SUDO_USER
+// is unset there, and the server reads /etc/bhatti/config.yaml which
+// supplies an explicit data_dir anyway.
 func DefaultDataDir() string {
+	return filepath.Join(invokingUserHome(), ".bhatti")
+}
+
+// invokingUserHome returns the home directory of the user who started
+// this process, looking through sudo if applicable.
+func invokingUserHome() string {
+	if u := invokingUser(); u != nil {
+		return u.HomeDir
+	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".bhatti")
+	return home
+}
+
+// invokingUser returns the SUDO_USER's *user.User when running under
+// sudo, or nil otherwise. Handy when callers need uid/gid for chown.
+func invokingUser() *user.User {
+	name := os.Getenv("SUDO_USER")
+	if name == "" || name == "root" {
+		return nil
+	}
+	u, err := user.Lookup(name)
+	if err != nil {
+		return nil
+	}
+	return u
+}
+
+// InvokingUserIDs returns (uid, gid, ok) for the SUDO_USER, parsed as
+// integers suitable for os.Chown. Returns ok=false if not under sudo or
+// the lookup failed.
+func InvokingUserIDs() (int, int, bool) {
+	u := invokingUser()
+	if u == nil {
+		return 0, 0, false
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return uid, gid, true
+}
+
+// EnsureUserOwnedPath makes sure `path` (which we just created or wrote
+// while running under sudo) ends up owned by the invoking user, not
+// root. No-op when not running under sudo.
+//
+// The classic trap this prevents:
+//
+//	$ sudo bhatti version    # creates /home/alice/.bhatti/ owned by root
+//	$ bhatti setup           # EACCES — alice can't write into root's dir
+//
+// Use after every os.MkdirAll / os.WriteFile that touches a user-home
+// path. Errors are intentionally swallowed: we can't recover from a
+// failed chown, and the next interactive command will surface the
+// permission issue with a clearer message anyway.
+func EnsureUserOwnedPath(paths ...string) {
+	uid, gid, ok := InvokingUserIDs()
+	if !ok {
+		return
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		_ = os.Chown(p, uid, gid)
+	}
+}
+
+// InvokingUID returns the uid of the user who launched the process.
+// Under sudo, this is SUDO_USER's uid; otherwise the current uid.
+// Used for per-user cache paths that must be stable across sudo and
+// non-sudo invocations of the same command.
+func InvokingUID() int {
+	if uid, _, ok := InvokingUserIDs(); ok {
+		return uid
+	}
+	return os.Getuid()
 }
 
 // LoadConfig reads config from multiple locations and layers them:

@@ -72,10 +72,65 @@ trap '_err_trap $LINENO' ERR
 # Clean up temp files on any exit (including staged downloads)
 _cleanup() {
     rm -f /tmp/bhatti.tmp
-    rm -f /usr/local/bin/bhatti.tmp.$$ 2>/dev/null || true
+    rm -f "${BHATTI_STAGE_FILE:-}" 2>/dev/null || true
     rm -f "$DATA_DIR"/images/*.zst.tmp 2>/dev/null || true
+    if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
 }
 trap '_cleanup' EXIT
+
+# ── Privilege escalation ──────────────────────────────
+#
+# Earlier versions tried `sudo touch "$tmp"` followed by an unprivileged
+# `curl -o "$tmp"`, which fails with EACCES because curl runs as the
+# invoking user but the file is now owned by root. The fix: always stage
+# downloads into a user-writable tmp dir, then `sudo install` the
+# finished file into place.
+#
+# need_sudo MSG — ensure we have a usable sudo session.
+#
+# Sets SUDO="sudo" so callers can do `$SUDO mv ...`. When already root,
+# sets SUDO="" so the same callsites become no-ops.
+#
+# Prompts for the password ONCE and starts a keepalive so we don't
+# re-prompt mid-install. Reads the password from /dev/tty so it works
+# under `curl ... | bash` (where stdin is the script).
+
+SUDO=""
+SUDO_PRIMED=0
+need_sudo() {
+    local why="${1:-perform a privileged operation}"
+    if [ "$(id -u)" -eq 0 ]; then
+        SUDO=""
+        return 0
+    fi
+    command -v sudo >/dev/null 2>&1 \
+        || die "sudo is required to ${why}" \
+               "Either install sudo, or re-run this script as root."
+    SUDO="sudo"
+    [ "$SUDO_PRIMED" -eq 1 ] && return 0
+
+    if sudo -n true 2>/dev/null; then
+        SUDO_PRIMED=1
+        return 0
+    fi
+
+    info "Administrator password required to ${why}."
+    # Read from /dev/tty so this works under `curl … | bash`, where
+    # stdin is the piped script and not a terminal.
+    if [ -r /dev/tty ]; then
+        sudo -v < /dev/tty || die "could not obtain sudo privileges"
+    else
+        sudo -v || die "could not obtain sudo privileges" \
+                       "Re-run with: curl -fsSL bhatti.sh/install | sudo bash"
+    fi
+    SUDO_PRIMED=1
+    # Keepalive: refresh the sudo timestamp every 50s while the script
+    # runs. Cleanup trap kills this PID on exit.
+    ( while true; do sudo -n true 2>/dev/null || exit; sleep 50; done ) &
+    SUDO_KEEPALIVE_PID=$!
+}
 
 # ── Platform detection ────────────────────────────────
 
@@ -100,22 +155,25 @@ download() {
 
     # Don't use -f (fail fast) — it causes curl to exit before writing
     # the -w output, so $http_code would be empty in the error path.
+    # Silence rm errors: if $dest was created by a different user
+    # (legacy bug), we don't want a confusing "Permission denied"
+    # piling on top of the actual download failure.
     http_code=$(curl -sSL -w '%{http_code}' -o "$dest" "$url") || {
-        rm -f "$dest"
+        rm -f "$dest" 2>/dev/null || true
         die "download failed: $url" \
             "curl error (network issue or invalid URL)" \
             "Check your network connection and try again."
     }
 
     if [ "$http_code" -ge 400 ] 2>/dev/null; then
-        rm -f "$dest"
+        rm -f "$dest" 2>/dev/null || true
         die "download failed: $url" \
             "HTTP status: $http_code" \
             "Check your network connection and try again."
     fi
 
     if [ ! -s "$dest" ]; then
-        rm -f "$dest"
+        rm -f "$dest" 2>/dev/null || true
         die "download produced an empty file: $url" \
             "This usually means the release asset is missing." \
             "Check: $url"
@@ -129,21 +187,21 @@ download_large() {
     local http_code
 
     http_code=$(curl -SL --progress-bar -w '%{http_code}' -o "$dest" "$url") || {
-        rm -f "$dest"
+        rm -f "$dest" 2>/dev/null || true
         die "download failed: $url" \
             "curl error (network issue or invalid URL)" \
             "Check your network connection and try again."
     }
 
     if [ "$http_code" -ge 400 ] 2>/dev/null; then
-        rm -f "$dest"
+        rm -f "$dest" 2>/dev/null || true
         die "download failed: $url" \
             "HTTP status: $http_code" \
             "Check your network connection and try again."
     fi
 
     if [ ! -s "$dest" ]; then
-        rm -f "$dest"
+        rm -f "$dest" 2>/dev/null || true
         die "download produced an empty file: $url" \
             "This usually means the release asset is missing." \
             "Check: $url"
@@ -365,17 +423,19 @@ installed_fc_version() {
 install_bhatti_binary() {
     local binary="bhatti-${OS}-${ARCH}"
     local dest="/usr/local/bin/bhatti"
-    local tmp="${dest}.tmp.$$"
+    local dest_dir
+    dest_dir=$(dirname "$dest")
 
-    # Stage to same filesystem as destination — mv is atomic rename.
-    # Cross-filesystem mv (e.g. /tmp → /usr/local/bin) falls back to
-    # copy+delete which is not atomic.
-    if [ -w "/usr/local/bin" ]; then
-        download "${RELEASE_URL}/${binary}" "$tmp"
-    else
-        sudo touch "$tmp" 2>/dev/null || true
-        download "${RELEASE_URL}/${binary}" "$tmp"
-    fi
+    # Stage to a user-writable tmp file. mktemp picks $TMPDIR (per-user
+    # on macOS, /tmp on Linux) — both are guaranteed writable by the
+    # invoking user, which avoids the EACCES we'd hit if we tried to
+    # download straight into a root-owned /usr/local/bin.
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/bhatti.XXXXXX") \
+        || die "could not create temp file"
+    BHATTI_STAGE_FILE="$tmp"  # picked up by _cleanup on exit
+
+    download "${RELEASE_URL}/${binary}" "$tmp"
     chmod +x "$tmp"
 
     verify_checksum "$tmp" "$binary"
@@ -395,16 +455,45 @@ install_bhatti_binary() {
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
     fi
 
-    # Backup previous binary for manual rollback
-    if [ -f "$dest" ]; then
-        cp "$dest" "${dest}.old" 2>/dev/null || true
+    # Decide whether we need sudo for the install step. We may need it
+    # for two reasons: dest_dir doesn't exist (Apple Silicon: no
+    # /usr/local/bin by default) or it isn't writable by us.
+    local need_priv=0
+    if [ ! -d "$dest_dir" ]; then
+        need_priv=1
+    elif [ ! -w "$dest_dir" ]; then
+        need_priv=1
+    elif [ -e "$dest" ] && [ ! -w "$dest" ]; then
+        need_priv=1
+    fi
+    if [ "$need_priv" -eq 1 ]; then
+        need_sudo "install bhatti to ${dest}"
+    else
+        SUDO=""
     fi
 
-    if [ -w "/usr/local/bin" ]; then
-        mv "$tmp" "$dest"
-    else
-        sudo mv "$tmp" "$dest"
+    # Apple Silicon Macs don't ship /usr/local/bin; create it if missing.
+    if [ ! -d "$dest_dir" ]; then
+        $SUDO mkdir -p "$dest_dir"
     fi
+
+    # Backup previous binary for manual rollback
+    if [ -f "$dest" ]; then
+        $SUDO cp "$dest" "${dest}.old" 2>/dev/null || true
+    fi
+
+    # `install(1)` does mode-set + atomic rename in a single call.
+    # It exists on both macOS (BSD) and Linux (GNU coreutils) with
+    # compatible -m semantics. Falls back to cp+mv if absent.
+    if command -v install >/dev/null 2>&1; then
+        $SUDO install -m 0755 "$tmp" "$dest" \
+            || die "failed to install binary to ${dest}"
+    else
+        $SUDO cp "$tmp" "$dest" && $SUDO chmod 0755 "$dest" \
+            || die "failed to install binary to ${dest}"
+    fi
+    rm -f "$tmp"
+    BHATTI_STAGE_FILE=""
 }
 
 install_firecracker() {

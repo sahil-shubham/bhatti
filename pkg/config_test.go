@@ -2,7 +2,9 @@ package pkg
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -159,6 +161,54 @@ func TestLoadConfigPathIsSet(t *testing.T) {
 	}
 	if cfg.ConfigPath != cfgPath {
 		t.Errorf("config_path=%q, want %q", cfg.ConfigPath, cfgPath)
+	}
+}
+
+// TestDefaultDataDirHonorsSudoUser verifies that running under sudo
+// resolves the data dir to the *invoking* user's home, not root's.
+// This is the bug that caused `sudo bhatti setup` to write to
+// /var/root/.bhatti while `bhatti list` looked at /home/alice/.bhatti.
+func TestDefaultDataDirHonorsSudoUser(t *testing.T) {
+	orig := os.Getenv("SUDO_USER")
+	t.Cleanup(func() { os.Setenv("SUDO_USER", orig) })
+
+	// Without SUDO_USER: returns the current user's home/.bhatti.
+	os.Unsetenv("SUDO_USER")
+	home, _ := os.UserHomeDir()
+	want := filepath.Join(home, ".bhatti")
+	if got := DefaultDataDir(); got != want {
+		t.Errorf("no SUDO_USER: DefaultDataDir()=%q, want %q", got, want)
+	}
+
+	// SUDO_USER=root behaves the same — we treat "root" as not-sudo so
+	// real-root invocations (no sudo) don't pivot to a phantom user.
+	os.Setenv("SUDO_USER", "root")
+	if got := DefaultDataDir(); got != want {
+		t.Errorf("SUDO_USER=root: DefaultDataDir()=%q, want %q", got, want)
+	}
+
+	// SUDO_USER set to a real user: should resolve to that user's home.
+	// Use the current process owner so the test works on any host.
+	curUser, err := user.Current()
+	if err != nil {
+		t.Skip("cannot resolve current user")
+	}
+	os.Setenv("SUDO_USER", curUser.Username)
+	if got := DefaultDataDir(); got != filepath.Join(curUser.HomeDir, ".bhatti") {
+		t.Errorf("SUDO_USER=%s: DefaultDataDir()=%q, want %q",
+			curUser.Username, got, filepath.Join(curUser.HomeDir, ".bhatti"))
+	}
+
+	// Same expectation for InvokingUID: when SUDO_USER points at a real
+	// account, InvokingUID returns *that* uid, not root's.
+	curUID, _, ok := InvokingUserIDs()
+	if !ok {
+		t.Errorf("InvokingUserIDs() ok=false with SUDO_USER=%s", curUser.Username)
+	} else if uidStr := curUser.Uid; uidStr != "" {
+		wantUID, _ := strconv.Atoi(uidStr)
+		if curUID != wantUID {
+			t.Errorf("InvokingUserIDs uid=%d, want %d", curUID, wantUID)
+		}
 	}
 }
 

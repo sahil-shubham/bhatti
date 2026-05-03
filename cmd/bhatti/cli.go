@@ -569,8 +569,15 @@ func completeSandboxNames(cmd *cobra.Command, args []string, toComplete string) 
 	return strings.Split(raw, "\n"), cobra.ShellCompDirectiveNoFileComp
 }
 
+// completionCachePath returns the per-user completion cache path,
+// stable across sudo and non-sudo invocations of the same user.
+//
+// Using os.Getuid() directly would give us a different cache file
+// under sudo (uid 0) than as the user (uid 501), causing tab-complete
+// to silently miss sandbox names created by the "other" UID. Anchoring
+// to the *invoking* user keeps both views in sync.
 func completionCachePath() string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("bhatti-completions-%d", os.Getuid()))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("bhatti-completions-%d", pkg.InvokingUID()))
 }
 
 // --- Arg validators ---

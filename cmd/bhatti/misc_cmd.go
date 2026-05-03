@@ -132,10 +132,24 @@ func checkLatestRelease() string {
 		return ""
 	}
 
-	// Write cache
-	os.MkdirAll(cacheDir, 0700)
+	// Write cache. If we're under sudo we MUST chown the dir+file back
+	// to the invoking user, otherwise a stray `sudo bhatti version` would
+	// leave ~/.bhatti owned by root and break every later non-sudo
+	// command (including `bhatti setup`) with EACCES.
+	createdDir := false
+	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+		createdDir = true
+	}
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		return release.TagName // best-effort: cache miss is harmless
+	}
 	content := fmt.Sprintf("%s\n%d", release.TagName, time.Now().Unix())
-	os.WriteFile(cachePath, []byte(content), 0600)
+	if err := os.WriteFile(cachePath, []byte(content), 0600); err == nil {
+		if createdDir {
+			pkg.EnsureUserOwnedPath(cacheDir)
+		}
+		pkg.EnsureUserOwnedPath(cachePath)
+	}
 
 	return release.TagName
 }
@@ -291,10 +305,23 @@ var unpublishCmd = &cobra.Command{
 // --- completion ---
 
 var completionCmd = &cobra.Command{
-	Use:       "completion <bash|zsh|fish>",
-	Short:     "Generate shell completion script",
+	Use:   "completion <bash|zsh|fish|powershell>",
+	Short: "Generate shell completion script",
+	Long: `Generate a shell completion script for the named shell.
+
+Load once into the current session:
+  bash:        source <(bhatti completion bash)
+  zsh:         source <(bhatti completion zsh)
+  fish:        bhatti completion fish | source
+  powershell:  bhatti completion powershell | Out-String | Invoke-Expression
+
+Persist across sessions:
+  bash:        echo 'source <(bhatti completion bash)' >> ~/.bashrc
+  zsh:         echo 'source <(bhatti completion zsh)'  >> ~/.zshrc
+  fish:        bhatti completion fish > ~/.config/fish/completions/bhatti.fish
+  powershell:  bhatti completion powershell >> $PROFILE`,
 	Args:      exactArgs(1),
-	ValidArgs: []string{"bash", "zsh", "fish"},
+	ValidArgs: []string{"bash", "zsh", "fish", "powershell"},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		switch args[0] {
 		case "bash":
@@ -303,6 +330,10 @@ var completionCmd = &cobra.Command{
 			return rootCmd.GenZshCompletion(os.Stdout)
 		case "fish":
 			return rootCmd.GenFishCompletion(os.Stdout, true)
+		case "powershell":
+			// WithDesc surfaces flag/argument descriptions in PSReadLine's
+			// menu, matching kubectl/helm/cobra's own conventions.
+			return rootCmd.GenPowerShellCompletionWithDesc(os.Stdout)
 		default:
 			return cmd.Help()
 		}
