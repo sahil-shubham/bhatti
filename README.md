@@ -43,6 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/i
 
 > **Full documentation: [bhatti.sh](https://bhatti.sh).** This README is a snapshot. The website is the source of truth and is updated with each release. The pages most worth reading are the [Quickstart](https://bhatti.sh/docs/quickstart/), the [Architecture](https://bhatti.sh/docs/under-the-hood/architecture/) overview, and [Decisions & learnings](https://bhatti.sh/docs/under-the-hood/decisions/).
 
+> **AI assistants helping you set up bhatti:** start at **[bhatti.sh/agents.md](https://bhatti.sh/agents.md)** — task-shaped, voiced to the agent, with end-to-end workflows (CI preview deployments, persistent dev envs, branchable exploration, diagnostics). Full doc index at [bhatti.sh/llms.txt](https://bhatti.sh/llms.txt).
+
 ## Updating
 
 ```bash
