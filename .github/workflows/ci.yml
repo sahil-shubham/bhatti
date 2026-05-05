@@ -52,3 +52,33 @@ jobs:
 
       - name: Run shellcheck
         run: find scripts/ -name '*.sh' -exec shellcheck --severity=error -e SC1091 {} +
+
+  install-script-tests:
+    # Bats tests for scripts/install.sh. Until this job existed the
+    # tests in scripts/install_test.bats were never run by CI — they
+    # could break and nobody would know. macOS is in the matrix because
+    # install.sh has macOS-specific code paths (CLI-only flow,
+    # /usr/local/bin creation on Apple Silicon, xattr quarantine strip,
+    # /bin/bash 3.2) that don't run on a Linux host.
+    name: Install Script Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install bats
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install bats-core
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq bats
+          fi
+          bats --version
+
+      - name: Run bats
+        run: bats scripts/install_test.bats

@@ -236,6 +236,115 @@ _set_checksums() {
     _teardown_rootfs_fixture
 }
 
+# ── stale_rootfs_tiers / missing_rootfs_tiers ───────────────────────────────
+# Drives the post-update hint that classifies every "other" tier (not
+# in this update's $tiers_to_install) into:
+#   stale-on-disk — user has a tier image from a previous release
+#   not-installed — user never pulled this tier
+# Empty buckets => no hint shown. The exact UX scenario covered by
+# 'lists stale on disk excluded from skip list' is the one a user hits
+# when they run a plain `bhatti update` after having pulled `computer`
+# in a previous release — prior to this hint, they'd get no signal.
+
+@test "stale_rootfs_tiers: empty when nothing is stale" {
+    _setup_rootfs_fixture
+    _set_checksums minimal aaaa1111
+    _stage_rootfs minimal aaaa1111
+    result=$(stale_rootfs_tiers minimal)
+    [ -z "$result" ]
+    _teardown_rootfs_fixture
+}
+
+@test "stale_rootfs_tiers: lists stale-on-disk tier outside the skip list" {
+    # Post-update UX scenario: minimal just updated (skip), computer on
+    # disk but stale, browser/docker not on disk — expect just "computer".
+    _setup_rootfs_fixture
+    _set_checksums minimal aaaa1111 computer bbbb2222
+    _stage_rootfs minimal aaaa1111
+    _stage_rootfs computer staleoldsha
+    result=$(stale_rootfs_tiers minimal)
+    [ "$result" = "computer" ]
+    _teardown_rootfs_fixture
+}
+
+@test "stale_rootfs_tiers: skip list suppresses just-updated tiers even when sidecar is stale" {
+    # Defensive: install_rootfs is the source of truth for freshness of
+    # tiers we just touched. The hint must trust the skip list and not
+    # second-guess in-flight installs by re-checking sidecars.
+    _setup_rootfs_fixture
+    _set_checksums minimal aaaa1111 computer bbbb2222
+    _stage_rootfs minimal staleoldsha    # would be stale by sidecar
+    _stage_rootfs computer staleoldsha   # would be stale by sidecar
+    result=$(stale_rootfs_tiers minimal computer)
+    [ -z "$result" ]
+    _teardown_rootfs_fixture
+}
+
+@test "stale_rootfs_tiers: returns multiple tiers in ALL_KNOWN_TIERS order" {
+    # Output ordering is user-facing (becomes 'outdated on disk: ...'),
+    # so it must be deterministic.
+    _setup_rootfs_fixture
+    _set_checksums minimal a browser b docker c computer d
+    _stage_rootfs minimal a              # fresh, in skip list anyway
+    _stage_rootfs browser  stale1
+    _stage_rootfs docker   stale2
+    # computer not on disk
+    result=$(stale_rootfs_tiers minimal)
+    [ "$result" = "browser docker" ]
+    _teardown_rootfs_fixture
+}
+
+@test "missing_rootfs_tiers: lists tiers not on disk, excluding skip list" {
+    _setup_rootfs_fixture
+    _set_checksums minimal a
+    _stage_rootfs minimal a
+    result=$(missing_rootfs_tiers minimal)
+    [ "$result" = "browser docker computer" ]
+    _teardown_rootfs_fixture
+}
+
+@test "missing_rootfs_tiers: skip list excludes tiers we just installed" {
+    # If --tiers browser was just run, browser ends up in the skip list.
+    # It should not show up as "not installed" even if for some reason
+    # the .ext4 isn't on disk yet (e.g. mid-install hint inspection).
+    _setup_rootfs_fixture
+    _set_checksums minimal a
+    _stage_rootfs minimal a
+    result=$(missing_rootfs_tiers minimal browser)
+    [ "$result" = "docker computer" ]
+    _teardown_rootfs_fixture
+}
+
+@test "missing_rootfs_tiers: empty when every tier is on disk" {
+    _setup_rootfs_fixture
+    _set_checksums minimal a browser b docker c computer d
+    _stage_rootfs minimal a
+    _stage_rootfs browser b
+    _stage_rootfs docker c
+    _stage_rootfs computer d
+    result=$(missing_rootfs_tiers minimal)
+    [ -z "$result" ]
+    _teardown_rootfs_fixture
+}
+
+@test "stale + missing: bucketed UX scenario the hint was added for" {
+    # End-to-end check on the user-reported flow: minimal just updated,
+    # computer left over and stale, browser/docker never installed.
+    # The two helpers together drive the hint block; verifying both at
+    # once locks in the exact strings the user sees.
+    _setup_rootfs_fixture
+    _set_checksums minimal a computer d
+    _stage_rootfs minimal a              # fresh
+    _stage_rootfs computer staleoldsha   # stale
+    # browser, docker absent
+    local stale missing
+    stale=$(stale_rootfs_tiers minimal)
+    missing=$(missing_rootfs_tiers minimal)
+    [ "$stale" = "computer" ]
+    [ "$missing" = "browser docker" ]
+    _teardown_rootfs_fixture
+}
+
 # ── detect_tier ────────────────────────────────────
 
 @test "detect_tier: parses browser from config" {

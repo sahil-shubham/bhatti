@@ -21,6 +21,9 @@ GITHUB_REPO="sahil-shubham/bhatti"
 FC_VERSION="1.14.0"
 KERNEL_VERSION="6.1.155"
 DATA_DIR="/var/lib/bhatti"
+# Order matters: drives the order in user-facing hints ("outdated on disk:
+# computer, browser" follows ALL_KNOWN_TIERS order, not insertion order).
+ALL_KNOWN_TIERS="minimal browser docker computer"
 
 # ── Formatting ────────────────────────────────────────
 
@@ -294,6 +297,36 @@ all_rootfs_up_to_date() {
         [ "$stored" = "$expected" ] || return 1
     done
     return 0
+}
+
+# Echo space-separated list of tiers whose rootfs is on disk but stale,
+# excluding any tier in the args (caller passes the just-updated set).
+# Used by the post-update hint so a user with a leftover stale tier
+# image gets a visible nudge — the same UX gap that hid the original
+# `bhatti update --tiers <X>` bug.
+stale_rootfs_tiers() {
+    local skip=" $* " result="" tier
+    for tier in $ALL_KNOWN_TIERS; do
+        case "$skip" in *" $tier "*) continue ;; esac
+        [ -f "$DATA_DIR/images/rootfs-${tier}-${ARCH}.ext4" ] || continue
+        all_rootfs_up_to_date "$tier" && continue
+        result="${result:+$result }$tier"
+    done
+    echo "$result"
+}
+
+# Echo space-separated list of tiers whose rootfs is NOT on disk,
+# excluding any tier in the args. Symmetric counterpart to
+# stale_rootfs_tiers — together they classify every "other" tier into
+# {fresh (skipped), stale-on-disk, not-installed}.
+missing_rootfs_tiers() {
+    local skip=" $* " result="" tier
+    for tier in $ALL_KNOWN_TIERS; do
+        case "$skip" in *" $tier "*) continue ;; esac
+        [ -f "$DATA_DIR/images/rootfs-${tier}-${ARCH}.ext4" ] && continue
+        result="${result:+$result }$tier"
+    done
+    echo "$result"
 }
 
 # Verify a downloaded file matches the expected checksum. Dies on mismatch.
@@ -941,7 +974,6 @@ do_server_update() {
     # Default: only the configured tier. BHATTI_TIERS overrides:
     #   all            → every known tier
     #   tier1,tier2    → specific list
-    local ALL_KNOWN_TIERS="minimal browser docker computer"
     local tiers_to_install="$tier"
     if [ -n "${BHATTI_TIERS:-}" ]; then
         if [ "${BHATTI_TIERS}" = "all" ]; then
@@ -1055,15 +1087,23 @@ do_server_update() {
     local elapsed=$(( SECONDS - _total_start ))
     echo "  bhatti updated to ${VERSION} (${elapsed}s)"
     echo "  tiers: $(echo $tiers_to_install | tr ' ' ', ')"
-    # Hint about tiers not installed locally
-    local missing_tiers=""
-    for t in $ALL_KNOWN_TIERS; do
-        [ -f "$DATA_DIR/images/rootfs-${t}-${ARCH}.ext4" ] && continue
-        missing_tiers="${missing_tiers:+$missing_tiers, }$t"
-    done
-    if [ -n "$missing_tiers" ]; then
-        echo "  other tiers available: ${missing_tiers}"
-        echo "  install with: sudo bhatti update --tiers all"
+    # Status of every "other" tier (not in this update), in two buckets:
+    #   stale on disk — user has a tier image from a previous release
+    #   not installed — user never pulled this tier
+    # One unified `--tiers all` suggestion follows because the gate fix
+    # makes --tiers all reliable: it refreshes anything stale and no-ops
+    # anything already fresh, so we don't need separate commands.
+    local stale missing
+    # shellcheck disable=SC2086
+    # intentional word-splitting: $tiers_to_install is space-separated tokens
+    stale=$(stale_rootfs_tiers $tiers_to_install)
+    # shellcheck disable=SC2086
+    missing=$(missing_rootfs_tiers $tiers_to_install)
+    if [ -n "$stale" ] || [ -n "$missing" ]; then
+        echo ""
+        [ -n "$stale" ]   && echo "  outdated on disk: ${stale// /, }"
+        [ -n "$missing" ] && echo "  not installed:    ${missing// /, }"
+        echo "  update with:      sudo bhatti update --tiers all"
     fi
     if [ "$was_running" = true ]; then
         echo "  systemd service: restarted"
