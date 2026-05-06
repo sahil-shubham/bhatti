@@ -72,15 +72,28 @@ done
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
+# Re-entrancy guard: once cleanup has run, don't run it again. Without this,
+# Ctrl+C during the prompt fires the INT trap (cleanup destroys the VM), the
+# script keeps going (set -e isn't on), every subsequent bvm call fails, and
+# each fresh Ctrl+C re-fires the trap and re-prints "Destroying ...". The
+# guard fixes that, and the explicit `exit 130` in on_signal stops the script
+# from running past the prompt after a SIGINT.
+_cleaned_up=0
 cleanup() {
+    [ "$_cleaned_up" = "1" ] && return
+    _cleaned_up=1
     set +e
-    # Only destroy if WE created it; reused sandboxes belong to the caller.
     if [ -z "$REUSE" ] && [ -n "${NAME:-}" ]; then
         echo "==> Destroying $NAME..."
         bhatti destroy "$NAME" -y >/dev/null 2>&1 || true
     fi
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+    cleanup
+    exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -159,12 +172,25 @@ if [ -z "$REUSE" ]; then
     sleep 10
 fi
 
-# ── Print connection info for the human-mode browser session ──────────────────
+# ── Publish 6080 + capture a Mac-reachable URL ────────────────────────────────
 
-# Get the bhatti API URL from the local config; the proxy URL is constructed
-# deterministically from the sandbox name.
-API_URL=$(bhatti version 2>/dev/null | awk '/^api:/ {print $2}')
-PROXY_URL="${API_URL%/}/sandboxes/$NAME/proxy/6080/"
+# `bhatti publish` is the right call here: it registers the port mapping and
+# emits a public URL when a custom domain is configured on the server, or the
+# localhost proxy URL otherwise. We constructed the proxy URL ourselves in an
+# earlier rev, which was wrong for any operator running the script over SSH
+# from a different machine.
+#
+# The output format isn't structured (no --json on publish today) so we grep
+# for an http(s):// token and prefer one that isn't localhost.
+echo "==> Publishing 6080..."
+PUBLISH_OUT=$(bhatti publish "$NAME" -p 6080 2>&1 || true)
+PUBLIC_URL=$(echo "$PUBLISH_OUT" | grep -oE 'https?://[^[:space:]<>]+' | grep -vE '127\.0\.0\.1|localhost' | head -1)
+if [ -z "$PUBLIC_URL" ]; then
+    PUBLIC_URL=$(echo "$PUBLISH_OUT" | grep -oE 'https?://[^[:space:]<>]+' | head -1)
+    echo "    note: no custom-domain URL configured \u2014 falling back to localhost"
+    echo "          (SSH-tunnel localhost:8080 to your laptop to reach it,"
+    echo "           or set up a custom domain: bhatti.sh/docs/managing/custom-domain)"
+fi
 
 # Capture run parameters for later result-diffing. Anything that affects the
 # numbers (cpus, memory, target page, bhatti+git versions) goes here so a
@@ -189,7 +215,7 @@ cat <<EOF
 
 ──────────────────────────────────────────────────
   Sandbox:      $NAME
-  Proxy URL:    $PROXY_URL
+  URL:          $PUBLIC_URL
   KasmVNC user: $KUSER
   KasmVNC pass: $KPW
   Run meta:     $RUN_META
