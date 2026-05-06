@@ -480,6 +480,12 @@ detect_install_type() {
 # Optional arg $1: explicit config path. When unset, tries the canonical
 # location and the pre-v1.6 fallback in $DATA_DIR. Tests pass an explicit
 # path to drive the parser without touching real system files.
+# shellcheck disable=SC2120
+# SC2120: "function references arguments, but none are ever passed".
+# Production callers (do_server_install, do_server_update) intentionally
+# call this without args to use the canonical config path; the optional
+# arg is for the bats unit tests in install_test.bats. Same reason for
+# the SC2119 disable on the production callers below.
 detect_tier() {
     # Primary: parse firecracker_rootfs from config.yaml
     local config_file="${1:-}"
@@ -722,11 +728,16 @@ install_rootfs() {
         computer) check_disk_space 2500 "$DATA_DIR" ;;
     esac
 
-    # Install zstd if needed
+    # Install zstd if needed. Each branch is a best-effort install — if
+    # any step fails, we tolerate it and re-check `command -v zstd` below
+    # to die with a clear message. The `{ ...; } || true` brace grouping
+    # is the unambiguous form of "the whole compound was best-effort";
+    # `A && B || true` would silently let A's failure look like a
+    # success-path skip of B (SC2015).
     if ! command -v zstd >/dev/null 2>&1; then
         info "Installing zstd..."
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y -qq zstd >/dev/null || true
+            { apt-get update -qq && apt-get install -y -qq zstd >/dev/null; } || true
         elif command -v dnf >/dev/null 2>&1; then
             dnf install -y -q zstd >/dev/null || true
         elif command -v yum >/dev/null 2>&1; then
@@ -802,7 +813,13 @@ create_admin_user() {
             local user_home user_group
             user_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6) || true
             user_group=$(id -gn "$SUDO_USER" 2>/dev/null) || user_group="$SUDO_USER"
-            [ -z "$user_home" ] && user_home=$(eval echo "~$SUDO_USER" 2>/dev/null) || true
+            # Fallback for systems without getent (some minimal images).
+            # `if`-form, not `&& ... || true`, to keep the failure semantics
+            # explicit (SC2015): we want "set user_home from eval, ignore
+            # eval errors", not "if test passes and assignment fails, run true".
+            if [ -z "$user_home" ]; then
+                user_home=$(eval echo "~$SUDO_USER" 2>/dev/null) || true
+            fi
 
             if [ -n "$user_home" ] && [ -d "$user_home" ]; then
                 mkdir -p "$user_home/.bhatti"
@@ -1029,6 +1046,10 @@ do_server_update() {
                                 "  curl -fsSL bhatti.sh/install | sudo bash"
 
     local tier current
+    # shellcheck disable=SC2119
+    # SC2119 pairs with the SC2120 disable on detect_tier itself: the
+    # function's $1 is an optional test hook, production calls use the
+    # canonical config path.
     tier=$(detect_tier)
     current=$(installed_bhatti_version)
 
