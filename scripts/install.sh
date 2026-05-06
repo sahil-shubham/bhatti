@@ -15,7 +15,16 @@
 #   BHATTI_MODE=cli|server     — skip install type prompt
 #   BHATTI_TIER=minimal|browser|docker|computer — skip tier prompt (server only)
 #   BHATTI_TIERS=all|tier1,tier2,...  — install additional tiers on update (server only)
-set -euo pipefail
+
+# Skip script-mode hardening (set -e, traps) when sourced by the bats
+# test suite — those flags clobber bats' own ERR trap and result
+# tracking, causing failed assertions to be reported as "missing" tests
+# instead of "not ok". When BHATTI_TEST=1, this file is purely a
+# function library; the smoke test runs the script as a real process,
+# where these protections DO apply.
+if [ "${BHATTI_TEST:-}" != "1" ]; then
+    set -euo pipefail
+fi
 
 GITHUB_REPO="sahil-shubham/bhatti"
 FC_VERSION="1.14.0"
@@ -83,8 +92,6 @@ _err_trap() {
     printf '\n  Please report this at:\n' >&2
     printf '  https://github.com/%s/issues\n\n' "$GITHUB_REPO" >&2
 }
-trap '_err_trap $LINENO' ERR
-
 # Clean up temp files on any exit (including staged downloads)
 _cleanup() {
     rm -f /tmp/bhatti.tmp
@@ -94,7 +101,14 @@ _cleanup() {
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
     fi
 }
-trap '_cleanup' EXIT
+
+# Same reasoning as set -euo pipefail above: don't install ERR/EXIT
+# traps when sourced by tests — they fight with bats' bats_error_trap
+# and obscure real test failures.
+if [ "${BHATTI_TEST:-}" != "1" ]; then
+    trap '_err_trap $LINENO' ERR
+    trap '_cleanup' EXIT
+fi
 
 # ── Privilege escalation ──────────────────────────────
 #

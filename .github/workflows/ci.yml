@@ -50,16 +50,46 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Run shellcheck
-        run: find scripts/ -name '*.sh' -exec shellcheck --severity=error -e SC1091 {} +
+      - name: Shellcheck install.sh (strict)
+        # No --severity filter on the user-facing installer. The previous
+        # --severity=error policy hid SC2024 (sudo redirect smell), SC2015
+        # (A&&B||C anti-pattern), SC2059 (variables in printf format) —
+        # all of which were fixed in this hardening pass. -e SC1091 stays
+        # because it flags `source` paths shellcheck can't resolve, which
+        # is expected for our bats-test sourcing pattern.
+        run: shellcheck -e SC1091 scripts/install.sh
+
+      - name: Shellcheck other scripts (error-level)
+        # build-kernel/build-rootfs/test-on-pi/uninstall have outstanding
+        # info/warning-level findings that aren't in scope of the install
+        # script audit. Keep them at --severity=error so a future regression
+        # in the error tier is still caught.
+        run: |
+          find scripts/ -name '*.sh' ! -name 'install.sh' \
+            -exec shellcheck --severity=error -e SC1091 {} +
 
   install-script-tests:
-    # Bats tests for scripts/install.sh. Until this job existed the
-    # tests in scripts/install_test.bats were never run by CI — they
-    # could break and nobody would know. macOS is in the matrix because
-    # install.sh has macOS-specific code paths (CLI-only flow,
-    # /usr/local/bin creation on Apple Silicon, xattr quarantine strip,
-    # /bin/bash 3.2) that don't run on a Linux host.
+    # Two-tier coverage of scripts/install.sh:
+    #
+    #   install_test.bats  — unit tests for the pure helpers (53 tests).
+    #                        Sub-second, no network, no disk side effects.
+    #                        Covers: arch mapping, install-type detection,
+    #                        version comparisons, tier classification, the
+    #                        gate logic from the c80638f / 4286d3a bug fix,
+    #                        flag parsing, sudo invariants, checksum logic.
+    #
+    #   install_smoke.bats — end-to-end against a local fake-release tree
+    #                        (5 tests). Runs install.sh as a process and
+    #                        verifies: fresh CLI install, idempotent
+    #                        no-op, version update, checksum mismatch
+    #                        dies loudly with no half-installed artifact,
+    #                        missing-asset dies at download.
+    #
+    # Together: "if these pass, install + update works modulo GitHub
+    # being down". macOS is in the matrix because install.sh has
+    # macOS-specific paths (Apple Silicon /usr/local/bin creation, xattr
+    # quarantine strip, /bin/bash 3.2 compatibility) that don't exercise
+    # on a Linux host — same class as the c31d997 sudo regression.
     name: Install Script Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
@@ -80,5 +110,10 @@ jobs:
           fi
           bats --version
 
-      - name: Run bats
+      - name: Unit tests (install_test.bats)
         run: bats scripts/install_test.bats
+
+      - name: Smoke tests (install_smoke.bats)
+        # Sets BHATTI_TEST_* env vars to redirect the script at a local
+        # fake-release tree; doesn't touch GitHub or /usr/local/bin.
+        run: bats scripts/install_smoke.bats
