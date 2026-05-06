@@ -59,6 +59,7 @@ mkdir -p "$RESULTS_DIR"
 
 HUMAN_OUT="$RESULTS_DIR/computer_human.jsonl"
 AGENT_OUT="$RESULTS_DIR/computer_agent.csv"
+RUN_META="$RESULTS_DIR/computer_run.txt"
 
 # ── Tooling check ─────────────────────────────────────────────────────────────
 
