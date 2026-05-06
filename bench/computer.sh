@@ -117,11 +117,27 @@ now_ms() { echo $(($(date +%s%N) / 1000000)); }
 
 # stat_or_empty: curl an /api endpoint with creds, return jq-compacted JSON,
 # falling back to "null" on any error or non-JSON response.
+#
+# Why we do not just `jq -c . 2>/dev/null || echo null`: KasmVNC returns plain
+# text bodies for endpoints called with missing/wrong params (e.g. "400 Bad
+# Request", "503 Service Unavailable"). jq parses the *leading number* from
+# such bodies as valid JSON, prints `400` to stdout, AND exits non-zero on the
+# trailing garbage. The `|| echo null` then appends `null` after the leaked
+# digits, producing two-line junk that breaks the JSONL stream downstream.
+#
+# Pre-validate by capturing jq's output AND its exit status; only emit on a
+# clean parse. With `set -uo pipefail` (set at the top of the script), $? after
+# the `result=$(... | jq ...)` assignment reflects jq's exit code.
 stat_or_empty() {
     local path="$1"
-    local body
+    local body result
     body=$(bvm curl -s -m 2 -u "$KUSER:$KPW" "http://127.0.0.1:6080$path" 2>/dev/null)
-    echo "$body" | jq -c . 2>/dev/null || echo "null"
+    result=$(echo "$body" | jq -c . 2>/dev/null)
+    if [ "$?" -ne 0 ] || [ -z "$result" ]; then
+        echo "null"
+    else
+        echo "$result"
+    fi
 }
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
