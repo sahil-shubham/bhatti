@@ -201,6 +201,7 @@ func init() {
 
 	editCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions (for autonomous agents)")
 	editCmd.Flags().Bool("allow-cold", false, "Re-enable thermal transitions")
+	editCmd.Flags().String("name", "", "Rename sandbox")
 
 	startCmd.Flags().Bool("force", false, "Force start (retry after failed restore)")
 }
@@ -210,13 +211,16 @@ func init() {
 var editCmd = &cobra.Command{
 	Use:   "edit <sandbox> [flags]",
 	Short: "Update sandbox settings",
-	Long: `Update mutable settings on an existing sandbox. Currently supports
-toggling keep_hot to control thermal management.`,
+	Long: `Update mutable settings on an existing sandbox. Supports renaming
+and toggling keep_hot to control thermal management.`,
 	Example: `  # Prevent a sandbox from being paused/snapshotted
   bhatti edit my-agent --keep-hot
 
   # Re-enable thermal transitions
-  bhatti edit my-agent --allow-cold`,
+  bhatti edit my-agent --allow-cold
+
+  # Rename a sandbox
+  bhatti edit dev --name dev-old`,
 	Args:              exactArgs(1),
 	ValidArgsFunction: completeSandboxNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -228,6 +232,7 @@ toggling keep_hot to control thermal management.`,
 		req := map[string]any{}
 		keepHot, _ := cmd.Flags().GetBool("keep-hot")
 		allowCold, _ := cmd.Flags().GetBool("allow-cold")
+		newName, _ := cmd.Flags().GetString("name")
 		if keepHot && allowCold {
 			return fmt.Errorf("cannot use --keep-hot and --allow-cold together")
 		}
@@ -237,19 +242,34 @@ toggling keep_hot to control thermal management.`,
 		if allowCold {
 			req["keep_hot"] = false
 		}
+		if newName != "" {
+			req["name"] = newName
+		}
 
 		if len(req) == 0 {
-			return fmt.Errorf("nothing to update — use --keep-hot or --allow-cold")
+			return fmt.Errorf("nothing to update — use --name, --keep-hot, or --allow-cold")
 		}
 
 		var sb map[string]any
 		if err := apiJSON("PATCH", "/sandboxes/"+id, req, &sb); err != nil {
 			return err
 		}
+
+		// Keep the local completion cache in sync. The cache is also
+		// rebuilt on every `bhatti ls`, so this is just for users who
+		// rename and immediately tab-complete.
+		if newName != "" && newName != args[0] {
+			removeFromCompletionCache(args[0])
+			addToCompletionCache(newName)
+		}
+
 		if isJSON(cmd) {
 			outputJSON(sb)
 		} else {
 			fmt.Printf("Updated %s\n", args[0])
+			if newName != "" {
+				fmt.Printf("  name:     %s\n", newName)
+			}
 			if keepHot {
 				fmt.Println("  keep_hot: true (thermal transitions disabled)")
 			}

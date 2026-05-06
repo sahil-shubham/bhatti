@@ -684,6 +684,49 @@ func TestCLIEditKeepHot(t *testing.T) {
 	}
 }
 
+func TestCLIEditRename(t *testing.T) {
+	c := setupCLITest(t)
+
+	oldName := fmt.Sprintf("cli-rn-%d", time.Now().UnixNano()%100000)
+	newName := oldName + "-renamed"
+	c.run("create", "--name", oldName)
+	// Cleanup uses whichever name is current at teardown time. Fall back to
+	// destroying both to be safe in any failure mode.
+	t.Cleanup(func() {
+		c.run("destroy", newName, "-y")
+		c.run("destroy", oldName, "-y")
+	})
+
+	// Rename
+	_, stderr, code := c.run("edit", oldName, "--name", newName)
+	if code != 0 {
+		t.Fatalf("edit --name exit %d, stderr: %s", code, stderr)
+	}
+
+	// Inspect by new name works
+	stdout, _, code := c.run("--json", "inspect", newName)
+	if code != 0 {
+		t.Fatalf("inspect new name: exit %d", code)
+	}
+	var sb map[string]interface{}
+	json.Unmarshal([]byte(stdout), &sb)
+	if sb["name"] != newName {
+		t.Errorf("name after rename: %v, want %q", sb["name"], newName)
+	}
+
+	// Inspect by old name fails
+	_, _, code = c.run("inspect", oldName)
+	if code == 0 {
+		t.Error("inspect by old name should fail after rename")
+	}
+
+	// Renaming to a same-name target is a no-op (200) and not an error.
+	_, _, code = c.run("edit", newName, "--name", newName)
+	if code != 0 {
+		t.Errorf("same-name rename should succeed as no-op, got exit %d", code)
+	}
+}
+
 func TestCLIPublishUnpublish(t *testing.T) {
 	c := setupCLITest(t)
 
