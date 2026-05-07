@@ -211,6 +211,100 @@ func TestPatchSandbox_RenameAndKeepHot(t *testing.T) {
 	}
 }
 
+// ==========================================================================
+// state-sync after name-based stop/start (regression for #16)
+// ==========================================================================
+//
+// resolveID in the CLI returns names as-is when the name lookup hits, so
+// /sandboxes/<name>/start has the name in the URL. Before this fix,
+// handleSandboxStart and handleSandbox GET passed that URL parameter to
+// store methods that key on the primary key (UpdateSandboxStatus,
+// UpdateSandboxEngine, GetSandboxByID, saveVMState). With a name as the
+// key, the UPDATE matches zero rows, returns no error, and silently leaves
+// the store out of sync with the engine — surfacing as `bhatti list`
+// showing a running VM as stopped.
+
+func TestStartByName_PersistsStatus(t *testing.T) {
+	srv, ts := setup(t)
+	name := uniqueName(t, "startname")
+	sb := createSandbox(t, ts, name)
+
+	// Stop via name (this path uses sb.ID internally and was always correct).
+	resp := doReq(t, ts, "POST", "/sandboxes/"+name+"/stop", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("stop by name: expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	if stored.Status != "stopped" {
+		t.Fatalf("after stop: store status = %q, want stopped", stored.Status)
+	}
+
+	// Start via name. Pre-fix: silent no-op on the persistence side.
+	resp = doReq(t, ts, "POST", "/sandboxes/"+name+"/start", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("start by name: expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	stored, _ = srv.store.GetSandboxByID(sb.ID)
+	if stored.Status != "running" {
+		t.Fatalf("after start: store status = %q, want running (regression: #16)",
+			stored.Status)
+	}
+}
+
+func TestGetByName_PersistsStatusRefresh(t *testing.T) {
+	srv, ts := setup(t)
+	name := uniqueName(t, "getname")
+	sb := createSandbox(t, ts, name)
+
+	// Tamper with the store to simulate drift between store and engine
+	// (e.g. a missed update due to an earlier crash).
+	if err := srv.store.UpdateSandboxStatus(sb.ID, "stopped"); err != nil {
+		t.Fatal(err)
+	}
+
+	// GET by name should refresh status from the engine AND persist it.
+	resp := doReq(t, ts, "GET", "/sandboxes/"+name, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("get by name: expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	if stored.Status != "running" {
+		t.Fatalf("after GET-by-name refresh: store status = %q, want running (regression: #16)",
+			stored.Status)
+	}
+}
+
+func TestStartByName_RenameThenStartStop(t *testing.T) {
+	// End-to-end repro of issue #16: rename, stop, start — all by the new
+	// name — and verify the store stays in sync with the engine.
+	srv, ts := setup(t)
+	oldName := uniqueName(t, "old")
+	sb := createSandbox(t, ts, oldName)
+
+	newName := uniqueName(t, "new")
+	resp := doReq(t, ts, "PATCH", "/sandboxes/"+sb.ID, map[string]any{"name": newName})
+	resp.Body.Close()
+
+	// Stop by new name
+	resp = doReq(t, ts, "POST", "/sandboxes/"+newName+"/stop", nil)
+	resp.Body.Close()
+	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	if stored.Status != "stopped" {
+		t.Fatalf("after stop: %q, want stopped", stored.Status)
+	}
+
+	// Start by new name
+	resp = doReq(t, ts, "POST", "/sandboxes/"+newName+"/start", nil)
+	resp.Body.Close()
+	stored, _ = srv.store.GetSandboxByID(sb.ID)
+	if stored.Status != "running" {
+		t.Fatalf("after start: %q, want running", stored.Status)
+	}
+}
+
 func TestKeepHotThermalCycleSkip(t *testing.T) {
 	srv, ts := setup(t)
 

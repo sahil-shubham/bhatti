@@ -610,12 +610,14 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			errResp(w, 404, "not found")
 			return
 		}
-		// Refresh status from engine
+		// Refresh status from engine. Use sb.ID, not the URL path id —
+		// callers can pass a name there and UpdateSandboxStatus keys on
+		// the primary key, so a name would silently update zero rows.
 		info, err := s.engine.Status(r.Context(), sb.EngineID)
 		if err == nil {
 			sb.Status = info.Status
 			sb.IP = info.IP
-			s.store.UpdateSandboxStatus(id, info.Status)
+			s.store.UpdateSandboxStatus(sb.ID, info.Status)
 		}
 		writeJSON(w, 200, sb)
 	case http.MethodDelete:
@@ -788,21 +790,26 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 		errRespInternal(w, r, "start sandbox failed", startErr)
 		return
 	}
-	// Refresh from engine — IP may have changed after restart
+	// Refresh from engine — IP may have changed after restart. Use
+	// sb.ID throughout: the URL path id may be a name (resolveID in
+	// the CLI returns names as-is when GET-by-name succeeds), and
+	// these store methods all key on the primary key. Passing a name
+	// is a silent no-op that leaves the store out of sync with the
+	// engine — e.g. running VMs showing stopped in `bhatti list`.
 	info, err := s.engine.Status(r.Context(), sb.EngineID)
 	if err == nil {
-		s.store.UpdateSandboxStatus(id, info.Status)
-		s.store.UpdateSandboxEngine(id, sb.EngineID, info.IP)
+		s.store.UpdateSandboxStatus(sb.ID, info.Status)
+		s.store.UpdateSandboxEngine(sb.ID, sb.EngineID, info.IP)
 	} else {
-		s.store.UpdateSandboxStatus(id, "running")
+		s.store.UpdateSandboxStatus(sb.ID, "running")
 	}
-	s.saveVMState(id, sb.EngineID) // persist updated state
+	s.saveVMState(sb.ID, sb.EngineID) // persist updated state
 	user := UserFromContext(r.Context())
 	s.RecordEvent(store.Event{
 		Type: "sandbox.started", UserID: user.ID, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": "api"},
 	})
-	updated, err := s.store.GetSandboxByID(id)
+	updated, err := s.store.GetSandboxByID(sb.ID)
 	if err != nil {
 		// Start succeeded but DB refresh failed — return the original sandbox
 		// with updated status rather than null.
