@@ -116,9 +116,7 @@ func runAgent() {
 		if cfg.Hostname != "" {
 			hostname = cfg.Hostname
 		}
-		syscall.Sethostname([]byte(hostname))
-		os.WriteFile("/etc/hosts", []byte(
-			"127.0.0.1 localhost "+hostname+"\n::1 localhost "+hostname+"\n"), 0644)
+		applyHostname(hostname)
 		if len(cfg.DNS) > 0 {
 			applyDNS(cfg.DNS)
 		} else {
@@ -132,9 +130,7 @@ func runAgent() {
 		os.RemoveAll("/run/bhatti/config")
 		bp("config_applied")
 	} else {
-		syscall.Sethostname([]byte("bhatti"))
-		os.WriteFile("/etc/hosts", []byte(
-			"127.0.0.1 localhost bhatti\n::1 localhost bhatti\n"), 0644)
+		applyHostname("bhatti")
 		ensureResolvConf()
 	}
 
