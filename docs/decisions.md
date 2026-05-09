@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/under-the-hood/decisions/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # Design Decisions
 
 Key architectural decisions with context, alternatives considered, and rationale. These are the decisions that shaped the system — the ones worth discussing in detail because they have non-obvious tradeoffs.

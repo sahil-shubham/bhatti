@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/under-the-hood/networking/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # Networking
 
 Every VM gets its own network interface, IP address, and internet access through a shared bridge on the host. The network is configured at the kernel level before init runs — no DHCP, no NetworkManager, no race conditions.

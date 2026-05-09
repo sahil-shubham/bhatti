@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/under-the-hood/wire-protocol/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # Wire Protocol
 
 All communication between the bhatti host and a guest VM happens over a binary framing protocol. The same protocol runs over vsock (cold boot), TCP over TAP (post-snapshot), or Unix sockets (testing). The protocol is engine-independent — the entire agent test suite runs on macOS over `net.Pipe()` without any VM.

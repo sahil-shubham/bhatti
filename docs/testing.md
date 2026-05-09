@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/contributing/testing/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # Testing
 
 ~11,000 lines of tests across 25 test files. Zero mocks for VM tests — all Firecracker integration tests run on real microVMs.

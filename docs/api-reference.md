@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/reference/api/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # API Reference
 
 All endpoints require `Authorization: Bearer <token>` except `/health` and static paths (`/`, `/index.html`, `/static/*`).

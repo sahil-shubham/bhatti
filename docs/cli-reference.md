@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/reference/cli/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # CLI Reference
 
 `bhatti` is a single binary — `bhatti serve` starts the daemon, everything else is a CLI command that talks to the daemon's HTTP API.

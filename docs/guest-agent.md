@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained version of this page is at
+> <https://bhatti.sh/docs/under-the-hood/lohar-the-blacksmith/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # Guest Agent (Lohar)
 
 Lohar is a single static Go binary that runs as PID 1 — the init process — inside every Firecracker microVM. It replaces systemd, handles all system initialization, and serves as the execution and file operations backend for the host.

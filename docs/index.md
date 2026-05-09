@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — do not edit.**
+> The canonical, maintained docs landing page is at
+> <https://bhatti.sh/docs/>.
+> This file is kept only for git history and may be removed in a future
+> cleanup. See [`docs/README.md`](./README.md) for the redirect index.
+
+---
+
 # Bhatti
 
 **Firecracker microVM orchestrator for AI coding agents.**
