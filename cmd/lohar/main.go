@@ -97,6 +97,16 @@ func runAgent() {
 	os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control",
 		[]byte("+cpu +memory +io +pids"), 0644)
 
+	// binfmt_misc — kernel API filesystem that lets the kernel hand foreign-arch
+	// ELFs to a userspace interpreter (qemu-user). Needed for `docker buildx`
+	// cross-arch builds inside the sandbox: `tonistiigi/binfmt --install all`
+	// writes its handler registrations through /proc/sys/fs/binfmt_misc/register.
+	// Normally systemd-binfmt mounts this; with the shim, lohar does it.
+	// Best-effort: only fails if the kernel was built without CONFIG_BINFMT_MISC.
+	if err := syscall.Mount("binfmt_misc", "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: mount binfmt_misc (non-fatal): %v\n", err)
+	}
+
 	bringUpInterface("lo")
 	bp("lo_up")
 
@@ -196,10 +206,30 @@ func runAgent() {
 	}
 	bp("tcp_listen")
 
-	// --- Boot timing ---
-
-	os.WriteFile("/run/bhatti/boot-timing.txt", []byte(bootLog.String()), 0644)
 	fmt.Fprintln(os.Stderr, "lohar: ready")
+
+	// --- Bridge user --env into unit-file environment ---
+	// configEnv comes from the config drive (populated by `bhatti create
+	// --env KEY=VALUE`). Today it only reaches `bhatti exec` invocations
+	// via the env-merge in exec.go. Units spawned by
+	// startEnabledServices() can't see it unless we materialise it as a
+	// file they can EnvironmentFile= from.
+	//
+	// Convention (per PLAN-tiers-systemd.md): write canonical KEY=VALUE
+	// lines to /run/bhatti/config-env. Tier units opt in with
+	//   EnvironmentFile=-/run/bhatti/config-env
+	// The leading '-' makes the file optional, so minimal sandboxes
+	// without any --env flags still boot cleanly.
+	os.MkdirAll("/run/bhatti", 0755)
+	if len(configEnv) > 0 {
+		var b strings.Builder
+		for k, v := range configEnv {
+			fmt.Fprintf(&b, "%s=%s\n", k, v)
+		}
+		if err := os.WriteFile("/run/bhatti/config-env", []byte(b.String()), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "lohar: write config-env: %v\n", err)
+		}
+	}
 
 	// --- Start enabled services ---
 	// Read /etc/systemd/system/multi-user.target.wants/ and start each
@@ -221,6 +251,13 @@ func runAgent() {
 
 	startEnabledServices()
 	bp("services_started")
+
+	// --- Boot timing ---
+	// Written AFTER tmpfiles_applied / services_started so the
+	// trace actually reflects what happened. Previously written
+	// right after tcp_listen, which truncated the visible boot to
+	// the first ~7ms and hid the slow phases.
+	os.WriteFile("/run/bhatti/boot-timing.txt", []byte(bootLog.String()), 0644)
 
 	// --- Boot profile ---
 
@@ -364,8 +401,9 @@ func startSyslogReceiver(reg *Registry) {
 
 // parseSyslogMessage extracts the tag (service name) and message from a
 // syslog datagram. Handles common formats:
-//   "<priority>Mon DD HH:MM:SS hostname tag[pid]: message"
-//   "<priority>tag: message"
+//
+//	"<priority>Mon DD HH:MM:SS hostname tag[pid]: message"
+//	"<priority>tag: message"
 func parseSyslogMessage(raw string) (tag, msg string) {
 	s := raw
 	if len(s) > 0 && s[0] == '<' {

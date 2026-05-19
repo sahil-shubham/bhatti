@@ -35,13 +35,13 @@ import (
 // Well-known targets that are always "active" — invoke-rc.d checks
 // sysinit.target to determine runlevel.
 var alwaysActiveTargets = map[string]bool{
-	"sysinit":      true,
-	"multi-user":   true,
-	"default":      true,
-	"network":      true,
+	"sysinit":        true,
+	"multi-user":     true,
+	"default":        true,
+	"network":        true,
 	"network-online": true,
-	"sockets":      true,
-	"basic":        true,
+	"sockets":        true,
+	"basic":          true,
 }
 
 // runSystemctl is the entry point when invoked as /usr/bin/systemctl.
@@ -588,11 +588,12 @@ func svcStart(u *Unit) error {
 		}
 	}
 
+	var startErr error
 	switch svcType {
 	case "oneshot":
-		return runServiceCommand(execStart, svc)
+		startErr = runServiceCommand(execStart, svc)
 	case "forking":
-		return startForking(u, execStart, svc)
+		startErr = startForking(u, execStart, svc)
 	default:
 		// simple, exec, dbus -- treated as simple daemons (active on
 		// fork+exec). notify is also handled by startDaemon but blocks
@@ -602,10 +603,32 @@ func svcStart(u *Unit) error {
 			return err
 		}
 		if svcType == "notify" {
-			return waitForNotifyReady(u, svc)
+			startErr = waitForNotifyReady(u, svc)
 		}
-		return nil
 	}
+	if startErr != nil {
+		return startErr
+	}
+
+	// ExecStartPost: runs after the unit is considered active. For
+	// Type=oneshot/forking this is after ExecStart returns; for
+	// Type=simple it's after fork+exec; for Type=notify it's after
+	// READY=1 from sd_notify. Mirrors systemd's semantics: leading '-'
+	// makes failure non-fatal; otherwise a failing post stops the unit.
+	// (PLAN-tiers-systemd.md depends on this for chmod-the-socket
+	// hooks; arrived as part of v1.11.3.)
+	for _, cmdLine := range svc.getAll("Service", "ExecStartPost") {
+		ignoreErr := strings.HasPrefix(cmdLine, "-")
+		if err := runServiceCommand(cmdLine, svc); err != nil {
+			if ignoreErr {
+				fmt.Fprintf(os.Stderr, "ExecStartPost (ignored): %v\n", err)
+			} else {
+				return fmt.Errorf("ExecStartPost failed: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // waitForNotifyReady blocks until the unit's .activating marker is
@@ -778,12 +801,12 @@ func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd) {
 // shouldRestart maps the Restart= directive to a yes/no for the given
 // exit code. Mirrors systemd's policy:
 //
-//   no            never
-//   always        always (also after clean exits)
-//   on-success    only after exit 0
-//   on-failure    after non-zero exit (the common case)
-//   on-abnormal   after signals (exit > 128, by convention)
-//   "" (unset)    treated as no — services explicitly opt in
+//	no            never
+//	always        always (also after clean exits)
+//	on-success    only after exit 0
+//	on-failure    after non-zero exit (the common case)
+//	on-abnormal   after signals (exit > 128, by convention)
+//	"" (unset)    treated as no — services explicitly opt in
 func shouldRestart(policy string, exitCode int) bool {
 	failed := exitCode != 0
 	switch policy {
@@ -1654,7 +1677,7 @@ func (sf serviceFile) get(section, key string) string {
 }
 
 // getAll returns every value for the given section/key in order. Used for
-// list-typed directives like ExecStartPre, Environment, EnvironmentFile.
+// list-typed directives like ExecStartPre, ExecStartPost, Environment, EnvironmentFile.
 // Reset markers (empty values) are filtered out by merge() before this is
 // called, so callers don't need to handle them.
 func (sf serviceFile) getAll(section, key string) []string {
@@ -1670,17 +1693,19 @@ func (sf serviceFile) getAll(section, key string) []string {
 // merge appends another serviceFile's directives onto this one, implementing
 // systemd's drop-in merge semantics:
 //
-//   - List-valued directives (ExecStartPre, Environment, etc.) accumulate —
+//   - List-valued directives (ExecStartPre, ExecStartPost, Environment, etc.) accumulate —
 //     a later directive is appended to the list returned by getAll().
+//
 //   - Scalar directives (ExecStart, Type, User) effectively override because
 //     get() returns the LAST value.
+//
 //   - **Reset semantics**: an empty assignment (e.g. `ExecStart=`) clears
 //     every prior entry for that key in that section. This is the
 //     conventional way drop-ins replace a fragment's directive cleanly:
 //
-//         [Service]
-//         ExecStart=
-//         ExecStart=/usr/bin/foo --new-args
+//     [Service]
+//     ExecStart=
+//     ExecStart=/usr/bin/foo --new-args
 //
 //     The empty marker itself is dropped after the reset; only the
 //     subsequent assignment(s) remain.
