@@ -74,6 +74,17 @@ jobs:
         run: |
           go test ./cmd/bhatti/ -v -count=1 -timeout=120s -run 'TestRecover|TestFirecrackerState'
 
+      - name: Run lohar cgroup integration tests
+        run: |
+          # The lohar package has a handful of integration tests that are
+          # gated behind os.Getuid() != 0 and the presence of cgroup v2 at
+          # /sys/fs/cgroup. They exercise the real kernel cgroup primitives
+          # (cgroup.kill, memory.max enforcement, and the spawn-helper
+          # placement guarantee for forking daemons). Skipped on dev
+          # machines and non-root Linux; sudo here lets them execute.
+          sudo go test ./cmd/lohar/ -v -count=1 -timeout=120s \
+            -run 'TestCgroupKillIntegration|TestCgroupMemoryMaxEnforcement|TestStartDaemonPlacesProcessInUnitCgroup'
+
       - name: Run integration tests
         run: |
           sudo apt-get update -qq
