@@ -217,6 +217,7 @@ func TestCgroupKillIntegration(t *testing.T) {
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		t.Skip("requires cgroup v2 mounted at /sys/fs/cgroup")
 	}
+	requireUnrestrictedCgroup(t)
 	if _, err := os.Stat("/sys/fs/cgroup/system.slice"); err != nil {
 		// Try to create it for the test.
 		if err := os.MkdirAll("/sys/fs/cgroup/system.slice", 0755); err != nil {
@@ -287,6 +288,7 @@ func TestCgroupMemoryMaxEnforcement(t *testing.T) {
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		t.Skip("requires cgroup v2 mounted at /sys/fs/cgroup")
 	}
+	requireUnrestrictedCgroup(t)
 	rootCtrl, _ := os.ReadFile("/sys/fs/cgroup/cgroup.subtree_control")
 	if !strings.Contains(string(rootCtrl), "memory") {
 		t.Skip("memory controller not enabled in /sys/fs/cgroup/cgroup.subtree_control")
@@ -379,6 +381,7 @@ func TestStartDaemonPlacesProcessInUnitCgroup(t *testing.T) {
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		t.Skip("requires cgroup v2 mounted at /sys/fs/cgroup")
 	}
+	requireUnrestrictedCgroup(t)
 	if _, err := os.Stat("/sys/fs/cgroup/system.slice"); err != nil {
 		if err := os.MkdirAll("/sys/fs/cgroup/system.slice", 0755); err != nil {
 			t.Skipf("can't create system.slice: %v", err)

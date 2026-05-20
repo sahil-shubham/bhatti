@@ -4,8 +4,45 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
+
+// requireUnrestrictedCgroup skips the calling test unless we have direct
+// write access to /sys/fs/cgroup — i.e. we're PID 1 on a real host, the
+// agni-01 smoke environment, or a privileged developer machine. Returns
+// without skipping in those cases; t.Skip's the test in container/K8s
+// pod environments where cgroup-namespace isolation makes our
+// cgroup.procs writes either silently fail or land in the wrong
+// subtree.
+//
+// Detection: /proc/self/cgroup in cgroup v2 has one line "0::<path>".
+// An unrestricted env has path "/" (we're the root cgroup, or PID 1
+// inside a VM that owns the cgroup hierarchy). A nested env has
+// something like "/kubepods.slice/...cri-containerd-....scope" — the
+// ARC runner inside a K8s pod is the common case.
+//
+// This is a stricter check than "is root" or "has cgroup v2 mounted"
+// (the existing t.Skip pattern in cgroup_test.go) and catches the
+// case where root + cgroup v2 are both present but the namespace
+// boundary prevents moves to /sys/fs/cgroup/system.slice/.
+func requireUnrestrictedCgroup(t *testing.T) {
+	t.Helper()
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		t.Skipf("cannot read /proc/self/cgroup: %v", err)
+	}
+	line := strings.TrimSpace(string(data))
+	// cgroup v2 single line: "0::<path>"
+	parts := strings.SplitN(line, "::", 2)
+	if len(parts) != 2 {
+		t.Skipf("unexpected /proc/self/cgroup format: %q", line)
+	}
+	if parts[1] != "/" {
+		t.Skipf("requires unrestricted cgroup v2 (we're nested at %q — container or K8s pod). "+
+			"This test runs on real hosts only; verify on agni-01.", parts[1])
+	}
+}
 
 // TestMain wires the spawn-helper indirection so existing startDaemon
 // tests (TestRestartOnFailure, TestStopSuppressesRestart, the cgroup
