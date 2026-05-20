@@ -61,10 +61,10 @@ The server install prompts you to pick a rootfs tier. Each tier is a pre-built U
 
 | Tier | What's in it | Size |
 |------|-------------|------|
-| `minimal` | Bare Ubuntu + curl + fuse3 | ~200MB |
-| `browser` | + Chromium, Playwright, Node 22 | ~600MB |
-| `docker` | + Docker Engine | ~550MB |
-| `computer` | + Full desktop: XFCE, KasmVNC, Chromium | ~1.5GB |
+| [`minimal`](https://bhatti.sh/docs/managing/tiers/) | Bare Ubuntu + curl + fuse3 | ~200MB |
+| [`browser`](https://bhatti.sh/docs/managing/tiers/browser/) | + Chromium, Playwright, Node 22 | ~600MB |
+| [`docker`](https://bhatti.sh/docs/managing/tiers/docker/) | + Docker Engine + buildx (multi-arch) | ~550MB |
+| [`computer`](https://bhatti.sh/docs/managing/tiers/computer/) | + Full desktop: XFCE, KasmVNC, Chromium | ~1.5GB |
 
 Use `--image` to create sandboxes from non-default tiers:
 
@@ -81,9 +81,13 @@ bhatti exec desktop -- vnc-creds          # username + per-sandbox password
 # Run Docker-in-VM
 bhatti create --name ci --image docker
 bhatti exec ci -- docker run hello-world
+
+# Multi-arch builds inside one sandbox (qemu-user emulation)
+bhatti exec ci -- docker run --privileged --rm tonistiigi/binfmt --install all
+bhatti exec ci -- docker buildx build --platform linux/amd64,linux/arm64 -t me/app .
 ```
 
-The server auto-discovers tiers from `/var/lib/bhatti/images/`. Install more with `sudo bhatti update --tiers all`. See [Adding a tier](https://bhatti.sh/docs/contributing/adding-a-tier/) for details on building your own.
+The server auto-discovers tiers from `/var/lib/bhatti/images/`. Install more with `sudo bhatti update --tiers all`. Full per-tier docs (operator UX, env knobs, sizing, troubleshooting) live at [bhatti.sh/docs/managing/tiers/](https://bhatti.sh/docs/managing/tiers/); see [Adding a tier](https://bhatti.sh/docs/contributing/adding-a-tier/) for building your own.
 
 ## CLI Commands
 
