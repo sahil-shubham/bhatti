@@ -215,25 +215,11 @@ func New(dbPath string) (*Store, error) {
 	db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_user_name
 		ON sandboxes(created_by, name) WHERE status != 'destroyed'`)
 
-	// Migrate secrets table to composite primary key (user_id, name).
-	// The original table had PRIMARY KEY(name) which prevents two users
-	// from having a secret with the same name. This migration recreates
-	// the table with the correct composite key.
-	db.Exec(`CREATE TABLE IF NOT EXISTS secrets_v2 (
-		user_id TEXT NOT NULL DEFAULT '',
-		name TEXT NOT NULL,
-		path TEXT NOT NULL DEFAULT '',
-		value_encrypted BLOB DEFAULT NULL,
-		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (user_id, name)
-	)`)
-	// Copy data from old table if it exists and secrets_v2 is empty
-	db.Exec(`INSERT OR IGNORE INTO secrets_v2 (user_id, name, path, value_encrypted, created_at, updated_at)
-		SELECT COALESCE(user_id, ''), name, COALESCE(path, ''), value_encrypted,
-		       created_at, COALESCE(updated_at, created_at) FROM secrets`)
-	db.Exec(`DROP TABLE IF EXISTS secrets`)
-	db.Exec(`ALTER TABLE secrets_v2 RENAME TO secrets`)
+	// Migrate secrets from v1 (PRIMARY KEY name) to v2 (PRIMARY KEY
+	// (user_id, name)). Idempotent — a no-op once the table is v2.
+	if _, err := migrateSecretsToV2(db); err != nil {
+		return nil, fmt.Errorf("migrate secrets v1→v2: %w", err)
+	}
 
 	// Image sharing table — allows sharing images with specific users
 	db.Exec(`CREATE TABLE IF NOT EXISTS image_shares (
@@ -280,6 +266,59 @@ func New(dbPath string) (*Store, error) {
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_ms_ts ON metrics_snapshots(ts)`)
 
 	return &Store{db: db}, nil
+}
+
+// migrateSecretsToV2 converts the legacy v1 secrets schema
+// (PRIMARY KEY name) to the v2 composite-key schema
+// (PRIMARY KEY (user_id, name)). The v1 shape prevented two users
+// from owning a secret with the same name.
+//
+// Idempotent. Detects the v2 schema via pragma_table_info and is a
+// no-op when already migrated. Returns true if the rewrite ran on
+// this call, false if it was a no-op.
+//
+// Pre-fix, the rewrite ran unconditionally on every boot: CREATE
+// secrets_v2, INSERT from secrets, DROP secrets, RENAME. That
+// re-copies every secret on every restart and opens a narrow crash
+// window between DROP and RENAME where the secrets table doesn't
+// exist. Tranche 0a item #6 of PLAN-bhatti-v2.md.
+func migrateSecretsToV2(db *sql.DB) (bool, error) {
+	// Composite PK on (user_id, name) means user_id is part of the
+	// primary key (pk > 0 in pragma_table_info). On a v1 schema,
+	// user_id doesn't exist at all and the query returns 0.
+	var pkCount int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name='user_id' AND pk > 0`,
+	).Scan(&pkCount); err != nil {
+		return false, fmt.Errorf("inspect secrets schema: %w", err)
+	}
+	if pkCount > 0 {
+		return false, nil
+	}
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS secrets_v2 (
+		user_id TEXT NOT NULL DEFAULT '',
+		name TEXT NOT NULL,
+		path TEXT NOT NULL DEFAULT '',
+		value_encrypted BLOB DEFAULT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (user_id, name)
+	)`); err != nil {
+		return false, fmt.Errorf("create secrets_v2: %w", err)
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO secrets_v2 (user_id, name, path, value_encrypted, created_at, updated_at)
+		SELECT COALESCE(user_id, ''), name, COALESCE(path, ''), value_encrypted,
+		       created_at, COALESCE(updated_at, created_at) FROM secrets`); err != nil {
+		return false, fmt.Errorf("copy secrets v1→v2: %w", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS secrets`); err != nil {
+		return false, fmt.Errorf("drop secrets: %w", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE secrets_v2 RENAME TO secrets`); err != nil {
+		return false, fmt.Errorf("rename secrets_v2: %w", err)
+	}
+	return true, nil
 }
 
 // Close closes the database.
