@@ -248,7 +248,22 @@ func copyRootfs(src, dst string) error {
 	return copyBlock(src, dst)
 }
 
-// fcAPIClient returns an HTTP client that talks to Firecracker's API over a Unix socket.
+// fcAPIClient returns an HTTP client that talks to Firecracker's API
+// over a Unix socket. Keep-alives are enabled, so multi-call sequences
+// (the ~10-PUT Create boot configuration, the pause+snapshot dance)
+// reuse a single underlying connection instead of dialing/closing the
+// socket per call. Each call site still constructs its own client, so
+// across-call connection reuse is not in scope here — each Pause /
+// Resume / BalloonSet on a VM still dials fresh.
+//
+// Pre-fix, DisableKeepAlives=true forced one connection per request
+// with a defensive note about "stale socket issues." The relevant
+// staleness is when FC dies and respawns (snapshot stop/restore), at
+// which point the socket on the kernel side is gone and any cached
+// connection would be invalid. Within a single fcAPIClient lifetime
+// FC does not respawn (the caller holds the VM's stateMu, and
+// snapshot stop/restore constructs a fresh client afterwards), so
+// keep-alives are safe here. Tranche 0a item #5 of PLAN-bhatti-v2.md.
 func fcAPIClient(socketPath string) *http.Client {
 	return &http.Client{
 		// No Timeout — each call site uses context.WithTimeout.
@@ -259,7 +274,6 @@ func fcAPIClient(socketPath string) *http.Client {
 				d := net.Dialer{Timeout: 5 * time.Second}
 				return d.DialContext(ctx, "unix", socketPath)
 			},
-			DisableKeepAlives: true, // one request per connection, avoids stale socket issues
 		},
 	}
 }
