@@ -155,6 +155,20 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 
 // handleSessionAttach reconnects a client to an existing session.
 // If ifDetached is true, the attach fails if the session is already attached.
+//
+// The historical setup (SESSION_INFO + scrollback replay) runs under
+// sess.mu and BEFORE sess.Attached is set. This is load-bearing: the
+// PTY reader goroutine takes sess.mu before writing new bytes to both
+// Scrollback and Attached. Holding the lock here blocks the PTY reader
+// during the replay, and leaving Attached=nil until the replay finishes
+// ensures the reader cannot interleave live bytes ahead of the
+// historical buffer when the lock is finally released. Tranche 0a #2
+// of PLAN-bhatti-v2.md.
+//
+// Pre-fix, sess.Attached was set early and scrollback was written
+// outside the lock; the PTY reader could fire between the two, sending
+// live STDOUT to the client before the historical replay arrived —
+// observable as garbled terminal output on reconnect.
 func handleSessionAttach(conn net.Conn, sessionID string, ifDetached bool) {
 	sess := getSession(sessionID)
 	if sess == nil {
@@ -168,18 +182,17 @@ func handleSessionAttach(conn net.Conn, sessionID string, ifDetached bool) {
 		proto.WriteFrame(conn, proto.ERROR, []byte("session is attached"))
 		return
 	}
-	// Detach previous client if any
+	// Detach previous client if any.
 	if sess.Attached != nil {
 		exit := proto.ExitPayload(0)
 		proto.WriteFrame(sess.Attached, proto.EXIT, exit[:])
 		sess.Attached = nil
 	}
 	sess.cancelIdleTimer()
-	sess.Attached = conn
-	sess.mu.Unlock()
 
-	// Send session info
-	sess.mu.Lock()
+	// Snapshot all state we need to replay. Keep sess.Attached = nil
+	// for now — the PTY reader will not write to conn until we set it
+	// below, after the historical bytes have been sent.
 	info := proto.SessionInfo{
 		SessionID: sess.ID,
 		Argv:      strings.Join(sess.Argv, " "),
@@ -189,33 +202,37 @@ func handleSessionAttach(conn net.Conn, sessionID string, ifDetached bool) {
 		Attached:  true,
 		CreatedAt: sess.CreatedAt.Unix(),
 	}
-	sess.mu.Unlock()
-	proto.SendJSON(conn, proto.SESSION_INFO, info)
-
-	// Replay scrollback (under lock — PTY reader writes concurrently)
-	sess.mu.Lock()
 	var scrollback []byte
 	if sess.Scrollback != nil {
 		scrollback = sess.Scrollback.Bytes()
 	}
-	sess.mu.Unlock()
+	exited := sess.ExitCode != nil
+	exitCode := sess.ExitCode
+
+	// Send the historical state under the lock. The PTY reader is
+	// blocked at its own sess.mu.Lock() for the duration, so no new
+	// bytes are appended to Scrollback or sent to conn during the
+	// replay. This is the same backpressure model the PTY reader
+	// itself uses (it holds sess.mu across its WriteFrame).
+	proto.SendJSON(conn, proto.SESSION_INFO, info)
 	if len(scrollback) > 0 {
 		proto.WriteFrame(conn, proto.STDOUT, scrollback)
 	}
 
-	// If process already exited, send exit and clean up
-	sess.mu.Lock()
-	exited := sess.ExitCode != nil
-	exitCode := sess.ExitCode
-	sess.mu.Unlock()
 	if exited {
 		exit := proto.ExitPayload(int32(*exitCode))
 		proto.WriteFrame(conn, proto.EXIT, exit[:])
+		sess.mu.Unlock()
 		removeSession(sess.ID)
 		return
 	}
 
-	// Read host input until disconnect
+	// Hand off to the live path. From this point the PTY reader will
+	// forward fresh bytes to conn, picking up exactly where the
+	// scrollback ended.
+	sess.Attached = conn
+	sess.mu.Unlock()
+
 	readHostInput(conn, sess)
 }
 
