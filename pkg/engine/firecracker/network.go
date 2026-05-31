@@ -128,20 +128,62 @@ func (p *ipPool) Mark(ip string) {
 	p.mu.Unlock()
 }
 
-// ensureUserBridge creates a user's bridge if it doesn't exist.
-// Idempotent — safe to call on every sandbox creation.
+// ensureUserBridge creates a user's bridge if it doesn't exist and
+// installs the per-bridge iptables exemption. Idempotent — safe to
+// call on every sandbox creation.
 func ensureUserBridge(net *UserNetwork) error {
 	runQuiet("ip", "link", "add", net.BridgeName, "type", "bridge")
 	runQuiet("ip", "addr", "add", net.GatewayIP+"/24", "dev", net.BridgeName)
 	if err := run("ip", "link", "set", net.BridgeName, "up"); err != nil {
 		return fmt.Errorf("bring up bridge %s: %w", net.BridgeName, err)
 	}
+	pred := intraBridgeAllowPredicate(net.BridgeName)
+	check := append([]string{"-t", "filter", "-C", "FORWARD"}, pred...)
+	if runQuiet("iptables", check...) != nil {
+		// Insert at position 1 so the ACCEPT shadows the cross-bridge
+		// DROP that setupGlobalFirewall installs (also at position 1,
+		// pushed down to position 2 after this insert).
+		insert := append([]string{"-t", "filter", "-I", "FORWARD", "1"}, pred...)
+		if err := run("iptables", insert...); err != nil {
+			return fmt.Errorf("install intra-bridge allow rule: %w", err)
+		}
+	}
 	return nil
 }
 
-// destroyUserBridge removes a user's bridge device.
+// destroyUserBridge removes a user's bridge device and its per-bridge
+// iptables exemption.
 func destroyUserBridge(bridgeName string) {
+	pred := intraBridgeAllowPredicate(bridgeName)
+	del := append([]string{"-t", "filter", "-D", "FORWARD"}, pred...)
+	runQuiet("iptables", del...)
 	run("ip", "link", "del", bridgeName)
+}
+
+// intraBridgeAllowPredicate returns the iptables predicate arguments
+// (the "-i <bridge> -o <bridge> -j ACCEPT" portion) that match intra-
+// bridge same-user-sandbox-to-same-user-sandbox traffic. Callers prepend
+// "-t filter -I/-A/-C/-D FORWARD [pos]" depending on the operation.
+//
+// Why this exists: setupGlobalFirewall's DROP rule on
+// 10.0.0.0/8 -> 10.0.0.0/8 assumes intra-bridge traffic stays at L2 and
+// never enters the FORWARD chain. That assumption holds on a pure
+// bhatti host. It BREAKS when the host has bridge-nf-call-iptables=1,
+// which is the universal case for any host also running Kubernetes,
+// Docker, or anything else that loads br_netfilter. With br_netfilter
+// active, intra-bridge L2 traffic is routed through L3 iptables; same-
+// user-sandbox-to-same-user-sandbox traffic hits the cross-bridge DROP
+// and is silently lost.
+//
+// Surfaced during the G1.3 spike: k3s worker -> k3s control plane on
+// the same bhatti bridge timed out because the host (asus-i5) was also
+// a k3s node, which had loaded br_netfilter.
+//
+// The rule is harmless when br_netfilter is OFF: no traffic matches
+// because intra-bridge traffic stays at L2 and never reaches FORWARD,
+// so the rule sits at counter zero forever.
+func intraBridgeAllowPredicate(bridgeName string) []string {
+	return []string{"-i", bridgeName, "-o", bridgeName, "-j", "ACCEPT"}
 }
 
 // setupGlobalFirewall configures isolation rules for all VM traffic.
