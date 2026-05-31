@@ -249,33 +249,49 @@ func copyRootfs(src, dst string) error {
 }
 
 // fcAPIClient returns an HTTP client that talks to Firecracker's API
-// over a Unix socket. Keep-alives are enabled, so multi-call sequences
-// (the ~10-PUT Create boot configuration, the pause+snapshot dance)
-// reuse a single underlying connection instead of dialing/closing the
-// socket per call. Each call site still constructs its own client, so
-// across-call connection reuse is not in scope here — each Pause /
-// Resume / BalloonSet on a VM still dials fresh.
+// over a Unix socket, plus a cleanup function the caller MUST defer.
+// Keep-alives are enabled inside the client's lifetime, so multi-call
+// sequences (the ~10-PUT Create boot configuration, the pause+snapshot
+// dance) reuse a single underlying connection instead of dialing per
+// call. The cleanup closes idle connections when the caller is done,
+// preventing accumulation across the many short-lived clients that
+// rapid pause/resume cycles produce.
 //
-// Pre-fix, DisableKeepAlives=true forced one connection per request
-// with a defensive note about "stale socket issues." The relevant
-// staleness is when FC dies and respawns (snapshot stop/restore), at
-// which point the socket on the kernel side is gone and any cached
-// connection would be invalid. Within a single fcAPIClient lifetime
-// FC does not respawn (the caller holds the VM's stateMu, and
-// snapshot stop/restore constructs a fresh client afterwards), so
-// keep-alives are safe here. Tranche 0a item #5 of PLAN-bhatti-v2.md.
-func fcAPIClient(socketPath string) *http.Client {
-	return &http.Client{
-		// No Timeout — each call site uses context.WithTimeout.
-		// This avoids the old 10s global timeout silently racing with
-		// per-call context deadlines (see issue #4).
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 5 * time.Second}
-				return d.DialContext(ctx, "unix", socketPath)
-			},
+// History:
+//
+//	v1.11.10: DisableKeepAlives=true. One connection per request.
+//	         Slow during Create (~10 dials) but no accumulation.
+//	cd24d4c:  Dropped DisableKeepAlives. Within-call reuse, but
+//	         each short-lived client left its idle connection alive
+//	         in the Transport's pool. The Transport's GC is lazy;
+//	         a tight pause/resume loop accumulated stale connections
+//	         on Firecracker's side. TestPerfPauseResume failed at
+//	         iteration 4 with "write: broken pipe" as FC closed
+//	         half-open sockets out from under us.
+//	this fix: Keep-alives stay on (within-call reuse preserved) but
+//	         the returned cleanup closure explicitly closes idle
+//	         connections via Transport.CloseIdleConnections. Calling
+//	         sites use `client, done := fcAPIClient(...); defer
+//	         done()`. Compile-checked: forgetting the cleanup is a
+//	         compilation error because the function returns two values.
+//
+// FC respawn (snapshot stop/restore) was the original "stale socket"
+// concern. That's still fine: each short-lived client's cleanup fires
+// at function exit, well before FC respawns under the next API call.
+func fcAPIClient(socketPath string) (*http.Client, func()) {
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "unix", socketPath)
 		},
 	}
+	client := &http.Client{
+		// No Timeout — each call site uses context.WithTimeout.
+		// This avoids the old 10s global timeout silently racing with
+		// per-call context deadlines.
+		Transport: t,
+	}
+	return client, t.CloseIdleConnections
 }
 
 func fcPut(ctx context.Context, client *http.Client, path, body string) error {

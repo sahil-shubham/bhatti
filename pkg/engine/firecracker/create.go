@@ -268,7 +268,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	// 6. Configure via HTTP API
 	phase("fc_api_start")
-	client := fcAPIClient(apiSocket)
+	client, fcDone := fcAPIClient(apiSocket)
+	defer fcDone()
 
 	// FC logger and metrics must be set before any other configuration.
 	// Warning level only — Debug is guest-influenceable. Non-fatal if setup fails.
