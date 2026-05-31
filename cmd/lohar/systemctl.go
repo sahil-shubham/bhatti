@@ -381,9 +381,17 @@ func runSystemctl(args []string) {
 			}
 		}
 	case "daemon-reload", "daemon-reexec":
-		// no-op (we re-read unit files on each Resolve, so daemon-reload
-		// has no work to do; daemon-reexec is meaningless because we're
-		// not a long-running process here)
+		// We re-read unit files on each fresh Resolve, so we don't need
+		// to clear the positive cache (byKey). But the NEGATIVE cache
+		// (notFound) is sticky — once a Resolve misses, subsequent
+		// Resolves return the cached miss without re-checking the
+		// filesystem. Installers that probe-then-write-then-start
+		// (k3s install is the canonical example: it calls
+		// `systemctl is-active foo` before writing /etc/systemd/system/
+		// foo.service, then `systemctl restart foo` after) hit
+		// "Unit foo not found" on the start because the probe cached
+		// the miss. daemon-reload's job is to invalidate that cache.
+		reg.InvalidateNotFound()
 	case "reset-failed":
 		for _, raw := range units {
 			if u, _ := resolveOrTolerate(raw); u != nil {

@@ -370,6 +370,19 @@ func (r *Registry) isStopRequested(canonical string) bool {
 // code never calls this because PID-1 lohar lives forever.
 func (r *Registry) WaitForWatchers() { r.watcherWG.Wait() }
 
+// InvalidateNotFound clears the negative-resolution cache. Called by
+// the systemctl shim's daemon-reload handler so a unit file written
+// after a previous "is-active"/"status"/etc. lookup (which cached the
+// miss) becomes visible to subsequent start/restart commands. Without
+// this, installers that probe-then-write-then-start (k3s, docker, lots
+// of distro packages) hit "Unit not found" on the start because the
+// probe cached a miss that the write didn't invalidate.
+func (r *Registry) InvalidateNotFound() {
+	r.mu.Lock()
+	r.notFound = make(map[string]struct{})
+	r.mu.Unlock()
+}
+
 // globalRegistry is the long-lived Registry used by PID-1 lohar's syslog
 // receiver, target-wants service activation, and IPC handler. Created in
 // runAgent at boot via NewRegistry(ProductionConfig()).

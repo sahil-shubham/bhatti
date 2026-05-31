@@ -213,6 +213,46 @@ func TestRegistryResolveDirect(t *testing.T) {
 	}
 }
 
+// TestRegistryInvalidateNotFound covers the probe-then-write-then-start
+// pattern: an installer calls is-active on a unit that doesn't exist yet
+// (caches the miss), writes the unit file, runs daemon-reload, then
+// starts the unit. Without InvalidateNotFound() the start fails with
+// "Unit not found" because Resolve hits the stale negative cache.
+//
+// The k3s install script is the canonical offender; this bug blocked
+// the G1.3 kubelet-pause-resume spike.
+func TestRegistryInvalidateNotFound(t *testing.T) {
+	dir := t.TempDir()
+	reg := testRegistry(t, dir)
+
+	// First Resolve before the file exists — caches the miss.
+	if _, err := reg.Resolve("k3s"); err == nil {
+		t.Fatal("Resolve(k3s) on empty dir should fail")
+	}
+
+	// Write the unit file. Without InvalidateNotFound, Resolve still
+	// returns the cached miss.
+	svcPath := filepath.Join(dir, "k3s.service")
+	if err := os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/local/bin/k3s server\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Resolve("k3s"); err == nil {
+		t.Fatal("Resolve(k3s) after write should still fail — negative cache is sticky by design")
+	}
+
+	// daemon-reload's job: invalidate the negative cache.
+	reg.InvalidateNotFound()
+
+	// Now Resolve picks up the on-disk file.
+	u, err := reg.Resolve("k3s")
+	if err != nil {
+		t.Fatalf("Resolve(k3s) after InvalidateNotFound should succeed: %v", err)
+	}
+	if u.Canonical != "k3s" || u.Path != svcPath {
+		t.Errorf("resolved to wrong unit: %+v", u)
+	}
+}
+
 func TestRegistryServiceAndSocketAreDistinct(t *testing.T) {
 	// Regression for an integration-test failure: openssh-server's
 	// postinst calls 'systemctl enable ssh.socket' (resolving .socket)
