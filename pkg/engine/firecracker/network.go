@@ -196,7 +196,7 @@ func intraBridgeAllowPredicate(bridgeName string) []string {
 }
 
 // setupGlobalFirewall configures isolation rules for all VM traffic.
-// Called once from Engine.New(). Idempotent. 6 rules total regardless
+// Called once from Engine.New(). Idempotent. 8 rules total regardless
 // of user/VM count.
 func setupGlobalFirewall() error {
 	defaultIface := detectDefaultInterface()
@@ -219,15 +219,27 @@ func setupGlobalFirewall() error {
 
 		// 4. Allow return traffic from VMs to host (agent TCP responses).
 		// The bhatti daemon initiates TCP connections to VMs. The SYN-ACK
-		// enters INPUT with source 10.0.0.0/8. Without this rule, rule 5
+		// enters INPUT with source 10.0.0.0/8. Without this rule, rule 6
 		// would kill all agent connections.
-		// MUST come before rule 5.
+		// MUST come before rule 6.
 		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-m", "state",
 			"--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
 
-		// 5. Block VM-initiated connections to host (API, SSH, everything).
+		// 5a/5b. Allow VM → host DNS (G1.1 of PLAN-bhatti-v2.md). The
+		// per-user DNS responder binds to the bridge gateway IP
+		// (10.0.N.1:53). A sandbox querying its resolver opens a NEW
+		// connection from 10.0.0.0/8 — without these rules, rule 6 drops
+		// it. Port-scoped to 53 so this doesn't widen the attack
+		// surface for non-DNS host services; destination match against
+		// 10.0.0.0/8 keeps it scoped to bridge gateways.
+		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-d", "10.0.0.0/8",
+			"-p", "udp", "--dport", "53", "-j", "ACCEPT"}},
+		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-d", "10.0.0.0/8",
+			"-p", "tcp", "--dport", "53", "-j", "ACCEPT"}},
+
+		// 6. Block VM-initiated connections to host (API, SSH, everything).
 		// Only NEW connections are dropped. Prevents compromised VMs from
-		// reaching the bhatti API or SSH.
+		// reaching the bhatti API or SSH. DNS escape hatch is rules 5a/5b.
 		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-m", "state",
 			"--state", "NEW", "-j", "DROP"}},
 
