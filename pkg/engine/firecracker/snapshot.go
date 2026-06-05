@@ -83,7 +83,8 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 	}
 
 	// Pause VM
-	client := fcAPIClient(vm.SocketPath)
+	client, fcDone := fcAPIClient(vm.SocketPath)
+	defer fcDone()
 	wasPaused := vm.Thermal == "warm"
 	if vm.Thermal == "hot" {
 		if err := fcPatch(ctx, client, "/vm", `{"state":"Paused"}`); err != nil {
@@ -297,7 +298,7 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 
 	// 2. Network: allocate the EXACT same IP (guest memory has it hardcoded)
 	userNet := e.getOrCreateUserNetwork(manifest.UserID, manifest.SubnetIndex)
-	if err = ensureUserBridge(userNet); err != nil {
+	if err = e.bringUpUserNetwork(userNet); err != nil {
 		return info, fmt.Errorf("setup user bridge: %w", err)
 	}
 	if err = userNet.Pool.TryAllocate(manifest.Network.GuestIP); err != nil {
@@ -350,7 +351,8 @@ func (e *Engine) ResumeSnapshot(ctx context.Context, snapDir string, manifest *S
 	if fcProc.socket != "" {
 		apiSocket = fcProc.socket
 	}
-	client := fcAPIClient(apiSocket)
+	client, fcDone := fcAPIClient(apiSocket)
+	defer fcDone()
 
 	// 5. Load snapshot.
 	var loadVMPath, loadMemPath string

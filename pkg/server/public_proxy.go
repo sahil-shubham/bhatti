@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"log/slog"
@@ -75,76 +76,86 @@ type resolvedRoute struct {
 	port      int
 }
 
-// routeCache maps alias → resolvedRoute. Bounded to 10K entries (LRU eviction).
-// Invalidated on unpublish and sandbox destroy.
+// routeCache maps alias → resolvedRoute. Bounded to 10K entries with
+// true LRU eviction backed by a container/list doubly-linked list.
+// Front = most-recently-used, back = least-recently-used. Eviction is
+// O(1) (pop the back).
+//
+// Pre-fix used a plain map and scanned every entry on each Set to find
+// the oldest — O(N) per eviction with N=10,000 while holding the write
+// lock, which is exactly the wrong shape for a hot path. Tranche 0a #4
+// of PLAN-bhatti-v2.md.
 type routeCache struct {
-	mu      sync.RWMutex
-	entries map[string]*routeCacheEntry
+	mu      sync.Mutex
+	entries map[string]*list.Element // alias → element in order
+	order   *list.List               // front = MRU, back = LRU; values are *routeCacheNode
 }
 
-type routeCacheEntry struct {
-	route      resolvedRoute
-	lastAccess time.Time
+type routeCacheNode struct {
+	alias string
+	route resolvedRoute
 }
 
 const routeCacheMaxSize = 10_000
 
 func newRouteCache() *routeCache {
 	return &routeCache{
-		entries: make(map[string]*routeCacheEntry),
+		entries: make(map[string]*list.Element),
+		order:   list.New(),
 	}
 }
 
 func (rc *routeCache) Get(alias string) (resolvedRoute, bool) {
-	rc.mu.RLock()
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
 	e, ok := rc.entries[alias]
-	rc.mu.RUnlock()
 	if !ok {
 		return resolvedRoute{}, false
 	}
-	// Update access time under write lock (for LRU eviction)
-	rc.mu.Lock()
-	e.lastAccess = time.Now()
-	rc.mu.Unlock()
-	return e.route, true
+	rc.order.MoveToFront(e)
+	return e.Value.(*routeCacheNode).route, true
 }
 
 func (rc *routeCache) Set(alias string, route resolvedRoute) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	// Evict oldest if at capacity
-	if len(rc.entries) >= routeCacheMaxSize {
-		var oldestKey string
-		var oldestTime time.Time
-		for k, v := range rc.entries {
-			if oldestKey == "" || v.lastAccess.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.lastAccess
-			}
-		}
-		if oldestKey != "" {
-			delete(rc.entries, oldestKey)
+	if e, ok := rc.entries[alias]; ok {
+		e.Value.(*routeCacheNode).route = route
+		rc.order.MoveToFront(e)
+		return
+	}
+	if rc.order.Len() >= routeCacheMaxSize {
+		if oldest := rc.order.Back(); oldest != nil {
+			node := oldest.Value.(*routeCacheNode)
+			delete(rc.entries, node.alias)
+			rc.order.Remove(oldest)
 		}
 	}
-	rc.entries[alias] = &routeCacheEntry{
-		route:      route,
-		lastAccess: time.Now(),
-	}
+	node := &routeCacheNode{alias: alias, route: route}
+	rc.entries[alias] = rc.order.PushFront(node)
 }
 
 func (rc *routeCache) Invalidate(alias string) {
 	rc.mu.Lock()
-	delete(rc.entries, alias)
-	rc.mu.Unlock()
+	defer rc.mu.Unlock()
+	if e, ok := rc.entries[alias]; ok {
+		delete(rc.entries, alias)
+		rc.order.Remove(e)
+	}
 }
 
-// InvalidateSandbox removes all cached routes for a sandbox.
+// InvalidateSandbox removes all cached routes for a sandbox. This is
+// O(N) in the cache size but unavoidable: we have to walk the whole
+// map to find matches by sandboxID. It only runs on destroy, not on
+// hot path Get/Set.
 func (rc *routeCache) InvalidateSandbox(sandboxID string) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	for k, v := range rc.entries {
-		if v.route.sandboxID == sandboxID {
+	for k, e := range rc.entries {
+		node := e.Value.(*routeCacheNode)
+		if node.route.sandboxID == sandboxID {
 			delete(rc.entries, k)
+			rc.order.Remove(e)
 		}
 	}
 }
@@ -159,26 +170,36 @@ func (rc *routeCache) InvalidateSandbox(sandboxID string) {
 //     where many IPs target a single published alias.
 //   - Global: protects the proxy process from total overload.
 //
-// Both per-IP and per-alias maps are bounded with LRU eviction.
+// Both per-IP and per-alias maps are bounded with true LRU eviction
+// backed by a container/list doubly-linked list (O(1) eviction).
+//
+// Pre-fix scanned the entire bounded map on every cache miss past
+// capacity to find the oldest entry. With max-size 10,000 and the
+// limiter mutex held throughout, every excess Allow() spent O(N) on a
+// hot HTTP path. Tranche 0a #4 of PLAN-bhatti-v2.md.
 type publicRateLimiter struct {
-	mu       sync.Mutex
-	perIP    map[string]*publicBucket // primary: per source IP
-	perAlias map[string]*publicBucket // secondary: aggregate per alias
-	global   *tokenBucket
+	mu          sync.Mutex
+	perIP       map[string]*list.Element // ip → element in perIPOrder
+	perIPOrder  *list.List               // front = MRU, back = LRU
+	perAlias    map[string]*list.Element
+	perAliasOrder *list.List
+	global      *tokenBucket
 }
 
-type publicBucket struct {
-	bucket     *tokenBucket
-	lastAccess time.Time
+type publicBucketNode struct {
+	key    string
+	bucket *tokenBucket
 }
 
 const publicRateLimiterMaxSize = 10_000
 
 func newPublicRateLimiter() *publicRateLimiter {
 	return &publicRateLimiter{
-		perIP:    make(map[string]*publicBucket),
-		perAlias: make(map[string]*publicBucket),
-		global:   newTokenBucket(10000, 10000),
+		perIP:         make(map[string]*list.Element),
+		perIPOrder:    list.New(),
+		perAlias:      make(map[string]*list.Element),
+		perAliasOrder: list.New(),
+		global:        newTokenBucket(10000, 10000),
 	}
 }
 
@@ -193,13 +214,13 @@ func (l *publicRateLimiter) Allow(alias, ip string) bool {
 	}
 
 	// Primary: per source IP
-	ipb := l.getOrCreate(l.perIP, ip, 500, 1500)
+	ipb := l.getOrCreate(l.perIP, l.perIPOrder, ip, 500, 1500)
 	if !ipb.allow() {
 		return false
 	}
 
 	// Secondary: per-alias aggregate
-	ab := l.getOrCreate(l.perAlias, alias, 2000, 5000)
+	ab := l.getOrCreate(l.perAlias, l.perAliasOrder, alias, 2000, 5000)
 	if !ab.allow() {
 		return false
 	}
@@ -208,39 +229,29 @@ func (l *publicRateLimiter) Allow(alias, ip string) bool {
 }
 
 // getOrCreate returns the token bucket for key, creating one if needed.
-// Evicts the oldest entry if the map exceeds publicRateLimiterMaxSize.
+// Evicts the back (least-recently-used) of `order` if at capacity.
+// MRU bookkeeping: on every call, move the entry to the front.
 func (l *publicRateLimiter) getOrCreate(
-	m map[string]*publicBucket, key string,
-	burst, perMin float64,
+	m map[string]*list.Element, order *list.List,
+	key string, burst, perMin float64,
 ) *tokenBucket {
-	pb, ok := m[key]
-	if !ok {
-		if len(m) >= publicRateLimiterMaxSize {
-			evictOldest(m)
-		}
-		pb = &publicBucket{
-			bucket:     newTokenBucket(burst, perMin),
-			lastAccess: time.Now(),
-		}
-		m[key] = pb
+	if e, ok := m[key]; ok {
+		order.MoveToFront(e)
+		return e.Value.(*publicBucketNode).bucket
 	}
-	pb.lastAccess = time.Now()
-	return pb.bucket
-}
-
-// evictOldest removes the least-recently-accessed entry from the map.
-func evictOldest(m map[string]*publicBucket) {
-	var oldestKey string
-	var oldestTime time.Time
-	for k, v := range m {
-		if oldestKey == "" || v.lastAccess.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = v.lastAccess
+	if order.Len() >= publicRateLimiterMaxSize {
+		if oldest := order.Back(); oldest != nil {
+			node := oldest.Value.(*publicBucketNode)
+			delete(m, node.key)
+			order.Remove(oldest)
 		}
 	}
-	if oldestKey != "" {
-		delete(m, oldestKey)
+	node := &publicBucketNode{
+		key:    key,
+		bucket: newTokenBucket(burst, perMin),
 	}
+	m[key] = order.PushFront(node)
+	return node.bucket
 }
 
 // extractIP strips the port from a RemoteAddr "host:port" string.

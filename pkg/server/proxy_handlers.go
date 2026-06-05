@@ -252,6 +252,50 @@ func idleCopyWithDeadline(dst io.Writer, src deadlineConn, timeout time.Duration
 	}
 }
 
+// relayBidirectional copies bytes in both directions between a and b
+// until either direction ends (close, error, or idle timeout). When
+// one direction returns, the function closes the OTHER side's source
+// so the still-running direction's blocking Read errors out and its
+// goroutine exits.
+//
+// Without that explicit close, plain io.Copy between two long-lived
+// half-open-tolerant peers (e.g. one side EOFs but the other keeps
+// its Read blocked because nobody closed its source) leaks the
+// goroutine for the blocked direction — the deferred Close in the
+// caller doesn't fire until the function returns, and the function
+// can't return until the blocked direction unblocks. Tranche 0a #1.
+//
+// If a side implements deadlineConn it uses idle-timeout detection;
+// otherwise plain io.Copy. The close-the-other-side mechanism is
+// the teardown path either way.
+func relayBidirectional(a, b io.ReadWriteCloser, idle time.Duration) {
+	done := make(chan struct{})
+
+	// Direction 1 (background goroutine): a → b.
+	go func() {
+		if dc, ok := a.(deadlineConn); ok {
+			idleCopyWithDeadline(b, dc, idle)
+		} else {
+			io.Copy(b, a)
+		}
+		// a's read ended — wake the other direction by closing b
+		// so its Read on b returns.
+		b.Close()
+		close(done)
+	}()
+
+	// Direction 2 (foreground): b → a.
+	if dc, ok := b.(deadlineConn); ok {
+		idleCopyWithDeadline(a, dc, idle)
+	} else {
+		io.Copy(a, b)
+	}
+	// b's read ended — wake the background goroutine.
+	a.Close()
+
+	<-done
+}
+
 // proxyWebSocket hijacks the client connection and relays WS frames
 // through an engine tunnel. Used by both the authenticated proxy and
 // (in the future) the public proxy. Includes an idle timeout to prevent
@@ -313,25 +357,12 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, eng engine.Engine, e
 		}()
 	}
 
-	// Bidirectional relay with idle timeout.
-	// If the tunnel supports SetReadDeadline (net.Conn-backed), use
-	// deadline-based idle detection. Otherwise fall back to plain io.Copy.
-	done := make(chan struct{})
-	tunnelDC, tunnelHasDeadline := tunnel.(deadlineConn)
-	if tunnelHasDeadline {
-		go func() {
-			idleCopyWithDeadline(tunnel, clientConn, wsIdleTimeout)
-			close(done)
-		}()
-		idleCopyWithDeadline(clientConn, tunnelDC, wsIdleTimeout)
-	} else {
-		go func() {
-			io.Copy(tunnel, clientConn)
-			close(done)
-		}()
-		io.Copy(clientConn, tunnel)
-	}
-	<-done
+	// Bidirectional relay with idle timeout and leak-free teardown.
+	// See relayBidirectional's docs for the close-the-other-side
+	// teardown pattern. The deferred clientConn.Close() and
+	// tunnel.Close() at function entry still fire afterwards;
+	// net.Conn.Close is safe to call multiple times.
+	relayBidirectional(clientConn, tunnel, wsIdleTimeout)
 
 	if stopActivity != nil {
 		stopActivity()

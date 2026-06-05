@@ -41,6 +41,14 @@ func testEngine(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Pre-G1.1 the engine had no long-lived background goroutines, so
+	// tests could just let it go out of scope. Now Engine.New spawns a
+	// per-user DNS responder bound to the bridge gateway IP. Without
+	// explicit Shutdown each test leaks the goroutine + holds the port
+	// 53 bind, and consecutive tests on the same subnet (e.g. all the
+	// thermal_test.go tests on usr_test/subnet 99) fail to start their
+	// own responder with "address already in use".
+	t.Cleanup(eng.Shutdown)
 	return eng
 }
 

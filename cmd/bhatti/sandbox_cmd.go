@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -12,6 +14,48 @@ import (
 
 func base64Encode(data []byte) string {
 	return base64.StdEncoding.EncodeToString(data)
+}
+
+// parseLabelFlag turns []string{"k=v", "k2=v2"} into a map. Splits on
+// the first `=` so values can contain further `=` chars. Returns an
+// error on the first malformed entry. Empty input returns nil; callers
+// guard on `len(labels) > 0` before populating the request body.
+func parseLabelFlag(raw []string) (map[string]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(raw))
+	for _, lf := range raw {
+		eq := strings.IndexByte(lf, '=')
+		if eq < 0 {
+			return nil, fmt.Errorf("invalid --label %q: expected key=value", lf)
+		}
+		key := lf[:eq]
+		if key == "" {
+			return nil, fmt.Errorf("invalid --label %q: empty key", lf)
+		}
+		out[key] = lf[eq+1:]
+	}
+	return out, nil
+}
+
+// formatLabels renders a labels map as "k=v,k2=v2" with deterministic
+// key ordering (alphabetical) for tabular ls -o wide output. Returns
+// "-" for empty/nil so the column doesn't collapse.
+func formatLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(labels))
+	for _, k := range keys {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return strings.Join(parts, ",")
 }
 
 var createCmd = &cobra.Command{
@@ -52,6 +96,7 @@ with its own kernel, filesystem, and network.`,
 		volFlags, _ := cmd.Flags().GetStringSlice("volume")
 		secretFlags, _ := cmd.Flags().GetStringSlice("secret")
 		fileFlags, _ := cmd.Flags().GetStringSlice("file")
+		labelFlags, _ := cmd.Flags().GetStringSlice("label")
 
 		tmpl, _ := cmd.Flags().GetString("template")
 
@@ -82,6 +127,15 @@ with its own kernel, filesystem, and network.`,
 		}
 		if hugepages {
 			req["hugepages"] = true
+		}
+
+		// Parse --label flags: key=value pairs (repeatable)
+		if len(labelFlags) > 0 {
+			labels, err := parseLabelFlag(labelFlags)
+			if err != nil {
+				return err
+			}
+			req["labels"] = labels
 		}
 
 		// Parse --secret flags
@@ -198,10 +252,15 @@ func init() {
 	createCmd.Flags().StringSlice("volume", nil, "Persistent volume (name:mount[:ro])")
 	createCmd.Flags().StringSlice("secret", nil, "Secret name from store (repeatable)")
 	createCmd.Flags().StringSlice("file", nil, "Inject file (local_path:guest_path, repeatable)")
+	createCmd.Flags().StringSlice("label", nil, "Set label key=value (repeatable)")
 
 	editCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions (for autonomous agents)")
 	editCmd.Flags().Bool("allow-cold", false, "Re-enable thermal transitions")
 	editCmd.Flags().String("name", "", "Rename sandbox")
+	editCmd.Flags().StringSlice("label", nil, "Set or update label key=value (repeatable)")
+	editCmd.Flags().StringSlice("label-delete", nil, "Remove label by key (repeatable)")
+
+	listCmd.Flags().StringSlice("label", nil, "Filter by label key=value (AND across multiple, repeatable)")
 
 	startCmd.Flags().Bool("force", false, "Force start (retry after failed restore)")
 }
@@ -246,8 +305,21 @@ and toggling keep_hot to control thermal management.`,
 			req["name"] = newName
 		}
 
+		labelFlags, _ := cmd.Flags().GetStringSlice("label")
+		labelDeleteFlags, _ := cmd.Flags().GetStringSlice("label-delete")
+		if len(labelFlags) > 0 {
+			add, err := parseLabelFlag(labelFlags)
+			if err != nil {
+				return err
+			}
+			req["labels_add"] = add
+		}
+		if len(labelDeleteFlags) > 0 {
+			req["labels_remove"] = labelDeleteFlags
+		}
+
 		if len(req) == 0 {
-			return fmt.Errorf("nothing to update — use --name, --keep-hot, or --allow-cold")
+			return fmt.Errorf("nothing to update — use --name, --keep-hot, --allow-cold, --label, or --label-delete")
 		}
 
 		var sb map[string]any
@@ -465,18 +537,32 @@ var listCmd = &cobra.Command{
 		defer printTiming()
 
 		var sandboxes []struct {
-			ID         string   `json:"id"`
-			Name       string   `json:"name"`
-			Status     string   `json:"status"`
-			Thermal    string   `json:"thermal"`
-			IP         string   `json:"ip"`
-			URLs       []string `json:"urls"`
-			CPUs       float64  `json:"cpus"`
-			MemoryMB   float64  `json:"memory_mb"`
-			DiskSizeMB float64  `json:"disk_size_mb"`
-			Image      string   `json:"image"`
+			ID         string            `json:"id"`
+			Name       string            `json:"name"`
+			Status     string            `json:"status"`
+			Thermal    string            `json:"thermal"`
+			IP         string            `json:"ip"`
+			URLs       []string          `json:"urls"`
+			CPUs       float64           `json:"cpus"`
+			MemoryMB   float64           `json:"memory_mb"`
+			DiskSizeMB float64           `json:"disk_size_mb"`
+			Image      string            `json:"image"`
+			Labels     map[string]string `json:"labels,omitempty"`
 		}
-		if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
+		// Build query string with optional --label filters.
+		path := "/sandboxes"
+		labelFlags, _ := cmd.Flags().GetStringSlice("label")
+		if len(labelFlags) > 0 {
+			q := url.Values{}
+			for _, lf := range labelFlags {
+				// Pass through as-is; the server validates k=v shape and
+				// returns 400 on invalid input. The client doesn't try to
+				// pre-validate so the user gets one consistent error path.
+				q.Add("label", lf)
+			}
+			path += "?" + q.Encode()
+		}
+		if err := apiJSON("GET", path, nil, &sandboxes); err != nil {
 			return err
 		}
 
@@ -494,8 +580,8 @@ var listCmd = &cobra.Command{
 			outputJSON(sandboxes)
 		} else if wide {
 			// B6: wide mode with resources and image
-			fmt.Printf("%-20s %-10s %-8s %-16s %-6s %-8s %-8s %s\n",
-				"NAME", "STATUS", "THERMAL", "IP", "CPUS", "MEMORY", "DISK", "IMAGE")
+			fmt.Printf("%-20s %-10s %-8s %-16s %-6s %-8s %-8s %-12s %s\n",
+				"NAME", "STATUS", "THERMAL", "IP", "CPUS", "MEMORY", "DISK", "IMAGE", "LABELS")
 			for _, sb := range sandboxes {
 				thermal := sb.Thermal
 				if thermal == "" {
@@ -513,8 +599,8 @@ var listCmd = &cobra.Command{
 				if img == "" {
 					img = "minimal"
 				}
-				fmt.Printf("%-20s %-10s %-8s %-16s %-6g %-8.0f %-8.0f %s\n",
-					sb.Name, sb.Status, thermal, sb.IP, cpus, mem, sb.DiskSizeMB, img)
+				fmt.Printf("%-20s %-10s %-8s %-16s %-6g %-8.0f %-8.0f %-12s %s\n",
+					sb.Name, sb.Status, thermal, sb.IP, cpus, mem, sb.DiskSizeMB, img, formatLabels(sb.Labels))
 			}
 		} else {
 			// B6: clean default — no ID column

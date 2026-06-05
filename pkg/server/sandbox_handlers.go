@@ -39,6 +39,9 @@ type createSandboxReq struct {
 	// B15: secrets and files on create
 	Secrets []string       `json:"secrets,omitempty"` // secret names to resolve from store
 	Files   []createFileReq `json:"files,omitempty"`   // files to inject via config drive
+
+	// G1.6: operator-controlled labels for fleet enumeration
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // createFileReq describes a file to inject at sandbox creation.
@@ -53,7 +56,12 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListSandboxes(user.ID)
+		labelFilter, err := parseLabelQueryParams(r.URL.Query()["label"])
+		if err != nil {
+			errResp(w, 400, err.Error())
+			return
+		}
+		list, err := s.store.ListSandboxesWithFilter(user.ID, labelFilter)
 		if err != nil {
 			errRespInternal(w, r, "list sandboxes failed", err)
 			return
@@ -125,6 +133,12 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// Validate sandbox name
 		if req.Name != "" && !isValidName(req.Name) {
 			errResp(w, 400, "invalid sandbox name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
+			return
+		}
+
+		// Validate labels.
+		if err := validateLabels(req.Labels); err != nil {
+			errResp(w, 400, err.Error())
 			return
 		}
 
@@ -491,6 +505,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			MemoryMB:   spec.MemoryMB,
 			DiskSizeMB: spec.DiskSizeMB,
 			Image:      imageName,
+			Labels:     req.Labels,
 		}
 		if err := s.store.CreateSandbox(sb); err != nil {
 			// UNIQUE constraint violation → name race. Another concurrent
@@ -663,8 +678,10 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			KeepHot *bool   `json:"keep_hot"`
-			Name    *string `json:"name"`
+			KeepHot       *bool             `json:"keep_hot"`
+			Name          *string           `json:"name"`
+			LabelsAdd     map[string]string `json:"labels_add,omitempty"`
+			LabelsRemove  []string          `json:"labels_remove,omitempty"`
 		}
 		if err := readJSON(r, &req); err != nil {
 			errResp(w, 400, "invalid json: "+err.Error())
@@ -698,6 +715,36 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			s.RecordEvent(store.Event{
 				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
 				Meta: map[string]any{"old_name": oldName, "new_name": newName},
+			})
+		}
+		// Labels: validate, then merge via UpdateSandboxLabels.
+		if len(req.LabelsAdd) > 0 || len(req.LabelsRemove) > 0 {
+			if err := validateLabels(req.LabelsAdd); err != nil {
+				errResp(w, 400, err.Error())
+				return
+			}
+			if err := validateLabelKeys(req.LabelsRemove); err != nil {
+				errResp(w, 400, err.Error())
+				return
+			}
+			if err := s.store.UpdateSandboxLabels(user.ID, sb.ID, req.LabelsAdd, req.LabelsRemove); err != nil {
+				errRespInternal(w, r, "update labels failed", err)
+				return
+			}
+			// Refresh sb so the response reflects the new labels.
+			if refreshed, err := s.store.GetSandbox(user.ID, sb.ID); err == nil {
+				sb = refreshed
+			}
+			slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name,
+				"labels_added", len(req.LabelsAdd), "labels_removed", len(req.LabelsRemove),
+				"user", user.Name)
+			s.RecordEvent(store.Event{
+				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
+				Meta: map[string]any{
+					"name": sb.Name,
+					"labels_added":   len(req.LabelsAdd),
+					"labels_removed": len(req.LabelsRemove),
+				},
 			})
 		}
 		if req.KeepHot != nil {

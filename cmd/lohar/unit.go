@@ -370,6 +370,38 @@ func (r *Registry) isStopRequested(canonical string) bool {
 // code never calls this because PID-1 lohar lives forever.
 func (r *Registry) WaitForWatchers() { r.watcherWG.Wait() }
 
+// Reload re-reads on-disk unit state, matching real systemd's
+// daemon-reload semantics: NEW unit files become discoverable
+// (negative cache cleared), MODIFIED unit files have their parsed
+// directives refreshed (positive cache cleared so the next Resolve
+// re-parses from disk), and RUNTIME state is preserved (PIDs,
+// .activating markers, .failed markers all live in marker files on
+// disk, not on the Unit struct, so dropping byKey doesn't lose
+// them).
+//
+// Why we clear byKey wholesale rather than re-parsing each unit's
+// Sections in place: drop-ins, [Install] Alias= entries, and
+// template specifier expansion all happen in buildUnit. Re-running
+// the full pipeline in place is more code than just letting the
+// next Resolve do it fresh, and it'd risk leaving partially-updated
+// state (e.g., an alias added to a unit file but not yet indexed
+// in byKey) until the next access.
+//
+// Surfaced twice during the G1.3 kubelet spike:
+//   1. notFound cache: probe-then-write-then-start (k3s install).
+//      Pre-fix: "Unit k3s not found" on start.
+//   2. byKey cache: edit unit file in place, daemon-reload, restart.
+//      Pre-fix: cached parse still has Type=notify even though file
+//      now says Type=exec, so waitForNotifyReady fires for the
+//      wrong unit shape.
+func (r *Registry) Reload() {
+	r.mu.Lock()
+	r.notFound = make(map[string]struct{})
+	r.byKey = make(map[string]*Unit)
+	r.byInode = make(map[uint64]*Unit)
+	r.mu.Unlock()
+}
+
 // globalRegistry is the long-lived Registry used by PID-1 lohar's syslog
 // receiver, target-wants service activation, and IPC handler. Created in
 // runAgent at boot via NewRegistry(ProductionConfig()).

@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/sahil-shubham/bhatti/pkg/dns"
 )
 
 // UserNetwork holds the network state for a single user.
@@ -18,6 +20,13 @@ type UserNetwork struct {
 	GatewayIP  string // e.g. "10.0.1.1"
 	Subnet     string // e.g. "10.0.1.0/24"
 	Pool       *ipPool
+
+	// DNS is the per-user DNS responder bound to GatewayIP:53. Started
+	// by Engine.bringUpUserNetwork after ensureUserBridge succeeds;
+	// stopped by Engine.removeUserNetworkIfEmpty before destroyUserBridge.
+	// nil when the bind failed (in which case L2/L3 still works, just
+	// no name resolution for this user). G1.1 of PLAN-bhatti-v2.md.
+	DNS *dns.Server
 }
 
 // subnetFromIndex converts a 1-based subnet index to network parameters.
@@ -128,24 +137,66 @@ func (p *ipPool) Mark(ip string) {
 	p.mu.Unlock()
 }
 
-// ensureUserBridge creates a user's bridge if it doesn't exist.
-// Idempotent — safe to call on every sandbox creation.
+// ensureUserBridge creates a user's bridge if it doesn't exist and
+// installs the per-bridge iptables exemption. Idempotent — safe to
+// call on every sandbox creation.
 func ensureUserBridge(net *UserNetwork) error {
 	runQuiet("ip", "link", "add", net.BridgeName, "type", "bridge")
 	runQuiet("ip", "addr", "add", net.GatewayIP+"/24", "dev", net.BridgeName)
 	if err := run("ip", "link", "set", net.BridgeName, "up"); err != nil {
 		return fmt.Errorf("bring up bridge %s: %w", net.BridgeName, err)
 	}
+	pred := intraBridgeAllowPredicate(net.BridgeName)
+	check := append([]string{"-t", "filter", "-C", "FORWARD"}, pred...)
+	if runQuiet("iptables", check...) != nil {
+		// Insert at position 1 so the ACCEPT shadows the cross-bridge
+		// DROP that setupGlobalFirewall installs (also at position 1,
+		// pushed down to position 2 after this insert).
+		insert := append([]string{"-t", "filter", "-I", "FORWARD", "1"}, pred...)
+		if err := run("iptables", insert...); err != nil {
+			return fmt.Errorf("install intra-bridge allow rule: %w", err)
+		}
+	}
 	return nil
 }
 
-// destroyUserBridge removes a user's bridge device.
+// destroyUserBridge removes a user's bridge device and its per-bridge
+// iptables exemption.
 func destroyUserBridge(bridgeName string) {
+	pred := intraBridgeAllowPredicate(bridgeName)
+	del := append([]string{"-t", "filter", "-D", "FORWARD"}, pred...)
+	runQuiet("iptables", del...)
 	run("ip", "link", "del", bridgeName)
 }
 
+// intraBridgeAllowPredicate returns the iptables predicate arguments
+// (the "-i <bridge> -o <bridge> -j ACCEPT" portion) that match intra-
+// bridge same-user-sandbox-to-same-user-sandbox traffic. Callers prepend
+// "-t filter -I/-A/-C/-D FORWARD [pos]" depending on the operation.
+//
+// Why this exists: setupGlobalFirewall's DROP rule on
+// 10.0.0.0/8 -> 10.0.0.0/8 assumes intra-bridge traffic stays at L2 and
+// never enters the FORWARD chain. That assumption holds on a pure
+// bhatti host. It BREAKS when the host has bridge-nf-call-iptables=1,
+// which is the universal case for any host also running Kubernetes,
+// Docker, or anything else that loads br_netfilter. With br_netfilter
+// active, intra-bridge L2 traffic is routed through L3 iptables; same-
+// user-sandbox-to-same-user-sandbox traffic hits the cross-bridge DROP
+// and is silently lost.
+//
+// Surfaced during the G1.3 spike: k3s worker -> k3s control plane on
+// the same bhatti bridge timed out because the host (asus-i5) was also
+// a k3s node, which had loaded br_netfilter.
+//
+// The rule is harmless when br_netfilter is OFF: no traffic matches
+// because intra-bridge traffic stays at L2 and never reaches FORWARD,
+// so the rule sits at counter zero forever.
+func intraBridgeAllowPredicate(bridgeName string) []string {
+	return []string{"-i", bridgeName, "-o", bridgeName, "-j", "ACCEPT"}
+}
+
 // setupGlobalFirewall configures isolation rules for all VM traffic.
-// Called once from Engine.New(). Idempotent. 6 rules total regardless
+// Called once from Engine.New(). Idempotent. 8 rules total regardless
 // of user/VM count.
 func setupGlobalFirewall() error {
 	defaultIface := detectDefaultInterface()
@@ -166,17 +217,44 @@ func setupGlobalFirewall() error {
 		{"filter", "FORWARD", []string{"-d", "10.0.0.0/8", "-m", "state",
 			"--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
 
+		// ORDERING (in this slice == in iptables top-down): the install
+		// loop below iterates this slice in REVERSE and inserts each
+		// rule at position 1. That means the LAST rule iterated (= the
+		// FIRST rule in this slice) ends up at the TOP of the chain.
+		// So this slice reads in iptables-evaluation order: top first.
+		//
+		// I had this backwards in 412d82a and put port-53 ACCEPTs at
+		// the END of the slice thinking they'd land at the top. They
+		// landed at the BOTTOM, below the DROP NEW. Diagnostic dump
+		// from a raspi-5b reproduction showed the packet hitting the
+		// DROP NEW (pkt count = 1) and the ACCEPTs at 0. Reverted to
+		// the right order: port-53 ACCEPTs go BEFORE the DROP NEW in
+		// the slice so they're evaluated first.
+
 		// 4. Allow return traffic from VMs to host (agent TCP responses).
 		// The bhatti daemon initiates TCP connections to VMs. The SYN-ACK
-		// enters INPUT with source 10.0.0.0/8. Without this rule, rule 5
+		// enters INPUT with source 10.0.0.0/8. Without this rule, rule 6
 		// would kill all agent connections.
-		// MUST come before rule 5.
 		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-m", "state",
 			"--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
 
-		// 5. Block VM-initiated connections to host (API, SSH, everything).
+		// 5a/5b. Allow VM → host DNS (G1.1 of PLAN-bhatti-v2.md). The
+		// per-user DNS responder binds to the bridge gateway IP
+		// (10.0.N.1:53). A sandbox querying its resolver opens a NEW
+		// connection from 10.0.0.0/8 — without these rules, rule 6
+		// drops it. Port-scoped to 53 so this doesn't widen the attack
+		// surface for non-DNS host services; destination-scoped to
+		// 10.0.0.0/8 keeps it from accepting random DNS traffic.
+		// MUST come before rule 6 (the NEW DROP).
+		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-d", "10.0.0.0/8",
+			"-p", "udp", "--dport", "53", "-j", "ACCEPT"}},
+		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-d", "10.0.0.0/8",
+			"-p", "tcp", "--dport", "53", "-j", "ACCEPT"}},
+
+		// 6. Block VM-initiated connections to host (API, SSH, everything).
 		// Only NEW connections are dropped. Prevents compromised VMs from
-		// reaching the bhatti API or SSH.
+		// reaching the bhatti API or SSH. DNS escape hatch is rules 5a/5b
+		// which iptables evaluates BEFORE this DROP.
 		{"filter", "INPUT", []string{"-s", "10.0.0.0/8", "-m", "state",
 			"--state", "NEW", "-j", "DROP"}},
 
@@ -229,14 +307,26 @@ func cleanupOldBridge() {
 			"-i", defaultIface, "-o", "brbhatti0", "-j", "ACCEPT")
 	}
 
-	// Remove old 10.0.0.0/8 rules that may have been appended (-A) at
-	// the wrong position (bottom of chain, after UFW rules)
-	runQuiet("iptables", "-D", "FORWARD", "-s", "10.0.0.0/8", "-d", "10.0.0.0/8", "-j", "DROP")
-	runQuiet("iptables", "-D", "FORWARD", "-s", "10.0.0.0/8", "!", "-d", "10.0.0.0/8", "-j", "ACCEPT")
-	runQuiet("iptables", "-D", "FORWARD", "-d", "10.0.0.0/8", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-	runQuiet("iptables", "-D", "INPUT", "-s", "10.0.0.0/8", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-	runQuiet("iptables", "-D", "INPUT", "-s", "10.0.0.0/8", "-m", "state", "--state", "NEW", "-j", "DROP")
-	runQuiet("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "10.0.0.0/8", "-o", defaultIface, "-j", "MASQUERADE")
+	// DELIBERATELY do NOT delete the 10.0.0.0/8 FORWARD/INPUT/NAT
+	// rules here, even though earlier versions of this function did.
+	// Those rules ARE the current rules that setupGlobalFirewall
+	// installs — deleting them and re-inserting forces them to the
+	// top of the chain on each Engine.New, which gets the relative
+	// ordering between INPUT rules wrong on the 2nd-and-later call:
+	//
+	//   1st New: clean install → [RELATED, UDP53, TCP53, DROP] ✓
+	//   2nd New: cleanup deletes RELATED + DROP, leaves UDP53/TCP53.
+	//            setupGlobalFirewall's -C check finds UDP53/TCP53
+	//            and skips them, then -I-1 inserts DROP and RELATED
+	//            on top → [RELATED, DROP, UDP53, TCP53] ✗
+	//
+	// The 2nd-and-later order puts DROP NEW above the port-53
+	// ACCEPTs, so NEW DNS queries from sandboxes match the DROP
+	// first and get silently lost. setupGlobalFirewall is
+	// idempotent on its own (via -C), so the delete-and-reinsert
+	// dance buys nothing once we're past the 192.168.137.0/24 era
+	// migration. Hunted down via raspi-5b reproducer + iptables
+	// diagnostic dump on test failure.
 }
 
 func createTapDevice(sandboxID string, bridge string) (tapName string, err error) {

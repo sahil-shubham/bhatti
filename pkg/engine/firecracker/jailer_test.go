@@ -45,6 +45,14 @@ func testJailedEngine(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatalf("New (jailed): %v", err)
 	}
+	// Same as testEngine: after G1.1 the engine owns DNS responder
+	// goroutines bound to bridge gateway IPs. Without Shutdown each
+	// test leaks the responder and the next test on the same subnet
+	// hits "bind: address already in use". Caught in integration run
+	// 26741170133 when TestRecoveryMultiVolumeOrdering (which uses
+	// testJailedEngine, not testEngine) didn't clean up its DNS and
+	// every subsequent thermal_test.go test ran without a responder.
+	t.Cleanup(eng.Shutdown)
 	return eng
 }
 

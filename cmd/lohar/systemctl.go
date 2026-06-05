@@ -381,9 +381,13 @@ func runSystemctl(args []string) {
 			}
 		}
 	case "daemon-reload", "daemon-reexec":
-		// no-op (we re-read unit files on each Resolve, so daemon-reload
-		// has no work to do; daemon-reexec is meaningless because we're
-		// not a long-running process here)
+		// Drop both the negative cache (so newly-created unit files
+		// become discoverable) and the positive cache (so edited unit
+		// files have their parsed directives refreshed on next
+		// Resolve). Runtime state lives in marker files on disk —
+		// PIDs, .activating, .failed — so wiping byKey doesn't lose
+		// it. See Registry.Reload's doc comment for the full story.
+		reg.Reload()
 	case "reset-failed":
 		for _, raw := range units {
 			if u, _ := resolveOrTolerate(raw); u != nil {

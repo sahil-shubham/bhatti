@@ -7,6 +7,7 @@ require (
 	github.com/google/go-containerregistry v0.21.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/cobra v1.10.2
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.41.0

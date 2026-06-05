@@ -237,7 +237,8 @@ func TestPublicProxySnapshotFailureResetOnTraffic(t *testing.T) {
 	_, eid := publishSandbox(t, srv, eng, "snap-reset", "snap-rst", 8080)
 
 	// Simulate 2 consecutive snapshot failures
-	srv.snapshotFailures.Store(eid, 2)
+	srv.incrementSnapshotFailures(eid)
+	srv.incrementSnapshotFailures(eid)
 
 	hitPublicProxy(t, ts, "snap-rst")
 

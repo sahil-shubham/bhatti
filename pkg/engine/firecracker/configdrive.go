@@ -21,6 +21,14 @@ type SandboxConfig struct {
 	Volumes   []VolumeMountConfig   `json:"volumes"`
 	Init      string            `json:"init,omitempty"`
 	DNS       []string          `json:"dns"`
+	// DNSInternal is the per-user bridge gateway IP that hosts the
+	// in-cluster DNS responder (G1.1 of PLAN-bhatti-v2.md). Lohar
+	// installs this as the FIRST nameserver in /etc/resolv.conf so
+	// sandbox-name lookups resolve locally; the public DNS entries
+	// in DNS act as the fallback for non-sandbox names.
+	// Empty string skips the internal-DNS install (compatible with
+	// rootfs images built before G1.1 or hosts where DNS bind failed).
+	DNSInternal string `json:"dns_internal,omitempty"`
 	User      string            `json:"user"`
 }
 

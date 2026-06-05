@@ -213,6 +213,97 @@ func TestRegistryResolveDirect(t *testing.T) {
 	}
 }
 
+// TestRegistryReloadPicksUpModifiedUnitFile covers the case where an
+// admin edits a unit file in place (or an installer rewrites it with
+// different directives) and then runs daemon-reload. Without Reload
+// clearing byKey, Resolve returns the cached Unit object — with
+// stale u.Sections — forever, so subsequent svcStart calls operate on
+// the OLD parsed directives even though the on-disk file changed.
+//
+// Surfaced during the G1.3 spike: I edited k3s.service to swap
+// Type=notify -> Type=exec, ran daemon-reload + restart, and the
+// shim still walked the Type=notify code path (waitForNotifyReady)
+// because byKey held the stale parse. "Exited before sending
+// READY=1" from waitForNotifyReady, even though the file said exec.
+func TestRegistryReloadPicksUpModifiedUnitFile(t *testing.T) {
+	dir := t.TempDir()
+	svcPath := filepath.Join(dir, "test.service")
+
+	if err := os.WriteFile(svcPath, []byte("[Service]\nType=simple\nExecStart=/bin/true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	reg := testRegistry(t, dir)
+	u, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := u.Sections.get("Service", "Type"); got != "simple" {
+		t.Fatalf("initial parse: Type=%q, want simple", got)
+	}
+
+	// Edit the file: change Type.
+	if err := os.WriteFile(svcPath, []byte("[Service]\nType=oneshot\nExecStart=/bin/true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without Reload, the cached parse is still the old one.
+	cached, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cached.Sections.get("Service", "Type"); got != "simple" {
+		t.Fatalf("pre-reload Resolve: Type=%q, want stale 'simple' (the cache is doing its job)", got)
+	}
+
+	// daemon-reload's job: refresh byKey from disk.
+	reg.Reload()
+
+	fresh, err := reg.Resolve("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fresh.Sections.get("Service", "Type"); got != "oneshot" {
+		t.Fatalf("post-reload Resolve: Type=%q, want fresh 'oneshot'", got)
+	}
+}
+
+// TestRegistryReloadStillClearsNotFound is the regression for the
+// earlier daemon-reload fix (commit 579649d). After Reload was
+// extended to also clear byKey, make sure the negative cache still
+// gets invalidated too — the probe-then-write-then-start case must
+// keep working.
+func TestRegistryReloadStillClearsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	reg := testRegistry(t, dir)
+
+	// First Resolve before the file exists — caches the miss.
+	if _, err := reg.Resolve("k3s"); err == nil {
+		t.Fatal("Resolve(k3s) on empty dir should fail")
+	}
+
+	// Write the unit file. Without InvalidateNotFound, Resolve still
+	// returns the cached miss.
+	svcPath := filepath.Join(dir, "k3s.service")
+	if err := os.WriteFile(svcPath, []byte("[Service]\nExecStart=/usr/local/bin/k3s server\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Resolve("k3s"); err == nil {
+		t.Fatal("Resolve(k3s) after write should still fail — negative cache is sticky by design")
+	}
+
+	// daemon-reload's job: invalidate the negative cache.
+	reg.Reload()
+
+	// Now Resolve picks up the on-disk file.
+	u, err := reg.Resolve("k3s")
+	if err != nil {
+		t.Fatalf("Resolve(k3s) after Reload should succeed: %v", err)
+	}
+	if u.Canonical != "k3s" || u.Path != svcPath {
+		t.Errorf("resolved to wrong unit: %+v", u)
+	}
+}
+
 func TestRegistryServiceAndSocketAreDistinct(t *testing.T) {
 	// Regression for an integration-test failure: openssh-server's
 	// postinst calls 'systemctl enable ssh.socket' (resolving .socket)

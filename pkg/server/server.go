@@ -57,8 +57,8 @@ type Server struct {
 	stopTaskCleanup context.CancelFunc
 	startTime       time.Time
 	lastActivity     sync.Map // engineID → time.Time — host-side activity cache
-	snapshotFailures sync.Map // engineID → int — consecutive snapshot failure count
-	thermalFails     sync.Map // engineID → int — consecutive Activity query failures
+	snapshotFailures sync.Map // engineID → *atomic.Int64 — consecutive snapshot failure count
+	thermalFails     sync.Map // engineID → *atomic.Int64 — consecutive Activity query failures
 
 	// Task cancellation for async operations (image pull)
 	pullCancelMu sync.Mutex
@@ -97,11 +97,15 @@ type Server struct {
 const maxThermalFailures = 10
 
 // incrementThermalFails bumps and returns the consecutive failure count.
+// The sync.Map value is *atomic.Int64; LoadOrStore returns the existing
+// or newly-inserted pointer, and Add(1) on that pointer is atomic. If a
+// concurrent resetThermalFails (Delete) wins the race, our Add operates
+// on a detached pointer and the map state remains empty — the bug the
+// previous LoadOrStore→Store shape allowed (resurrection of the counter
+// after a Delete) is gone.
 func (s *Server) incrementThermalFails(engineID string) int {
-	val, _ := s.thermalFails.LoadOrStore(engineID, 0)
-	count := val.(int) + 1
-	s.thermalFails.Store(engineID, count)
-	return count
+	v, _ := s.thermalFails.LoadOrStore(engineID, new(atomic.Int64))
+	return int(v.(*atomic.Int64).Add(1))
 }
 
 // resetThermalFails clears the failure counter for an engine.
@@ -109,13 +113,43 @@ func (s *Server) resetThermalFails(engineID string) {
 	s.thermalFails.Delete(engineID)
 }
 
+// thermalFailsCount returns the current count, or 0 if absent.
+func (s *Server) thermalFailsCount(engineID string) int {
+	v, ok := s.thermalFails.Load(engineID)
+	if !ok {
+		return 0
+	}
+	return int(v.(*atomic.Int64).Load())
+}
+
+// incrementSnapshotFailures bumps and returns the consecutive snapshot
+// failure count. Same race-free shape as incrementThermalFails.
+func (s *Server) incrementSnapshotFailures(engineID string) int {
+	v, _ := s.snapshotFailures.LoadOrStore(engineID, new(atomic.Int64))
+	return int(v.(*atomic.Int64).Add(1))
+}
+
+// resetSnapshotFailures clears the snapshot failure counter for an engine.
+func (s *Server) resetSnapshotFailures(engineID string) {
+	s.snapshotFailures.Delete(engineID)
+}
+
+// snapshotFailuresCount returns the current count, or 0 if absent.
+func (s *Server) snapshotFailuresCount(engineID string) int {
+	v, ok := s.snapshotFailures.Load(engineID)
+	if !ok {
+		return 0
+	}
+	return int(v.(*atomic.Int64).Load())
+}
+
 // touchActivity records that a sandbox was accessed via the API.
 // The thermal manager checks this before querying the guest agent,
 // avoiding a TCP connection per sandbox per thermal cycle.
 func (s *Server) touchActivity(engineID string) {
 	s.lastActivity.Store(engineID, time.Now())
-	s.snapshotFailures.Delete(engineID) // reset retry counter on user activity
-	s.resetThermalFails(engineID)        // reset thermal failure counter on user activity
+	s.resetSnapshotFailures(engineID) // reset retry counter on user activity
+	s.resetThermalFails(engineID)     // reset thermal failure counter on user activity
 }
 
 // TouchActivity is the exported version of touchActivity for use by
@@ -514,19 +548,14 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 					// Track consecutive failures. The VM is still warm
 					// (alive, vCPUs paused) — retry on next cycle.
 					// Only mark unknown after 3 consecutive failures.
-					count := 0
-					if v, ok := s.snapshotFailures.Load(sb.EngineID); ok {
-						count = v.(int)
-					}
-					count++
-					s.snapshotFailures.Store(sb.EngineID, count)
+					count := s.incrementSnapshotFailures(sb.EngineID)
 
 					if count >= 3 {
 						slog.Error("thermal snapshot failed 3 times — marking unknown",
 							"sandbox", sb.Name, "id", sb.ID, "error", err,
 							"attempts", count)
 						s.store.UpdateSandboxStatus(sb.ID, "unknown")
-						s.snapshotFailures.Delete(sb.EngineID)
+						s.resetSnapshotFailures(sb.EngineID)
 					} else {
 						slog.Warn("thermal snapshot failed — will retry",
 							"sandbox", sb.Name, "id", sb.ID, "error", err,
@@ -540,7 +569,7 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 				}
 
 				// Success — clear failure counter
-				s.snapshotFailures.Delete(sb.EngineID)
+				s.resetSnapshotFailures(sb.EngineID)
 				s.store.StopSandbox(sb.ID)
 				s.saveVMState(sb.ID, sb.EngineID)
 				slog.Info("thermal transition", "sandbox", sb.Name,

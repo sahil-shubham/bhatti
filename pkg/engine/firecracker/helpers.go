@@ -48,7 +48,8 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 
 	wasPaused := vm.Thermal == "warm"
 	if vm.Thermal == "hot" {
-		client := fcAPIClient(vm.SocketPath)
+		client, fcDone := fcAPIClient(vm.SocketPath)
+		defer fcDone()
 		pauseCtx, pauseCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer pauseCancel()
 		if err := fcPatch(pauseCtx, client, "/vm", `{"state":"Paused"}`); err != nil {
@@ -60,7 +61,8 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 	// Copy rootfs while VM is paused — no concurrent mutations possible
 	if err := copyRootfs(vm.RootfsPath, destPath); err != nil {
 		if !wasPaused {
-			client := fcAPIClient(vm.SocketPath)
+			client, fcDone := fcAPIClient(vm.SocketPath)
+			defer fcDone()
 			resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			fcPatch(resumeCtx, client, "/vm", `{"state":"Resumed"}`)
 			resumeCancel()
@@ -70,7 +72,8 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 	}
 
 	if !wasPaused {
-		client := fcAPIClient(vm.SocketPath)
+		client, fcDone := fcAPIClient(vm.SocketPath)
+		defer fcDone()
 		resumeCtx, resumeCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer resumeCancel()
 		if err := fcPatch(resumeCtx, client, "/vm", `{"state":"Resumed"}`); err != nil {

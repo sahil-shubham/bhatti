@@ -126,7 +126,7 @@ func TestPublicRateLimiter_LargeViteApp(t *testing.T) {
 	// Simulate 20 seconds of refill: 1500/min = 25/sec → 500 tokens.
 	// A full page load should pass again.
 	rl.mu.Lock()
-	rl.perIP[ip].bucket.lastRefill = time.Now().Add(-20 * time.Second)
+	rl.perIP[ip].Value.(*publicBucketNode).bucket.lastRefill = time.Now().Add(-20 * time.Second)
 	rl.mu.Unlock()
 
 	allowed := 0
@@ -251,7 +251,7 @@ func TestPublicRateLimiter_RefillAfterWait(t *testing.T) {
 	// Simulate time passing by directly manipulating the bucket.
 	// Per-IP refill is 1500/min = 25/sec. After 1 second, ~25 tokens.
 	rl.mu.Lock()
-	ipb := rl.perIP[ip]
+	ipb := rl.perIP[ip].Value.(*publicBucketNode)
 	ipb.bucket.lastRefill = time.Now().Add(-1 * time.Second)
 	rl.mu.Unlock()
 

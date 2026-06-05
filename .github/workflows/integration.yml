@@ -42,7 +42,14 @@ jobs:
     name: Integration Tests
     needs: build-rootfs
     runs-on: arc-runner-set
-    timeout-minutes: 30
+    # 45m: previous successful v1.11.12 run took 27m48s, the
+    # subsequent workflow_dispatch run hit the 30m cap at 30m9s.
+    # The suite is genuinely close to the old limit — 230+ tests,
+    # ~10m of test time plus apt setup + rootfs download + kernel
+    # boot overheads. 45m gives headroom for organic growth (labels
+    # + DNS responder added ~15 tests; G1.8 QuiesceCopy will add
+    # more) without hiding a real perf regression.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

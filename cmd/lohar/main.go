@@ -137,8 +137,8 @@ func runAgent() {
 			hostname = cfg.Hostname
 		}
 		applyHostname(hostname)
-		if len(cfg.DNS) > 0 {
-			applyDNS(cfg.DNS)
+		if cfg.DNSInternal != "" || len(cfg.DNS) > 0 {
+			applyDNS(cfg.DNSInternal, cfg.DNS)
 		} else {
 			ensureResolvConf()
 		}
@@ -460,6 +460,13 @@ type SandboxConfig struct {
 	Volumes []VolumeMountConfig `json:"volumes"`
 	Init    string              `json:"init,omitempty"`
 	DNS     []string            `json:"dns"`
+	// DNSInternal is the per-user bridge gateway IP hosting the
+	// in-cluster DNS responder. Prepended to /etc/resolv.conf so
+	// sandbox-name lookups resolve locally before the public DNS
+	// fallbacks. Empty string skips the install — backwards-compatible
+	// with hosts running an older bhatti daemon. G1.1 of
+	// PLAN-bhatti-v2.md.
+	DNSInternal string `json:"dns_internal,omitempty"`
 	User    string              `json:"user"`
 }
 
@@ -487,13 +494,46 @@ func loadConfigDrive() *SandboxConfig {
 	return &cfg
 }
 
-func applyDNS(servers []string) {
+// applyDNS writes /etc/resolv.conf with the in-cluster DNS responder
+// (if any) first, followed by the public DNS fallbacks. Ordering
+// matters: the resolver tries entries in file order, so a query for
+// a sandbox name hits the local responder (10.0.N.1) before any
+// public server, and a non-sandbox name (e.g. example.com) cleanly
+// falls through to 1.1.1.1 after the local responder returns
+// NXDOMAIN. G1.1 of PLAN-bhatti-v2.md.
+func applyDNS(internal string, public []string) {
+	content := buildResolvConf(internal, public)
+	if content == "" {
+		return
+	}
 	os.Remove("/etc/resolv.conf")
+	os.WriteFile("/etc/resolv.conf", []byte(content), 0644)
+}
+
+// buildResolvConf renders the resolv.conf contents. Pure function for
+// testability: the ordering (internal first, public second) is the
+// load-bearing property a future refactor must preserve, and a
+// regression test on the string output catches accidental swaps.
+//
+// Returns "" when both inputs are empty; callers skip writing the
+// file in that case so an existing system-installed resolv.conf isn't
+// clobbered.
+func buildResolvConf(internal string, public []string) string {
+	if internal == "" && len(public) == 0 {
+		return ""
+	}
 	var content string
-	for _, s := range servers {
+	if internal != "" {
+		// Comment line so a human reading the file knows what 10.0.N.1
+		// is. Some tools strip comments; that's fine — the nameserver
+		// line is what actually matters.
+		content += "# bhatti in-cluster DNS (per-user, names: <sandbox>, <sandbox>.sb)\n"
+		content += "nameserver " + internal + "\n"
+	}
+	for _, s := range public {
 		content += "nameserver " + s + "\n"
 	}
-	os.WriteFile("/etc/resolv.conf", []byte(content), 0644)
+	return content
 }
 
 func writeConfigFiles(files map[string]struct {

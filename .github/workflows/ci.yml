@@ -28,8 +28,16 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test $(go list ./... | grep -v cmd/lohar) -count=1 -timeout=120s
+      - name: Test (with -race)
+        # -race on the full unit-test surface catches the class of
+        # concurrency bug that Tranche 0a of PLAN-bhatti-v2.md is
+        # chasing — sync.Map LoadOrStore+Store races on the thermal
+        # manager, route-cache LRU under churn, rate-limiter eviction.
+        # cmd/lohar is excluded here because some of its tests need a
+        # real sandbox (PID 1 dirs, vsock); the shim subset runs with
+        # -race in the next step. Timeout bumped to 240s — -race adds
+        # ~2× overhead on the SQLite-backed store tests.
+        run: go test -race $(go list ./... | grep -v cmd/lohar) -count=1 -timeout=240s
 
       # The systemctl/journalctl/syslog/cgroup shim tests in cmd/lohar are
       # tempdir-sandboxed unit tests that don't need a real Firecracker

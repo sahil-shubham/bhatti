@@ -24,11 +24,17 @@ type Sandbox struct {
 	MemoryMB   int             `json:"memory_mb"`
 	DiskSizeMB int             `json:"disk_size_mb"`
 	Image      string          `json:"image"`
+	// Labels is operator-controlled metadata for fleet enumeration
+	// (e.g. {"pool": "workers", "env": "prod"}). Persisted as JSON in
+	// the labels column. Empty/nil maps round-trip as the SQL default
+	// '{}'. Filtering uses exact match on both key and value; see
+	// ListSandboxesWithFilter. G1.6 of PLAN-bhatti-v2.md.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // SecretRecord tracks an encrypted secret.
 
-const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal')`
+const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal'), COALESCE(labels,'{}')`
 
 func (s *Store) CreateSandbox(sb Sandbox) error {
 	if sb.EngineMeta == nil {
@@ -38,11 +44,28 @@ func (s *Store) CreateSandbox(sb Sandbox) error {
 	if sb.KeepHot {
 		keepHot = 1
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image,
+	labelsJSON, err := marshalLabels(sb.Labels)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON,
 	)
 	return err
+}
+
+// marshalLabels serialises a labels map. An empty/nil map becomes "{}"
+// so the column's NOT NULL constraint is satisfied.
+func marshalLabels(labels map[string]string) (string, error) {
+	if len(labels) == 0 {
+		return "{}", nil
+	}
+	b, err := json.Marshal(labels)
+	if err != nil {
+		return "", fmt.Errorf("marshal labels: %w", err)
+	}
+	return string(b), nil
 }
 
 // GetSandbox returns a sandbox scoped to a user, matching by ID first then by name.
@@ -93,6 +116,45 @@ func (s *Store) ListSandboxes(userID string) ([]Sandbox, error) {
 		out = append(out, *sb)
 	}
 	return out, rows.Err()
+}
+
+// ListSandboxesWithFilter returns sandboxes for a user, optionally
+// filtered by labels. AND semantics: a sandbox matches only if every
+// (key, value) pair in filter is present on the sandbox. Empty/nil
+// filter is equivalent to ListSandboxes.
+//
+// Filtering is done in Go after the SQL fetch. For our scale (hundreds
+// of sandboxes per user at most), the wire transfer + in-memory walk
+// is cheaper than rewriting the query with json_extract per filter
+// dimension. If this becomes a bottleneck, the next optimisation is
+// a JSON1 WHERE clause; the wire shape stays the same.
+func (s *Store) ListSandboxesWithFilter(userID string, filter map[string]string) ([]Sandbox, error) {
+	all, err := s.ListSandboxes(userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(filter) == 0 {
+		return all, nil
+	}
+	out := all[:0]
+	for _, sb := range all {
+		if labelsMatch(sb.Labels, filter) {
+			out = append(out, sb)
+		}
+	}
+	return out, nil
+}
+
+// labelsMatch returns true if every (k,v) in filter is present in
+// labels with the same value. Filter keys missing from labels never
+// match; extra labels on the sandbox don't break the match.
+func labelsMatch(labels, filter map[string]string) bool {
+	for k, v := range filter {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // ListAllSandboxes returns all sandboxes regardless of owner. For internal use (thermal manager, recovery, port scanner).
@@ -161,6 +223,59 @@ func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
 	return err
 }
 
+// UpdateSandboxLabels merges labels for a sandbox: keys in `set` are
+// inserted or overwritten, keys in `remove` are deleted. Other existing
+// labels are preserved (no full replace). Runs in a transaction so
+// concurrent updates from another writer don't lose entries.
+//
+// Empty set + empty remove is a no-op (still does one round-trip to
+// validate ownership; returns "not found" if the (id, userID) pair is
+// absent).
+func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, remove []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var labelsJSON string
+	err = tx.QueryRow(
+		`SELECT COALESCE(labels, '{}') FROM sandboxes WHERE id = ? AND created_by = ?`,
+		id, userID,
+	).Scan(&labelsJSON)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("sandbox %q not found", id)
+	}
+	if err != nil {
+		return err
+	}
+
+	labels := map[string]string{}
+	if labelsJSON != "" && labelsJSON != "{}" {
+		if err := json.Unmarshal([]byte(labelsJSON), &labels); err != nil {
+			return fmt.Errorf("parse existing labels: %w", err)
+		}
+	}
+	for k, v := range set {
+		labels[k] = v
+	}
+	for _, k := range remove {
+		delete(labels, k)
+	}
+
+	out, err := marshalLabels(labels)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE sandboxes SET labels = ? WHERE id = ? AND created_by = ?`,
+		out, id, userID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) StopSandbox(id string) error {
 	now := time.Now()
 	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'stopped', stopped_at = ? WHERE id = ?`, now, id)
@@ -195,10 +310,10 @@ func (s *Store) DeleteSandboxByID(id string) error {
 
 func scanSandbox(s scanner) (*Sandbox, error) {
 	var sb Sandbox
-	var metaJSON string
+	var metaJSON, labelsJSON string
 	var stoppedAt sql.NullTime
 	var keepHot int
-	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image)
+	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image, &labelsJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +322,11 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 		sb.StoppedAt = &stoppedAt.Time
 	}
 	sb.KeepHot = keepHot != 0
+	if labelsJSON != "" && labelsJSON != "{}" {
+		if err := json.Unmarshal([]byte(labelsJSON), &sb.Labels); err != nil {
+			return nil, fmt.Errorf("parse sandbox labels: %w", err)
+		}
+	}
 	return &sb, nil
 }
 

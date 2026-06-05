@@ -44,7 +44,8 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 		syncCancel()
 	}
 
-	client := fcAPIClient(vm.SocketPath)
+	client, fcDone := fcAPIClient(vm.SocketPath)
+	defer fcDone()
 
 	// Skip Pause if already paused (warm→cold path).
 	// Firecracker may reject Pause on an already-paused VM.
@@ -133,7 +134,8 @@ func (e *Engine) Pause(ctx context.Context, id string) error {
 	if vm.Thermal != "hot" {
 		return fmt.Errorf("sandbox %q is not hot (thermal=%s)", id, vm.Thermal)
 	}
-	client := fcAPIClient(vm.SocketPath)
+	client, fcDone := fcAPIClient(vm.SocketPath)
+	defer fcDone()
 	if err := fcPatch(ctx, client, "/vm", `{"state":"Paused"}`); err != nil {
 		return fmt.Errorf("pause: %w", err)
 	}
@@ -154,7 +156,8 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 	if vm.Thermal != "warm" {
 		return fmt.Errorf("sandbox %q is not warm (thermal=%s)", id, vm.Thermal)
 	}
-	client := fcAPIClient(vm.SocketPath)
+	client, fcDone := fcAPIClient(vm.SocketPath)
+	defer fcDone()
 	if err := fcPatch(ctx, client, "/vm", `{"state":"Resumed"}`); err != nil {
 		return fmt.Errorf("resume: %w", err)
 	}
@@ -176,7 +179,8 @@ func (e *Engine) BalloonSet(ctx context.Context, id string, amountMiB int64) err
 	if vm.Thermal != "warm" {
 		return fmt.Errorf("balloon: sandbox %q is not warm (thermal=%s)", id, vm.Thermal)
 	}
-	client := fcAPIClient(vm.SocketPath)
+	client, fcDone := fcAPIClient(vm.SocketPath)
+	defer fcDone()
 	return fcPatch(ctx, client, "/balloon",
 		fmt.Sprintf(`{"amount_mib":%d}`, amountMiB))
 }
@@ -289,7 +293,7 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 			userNet := e.userNetworks[vm.UserID]
 			e.mu.RUnlock()
 			if userNet != nil {
-				if err := ensureUserBridge(userNet); err != nil {
+				if err := e.bringUpUserNetwork(userNet); err != nil {
 					return fmt.Errorf("recreate bridge for resume: %w", err)
 				}
 				if _, err := createTapDevice(id, userNet.BridgeName); err != nil {
@@ -348,7 +352,8 @@ func (e *Engine) startVM(ctx context.Context, id string, force bool) error {
 	if fcProc.socket != "" {
 		apiSocket = fcProc.socket
 	}
-	client := fcAPIClient(apiSocket)
+	client, fcDone := fcAPIClient(apiSocket)
+	defer fcDone()
 
 	// In bare mode, if this VM was resumed from a snapshot, vm.snap has the
 	// original sandbox's paths baked in (FCPathOrigin). Create symlinks so
@@ -439,6 +444,12 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	}
 
 	vm.stateMu.Lock()
+
+	// Unregister name → IP in the per-user DNS responder before the
+	// IP returns to the FIFO pool. Doing this BEFORE killFC means a
+	// concurrent peer's name lookup can't race a destroyed sandbox's
+	// stale IP back into the wire. G1.1 of PLAN-bhatti-v2.md.
+	e.dnsDelete(vm.UserID, vm.Name)
 
 	if vm.Status == "running" && vm.cmd != nil {
 		killFC(vm.cmd, 1*time.Second)

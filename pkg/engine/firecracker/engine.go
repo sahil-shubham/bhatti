@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,12 @@ type Engine struct {
 	nextCID      uint32
 	userNetworks map[string]*UserNetwork // userID → network
 	loharHash    string                  // SHA-256 of current lohar binary, cached at init
+
+	// ctx + cancel are used as the parent context for per-user DNS
+	// responders (G1.1). Cancelled in Shutdown so all responder
+	// goroutines drain cleanly on SIGTERM.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // VolumeAttachmentInfo records a volume attached to a running VM.
@@ -132,11 +139,14 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 
+	engCtx, engCancel := context.WithCancel(context.Background())
 	eng := &Engine{
 		vms:          make(map[string]*VM),
 		cfg:          cfg,
 		nextCID:      3, // 0=hypervisor, 1=loopback, 2=host
 		userNetworks: make(map[string]*UserNetwork),
+		ctx:          engCtx,
+		cancel:       engCancel,
 	}
 
 	// Clean up legacy single-bridge from pre-multi-tenant setup
@@ -179,6 +189,24 @@ func (e *Engine) CleanupOrphanedTaps() {
 // Shutdown stops all running VMs and cleans up all TAP devices.
 // Called on server shutdown (SIGTERM).
 func (e *Engine) Shutdown() {
+	// Cancel the engine context first so per-user DNS responders
+	// (G1.1) tear down before the bridges they're bound to disappear.
+	if e.cancel != nil {
+		e.cancel()
+	}
+	// Lock (not RLock): we write un.DNS = nil inside the loop. Pre-fix
+	// this was an RLock + write race — not flagged by tests because
+	// Shutdown only runs once per Engine, but the lock-discipline
+	// invariant is
+	//   "writes go under Lock, reads go under RLock"
+	// and we'd be lying to readers otherwise.
+	e.mu.Lock()
+	for _, un := range e.userNetworks {
+		stopDNSForBridge(un.DNS)
+		un.DNS = nil
+	}
+	e.mu.Unlock()
+
 	e.mu.RLock()
 	ids := make([]string, 0, len(e.vms))
 	for id := range e.vms {
@@ -261,8 +289,67 @@ func (e *Engine) removeUserNetworkIfEmpty(userID string) {
 		}
 	}
 
+	// Stop the DNS responder BEFORE destroying the bridge — the
+	// responder is bound to the bridge's gateway IP, which is about
+	// to disappear. G1.1 of PLAN-bhatti-v2.md.
+	stopDNSForBridge(net.DNS)
+	net.DNS = nil
+
 	destroyUserBridge(net.BridgeName)
 	delete(e.userNetworks, userID)
 	slog.Info("destroyed user bridge", "user", userID, "bridge", net.BridgeName)
+}
+
+// bringUpUserNetwork ensures the bridge for un is created AND its DNS
+// responder is started. Idempotent on both pieces — safe to call on
+// every sandbox creation. The DNS responder lives at un.GatewayIP:53;
+// bind failures are logged but non-fatal (sandbox creation continues).
+//
+// When the DNS server is started for the first time (un.DNS was nil),
+// it's seeded from e.vms so any already-recovered sandboxes for this
+// user are immediately resolvable — the recovery path populates e.vms
+// without bringing up the bridge, so the seeding has to happen here
+// the first time the bridge does come up.
+func (e *Engine) bringUpUserNetwork(un *UserNetwork) error {
+	if err := ensureUserBridge(un); err != nil {
+		return err
+	}
+	if un.DNS != nil {
+		return nil
+	}
+	un.DNS = startDNSForBridge(e.ctx, un, slog.Default())
+	if un.DNS == nil {
+		return nil // bind failed, logged inside startDNSForBridge
+	}
+	e.seedDNS(un)
+	return nil
+}
+
+// seedDNS populates un.DNS with name → IP entries for every VM in e.vms
+// whose user owns un. Used by bringUpUserNetwork after first-time DNS
+// startup so recovered sandboxes (already in e.vms before the bridge
+// came up) are immediately resolvable. Exposed for tests.
+func (e *Engine) seedDNS(un *UserNetwork) {
+	if un.DNS == nil {
+		return
+	}
+	type seed struct{ name, ip string }
+	var seeds []seed
+	e.mu.RLock()
+	for _, vm := range e.vms {
+		if vm.UserID == "" || vm.GuestIP == "" || vm.Name == "" {
+			continue
+		}
+		if other, ok := e.userNetworks[vm.UserID]; ok && other.BridgeName == un.BridgeName {
+			seeds = append(seeds, seed{name: vm.Name, ip: vm.GuestIP})
+		}
+	}
+	e.mu.RUnlock()
+	for _, s := range seeds {
+		ip := net.ParseIP(s.ip)
+		if ip != nil {
+			un.DNS.Set(s.name, ip)
+		}
+	}
 }
 

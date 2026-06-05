@@ -317,9 +317,8 @@ func TestSnapshotFailureRetries(t *testing.T) {
 	if sb.Status == "unknown" {
 		t.Fatal("should not mark unknown on first failure")
 	}
-	v, ok := srv.snapshotFailures.Load(eid)
-	if !ok || v.(int) != 1 {
-		t.Fatalf("expected failure count 1, got %v (ok=%v)", v, ok)
+	if got := srv.snapshotFailuresCount(eid); got != 1 {
+		t.Fatalf("expected failure count 1, got %d", got)
 	}
 
 	// Second failure — still not unknown
@@ -329,9 +328,8 @@ func TestSnapshotFailureRetries(t *testing.T) {
 	if sb.Status == "unknown" {
 		t.Fatal("should not mark unknown on second failure")
 	}
-	v, _ = srv.snapshotFailures.Load(eid)
-	if v.(int) != 2 {
-		t.Fatalf("expected failure count 2, got %v", v)
+	if got := srv.snapshotFailuresCount(eid); got != 2 {
+		t.Fatalf("expected failure count 2, got %d", got)
 	}
 
 	// Third failure — NOW mark unknown
@@ -367,9 +365,8 @@ func TestSnapshotFailureCounterResetOnActivity(t *testing.T) {
 	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
 	srv.runThermalCycle(te, cfg)
 
-	v, _ := srv.snapshotFailures.Load(eid)
-	if v.(int) != 2 {
-		t.Fatalf("expected 2, got %v", v)
+	if got := srv.snapshotFailuresCount(eid); got != 2 {
+		t.Fatalf("expected 2, got %d", got)
 	}
 
 	// Simulate user activity (touchActivity resets counter)
@@ -397,9 +394,8 @@ func TestSnapshotSuccessClearsCounter(t *testing.T) {
 	te := srv.engine.(ThermalEngine)
 	srv.runThermalCycle(te, cfg)
 
-	v, _ := srv.snapshotFailures.Load(eid)
-	if v.(int) != 1 {
-		t.Fatalf("expected 1, got %v", v)
+	if got := srv.snapshotFailuresCount(eid); got != 1 {
+		t.Fatalf("expected 1, got %d", got)
 	}
 
 	// Clear error, retry succeeds

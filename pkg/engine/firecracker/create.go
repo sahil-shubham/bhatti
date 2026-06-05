@@ -115,7 +115,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// 3. Get or create user's network, allocate IP, create TAP
 	phase("network_start")
 	userNet := e.getOrCreateUserNetwork(spec.UserID, spec.SubnetIndex)
-	if err = ensureUserBridge(userNet); err != nil {
+	if err = e.bringUpUserNetwork(userNet); err != nil {
 		return info, fmt.Errorf("setup user bridge: %w", err)
 	}
 	guestIP, err = userNet.Pool.Allocate()
@@ -209,15 +209,16 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	phase("config_drive_start")
 	if err = createConfigDrive(configDrivePath, SandboxConfig{
-		SandboxID: id,
-		Hostname:  name,
-		Token:     token,
-		Env:       envMap,
-		Files:     filesMap,
-		Volumes:   volumeMounts,
-		Init:      spec.Init,
-		DNS:       []string{"1.1.1.1", "8.8.8.8"},
-		User:      "lohar",
+		SandboxID:   id,
+		Hostname:    name,
+		Token:       token,
+		Env:         envMap,
+		Files:       filesMap,
+		Volumes:     volumeMounts,
+		Init:        spec.Init,
+		DNS:         []string{"1.1.1.1", "8.8.8.8"},
+		DNSInternal: userNet.GatewayIP, // G1.1: lohar prepends as first resolver
+		User:        "lohar",
 	}); err != nil {
 		return info, fmt.Errorf("create config drive: %w", err)
 	}
@@ -268,7 +269,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	// 6. Configure via HTTP API
 	phase("fc_api_start")
-	client := fcAPIClient(apiSocket)
+	client, fcDone := fcAPIClient(apiSocket)
+	defer fcDone()
 
 	// FC logger and metrics must be set before any other configuration.
 	// Warning level only — Debug is guest-influenceable. Non-fatal if setup fails.
@@ -424,6 +426,13 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	e.mu.Lock()
 	e.vms[id] = vm
 	e.mu.Unlock()
+
+	// Register name → IP in the per-user DNS responder so other
+	// sandboxes on the same bridge can resolve this one by name.
+	// G1.1 of PLAN-bhatti-v2.md. No-op if DNS bind failed at bridge
+	// startup; we don't want sandbox creation to fail on a DNS
+	// hiccup.
+	e.dnsSet(spec.UserID, name, guestIP)
 	phase("create_complete")
 
 	return engine.SandboxInfo{
