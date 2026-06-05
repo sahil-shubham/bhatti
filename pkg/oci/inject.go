@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-const userName = "ubuntu"
-
 // injectLohar copies the lohar binary into the image tree and ensures
 // the boot directories and uid 1000 user exist.
 func injectLohar(rootDir, loharPath string) error {
@@ -37,7 +35,7 @@ func injectLohar(rootDir, loharPath string) error {
 }
 
 // ensureUser1000 checks if uid 1000 exists in /etc/passwd.
-// If not, creates a 'ubuntu' user with uid 1000.
+// If not, creates a 'lohar' user with uid 1000.
 // If uid 1000 exists (e.g., 'node' in node images), leaves it as-is.
 func ensureUser1000(rootDir string) error {
 	passwdPath := filepath.Join(rootDir, "etc/passwd")
@@ -51,7 +49,7 @@ func ensureUser1000(rootDir string) error {
 		fields := strings.Split(line, ":")
 		if len(fields) >= 4 && fields[2] == "1000" {
 			// uid 1000 exists — ensure home directory exists
-			homeDir := "/home/" + userName
+			homeDir := "/home/lohar"
 			if len(fields) >= 6 && fields[5] != "" {
 				homeDir = fields[5]
 			}
@@ -66,7 +64,7 @@ func ensureUser1000(rootDir string) error {
 	if err != nil {
 		return err
 	}
-	f.WriteString(userName + ":x:1000:1000::/home/" + userName + ":/bin/sh\n")
+	f.WriteString("lohar:x:1000:1000::/home/lohar:/bin/sh\n")
 	f.Close()
 
 	// Add group entry if gid 1000 doesn't exist
@@ -82,7 +80,7 @@ func ensureUser1000(rootDir string) error {
 	}
 	if !gid1000Exists {
 		if g, err := os.OpenFile(groupPath, os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-			g.WriteString(userName + ":x:1000:\n")
+			g.WriteString("lohar:x:1000:\n")
 			g.Close()
 		}
 	}
@@ -91,12 +89,12 @@ func ensureUser1000(rootDir string) error {
 	shadowPath := filepath.Join(rootDir, "etc/shadow")
 	if _, err := os.Stat(shadowPath); err == nil {
 		if s, err := os.OpenFile(shadowPath, os.O_APPEND|os.O_WRONLY, 0640); err == nil {
-			s.WriteString(userName + ":!:19000:0:99999:7:::\n")
+			s.WriteString("lohar:!:19000:0:99999:7:::\n")
 			s.Close()
 		}
 	}
 
-	os.MkdirAll(filepath.Join(rootDir, "home/"+userName), 0755)
-	os.Chown(filepath.Join(rootDir, "home/"+userName), 1000, 1000)
+	os.MkdirAll(filepath.Join(rootDir, "home/lohar"), 0755)
+	os.Chown(filepath.Join(rootDir, "home/lohar"), 1000, 1000)
 	return nil
 }
