@@ -284,11 +284,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		slog.Warn("FC metrics setup failed", "error", err)
 	}
 
-	
 	// Boot args include ip= for kernel-level network configuration.
 	// Uses the user's bridge gateway instead of a hardcoded IP.
 	// Prefer the system init if present, otherwise fall back to lohar.
 	initPath := "/usr/local/bin/lohar"
+	// If a lohar file exists under the standard init process path, use it.
 	if _, statErr := os.Stat("/sbin/init"); statErr == nil {
 		initPath = "/sbin/init"
 	}
@@ -413,7 +413,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	vm := &VM{
 		ID: id, Name: name, UserID: spec.UserID,
 		SocketPath: apiSocket,
-		VsockPath: vsockPath, RootfsPath: rootfsPath,
+		VsockPath:  vsockPath, RootfsPath: rootfsPath,
 		CID: cid, VcpuCount: vcpuCount, MemSizeMib: memMB,
 		TapDevice: tapName, GuestIP: guestIP, GuestMAC: mac,
 		Token: token, FCPathOrigin: id, Volumes: volAttachments,
@@ -440,4 +440,3 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		IP: guestIP, EngineID: id,
 	}, nil
 }
-

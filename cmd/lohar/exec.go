@@ -19,8 +19,8 @@ type frameMsg struct {
 	payload []byte
 }
 
-// User name
-const userName = "ubuntu"
+// User name. Defaults to lohar but may be overridden by the config drive.
+var userName = "lohar"
 
 // handleDetachedExec starts a command in a new session (setsid) with stdout/stderr
 // redirected to a file, then returns immediately with the child PID and output

@@ -32,6 +32,9 @@ type Config struct {
 	// Domain mode (Phase 2: host-based routing + TLS)
 	Domain *DomainConfig `yaml:"domain,omitempty"`
 
+	// Default user for exec commands (e.g. "ubuntu" for cloud images)
+	DefaultUser string `yaml:"default_user,omitempty"`
+
 	// Firecracker-specific
 	FirecrackerBin    string `yaml:"firecracker_bin"`    // path to firecracker binary
 	FirecrackerKernel string `yaml:"firecracker_kernel"` // path to vmlinux
@@ -48,8 +51,8 @@ type Config struct {
 
 // BackupConfig configures volume backup to S3-compatible object storage.
 type BackupConfig struct {
-	S3Endpoint  string           `yaml:"s3_endpoint"`   // e.g. "https://s3.eu-central-003.backblazeb2.com"
-	S3Region    string           `yaml:"s3_region"`     // e.g. "eu-central-003"
+	S3Endpoint  string           `yaml:"s3_endpoint"` // e.g. "https://s3.eu-central-003.backblazeb2.com"
+	S3Region    string           `yaml:"s3_region"`   // e.g. "eu-central-003"
 	S3Bucket    string           `yaml:"s3_bucket"`
 	S3AccessKey string           `yaml:"s3_access_key"`
 	S3SecretKey string           `yaml:"s3_secret_key"`

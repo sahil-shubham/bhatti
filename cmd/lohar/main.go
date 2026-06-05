@@ -132,6 +132,9 @@ func runAgent() {
 
 	cfg := loadConfigDrive()
 	if cfg != nil {
+		if cfg.User != "" {
+			userName = cfg.User
+		}
 		hostname := "bhatti"
 		if cfg.Hostname != "" {
 			hostname = cfg.Hostname
@@ -467,7 +470,7 @@ type SandboxConfig struct {
 	// with hosts running an older bhatti daemon. G1.1 of
 	// PLAN-bhatti-v2.md.
 	DNSInternal string `json:"dns_internal,omitempty"`
-	User    string              `json:"user"`
+	User        string `json:"user"`
 }
 
 func loadConfigDrive() *SandboxConfig {
