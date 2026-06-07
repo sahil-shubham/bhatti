@@ -32,19 +32,22 @@ import (
 
 // startDNSForBridge binds and starts a DNS server for the given user
 // network. The server's lifecycle is tied to e.ctx (cancelled on
-// engine shutdown). On bind failure, returns nil and logs — caller
-// should not treat that as fatal.
-func startDNSForBridge(ctx context.Context, net *UserNetwork, logger *slog.Logger) *dns.Server {
+// engine shutdown). upstreams are the resolvers the server forwards
+// non-sandbox queries to (G1.1) — without them a sandbox can resolve
+// siblings but not public names. On bind failure, returns nil and
+// logs — caller should not treat that as fatal.
+func startDNSForBridge(ctx context.Context, net *UserNetwork, upstreams []string, logger *slog.Logger) *dns.Server {
 	bindAddr := net.GatewayIP + ":53"
 	s := dns.NewServer(bindAddr)
 	s.Logger = logger
+	s.Upstreams = upstreams
 	if err := s.Start(ctx); err != nil {
 		logger.Warn("dns: failed to start responder; names won't resolve for this user",
 			"bridge", net.BridgeName, "bind", bindAddr, "err", err)
 		return nil
 	}
 	logger.Info("dns: responder started",
-		"bridge", net.BridgeName, "bind", bindAddr)
+		"bridge", net.BridgeName, "bind", bindAddr, "upstreams", upstreams)
 	return s
 }
 

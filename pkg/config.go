@@ -42,6 +42,13 @@ type Config struct {
 	JailUID           int    `yaml:"jail_uid,omitempty"`           // uid for jailed FC (e.g. 10000)
 	JailGID           int    `yaml:"jail_gid,omitempty"`           // gid for jailed FC (e.g. 10000)
 
+	// DNSUpstreams is the ordered list of upstream resolvers each
+	// per-user in-cluster DNS responder forwards non-sandbox queries
+	// to (G1.1). Empty → engine default (1.1.1.1, 8.8.8.8). Set this
+	// for a homelab that runs its own resolver (e.g. Pi-hole) so
+	// sandboxes inherit the host's view of the world.
+	DNSUpstreams []string `yaml:"dns_upstreams,omitempty"`
+
 	// Backup to S3-compatible storage
 	Backup *BackupConfig `yaml:"backup,omitempty"`
 }

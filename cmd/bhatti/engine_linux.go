@@ -17,5 +17,6 @@ func newFirecrackerEngine(cfg *pkg.Config) (engine.Engine, error) {
 		JailerBinary: cfg.FirecrackerJailer,
 		JailUID:      cfg.JailUID,
 		JailGID:      cfg.JailGID,
+		DNSUpstreams: cfg.DNSUpstreams, // empty → engine default (1.1.1.1/8.8.8.8)
 	})
 }

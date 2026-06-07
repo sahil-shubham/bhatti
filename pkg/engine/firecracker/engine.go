@@ -46,7 +46,20 @@ type Config struct {
 	JailerBinary string // path to jailer binary
 	JailUID      int    // uid for jailed FC processes (e.g. 10000)
 	JailGID      int    // gid for jailed FC processes (e.g. 10000)
+
+	// DNSUpstreams is the ordered list of upstream resolvers each
+	// per-user DNS responder forwards non-sandbox queries to (G1.1).
+	// Empty → defaultDNSUpstreams. Without forwarding, sandboxes can
+	// resolve siblings but not public names (the bug that blocked
+	// v1.12.0 on main). Overridable via daemon config for homelabs
+	// that run their own resolver.
+	DNSUpstreams []string
 }
+
+// defaultDNSUpstreams is what a per-user responder forwards to when
+// the daemon config doesn't specify. Cloudflare first, Google second
+// — both anycast, both fast, redundant if one is unreachable.
+var defaultDNSUpstreams = []string{"1.1.1.1", "8.8.8.8"}
 
 // jailed returns true if the jailer is configured.
 func (c Config) jailed() bool { return c.JailerBinary != "" }
@@ -137,6 +150,10 @@ func New(cfg Config) (*Engine, error) {
 		if err := os.MkdirAll(filepath.Join(cfg.DataDir, sub), 0700); err != nil {
 			return nil, fmt.Errorf("create %s dir: %w", sub, err)
 		}
+	}
+
+	if len(cfg.DNSUpstreams) == 0 {
+		cfg.DNSUpstreams = defaultDNSUpstreams
 	}
 
 	engCtx, engCancel := context.WithCancel(context.Background())
@@ -317,7 +334,7 @@ func (e *Engine) bringUpUserNetwork(un *UserNetwork) error {
 	if un.DNS != nil {
 		return nil
 	}
-	un.DNS = startDNSForBridge(e.ctx, un, slog.Default())
+	un.DNS = startDNSForBridge(e.ctx, un, e.cfg.DNSUpstreams, slog.Default())
 	if un.DNS == nil {
 		return nil // bind failed, logged inside startDNSForBridge
 	}
