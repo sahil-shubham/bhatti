@@ -221,11 +221,23 @@ func TestActivityTracking(t *testing.T) {
 		t.Fatalf("Activity after exec: %v", err)
 	}
 
-	// Timestamp should be recent (within last 5 seconds)
+	// Timestamp should be recent. We allow slack on BOTH sides rather
+	// than asserting the strict [beforeExec, now] window: activity can
+	// be recorded by an async agent→host path whose clock sample
+	// slightly precedes our beforeExec, and time.Now().Unix() truncation
+	// to whole seconds can land the recorded value up to a second below
+	// beforeExec. That produced a reproducible 1-second-low flake in CI
+	// (runs 26739850224 / 26741170133: "got N, expected between N+1 and
+	// N+1") that has nothing to do with the behavior under test. The
+	// product guarantee is "activity is recent", not "strictly after the
+	// test's clock read", so a 2s tolerance preserves the intent while
+	// killing the flake — a genuinely stale (minutes-old) or
+	// far-future timestamp still fails.
+	const slack = 2
 	now := time.Now().Unix()
-	if activity2.LastActivityUnix < beforeExec || activity2.LastActivityUnix > now {
-		t.Errorf("activity timestamp out of range: got %d, expected between %d and %d",
-			activity2.LastActivityUnix, beforeExec, now)
+	if activity2.LastActivityUnix < beforeExec-slack || activity2.LastActivityUnix > now+slack {
+		t.Errorf("activity timestamp out of range: got %d, expected within %ds of [%d, %d]",
+			activity2.LastActivityUnix, slack, beforeExec, now)
 	} else {
 		t.Logf("✓ activity timestamp is recent: %ds ago", now-activity2.LastActivityUnix)
 	}
