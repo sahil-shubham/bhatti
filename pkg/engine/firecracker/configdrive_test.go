@@ -258,15 +258,28 @@ func TestConfigDriveDNS(t *testing.T) {
 	}
 	defer eng.Destroy(ctx, info.ID)
 
-	// Config drive sets DNS to 1.1.1.1 and 8.8.8.8
+	// G1.1: with the per-user DNS responder up (testEngine's New()
+	// defaults DNSUpstreams, so it binds and forwards), resolv.conf
+	// must list ONLY the in-cluster responder at the bridge gateway
+	// (10.0.N.1) — NOT 1.1.1.1/8.8.8.8. The responder forwards public
+	// names upstream itself; listing public resolvers alongside it
+	// would let glibc round-robin away from the responder and miss
+	// sibling names. This test previously asserted the OPPOSITE
+	// (public DNS present), which pinned the bug that broke sandbox
+	// internet access — see lohar.applyDNS for the full story.
 	r, _ := execWithTimeout(t, eng, info.ID, []string{"cat", "/etc/resolv.conf"})
-	if !strings.Contains(r.Stdout, "1.1.1.1") {
-		t.Errorf("resolv.conf missing 1.1.1.1: %q", r.Stdout)
+	gw := "10.0.99.1" // testSpec uses SubnetIndex 99 → gateway 10.0.99.1
+	if !strings.Contains(r.Stdout, "nameserver "+gw) {
+		t.Errorf("resolv.conf missing in-cluster responder %q: %q", gw, r.Stdout)
 	}
-	if !strings.Contains(r.Stdout, "8.8.8.8") {
-		t.Errorf("resolv.conf missing 8.8.8.8: %q", r.Stdout)
+	if strings.Contains(r.Stdout, "1.1.1.1") || strings.Contains(r.Stdout, "8.8.8.8") {
+		t.Errorf("resolv.conf should NOT list public DNS when responder is up "+
+			"(responder forwards upstream itself): %q", r.Stdout)
 	}
-	t.Logf("✓ DNS configured via config drive:\n%s", r.Stdout)
+	if !strings.Contains(r.Stdout, "options timeout:2 attempts:1") {
+		t.Errorf("resolv.conf missing fast-timeout option: %q", r.Stdout)
+	}
+	t.Logf("✓ DNS configured via config drive (responder-only):\n%s", r.Stdout)
 }
 
 func TestEnvSpecialCharacters(t *testing.T) {
