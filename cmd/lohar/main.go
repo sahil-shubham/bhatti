@@ -494,13 +494,29 @@ func loadConfigDrive() *SandboxConfig {
 	return &cfg
 }
 
-// applyDNS writes /etc/resolv.conf with the in-cluster DNS responder
-// (if any) first, followed by the public DNS fallbacks. Ordering
-// matters: the resolver tries entries in file order, so a query for
-// a sandbox name hits the local responder (10.0.N.1) before any
-// public server, and a non-sandbox name (e.g. example.com) cleanly
-// falls through to 1.1.1.1 after the local responder returns
-// NXDOMAIN. G1.1 of PLAN-bhatti-v2.md.
+// applyDNS writes /etc/resolv.conf. Two mutually-exclusive shapes,
+// chosen by the host (engine) based on whether the per-user DNS
+// responder bound successfully:
+//
+//   1. Responder up (the normal case): internal != "", public empty.
+//      We write ONLY the in-cluster responder. It is authoritative for
+//      sibling sandbox names AND forwards everything else upstream
+//      itself (see pkg/dns Server.Upstreams), so it's the only resolver
+//      the sandbox needs.
+//
+//   2. Responder bind failed (degraded): internal == "", public set.
+//      We write the public resolvers directly so the sandbox still has
+//      working name resolution — just without sibling names.
+//
+// IMPORTANT: we do NOT list internal AND public together. An earlier
+// version did, on the assumption that a non-sandbox name would "fall
+// through" to 1.1.1.1 after the responder returned NXDOMAIN. That is
+// false — glibc treats NXDOMAIN as authoritative and never tries the
+// next nameserver (only a TIMEOUT does). Listing public servers
+// alongside the responder would just let glibc round-robin away from
+// our responder and miss sibling names. Forwarding (case 1) is what
+// makes both kinds of name resolve from a single nameserver line.
+// G1.1 of PLAN-bhatti-v2.md.
 func applyDNS(internal string, public []string) {
 	content := buildResolvConf(internal, public)
 	if content == "" {
@@ -527,8 +543,14 @@ func buildResolvConf(internal string, public []string) string {
 		// Comment line so a human reading the file knows what 10.0.N.1
 		// is. Some tools strip comments; that's fine — the nameserver
 		// line is what actually matters.
-		content += "# bhatti in-cluster DNS (per-user, names: <sandbox>, <sandbox>.sb)\n"
+		content += "# bhatti in-cluster DNS (per-user): resolves sibling sandbox\n"
+		content += "# names (<sandbox>, <sandbox>.sb) and forwards everything else\n"
+		content += "# upstream, so it's the only resolver the sandbox needs.\n"
 		content += "nameserver " + internal + "\n"
+		// timeout:2 attempts:1 — if the responder is unreachable, fail
+		// fast (2s) rather than stalling on glibc's default 5s × 2
+		// attempts = 10s before the sandbox gives up on DNS entirely.
+		content += "options timeout:2 attempts:1\n"
 	}
 	for _, s := range public {
 		content += "nameserver " + s + "\n"

@@ -207,6 +207,22 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		name = id
 	}
 
+	// G1.1: choose the resolv.conf shape based on whether the per-user
+	// DNS responder actually bound. When it's up it is the sandbox's
+	// ONLY resolver — it forwards public names upstream itself, so we
+	// must NOT also list 1.1.1.1/8.8.8.8 (glibc would round-robin to
+	// them and miss sibling names). When the bind failed (DNS == nil)
+	// we fall back to public resolvers directly so the sandbox still
+	// resolves public names, just without sibling resolution.
+	// bringUpUserNetwork ran above, so userNet.DNS is settled here.
+	var dnsInternal string
+	var dnsPublic []string
+	if userNet.DNS != nil {
+		dnsInternal = userNet.GatewayIP
+	} else {
+		dnsPublic = []string{"1.1.1.1", "8.8.8.8"}
+	}
+
 	phase("config_drive_start")
 	if err = createConfigDrive(configDrivePath, SandboxConfig{
 		SandboxID:   id,
@@ -216,8 +232,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		Files:       filesMap,
 		Volumes:     volumeMounts,
 		Init:        spec.Init,
-		DNS:         []string{"1.1.1.1", "8.8.8.8"},
-		DNSInternal: userNet.GatewayIP, // G1.1: lohar prepends as first resolver
+		DNS:         dnsPublic,
+		DNSInternal: dnsInternal,
 		User:        "lohar",
 	}); err != nil {
 		return info, fmt.Errorf("create config drive: %w", err)

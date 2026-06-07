@@ -37,6 +37,28 @@ func TestBuildResolvConf_InternalOnly(t *testing.T) {
 	}
 }
 
+func TestBuildResolvConf_InternalHasFastTimeout(t *testing.T) {
+	// When the in-cluster responder is the only nameserver, a fast
+	// timeout/attempts option means a dead responder fails in ~2s
+	// instead of glibc's default ~10s. Pin it so a refactor doesn't
+	// silently drop the line and reintroduce the stall.
+	got := buildResolvConf("10.0.5.1", nil)
+	if !strings.Contains(got, "options timeout:2 attempts:1") {
+		t.Errorf("internal resolv.conf missing fast-timeout option:\n%s", got)
+	}
+}
+
+func TestBuildResolvConf_PublicOnlyHasNoTimeoutOption(t *testing.T) {
+	// Degraded mode (responder bind failed) lists public resolvers
+	// directly. The fast-timeout option is tied to the in-cluster
+	// responder, so it must NOT appear here — public resolvers can be
+	// a hair slower and we don't want to give up on them in 2s.
+	got := buildResolvConf("", []string{"1.1.1.1", "8.8.8.8"})
+	if strings.Contains(got, "options timeout") {
+		t.Errorf("public-only resolv.conf should not set a timeout option:\n%s", got)
+	}
+}
+
 func TestBuildResolvConf_PublicOnly(t *testing.T) {
 	// Backwards-compat: a host running an older bhatti daemon won't set
 	// DNSInternal, so DNSInternal=="" and we render only public DNS.
