@@ -26,6 +26,13 @@ const DefaultTTL uint32 = 5
 // other tools expect from a search-path-friendly resolver.
 const SuffixSandbox = ".sb"
 
+// forwardTimeout bounds a single upstream round-trip. Deliberately
+// shorter than glibc's default 5s per-resolver timeout so that a dead
+// upstream doesn't blow the sandbox's whole resolve budget — we'd
+// rather SERVFAIL fast than hang. Two seconds is comfortably longer
+// than any healthy public resolver's RTT.
+const forwardTimeout = 2 * time.Second
+
 // Server is a per-network DNS responder. Each UserNetwork wires one
 // instance up at its gateway IP (10.0.N.1:53). The server holds a
 // name → IP table (zone) plus a reverse-direction IP → name table
@@ -42,6 +49,26 @@ type Server struct {
 	// Defaults to slog.Default() if nil. Tests inject a discarding logger
 	// to keep CI output quiet under stress.
 	Logger *slog.Logger
+
+	// Upstreams is the ordered list of upstream resolvers (host or
+	// host:port) to forward queries we are not authoritative for.
+	// Empty = authoritative-only mode: a name outside our zone gets
+	// NXDOMAIN (the historical behavior, kept for tests and for the
+	// degraded "bind succeeded but no upstream configured" case).
+	//
+	// When non-empty the server becomes a recursing forwarder: A/AAAA/
+	// PTR/other queries for names NOT in our zone are relayed verbatim
+	// to the first upstream that answers, and that answer (including a
+	// truthful NXDOMAIN from the upstream) is passed straight back to
+	// the client. This is what makes a sandbox able to resolve both
+	// `sibling.sb` (our zone) AND `archive.ubuntu.com` (forwarded)
+	// from the single nameserver line lohar writes. Without it, glibc
+	// takes our authoritative NXDOMAIN as final and never reaches a
+	// public resolver — which silently broke apt/curl in every
+	// sandbox (G1.1 regression, caught in CI run 26806008509).
+	//
+	// Set before Start; not mutated afterward (no lock needed).
+	Upstreams []string
 
 	// stop channels are closed by Stop() to signal goroutines to exit.
 	udpConn  net.PacketConn
@@ -246,7 +273,7 @@ func (s *Server) serveUDP(logger *slog.Logger) {
 						"panic", r, "from", addr.String())
 				}
 			}()
-			resp := s.handle(buf[:n])
+			resp := s.handle(buf[:n], "udp")
 			if resp == nil {
 				return
 			}
@@ -295,7 +322,7 @@ func (s *Server) serveTCP(logger *slog.Logger) {
 			if _, err := io.ReadFull(c, buf); err != nil {
 				return
 			}
-			resp := s.handle(buf)
+			resp := s.handle(buf, "tcp")
 			if resp == nil {
 				return
 			}
@@ -308,9 +335,13 @@ func (s *Server) serveTCP(logger *slog.Logger) {
 }
 
 // handle parses a query, looks up the answer, and returns the response
-// bytes. Returns nil if the query is too malformed to construct a
-// response (e.g. truncated header — there's no ID to echo).
-func (s *Server) handle(query []byte) []byte {
+// bytes. proto is "udp" or "tcp" — it selects the transport used when
+// forwarding to an upstream (we forward over the same protocol the
+// client used, so a TCP client that needed TCP for a large answer gets
+// TCP all the way through). Returns nil if the query is too malformed
+// to construct a response (e.g. truncated header — there's no ID to
+// echo).
+func (s *Server) handle(query []byte, proto string) []byte {
 	m, err := ParseMessage(query)
 	if err != nil {
 		// We don't have an ID; drop silently. Resolvers retry on timeout.
@@ -334,25 +365,178 @@ func (s *Server) handle(query []byte) []byte {
 		return resp
 	}
 
+	forwarding := len(s.Upstreams) > 0
+
 	switch q.QType {
 	case QTypeA:
-		return s.answerA(m, q.Name)
+		if _, ok := s.Lookup(q.Name); ok {
+			return s.answerA(m, q.Name)
+		}
+		if forwarding {
+			return s.forward(m, query, proto)
+		}
+		// Authoritative-only: the name isn't ours and we have nowhere
+		// to forward, so as far as we can tell it doesn't exist.
+		resp, _ := BuildResponse(m, nil, RCodeNXDomain)
+		return resp
+
 	case QTypeAAAA:
-		// We don't serve IPv6. RFC 4074 §3: respond NOERROR with no
-		// answers (not NXDOMAIN!) so the client moves to the next
-		// resolver / IPv4 fallback without negative-caching the name.
+		if _, ok := s.Lookup(q.Name); ok {
+			// The name is ours but we have no IPv6. RFC 4074 §3:
+			// respond NOERROR with no answers (NOT NXDOMAIN!) so the
+			// client falls back to the A record instead of negative-
+			// caching the name as nonexistent.
+			resp, _ := BuildResponse(m, nil, RCodeNoError)
+			return resp
+		}
+		if forwarding {
+			// Not ours — a public name may legitimately have AAAA
+			// records, so forward rather than synthesise empty.
+			return s.forward(m, query, proto)
+		}
+		// Authoritative-only legacy behavior: empty NOERROR for any
+		// AAAA (matches pre-forwarding tests).
 		resp, _ := BuildResponse(m, nil, RCodeNoError)
 		return resp
+
 	case QTypePTR:
-		return s.answerPTR(m, q.Name)
+		if ip, ok := InAddrArpaToIPv4(q.Name); ok {
+			if _, ok := s.LookupReverse(ip); ok {
+				return s.answerPTR(m, q.Name)
+			}
+		}
+		if forwarding {
+			// O4: we are only authoritative for our own bridge's
+			// subnet reverse zone, not all of 10.0.0.0/8. An IP we
+			// don't have a name for (in or out of our subnet) gets
+			// forwarded; the upstream returns the truthful answer
+			// (usually NXDOMAIN for private space, which we relay).
+			return s.forward(m, query, proto)
+		}
+		resp, _ := BuildResponse(m, nil, RCodeNXDomain)
+		return resp
+
 	default:
-		// Other QTYPEs (MX, TXT, etc.) — return empty NOERROR. NXDOMAIN
-		// would lie about the name's existence; NOTIMP would be more
-		// correct but isn't supported by all clients gracefully. Empty
-		// NOERROR is the safe default.
+		// Other QTYPEs (MX, TXT, SRV, ...). If the name is ours,
+		// return empty NOERROR — the name exists, just not with this
+		// record type, and NXDOMAIN would lie about its existence and
+		// risk the client giving up on the A query too. If the name
+		// isn't ours, forward (or empty NOERROR in authoritative-only
+		// mode, the historical safe default).
+		if _, ok := s.Lookup(q.Name); ok {
+			resp, _ := BuildResponse(m, nil, RCodeNoError)
+			return resp
+		}
+		if forwarding {
+			return s.forward(m, query, proto)
+		}
 		resp, _ := BuildResponse(m, nil, RCodeNoError)
 		return resp
 	}
+}
+
+// forward relays a query we are not authoritative for to the configured
+// upstreams, trying each in order until one responds. The upstream's
+// response bytes are returned verbatim: because we forwarded the
+// client's ORIGINAL query (which carries the client's transaction ID),
+// the response already has the matching ID and can go straight back to
+// the client without any rewriting.
+//
+// On total upstream failure (all timed out / unreachable) we synthesise
+// SERVFAIL so the client gets a definite negative rather than hanging
+// until its own timeout.
+//
+// Note on shutdown latency: a forward in flight when Stop() is called
+// is bounded by forwardTimeout (2s), so Stop()'s wg.Wait() can block up
+// to that long. Acceptable at our scale; revisit with a context if it
+// ever matters.
+func (s *Server) forward(m *Message, query []byte, proto string) []byte {
+	logger := s.logger()
+	for _, up := range s.Upstreams {
+		addr := withDefaultPort(up)
+		var resp []byte
+		var err error
+		if proto == "tcp" {
+			resp, err = forwardTCP(addr, query)
+		} else {
+			resp, err = forwardUDP(addr, query)
+		}
+		if err != nil {
+			logger.Debug("dns: upstream failed", "upstream", addr, "err", err)
+			continue
+		}
+		return resp
+	}
+	logger.Warn("dns: all upstreams failed; returning SERVFAIL",
+		"upstreams", s.Upstreams)
+	resp, _ := BuildResponse(m, nil, RCodeServFail)
+	return resp
+}
+
+// forwardUDP sends query to a single upstream over UDP and returns the
+// raw response. One socket per call — simple, and the per-query
+// connect cost is negligible at sandbox query volumes. The kernel
+// routes the response back to this socket, so concurrent forwards with
+// colliding transaction IDs can't cross-talk.
+func forwardUDP(upstream string, query []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("udp", upstream, forwardTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(forwardTimeout))
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 1500)
+	n, err := conn.Read(resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp[:n], nil
+}
+
+// forwardTCP sends query to a single upstream over TCP (RFC 1035
+// §4.2.2 length-prefixed framing) and returns the raw response body
+// (without the length prefix). Used when the client reached us over
+// TCP — typically because a prior UDP answer was truncated and the
+// client retried over TCP per spec.
+func forwardTCP(upstream string, query []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", upstream, forwardTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(forwardTimeout))
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(query)))
+	if _, err := conn.Write(append(lenBuf[:], query...)); err != nil {
+		return nil, err
+	}
+	var respLenBuf [2]byte
+	if _, err := io.ReadFull(conn, respLenBuf[:]); err != nil {
+		return nil, err
+	}
+	respLen := binary.BigEndian.Uint16(respLenBuf[:])
+	if respLen == 0 {
+		return nil, fmt.Errorf("dns: upstream %s returned zero-length response", upstream)
+	}
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// withDefaultPort appends :53 to an upstream address that doesn't
+// already carry a port. Handles bare IPv4 ("1.1.1.1"), IPv6
+// ("2606:4700:4700::1111"), and already-ported forms
+// ("1.1.1.1:5353", "[2606:...]:53").
+func withDefaultPort(addr string) string {
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr // already host:port
+	}
+	return net.JoinHostPort(addr, "53")
 }
 
 func (s *Server) answerA(query *Message, name string) []byte {

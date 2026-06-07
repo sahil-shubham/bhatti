@@ -572,3 +572,193 @@ func TestServer_StopsOnContextCancel(t *testing.T) {
 		t.Fatal("server should not reply after cancel")
 	}
 }
+
+// --- Forwarding (recursing-forwarder mode) ---
+//
+// These tests exercise the Upstreams path added for G1.1. The original
+// design served NXDOMAIN authoritatively for any name outside our zone,
+// which glibc takes as final — so a sandbox could never resolve
+// archive.ubuntu.com through us. Forwarding fixes that: unknown names
+// are relayed to an upstream and the upstream's answer is returned
+// verbatim. We use a second Server as a controllable fake upstream so
+// the test has no external network dependency.
+
+// startUpstream starts a second Server to stand in for a real upstream
+// resolver. It has its own zone and no upstream of its own, so names
+// it doesn't know come back NXDOMAIN — exactly what a public resolver
+// does for a nonexistent name.
+func startUpstream(t *testing.T, zone map[string]string) *Server {
+	t.Helper()
+	up := NewServer("127.0.0.1:0")
+	up.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	for name, ip := range zone {
+		up.Set(name, net.ParseIP(ip))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := up.Start(ctx); err != nil {
+		t.Fatalf("upstream Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		up.Stop()
+	})
+	return up
+}
+
+// startForwarder starts the unit-under-test Server with the given
+// upstream addresses and local zone.
+func startForwarder(t *testing.T, upstreams []string, zone map[string]string) *Server {
+	t.Helper()
+	s := NewServer("127.0.0.1:0")
+	s.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	s.Upstreams = upstreams
+	for name, ip := range zone {
+		s.Set(name, net.ParseIP(ip))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("forwarder Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		s.Stop()
+	})
+	return s
+}
+
+func TestServer_ForwardsUnknownName(t *testing.T) {
+	up := startUpstream(t, map[string]string{"external": "1.2.3.4"})
+	s := startForwarder(t, []string{up.Addr().String()},
+		map[string]string{"alpha": "10.0.0.5"})
+
+	// "external" isn't in our zone → forwarded → upstream answers.
+	resp := sendUDP(t, s.Addr(), buildQuery(t, 100, "external", QTypeA))
+	m, err := ParseMessage(resp)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if m.Header.RCode() != RCodeNoError || m.Header.ANCount != 1 {
+		t.Fatalf("forwarded A: rcode=%d ancount=%d, want NOERROR/1",
+			m.Header.RCode(), m.Header.ANCount)
+	}
+	// Transaction ID must survive the round-trip (we forward the
+	// client's original query bytes, so the upstream echoes our ID).
+	if m.Header.ID != 100 {
+		t.Errorf("forwarded response ID = %d, want 100", m.Header.ID)
+	}
+	// Last 4 bytes = A RDATA = 1.2.3.4.
+	tail := resp[len(resp)-4:]
+	if tail[0] != 1 || tail[1] != 2 || tail[2] != 3 || tail[3] != 4 {
+		t.Errorf("forwarded A RDATA = %v, want [1 2 3 4]", tail)
+	}
+}
+
+func TestServer_AuthoritativeBeforeForward(t *testing.T) {
+	// With an upstream configured, a name in OUR zone is still answered
+	// locally and the upstream is never consulted. The upstream is
+	// seeded with a DIFFERENT IP for the same name to prove which one
+	// wins.
+	up := startUpstream(t, map[string]string{"alpha": "9.9.9.9"})
+	s := startForwarder(t, []string{up.Addr().String()},
+		map[string]string{"alpha": "10.0.0.5"})
+
+	resp := sendUDP(t, s.Addr(), buildQuery(t, 101, "alpha", QTypeA))
+	tail := resp[len(resp)-4:]
+	if tail[0] != 10 || tail[1] != 0 || tail[2] != 0 || tail[3] != 5 {
+		t.Errorf("authoritative A RDATA = %v, want [10 0 0 5] "+
+			"(must NOT use upstream's 9.9.9.9)", tail)
+	}
+}
+
+func TestServer_PassesThroughUpstreamNXDOMAIN(t *testing.T) {
+	up := startUpstream(t, map[string]string{"external": "1.2.3.4"})
+	s := startForwarder(t, []string{up.Addr().String()}, nil)
+
+	// "ghost" is in neither zone → forwarded → upstream NXDOMAINs →
+	// we relay the NXDOMAIN so `dig ghost` reports the truth.
+	resp := sendUDP(t, s.Addr(), buildQuery(t, 102, "ghost", QTypeA))
+	m, _ := ParseMessage(resp)
+	if m.Header.RCode() != RCodeNXDomain {
+		t.Errorf("relayed rcode = %d, want NXDOMAIN(%d)",
+			m.Header.RCode(), RCodeNXDomain)
+	}
+}
+
+func TestServer_ForwardTimeoutReturnsServfail(t *testing.T) {
+	// 127.0.0.1:1 has nothing listening; a UDP send triggers ICMP port
+	// unreachable → ECONNREFUSED on read → forward fails → SERVFAIL.
+	// (Fast and deterministic on Linux; no 2s timeout wait.)
+	s := startForwarder(t, []string{"127.0.0.1:1"}, nil)
+
+	resp := sendUDP(t, s.Addr(), buildQuery(t, 103, "anything", QTypeA))
+	m, _ := ParseMessage(resp)
+	if m.Header.RCode() != RCodeServFail {
+		t.Errorf("dead-upstream rcode = %d, want SERVFAIL(%d)",
+			m.Header.RCode(), RCodeServFail)
+	}
+}
+
+func TestServer_TriesSecondUpstreamWhenFirstDead(t *testing.T) {
+	up := startUpstream(t, map[string]string{"external": "1.2.3.4"})
+	// First upstream dead, second alive — forward must fall through.
+	s := startForwarder(t, []string{"127.0.0.1:1", up.Addr().String()}, nil)
+
+	resp := sendUDP(t, s.Addr(), buildQuery(t, 105, "external", QTypeA))
+	m, _ := ParseMessage(resp)
+	if m.Header.RCode() != RCodeNoError || m.Header.ANCount != 1 {
+		t.Errorf("fallthrough A: rcode=%d ancount=%d, want NOERROR/1",
+			m.Header.RCode(), m.Header.ANCount)
+	}
+}
+
+func TestServer_ForwardsOverTCP(t *testing.T) {
+	up := startUpstream(t, map[string]string{"external": "1.2.3.4"})
+	// Forward over TCP must target the upstream's TCP listener, which
+	// the kernel may have put on a different port than its UDP socket
+	// (both bound with :0). Point Upstreams at the TCP addr explicitly.
+	s := startForwarder(t, []string{tcpAddr(up).String()}, nil)
+
+	resp := sendTCP(t, tcpAddr(s), buildQuery(t, 104, "external", QTypeA))
+	m, err := ParseMessage(resp)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if m.Header.RCode() != RCodeNoError || m.Header.ANCount != 1 {
+		t.Fatalf("forwarded-over-tcp A: rcode=%d ancount=%d, want NOERROR/1",
+			m.Header.RCode(), m.Header.ANCount)
+	}
+}
+
+func TestServer_AAAAUnknownForwardsWhenUpstreamSet(t *testing.T) {
+	// An AAAA for a name not in our zone should forward (a public name
+	// may legitimately have AAAA records) rather than synthesise an
+	// empty NOERROR. The upstream here has no AAAA for "external"
+	// either, so it NOERRORs empty — but the point is we consulted it.
+	up := startUpstream(t, map[string]string{"external": "1.2.3.4"})
+	s := startForwarder(t, []string{up.Addr().String()}, nil)
+
+	resp := sendUDP(t, s.Addr(), buildQuery(t, 106, "external", QTypeAAAA))
+	m, _ := ParseMessage(resp)
+	// Upstream (our fake) returns empty NOERROR for AAAA of a name it
+	// has an A for — RFC 4074 behavior. We relay that. The assertion
+	// that matters: not NXDOMAIN, i.e. the name wasn't treated as
+	// locally-nonexistent.
+	if m.Header.RCode() != RCodeNoError {
+		t.Errorf("forwarded AAAA rcode = %d, want NOERROR", m.Header.RCode())
+	}
+}
+
+func TestServer_WithDefaultPort(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"1.1.1.1", "1.1.1.1:53"},
+		{"1.1.1.1:5353", "1.1.1.1:5353"},
+		{"8.8.8.8:53", "8.8.8.8:53"},
+		{"2606:4700:4700::1111", "[2606:4700:4700::1111]:53"},
+		{"[2606:4700:4700::1111]:53", "[2606:4700:4700::1111]:53"},
+	}
+	for _, c := range cases {
+		if got := withDefaultPort(c.in); got != c.want {
+			t.Errorf("withDefaultPort(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
