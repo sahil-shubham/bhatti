@@ -1,4 +1,4 @@
-.PHONY: build test clean release
+.PHONY: build vmm test clean release
 
 VERSION ?= $(shell git describe --tags --always --dirty)
 
@@ -9,6 +9,17 @@ build:
 # Build lohar (guest agent) for Linux
 lohar:
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+
+# Build the per-VM libkrun helper (krucible engine). cgo + libkrun via
+# pkg-config; on macOS it must be codesigned with the hypervisor entitlement
+# to use HVF. The daemon spawns this binary per sandbox.
+vmm:
+	CGO_ENABLED=1 go build -tags krucible -ldflags="-X main.version=$(VERSION)" -o bhatti-vmm ./cmd/vmm/
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		codesign --force --entitlements cmd/vmm/hvf-entitlements.plist -s - bhatti-vmm && \
+		echo "codesigned bhatti-vmm for HVF"; \
+	fi
+	@echo "Built bhatti-vmm"
 
 test:
 	go test ./... -count=1 -timeout 120s
@@ -27,5 +38,5 @@ release:
 	@echo "Built $(VERSION) for 4 platforms in dist/"
 
 clean:
-	rm -f bhatti lohar
+	rm -f bhatti lohar bhatti-vmm
 	rm -rf dist/
