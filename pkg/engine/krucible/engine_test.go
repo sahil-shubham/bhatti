@@ -100,14 +100,24 @@ func hasLibkrun() bool {
 	return exec.Command("pkg-config", "--exists", "libkrun").Run() == nil
 }
 
-// libDir finds the dir holding libkrunfw (libkrun dlopen()s it by name).
+// libDir returns a dyld search path covering libkrun + libkrunfw. Prefers the
+// libkrucible build prefix (our fork's libkrun) and appends the dir holding
+// libkrunfw (Homebrew). Colon-separated; passed straight to the helper's
+// DYLD_FALLBACK_LIBRARY_PATH / LD_LIBRARY_PATH.
 func libDir() string {
-	for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"} {
-		if matches, _ := filepath.Glob(filepath.Join(d, "libkrunfw*")); len(matches) > 0 {
-			return d
+	var dirs []string
+	if fork, err := filepath.Abs("../../../../libkrucible/_install/lib"); err == nil {
+		if _, err := os.Stat(fork); err == nil {
+			dirs = append(dirs, fork)
 		}
 	}
-	return ""
+	for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"} {
+		if matches, _ := filepath.Glob(filepath.Join(d, "libkrunfw*")); len(matches) > 0 {
+			dirs = append(dirs, d)
+			break
+		}
+	}
+	return strings.Join(dirs, ":")
 }
 
 // buildBaseRootfs cross-compiles lohar to <root>/init.krun and a tiny multi-call
