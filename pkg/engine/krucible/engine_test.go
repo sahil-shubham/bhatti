@@ -145,8 +145,25 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	if out, err := utilBuild.CombinedOutput(); err != nil {
 		t.Fatalf("build miniutil: %v\n%s", err, out)
 	}
-	if err := os.Symlink("true", filepath.Join(root, "bin", "echo")); err != nil {
+	for _, n := range []string{"echo", "errcho", "false", "sleep"} {
+		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// netcheck -> /bin/netcheck (TSI egress prober + tiny HTTP server)
+	ncSrc := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ncSrc, "go.mod"), []byte("module nc\ngo 1.21\n"), 0644); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ncSrc, "main.go"), []byte(netcheckSrc), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ncBuild := exec.Command("go", "build", "-o", filepath.Join(root, "bin", "netcheck"), ".")
+	ncBuild.Dir = ncSrc
+	ncBuild.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+guestArch, "CGO_ENABLED=0")
+	if out, err := ncBuild.CombinedOutput(); err != nil {
+		t.Fatalf("build netcheck: %v\n%s", err, out)
 	}
 	return root
 }
@@ -157,16 +174,75 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
 	switch filepath.Base(os.Args[0]) {
 	case "echo":
 		fmt.Println(strings.Join(os.Args[1:], " "))
+	case "errcho":
+		fmt.Fprintln(os.Stderr, strings.Join(os.Args[1:], " "))
 	case "false":
 		os.Exit(1)
+	case "sleep":
+		if len(os.Args) > 1 {
+			n, _ := strconv.Atoi(os.Args[1])
+			time.Sleep(time.Duration(n) * time.Second)
+		}
 	default: // true
+	}
+}
+`
+
+const netcheckSrc = `package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("usage: netcheck MODE")
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "tcp":
+		c, err := net.DialTimeout("tcp", "1.1.1.1:443", 5*time.Second)
+		if err != nil {
+			fmt.Println("ERR", err)
+			os.Exit(1)
+		}
+		c.Close()
+		fmt.Println("OK tcp 1.1.1.1:443")
+	case "dns":
+		ips, err := net.LookupHost("example.com")
+		if err != nil {
+			fmt.Println("ERR", err)
+			os.Exit(1)
+		}
+		fmt.Println("OK dns", ips)
+	case "http":
+		cl := &http.Client{Timeout: 8 * time.Second}
+		r, err := cl.Get("http://example.com")
+		if err != nil {
+			fmt.Println("ERR", err)
+			os.Exit(1)
+		}
+		r.Body.Close()
+		fmt.Println("OK http", r.Status)
+	case "serve":
+		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+			io.WriteString(w, "hello-from-guest\n")
+		})
+		http.ListenAndServe("0.0.0.0:"+os.Args[2], nil)
 	}
 }
 `
