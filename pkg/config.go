@@ -37,6 +37,12 @@ type Config struct {
 	FirecrackerKernel string `yaml:"firecracker_kernel"` // path to vmlinux
 	FirecrackerRootfs string `yaml:"firecracker_rootfs"` // path to base rootfs.ext4
 
+	// Krucible-specific (libkrun engine; macOS + Linux)
+	KrucibleVMM       string `yaml:"krucible_vmm"`        // path to the bhatti-vmm helper (default: next to binary / PATH)
+	KrucibleRootfs    string `yaml:"krucible_rootfs"`     // base rootfs dir (virtiofs root) with /init.krun=lohar
+	KrucibleLibDir    string `yaml:"krucible_libdir"`     // dir with libkrun/libkrunfw (default: autodetect)
+	KrucibleSocketDir string `yaml:"krucible_socket_dir"` // short dir for vsock UDS (default: /tmp/bhatti-kr)
+
 	// Jailer (empty = bare mode, no isolation)
 	FirecrackerJailer string `yaml:"firecracker_jailer,omitempty"` // path to jailer binary
 	JailUID           int    `yaml:"jail_uid,omitempty"`           // uid for jailed FC (e.g. 10000)

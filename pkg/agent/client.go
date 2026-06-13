@@ -66,6 +66,19 @@ func NewTestClient(controlSock, forwardSock string) *AgentClient {
 	}
 }
 
+// NewKrucibleClient connects to lohar through the libkrun-bridged vsock UDS
+// paths (one per guest port: control=1024, forward=1025). libkrun listens on
+// these host UDS and bridges to the guest vsock port, so we dial them directly
+// as plain Unix sockets — no Firecracker CONNECT handshake. Carries the auth
+// token (empty = no auth, e.g. P1 before config-drive injection lands).
+func NewKrucibleClient(controlSock, forwardSock, token string) *AgentClient {
+	return &AgentClient{
+		controlSock: controlSock,
+		forwardSock: forwardSock,
+		token:       token,
+	}
+}
+
 // DialControl opens a connection to the control channel (port 1024).
 // The context controls connection timeout and cancellation.
 func (c *AgentClient) DialControl(ctx context.Context) (net.Conn, error) {

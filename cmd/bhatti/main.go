@@ -101,6 +101,8 @@ func runDaemon() {
 	switch cfg.Engine {
 	case "firecracker", "":
 		eng, err = newFirecrackerEngine(cfg)
+	case "krucible":
+		eng, err = newKrucibleEngine(cfg)
 	default:
 		slog.Error("unknown engine", "engine", cfg.Engine)
 		os.Exit(1)
