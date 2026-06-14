@@ -54,18 +54,25 @@ func TestEngineCapabilities(t *testing.T) {
 	record := func(cap, status, detail string) {
 		rows = append(rows, fmt.Sprintf("  %-26s %-7s %s", cap, status, detail))
 	}
-	probe := func(cap string, fn func() (string, error)) {
+	run := func(cap string, mustWork bool, fn func() (string, error)) {
 		detail, err := fn()
 		if err != nil {
 			record(cap, "FAILS", err.Error())
+			if mustWork {
+				t.Errorf("%s FAILED (must work on krucible): %v", cap, err)
+			}
 		} else {
 			record(cap, "WORKS", detail)
 		}
 	}
+	// must = assert (regression fails the test); info = report only (e.g. caps
+	// that need a richer guest userland than the minimal box rootfs).
+	must := func(cap string, fn func() (string, error)) { run(cap, true, fn) }
+	report := func(cap string, fn func() (string, error)) { run(cap, false, fn) }
 
-	probe("create", func() (string, error) { return "booted, agent ready", nil })
+	must("create", func() (string, error) { return "booted, agent ready", nil })
 
-	probe("exec exit-code 0", func() (string, error) {
+	report("exec exit-code 0", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"true"})
 		if err != nil {
 			return "", err
@@ -75,7 +82,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return "true -> 0", nil
 	})
-	probe("exec exit-code !=0", func() (string, error) {
+	report("exec exit-code !=0", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"false"})
 		if err != nil {
 			return "", err
@@ -85,7 +92,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return "false -> 1", nil
 	})
-	probe("exec stdout", func() (string, error) {
+	report("exec stdout", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"echo", "hi-stdout"})
 		if err != nil {
 			return "", err
@@ -95,7 +102,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return "captured", nil
 	})
-	probe("exec stderr", func() (string, error) {
+	report("exec stderr", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"errcho", "hi-stderr"})
 		if err != nil {
 			return "", err
@@ -106,7 +113,7 @@ func TestEngineCapabilities(t *testing.T) {
 		return "captured", nil
 	})
 
-	probe("file write+read", func() (string, error) {
+	report("file write+read", func() (string, error) {
 		content := "krucible-file-probe-12345"
 		if err := eng.FileWrite(ctx, id, "/tmp/probe.txt", "0644", int64(len(content)), strings.NewReader(content)); err != nil {
 			return "", fmt.Errorf("write: %w", err)
@@ -120,14 +127,14 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return "roundtrip ok", nil
 	})
-	probe("file stat", func() (string, error) {
+	report("file stat", func() (string, error) {
 		fi, err := eng.FileStat(ctx, id, "/init.krun")
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("/init.krun size=%d", fi.Size), nil
 	})
-	probe("file list", func() (string, error) {
+	report("file list", func() (string, error) {
 		fis, err := eng.FileList(ctx, id, "/bin")
 		if err != nil {
 			return "", err
@@ -135,7 +142,7 @@ func TestEngineCapabilities(t *testing.T) {
 		return fmt.Sprintf("/bin has %d entries", len(fis)), nil
 	})
 
-	probe("tsi egress: tcp", func() (string, error) {
+	must("tsi egress: tcp", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"netcheck", "tcp"})
 		if err != nil {
 			return "", err
@@ -145,7 +152,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return strings.TrimSpace(r.Stdout), nil
 	})
-	probe("tsi egress: dns", func() (string, error) {
+	must("tsi egress: dns", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"netcheck", "dns"})
 		if err != nil {
 			return "", err
@@ -155,7 +162,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return strings.TrimSpace(r.Stdout), nil
 	})
-	probe("tsi egress: http", func() (string, error) {
+	must("tsi egress: http", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"netcheck", "http"})
 		if err != nil {
 			return "", err
@@ -166,7 +173,7 @@ func TestEngineCapabilities(t *testing.T) {
 		return strings.TrimSpace(r.Stdout), nil
 	})
 
-	probe("detached exec + tunnel", func() (string, error) {
+	must("detached exec + tunnel", func() (string, error) {
 		if _, _, err := eng.ExecDetached(ctx, id, []string{"netcheck", "serve", "8088"}, "/tmp/serve.log"); err != nil {
 			return "", fmt.Errorf("detached: %w", err)
 		}
@@ -189,14 +196,14 @@ func TestEngineCapabilities(t *testing.T) {
 		return "tunneled to guest HTTP server", nil
 	})
 
-	probe("listening ports (ss)", func() (string, error) {
+	report("listening ports (ss)", func() (string, error) {
 		ports, err := eng.ListeningPorts(ctx, id)
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("%v", ports), nil
 	})
-	probe("shell / PTY", func() (string, error) {
+	report("shell / PTY", func() (string, error) {
 		_, term, err := eng.ShellSession(ctx, id)
 		if err != nil {
 			return "", err

@@ -1,88 +1,45 @@
 package krucible
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
 )
 
-// TestEngineCreateExecDestroy is the P1 gate: boot a real microVM via the
-// bhatti-vmm helper and drive lohar's agent through the bridged vsock.
-//
-// Self-skips unless the prereqs are present (libkrun via pkg-config + a built
-// bhatti-vmm), so `go test ./...` stays green on hosts without libkrun. Build
-// the helper first with `make vmm`.
-func TestEngineCreateExecDestroy(t *testing.T) {
+// newSuiteEngine builds a krucible engine for the shared enginetest suite,
+// self-skipping if libkrun / bhatti-vmm aren't available (so `go test ./...`
+// stays green on hosts without libkrun). Build the helper with `make vmm`.
+func newSuiteEngine(t *testing.T) engine.Engine {
 	repo := repoRoot(t)
 	if !hasLibkrun() {
-		t.Skip("libkrun not installed (pkg-config libkrun); skipping krucible engine test")
+		t.Skip("libkrun not installed (pkg-config libkrun); skipping")
 	}
 	vmm := filepath.Join(repo, "bhatti-vmm")
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
-
-	base := buildBaseRootfs(t, repo)
 	eng, err := New(Config{
 		DataDir:    t.TempDir(),
-		BaseRootfs: base,
+		BaseRootfs: buildBaseRootfs(t, repo),
 		VMMBinary:  vmm,
 		LibDir:     libDir(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return eng
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "p1test", CPUs: 1, MemoryMB: 512})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	defer eng.Destroy(context.Background(), info.ID)
-
-	if info.Status != "running" {
-		t.Fatalf("status = %q, want running", info.Status)
-	}
-
-	// List + Status reflect the new sandbox.
-	if list, _ := eng.List(ctx); len(list) != 1 {
-		t.Fatalf("List len = %d, want 1", len(list))
-	}
-
-	// Exec: exit code round-trips.
-	res, err := eng.Exec(ctx, info.ID, []string{"true"})
-	if err != nil {
-		t.Fatalf("Exec(true): %v", err)
-	}
-	if res.ExitCode != 0 {
-		t.Fatalf("Exec(true) exit = %d, want 0", res.ExitCode)
-	}
-
-	// Exec: stdout round-trips.
-	res, err = eng.Exec(ctx, info.ID, []string{"echo", "hello-krucible"})
-	if err != nil {
-		t.Fatalf("Exec(echo): %v", err)
-	}
-	if !strings.Contains(res.Stdout, "hello-krucible") {
-		t.Fatalf("Exec(echo) stdout = %q, want it to contain hello-krucible", res.Stdout)
-	}
-
-	// Destroy removes it.
-	if err := eng.Destroy(ctx, info.ID); err != nil {
-		t.Fatalf("Destroy: %v", err)
-	}
-	if list, _ := eng.List(ctx); len(list) != 0 {
-		t.Fatalf("List after destroy = %d, want 0", len(list))
-	}
+// TestKrucibleAgentSuite runs the shared VMM-agnostic behavior suite against the
+// krucible engine — the parity gate (the same suite is meant to pass on FC).
+func TestKrucibleAgentSuite(t *testing.T) {
+	enginetest.RunAgentSuite(t, newSuiteEngine)
 }
 
 // --- test helpers ---

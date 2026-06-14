@@ -49,14 +49,26 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-run() { echo; echo "\$ ./bhatti $*"; ./bhatti "$@"; }
+# check "<expected substring>" ./bhatti <args...> — runs, prints, and asserts.
+FAILED=0
+check() {
+  want="$1"; shift
+  echo; echo "\$ $*"
+  out="$("$@" 2>&1)"; echo "$out"
+  if printf '%s' "$out" | grep -qF -- "$want"; then echo "  [ok] matched: $want"; else echo "  [MISS] expected: $want"; FAILED=1; fi
+}
 
-run create --name s1 --cpus 1 --memory 512
-run list
-run exec s1 -- echo hello-from-cli
-run exec s1 -- netcheck http
-run inspect s1
-run destroy s1 --yes
+check "created"        ./bhatti create --name s1 --cpus 1 --memory 512
+check "s1"             ./bhatti list
+check "hello-from-cli" ./bhatti exec s1 -- echo hello-from-cli
+check "OK http 200"    ./bhatti exec s1 -- netcheck http   # real egress from the sandbox
+check "running"        ./bhatti inspect s1
+check "destroyed"      ./bhatti destroy s1 --yes
 
-echo; echo "SMOKE PASS: created, exec'd, and destroyed a sandbox via the local CLI."
-echo "  (daemon log: $WORK/serve.log)"
+echo
+if [ "$FAILED" = 0 ]; then
+  echo "SMOKE PASS: create/list/exec/egress/inspect/destroy via the local CLI all verified."
+  echo "  (this is a convenience e2e check; the primary gate is 'go test ./pkg/engine/krucible/')"
+else
+  echo "SMOKE FAIL — see output above and $WORK/serve.log"; exit 1
+fi
