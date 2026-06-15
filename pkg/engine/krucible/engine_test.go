@@ -42,6 +42,12 @@ func TestKrucibleAgentSuite(t *testing.T) {
 	enginetest.RunAgentSuite(t, newSuiteEngine)
 }
 
+// TestKrucibleThermalSuite asserts hot/warm transitions on the krucible engine.
+// Skips until the engine implements the thermal surface (P2).
+func TestKrucibleThermalSuite(t *testing.T) {
+	enginetest.RunThermalSuite(t, newSuiteEngine)
+}
+
 // --- test helpers ---
 
 func repoRoot(t *testing.T) string {

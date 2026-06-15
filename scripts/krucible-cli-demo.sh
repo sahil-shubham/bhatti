@@ -17,10 +17,15 @@ if ! pkg-config --exists libkrun 2>/dev/null; then
   echo "ERROR: libkrun not installed (brew install libkrun)"; exit 1
 fi
 
-echo "==> build (bhatti daemon/CLI + vmm helper + base rootfs)"
+echo "==> build (libkrucible + bhatti daemon/CLI + vmm helper + base rootfs)"
+make krucible >/dev/null
 go build -o bhatti ./cmd/bhatti/
 make vmm >/dev/null
 [ -x dist/krucible-rootfs/init.krun ] || ./scripts/krucible-rootfs.sh >/dev/null
+
+# libkrun comes from the libkrucible prefix; libkrunfw from Homebrew. The daemon
+# passes krucible_libdir to bhatti-vmm as its dyld search path.
+FORK_LIB="$(cd "$REPO/.." && pwd)/libkrucible/_install/lib"
 
 # Isolated config — never read/written by the system bhatti.
 cat > "$CFG" <<EOF
@@ -29,6 +34,7 @@ listen: ":$PORT"
 data_dir: $WORK/data
 krucible_rootfs: $REPO/dist/krucible-rootfs
 krucible_vmm: $REPO/bhatti-vmm
+krucible_libdir: $FORK_LIB:/opt/homebrew/lib
 api_url: http://localhost:$PORT
 EOF
 export BHATTI_CONFIG="$CFG"
@@ -54,7 +60,8 @@ FAILED=0
 check() {
   want="$1"; shift
   echo; echo "\$ $*"
-  out="$("$@" 2>&1)"; echo "$out"
+  out="$("$@" 2>&1)" || true   # don't let set -e abort before we assert
+  echo "$out"
   if printf '%s' "$out" | grep -qF -- "$want"; then echo "  [ok] matched: $want"; else echo "  [MISS] expected: $want"; FAILED=1; fi
 }
 
