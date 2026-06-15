@@ -1070,20 +1070,20 @@ a fuller service set than we'd need.
 | **Firecracker CI** | systemd | N/A (test rootfs) | ~310ms total (79ms kernel + 231ms userspace) | Yes (FC native) |
 | **Kata Containers** | Dual-mode (`getpid()==1` check) | PID 1 or systemd service | ~500ms (published) | No |
 | **OpenFaaS/faasd** | systemd | Agent as systemd service | Not published | Pause only (no snapshot) |
-| **smolvm** | Agent IS PID 1 | PID 1 (via libkrun init.c) | <200ms (published) | No |
+| **the reference runtime** | Agent IS PID 1 | PID 1 (via libkrun init.c) | <200ms (published) | No |
 | **Sprites** (fly.io) | Custom init | Built-in service manager | Not published | Filesystem only (no memory) |
 | **AWS Lambda** | Custom init | Runtime Interface | ~100-200ms (kernel to handler) | Yes (SnapStart) |
 | **Bhatti** | lohar | PID 1 | 365ms e2e (28ms init) | Yes (full memory) |
 
-**smolvm deep dive (from source review):**
+**the reference runtime deep dive (from source review):**
 
-smolvm uses libkrun (not Firecracker) as its VMM. libkrun's `init.c`
+the reference runtime uses libkrun (not Firecracker) as its VMM. libkrun's `init.c`
 mounts proc/sys/dev *before* exec'ing the agent — the VMM itself does
-the init duties, then the agent runs as a normal process. smolvm's
+the init duties, then the agent runs as a normal process. the reference runtime's
 agent checks if mounts already exist and skips them:
 
 ```rust
-// smolvm-agent/src/main.rs
+// the reference runtime-agent/src/main.rs
 fn mount_essential_filesystems() {
     // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before
     // exec'ing the agent. Skip redundant mounts if already present.
@@ -1094,7 +1094,7 @@ fn mount_essential_filesystems() {
 }
 ```
 
-smolvm does NOT use systemd. It also does NOT support snapshot/restore,
+the reference runtime does NOT use systemd. It also does NOT support snapshot/restore,
 does NOT run Ubuntu packages (it uses Alpine/OCI images via crun), and
 does NOT have thermal management. It's a fundamentally different
 architecture: ephemeral containers in microVMs, not persistent Linux
@@ -1102,13 +1102,13 @@ environments. Packages are installed via `apk add` (Alpine) or are
 baked into OCI images, and services are managed by crun's container
 lifecycle, not by an init system.
 
-**Why smolvm's approach doesn't apply to bhatti:**
-- smolvm runs OCI containers inside VMs — services are container
+**Why the reference runtime's approach doesn't apply to bhatti:**
+- the reference runtime runs OCI containers inside VMs — services are container
   lifecycle, not init system
-- smolvm uses Alpine, not Ubuntu — no systemd dependency chain
-- smolvm has no snapshot/restore — no time-jump concerns
-- smolvm is primarily for ephemeral workloads and `.smolmachine` packing
-- smolvm users don't `apt-get install postgresql` inside a running VM
+- the reference runtime uses Alpine, not Ubuntu — no systemd dependency chain
+- the reference runtime has no snapshot/restore — no time-jump concerns
+- the reference runtime is primarily for ephemeral workloads and single-file VM packing
+- the reference runtime users don't `apt-get install postgresql` inside a running VM
 
 **Kata Containers deep dive (from source review):**
 
