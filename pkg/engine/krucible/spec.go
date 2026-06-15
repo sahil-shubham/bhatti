@@ -38,6 +38,11 @@ type VMSpec struct {
 	VsockControlUDS string `json:"vsock_control_uds"`
 	VsockForwardUDS string `json:"vsock_forward_uds"`
 
+	// ControlSocketUDS, if set, is the host-side UDS the VMM serves for warm-tier
+	// commands (PAUSE/RESUME/STATUS). One newline command in, one line out, then
+	// close. See krun_set_control_socket.
+	ControlSocketUDS string `json:"control_socket_uds,omitempty"`
+
 	// LogLevel is the libkrun log level (0=off .. 5=trace). 2=warn keeps the
 	// guest console readable.
 	LogLevel uint32 `json:"log_level"`

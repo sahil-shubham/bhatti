@@ -45,8 +45,11 @@ type VM struct {
 	SandboxDir string
 	RootfsDir  string
 	SockDir    string
-	ControlUDS string
-	ForwardUDS string
+	ControlUDS string // guest vsock 1024 (agent control)
+	ForwardUDS string // guest vsock 1025 (port forward)
+	CtlSockUDS string // VMM control socket (PAUSE/RESUME/STATUS)
+	MemMiB     uint32 // configured at boot (for ThermalEngine.MemSizeMib)
+	Thermal    string // "hot" | "warm" | (cold lands in P3)
 	Token      string
 	Agent      *agent.AgentClient
 	Status     string // "running" | "stopped"
@@ -164,10 +167,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// deep DataDir/$TMPDIR would overflow it (ENAMETOOLONG on the vsock proxy).
 	controlUDS := filepath.Join(sockDir, "c.sock")
 	forwardUDS := filepath.Join(sockDir, "f.sock")
+	ctlSockUDS := filepath.Join(sockDir, "k.sock") // VMM control (PAUSE/RESUME/STATUS)
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
 		return info, fmt.Errorf("create socket dir: %w", err)
 	}
-	for _, p := range []string{controlUDS, forwardUDS} {
+	for _, p := range []string{controlUDS, forwardUDS, ctlSockUDS} {
 		if len(p) >= maxUnixPath {
 			return info, fmt.Errorf("vsock path too long (%d >= %d): %s — set a shorter SocketDir", len(p), maxUnixPath, p)
 		}
@@ -183,9 +187,10 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		MemMiB:          memMiB,
 		Pid1:            true,
 		ExecPath:        "/init.krun",
-		VsockControlUDS: controlUDS,
-		VsockForwardUDS: forwardUDS,
-		LogLevel:        2,
+		VsockControlUDS:  controlUDS,
+		VsockForwardUDS:  forwardUDS,
+		ControlSocketUDS: ctlSockUDS,
+		LogLevel:         2,
 	}
 	specPath := filepath.Join(sandboxDir, "vmspec.json")
 	specBytes, _ := json.MarshalIndent(vmSpec, "", "  ")
@@ -205,6 +210,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	vmCtx, vmCancel := context.WithCancel(context.Background())
 	cancel = vmCancel
 	cmd = exec.CommandContext(vmCtx, e.cfg.VMMBinary, specPath)
+	// Guest console + libkrun logs go to vmm.log; the tail is surfaced on boot
+	// failure (see WaitReady below).
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if e.cfg.LibDir != "" {
@@ -231,7 +238,8 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	vm := &VM{
 		ID: id, Name: name, UserID: spec.UserID,
 		SandboxDir: sandboxDir, RootfsDir: rootfsDir, SockDir: sockDir,
-		ControlUDS: controlUDS, ForwardUDS: forwardUDS,
+		ControlUDS: controlUDS, ForwardUDS: forwardUDS, CtlSockUDS: ctlSockUDS,
+		MemMiB: memMiB, Thermal: "hot",
 		Token: token, Agent: ag, Status: "running",
 		cmd: cmd, cancel: vmCancel,
 	}
@@ -272,13 +280,15 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
-// Stop/Start (thermal: warm/cold) land in P2 via the control socket.
+// Stop/Start are the cold tier (snapshot-to-disk + free RAM / restore), which
+// lands in P3. The warm tier (hot<->warm) is the ThermalEngine surface in
+// thermal.go (Pause/Resume/EnsureHot via the control socket).
 func (e *Engine) Stop(ctx context.Context, id string) error {
-	return fmt.Errorf("krucible: stop/snapshot not implemented yet (P2)")
+	return fmt.Errorf("krucible: stop/snapshot not implemented yet (P3)")
 }
 
 func (e *Engine) Start(ctx context.Context, id string) error {
-	return fmt.Errorf("krucible: start/resume not implemented yet (P2)")
+	return fmt.Errorf("krucible: start/resume not implemented yet (P3)")
 }
 
 func (e *Engine) Status(ctx context.Context, id string) (engine.SandboxInfo, error) {

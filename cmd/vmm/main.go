@@ -97,6 +97,15 @@ func run(spec krucible.VMSpec) {
 	addVsock(1024, spec.VsockControlUDS)
 	addVsock(1025, spec.VsockForwardUDS)
 
+	// Warm-tier control socket (PAUSE/RESUME/STATUS). Optional; skipped when empty.
+	if spec.ControlSocketUDS != "" {
+		c := C.CString(spec.ControlSocketUDS)
+		defer C.free(unsafe.Pointer(c))
+		if r := C.krun_set_control_socket(cid, c); r != 0 {
+			fail("krun_set_control_socket: %d", int(r))
+		}
+	}
+
 	// In PID-1 mode the kernel boots ExecPath directly; KRUN_INIT is ignored
 	// by lohar. We still set it (with env) for parity / non-PID1 use.
 	cexec := C.CString(spec.ExecPath)
