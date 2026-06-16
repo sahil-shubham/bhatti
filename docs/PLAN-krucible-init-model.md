@@ -168,7 +168,69 @@ it keeps the door open to M2 once the product question is answered.
 
 ---
 
-## 6. Open questions
+## 6. The real question: lohar's *delta* in libkrun (what's better NOT done in lohar)
+
+Much of lohar exists because **Firecracker gave us nothing** — FC boots a kernel and runs `init=`, full stop. So lohar had
+to *be* the init, the network setup, the clock-workaround, the service manager, and the agent. libkrun is the opposite: it
+ships an init and a device/boot model, and our own VMM work (the warm/cold tier) added the missing pieces. A lot of lohar
+is therefore **FC-era workaround that libkrun now subsumes.** The discussion isn't "shrink lohar for its own sake" — it's:
+*where libkrun (or the VMM) does a job natively and better, lohar carrying its own version is liability, not value.*
+
+### Why lohar did things its own way (documented) — and what changed
+- **No systemd (decisions §3):** determinism + boot speed (367ms vs 708ms) **and snapshot-correctness** — real systemd
+  reacts to the `CLOCK_MONOTONIC` jump on resume (arm64 `arch_timer` advances while vCPUs are paused) with timer storms /
+  `degraded`/`maintenance` mode (`EXPERIMENT-systemd-predictions.md`). lohar-as-PID-1 has no timers/watchdogs to misbehave.
+  **What changed:** the VMM now *freezes the guest clock* across pause (the `CNTVOFF` vtimer-offset adjust on warm resume;
+  absolute restore on cold). The clock-jump that broke systemd is **handled natively** — so the snapshot-correctness
+  argument for avoiding a real init is materially weaker on krucible than it was on FC.
+- **Own mounts / network / reaping:** FC had no init to do them. **What changed:** libkrun's init does idempotent
+  (`EBUSY`-tolerant), hardened (`MS_NOSUID|NODEV|NOEXEC`) mounts of `/proc`,`/sys`,`/dev`, the block-root pivot,
+  loopback/dummy-net (TSI-aware), zombie reaping + `reboot` (under `KRUN_INIT_PID1`), and virtio-port I/O redirects.
+- **Own networking (`net.go`, `ip=`):** FC used TAP + kernel `ip=`. **What changed:** TSI — no `eth0`; lohar's network
+  setup already no-ops on krucible. Dead code on this path.
+
+### Responsibility inventory: lohar today → libkrun-native → verdict
+| lohar does today | libkrun / VMM native? | Verdict on krucible |
+|---|---|---|
+| mount `/proc`,`/sys`,`/dev`,`devpts` | **yes** (init, idempotent + hardened) | **shed** — let the init do it |
+| block-root mount + pivot | **yes** (init) | **shed** (this is exactly the M1 unlock) |
+| loopback up / dummy net | **yes** (init, TSI-aware) | **shed** |
+| `ip=` parse / TAP networking | n/a under TSI | **delete** (dead) |
+| zombie reaping / `reboot` on exit | **yes** (init, `KRUN_INIT_PID1`) | **shed** (init owns PID-1 duties) |
+| stdio / console redirects | **yes** (init virtio-ports) | **shed** |
+| clock continuity across pause/restore | **yes** (VMM `CNTVOFF` freeze — our work) | **shed the workaround**; rely on VMM |
+| `cgroup2` + `binfmt_misc` mounts | no (init doesn't) | **keep** — but only the workload/docker tier needs them |
+| **agent protocol** (exec/shell/files/sessions/tunnel/vsock) | **no** — nothing like it | **KEEP — the irreducible product** |
+| **service supervision** (the systemd shim) | **no** | **keep, but decouple** (separable concern; see below) |
+| bhatti config drive (token/files/secrets/volumes/DNS) | partial (init reads OCI `KRUN_CONFIG`, different contract) | **keep** (bhatti's contract) |
+| syslog | partial | minor — keep |
+
+### Where the value is
+Strip the FC-era plumbing and lohar's *unique, defensible* value is two things, of very different natures:
+1. **The agent** — exec/shell/files/sessions/tunnel over vsock, with sessions-as-the-model (decisions §4), scrollback,
+   detach-survival. This is the bhatti guest contract and the product. libkrun has nothing like it. **This is the core;
+   make it thin and sharp.**
+2. **Service supervision (the shim)** — a real, hard-won dependency-ordered/condition-gated/cgroup-placing supervisor
+   (W9), so `apt install postgres|nginx|docker` works without booting systemd. Its rationale is documented and valid —
+   **but it is a different concern from the agent**, and it is only needed by the *workload* tiers, not the agent base.
+
+### The shape this points to
+- **init plumbing → libkrun's init** (M1): mounts, pivot, net, reaping, reboot, redirects. Delete lohar's copies.
+- **clock workarounds → gone**: the VMM owns clock continuity. (Re-audit lohar/the shim for any monotonic-jump
+  defensiveness that's now redundant.)
+- **agent → the thin core of lohar**, the workload the init execs (M1) — or a service (M2) once supervision is settled.
+- **service supervision → a tier concern, decoupled from the agent**: either keep the shim but as its own unit invoked by
+  the workload tiers, **or** — now that the VMM handles the clock jump — reconsider *real systemd for the heavy tiers*
+  (the M2 shape bhatti already prototyped at +340ms, whose main objection — snapshot fragility — the VMM just defused).
+  The agent base tier needs neither.
+
+Net: libkrun doesn't make lohar *less* valuable — it lets lohar **stop pretending to be an OS** and be the thing only
+bhatti can provide (the agent), while the VMM does the OS plumbing it does better. The systemd shim stays justified, but as
+a *tier capability*, not a tax every sandbox's PID 1 carries.
+
+---
+
+## 7. Open questions
 
 1. **Does the krucible guest need the systemd shim at all?** (The hinge for M2; likely "no" for pure agent sandboxes,
    "yes" for Docker-in-sandbox.)
