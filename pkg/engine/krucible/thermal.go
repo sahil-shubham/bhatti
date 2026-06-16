@@ -57,12 +57,32 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 }
 
 // EnsureHot is the canonical wake path used by the server's thermal manager
-// (the public proxy calls it on every incoming request). Idempotent on hot.
+// (the public proxy calls it on every incoming request). It is tier-aware:
+//   - hot:  no-op
+//   - warm: RESUME over the control socket (helper alive, vCPUs paused)
+//   - cold: Start (re-launch the helper + restore the snapshot bundle) — the
+//     helper was killed at Stop, so a socket RESUME would fail.
+// This lets a single wake-on-request transparently revive both warm and cold
+// sandboxes.
 func (e *Engine) EnsureHot(ctx context.Context, id string) error {
-	return e.Resume(ctx, id)
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	vm.mu.Lock()
+	thermal, status := vm.Thermal, vm.Status
+	vm.mu.Unlock()
+	switch {
+	case thermal == "hot" && status == "running":
+		return nil
+	case thermal == "cold" || status == "stopped":
+		return e.Start(ctx, id)
+	default:
+		return e.Resume(ctx, id)
+	}
 }
 
-// ThermalState returns "hot" | "warm" mirrored from local state. (We trust the
+// ThermalState returns "hot" | "warm" | "cold" mirrored from local state. (We trust the
 // state machine in Pause/Resume rather than round-tripping STATUS over the UDS
 // on every call — every server.ListSandboxes call would otherwise hit the UDS.)
 func (e *Engine) ThermalState(id string) string {
