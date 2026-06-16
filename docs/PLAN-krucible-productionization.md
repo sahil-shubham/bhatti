@@ -142,9 +142,18 @@ work on FC today work on krucible, plus the krucible-only wins (faster fs, sub-s
 ## 5. Recommended execution order
 
 1. **Cold-tier closeout (A)** + **lohar/daemon slimming (B, C)** — finish + clean up what's already validated on Mac. No
-   new hardware needed.
-2. **Production rootfs (4b)** + **CLI-direct mode (D)** — unblocks real use cases locally.
-3. **Test migration (4a)** — behavior suites on both engines; server-level integration on a krucible daemon.
+   new hardware needed. **— DONE (2026-06-16):** checkpoint magic+version (libkrucible) + the runtime portability gate
+   (`validateBundle`: refuse incomplete/cross-arch/proto-mismatch). **lohar slim resolved as moot** — the kernel-direct
+   block-root (M1′) keeps lohar PID-1 by design; the one FC-only fn (`setupNetworking`) self-skips on krucible and is
+   load-bearing on FC (see `PLAN-krucible-init-model.md` DECISION).
+2. **Production rootfs (4b)** + **CLI-direct mode (D)** — unblocks real use cases locally. **— rootfs DONE (2026-06-16):**
+   `oci.PullAndConvert` + `/init.krun` symlink + `Config.BaseImage` boot real OCI images on the block-root path;
+   `TestKrucibleProductionImage` boots Alpine linux/arm64 (real `/bin/sh`, `uname`, os-release) + cold round-trip, green
+   on HVF. **CLI-direct mode still TODO.**
+3. **Test migration (4a)** — behavior suites on both engines; server-level integration on a krucible daemon. **— STARTED
+   (2026-06-16):** `RunSnapshotSuite` (cold tier, both-engine-ready); `TestKrucibleServerIntegration` drives the full
+   daemon (HTTP API + store + thermal) over krucible incl. **cold wake-on-request** (fixed `EnsureHot` to be tier-aware:
+   cold→Start). Remaining: port the FC behavior suites (sessions/files/piped) into `enginetest`.
 4. **Production use-case matrix (4c)** on Mac, then the **Linux warm-cluster bring-up (E1)** — first multi-platform proof.
 5. **Cold-x86-Linux (E2)**, then the P4+ tracks (F) and **Tier-3 Pi (E3)** as their own gates.
 
