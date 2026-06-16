@@ -246,12 +246,57 @@ table with `/events?since=<id>` replay) and exec streaming over NDJSON + WebSock
 *fleet* stream (SSE/WS over `EventRecorder.Subscribe`), richer event types on the bus (output/log/thermal/network), and
 backpressure/replay polish — pairs naturally with §6a (observe the mesh).
 
+### 6e. Agent-state timeline (volumes & versioning)
+
+**Value first.** The experience we want is *"my agent's working context is a timeline I can rewind to before the mistake,
+branch to try three things, promote the one that worked, and carry to another machine."* Not "a disk I occasionally back
+up." The unit isn't a volume — it's a **timeline you checkpoint, branch, and promote.**
+
+**Where we are.** v0.3 `PersistentVolume` (named ext4, RW-xor-RO attach, quota, resize, S3 + chunked-CDC backup, btrfs
+CoW host backend) is solid and **engine-agnostic** — it ports to krucible unchanged (guest still sees `/dev/vdN`, mounted
+from config-drive metadata, so it's **blocked on the config drive (6c)** like env/secrets). But versioning today is
+*backup-shaped* (restore-from-S3), **not** first-class checkpoint/rollback.
+
+**What the code dictates (mechanics).** libkrun disks are **boot-time only** — `krun_add_disk` is pre-start, the block
+device's `write_config()` is a no-op (no online resize), no hotplug. So on krucible: **attach** = record + `krun_add_disk`
+on next launch (to a *running* sandbox → a cold stop/start, ~500 ms); **resize** = grow the file + `resize2fs` on next
+boot. Not a regression — a **simplification the cold tier earns**: cheap wake makes "reconfigure = quick restart" replace
+all the hotplug/online-resize machinery. Drop any hot-plug ambition.
+
+**The versioning model (the agent-first investment).** Inspired by a comparable agent-state versioned-FS runtime whose
+model is built on **Jujutsu (jj)** — chosen for agent-friendly properties worth adopting: working-copy-is-a-change
+(auto-snapshot, no explicit commit), **fork-on-first-write** (a fresh sandbox boots in "observe" off a golden base; its
+writes land in a *new* change; the base stays clean until you promote), **non-blocking conflicts** (a change can be
+conflicted; agents don't deadlock), lightweight **bookmarks** (movable pointers), and **repo-per-X** (their own example:
+*"each user volume is a separate repo"*). The workflow patterns are the gold: **checkpoint-per-prompt** (undo-last-prompt =
+move the bookmark back), **timeline-per-session** (one bookmark per run, merge or discard), **proposal + diff + approve**
+(human-in-the-loop with an audit trail), `main` = promoted state.
+
+**How it maps onto bhatti (granularity is the key call):** that runtime versions at the *file* level; bhatti's volumes are
+*block* devices (which is what buys cold/fork + portability). So we do **not** replace block volumes with a file-FS — we
+**adopt the model + workflows at the granularity each tier supports:**
+- **Now (VM-native, cheap): the whole-sandbox checkpoint *is* a "Change."** It rides the cold/fork tier already built and
+  is *more* powerful than file-level (it captures RAM + processes + disk + clock, not just files). `checkpoint` after a
+  prompt; **bookmarks** (`main`, `session/<id>`, `proposal/<feat>`) point at checkpoints; `restore <bookmark>` = undo;
+  `fork <checkpoint>` = branch; promote = move the bookmark. Fork-on-write isolation = the CoW-rootfs-from-base we already
+  do, with a bookmark on top.
+- **Later (file-level): a "workspace repo" tier** for the agent's code/output dir — diffs + approval gates + merge, on
+  bhatti's file API + a content-addressed store (the chunked-CDC dedup is half of it). This is the full file-level model
+  (and the eventual home of the deferred sync/Mutagen idea).
+
+**Two version stores, matching the ladder:** local **CoW** (clonefile/reflink/btrfs-subvol/qcow2-overlay — the primitive
+we already use for the rootfs) for instant on-host undo/branch; durable **chunked-CDC** (content-addressed, dedup) for
+retention + cross-machine carry. **Coherence rule:** a volume version must be cut at the *same paused/fsync'd instant* as
+the VM snapshot, or disk and RAM disagree on restore — tie it to the cold-tier pause+snapshot.
+
 ### Sequencing within §6
 
-**Config drive (6c.1) first** — it unblocks env/secrets *and* the per-sandbox token (6b.1), and real use cases need
-secrets. Then **host↔guest forward (6a.1)** (self-contained dev win + the mesh building block). Then they fan out:
-inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream (6d) as a low-risk track.
-Track J (6b.4) and the cold-tier secret-hygiene hardening (6c.3) follow.
+**Config drive (6c.1) first** — it unblocks env/secrets *and* the per-sandbox token (6b.1) *and* volume mount-metadata
+(6e), and real use cases need secrets. Then **host↔guest forward (6a.1)** (self-contained dev win + the mesh building
+block). Then they fan out: inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream
+(6d) as a low-risk track. The **agent-state timeline (6e)** rides the cold/fork tier — the checkpoint/bookmark workflow
+lands once `fork` does; the volume attach/resize cleanup is small and rides the config drive. Track J (6b.4) and the
+cold-tier secret-hygiene hardening (6c.3) follow.
 
 ---
 
