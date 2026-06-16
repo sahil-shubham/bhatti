@@ -48,6 +48,39 @@ func TestKrucibleThermalSuite(t *testing.T) {
 	enginetest.RunThermalSuite(t, newSuiteEngine)
 }
 
+// newBlockRootEngine builds a krucible engine that boots sandboxes from a CoW
+// ext4 block image (cold-tier capable). Requires mke2fs on the host.
+func newBlockRootEngine(t *testing.T) engine.Engine {
+	repo := repoRoot(t)
+	if !hasLibkrun() {
+		t.Skip("libkrun not installed (pkg-config libkrun); skipping")
+	}
+	if _, err := exec.LookPath("mke2fs"); err != nil {
+		t.Skip("mke2fs not found (e2fsprogs); skipping block-root suite")
+	}
+	vmm := filepath.Join(repo, "bhatti-vmm")
+	if _, err := os.Stat(vmm); err != nil {
+		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
+	}
+	eng, err := New(Config{
+		DataDir:    t.TempDir(),
+		BaseRootfs: buildBaseRootfs(t, repo),
+		VMMBinary:  vmm,
+		LibDir:     libDir(),
+		BlockRoot:  true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return eng
+}
+
+// TestKrucibleSnapshotSuite is the cold-tier gate: Stop (snapshot + free RAM) /
+// Start (restore) round-trip with RAM + rootfs intact and exec-after-restore.
+func TestKrucibleSnapshotSuite(t *testing.T) {
+	enginetest.RunSnapshotSuite(t, newBlockRootEngine)
+}
+
 // --- test helpers ---
 
 func repoRoot(t *testing.T) string {
