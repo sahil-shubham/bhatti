@@ -598,6 +598,8 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			s.handleSandboxExec(w, r, id)
 		case "ports":
 			s.handleSandboxPorts(w, r, id)
+		case "forward":
+			s.handleSandboxForward(w, r, id)
 		case "ws":
 			s.handleSandboxWS(w, r, id)
 		case "files":
@@ -644,6 +646,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		// Kill VM first, then release volume DB locks. Destroy() calls
 		// Kill+Wait which guarantees the FC process is dead even if other
 		// cleanup fails — safe to release volumes after.
+		s.closeForwards(sb.EngineID) // stop any host↔guest forwards before the VM dies
 		if err := s.engine.Destroy(r.Context(), sb.EngineID); err != nil {
 			slog.Warn("engine destroy failed, releasing volumes anyway",
 				"sandbox", sb.ID, "error", err)

@@ -64,6 +64,11 @@ type Server struct {
 	pullCancelMu sync.Mutex
 	pullCancels  map[string]context.CancelFunc // taskID → cancel
 
+	// Active host↔guest forwards (engineID → host listeners), torn down on
+	// Destroy. See forward_handlers.go.
+	forwardMu sync.Mutex
+	forwards  map[string][]net.Listener
+
 	// Request counters (read by metrics snapshot goroutine)
 	requestTotal  atomic.Int64
 	requestErrors atomic.Int64
@@ -192,6 +197,7 @@ func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOptio
 		limiter:       newRateLimiter(),
 		startTime:     time.Now(),
 		pullCancels:   make(map[string]context.CancelFunc),
+		forwards:      make(map[string][]net.Listener),
 		resumeSem:     make(chan struct{}, 10),
 		shellSessions: newShellSessionTracker(5),
 		shellLimiter:  newShellRateLimiter(10),

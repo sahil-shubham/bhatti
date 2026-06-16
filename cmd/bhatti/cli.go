@@ -97,6 +97,7 @@ func init() {
 	shellCmd.Flags().Bool("new", false, "Force a new session (don't reattach)")
 	rootCmd.AddCommand(psCmd)
 	rootCmd.AddCommand(portsCmd)
+	rootCmd.AddCommand(forwardCmd)
 	rootCmd.AddCommand(fileCmd)
 	rootCmd.AddCommand(secretCmd)
 	rootCmd.AddCommand(volumeCmd)
