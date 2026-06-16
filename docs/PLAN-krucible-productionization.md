@@ -170,8 +170,8 @@ work on FC today work on krucible, plus the krucible-only wins (faster fs, sub-s
 4. **Production use-case matrix (4c)** on Mac, then the **Linux warm-cluster bring-up (E1)** — first multi-platform proof.
 5. **Cold-x86-Linux (E2)**, then the P4+ tracks (F) and **Tier-3 Pi (E3)** as their own gates.
 
-**Capabilities (§7) now take priority over the rest of the P4+ backlog** — the order is: config drive + per-sandbox token
-(7c.1/7b.1) → host↔guest forward (7a.1) → inter-sandbox + capability tokens (7a.2/7b.2) → unified event stream (7d).
+**Capabilities (§6) now take priority over the rest of the P4+ backlog** — the order is: config drive + per-sandbox token
+(6c.1/6b.1) → host↔guest forward (6a.1) → inter-sandbox + capability tokens (6a.2/6b.2) → unified event stream (6d).
 These run alongside the Mac-doable cleanup; the Linux cluster work proceeds when hardware is in the loop.
 
 Steps 1–4 are Mac-doable now; 4c/E need the cluster. The through-line: every step is gated by the `enginetest`/server
@@ -179,12 +179,12 @@ integration suites going green on krucible with the *same* assertions as FC.
 
 ---
 
-## 7. Platform capabilities on top of the server (the new investment)
+## 6. Platform capabilities on top of the server (the new investment)
 
 With the topology settled (§2), this is where the value is: making the server *do more* for an agent driving fleets of
 sandboxes. Three tracks, plus streaming. Grounded in what the substrate actually offers today.
 
-### 7a. Networking (the real gap under TSI)
+### 6a. Networking (the real gap under TSI)
 
 **Where we are.** Firecracker's L2 model (per-user bridges, subnets, a sibling-name DNS responder) is **gone** under
 krucible/TSI. What krucible has: guest **outbound** via TSI (transparent, host stack) ✓; **host→guest port** via the vsock
@@ -202,28 +202,28 @@ the FC-style plumbing we shed):
 3. **Sandbox→host gateway** — a documented gateway address for guest→host services (validate what TSI already allows to
    the host's routable IP; add a magic host alias).
 
-### 7b. Agent-first multi-tenancy (capability tokens)
+### 6b. Agent-first multi-tenancy (capability tokens)
 
 **Where we are.** *Designed (§12 of the plan of record), not built.* Today is operator-first (`store.User` + per-user API
 keys + quotas + `SubnetIndex`). The network half of the old tenancy (`SubnetIndex`/bridges) is **deleted for free** by
 TSI. krucible currently injects **no token** (`vm.Token == ""`).
 
 **Forward path** (each its own commits; not tangled with the engine):
-1. **Per-sandbox token = the first brick** — falls out of wiring the config drive (§7c): each sandbox boots with its own
+1. **Per-sandbox token = the first brick** — falls out of wiring the config drive (§6c): each sandbox boots with its own
    token; the agent enforces it (empty token ⇒ no auth, as today). This alone gives per-sandbox isolation at the agent.
 2. **Capability tokens** — `{id, sandbox_id, caps[], expires_at, revoked}`, minted on Create, enforced by route
    middleware, revoked on Destroy, per-token exec/egress **audit to `events`**.
 3. **Agent-context refinements** — **offline-mintable** (operator signs `{sandbox_id, caps, exp}` with their key; the
-   daemon verifies, no mint state) + **scoped share-a-port URLs** (the wake-then-serve proxy already exists, §7a/§4).
+   daemon verifies, no mint state) + **scoped share-a-port URLs** (the wake-then-serve proxy already exists, §6a/§4).
 4. **Track J** (§11 of the plan of record) — jail the helper for *hostile* multi-tenant on Linux. Later; Mac/dev is
    single-user, FC keeps Hetzner multi-tenant meanwhile.
 
-### 7c. Env & secrets handling (the unblocking move)
+### 6c. Env & secrets handling (the unblocking move)
 
 **Where we are.** The interface (`SandboxSpec`) carries `Env`/`Secrets`/`Files`; the server resolves them (req.Env +
 store secrets, secrets override env). FC delivers them via the **config drive** (`configdrive.go` → `/dev/vdb` ext4, read
 by lohar's `loadConfigDrive`). **krucible delivers none of it.** This is the most concrete, MVP-relevant gap — and it's
-the move that unblocks §7b's first brick.
+the move that unblocks §6b's first brick.
 
 **Forward path:**
 1. **Wire the config drive on krucible** — reuse `configdrive.go` to build a RAW ext4 from `spec.{Env,Secrets,Files,
@@ -239,23 +239,23 @@ the move that unblocks §7b's first brick.
    keep secrets out of the snapshotted RAM where possible (e.g. fetch-on-demand from the agent vs. bake into env), and
    never leave the config-drive image world-readable. This is a design constraint to honor, not an afterthought.
 
-### 7d. Streaming (parallel, low-risk polish)
+### 6d. Streaming (parallel, low-risk polish)
 
 **Where we are.** Already solid: an `EventRecorder` pub/sub bus (`Subscribe(filter)` + fan-out + a persistent `events`
 table with `/events?since=<id>` replay) and exec streaming over NDJSON + WebSocket. **Forward path:** a unified live
 *fleet* stream (SSE/WS over `EventRecorder.Subscribe`), richer event types on the bus (output/log/thermal/network), and
-backpressure/replay polish — pairs naturally with §7a (observe the mesh).
+backpressure/replay polish — pairs naturally with §6a (observe the mesh).
 
-### Sequencing within §7
+### Sequencing within §6
 
-**Config drive (7c.1) first** — it unblocks env/secrets *and* the per-sandbox token (7b.1), and real use cases need
-secrets. Then **host↔guest forward (7a.1)** (self-contained dev win + the mesh building block). Then they fan out:
-inter-sandbox (7a.2) and capability tokens (7b.2) in parallel, with the unified event stream (7d) as a low-risk track.
-Track J (7b.4) and the cold-tier secret-hygiene hardening (7c.3) follow.
+**Config drive (6c.1) first** — it unblocks env/secrets *and* the per-sandbox token (6b.1), and real use cases need
+secrets. Then **host↔guest forward (6a.1)** (self-contained dev win + the mesh building block). Then they fan out:
+inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream (6d) as a low-risk track.
+Track J (6b.4) and the cold-tier secret-hygiene hardening (6c.3) follow.
 
 ---
 
-## 8. Open questions
+## 7. Open questions
 1. **Daemonless registry** — lockfile + per-VM state dir, or a tiny always-on supervisor? (Lean: state dir + adopt-by-pid.)
 2. **Production rootfs base** — build from an OCI image (like the FC path) or a from-scratch minimal userland? Tier split.
 3. **Is `publish`/share ever daemonless?** (Lean: no — it needs the resident proxy; CLI-direct is exec/attach only.)
