@@ -23,15 +23,32 @@ vsock/console/rng device state all round-trip. Layers 1→7b are committed.
 because the root is **virtio-fs**, whose FUSE inode map is not persisted (it goes
 stale on a fresh server). The fix is a block root (§1) — but with a new, concrete
 finding: **`krun_set_root_disk` alone does not boot a block root under PID-1.**
-libkrun's block-boot mounts `/dev/vda` and pivots from its *own* init
-(`init.c`); we disable that init so lohar is PID 1 (`init=/init.krun`,
-`rootfstype=virtiofs`, `nomodule`, no `root=`). So a block root needs **lohar to
-do the `switch_root`** itself (mount `/dev/vda` → move `/proc,/sys,/dev` →
-`switch_root` → continue as PID 1) — the libkrun-sanctioned pattern, just in lohar
-instead of `init.c`. After the pivot the guest's live root is the block device
-(persisted, no FUSE), so exec-after-restore works and the transient boot virtiofs
-is no longer referenced at snapshot time. That guest-side pivot is the next piece;
-the block device persist + `RootDisk`/`krun_set_root_disk` plumbing already exist.
+libkrun's block-boot mounts `/dev/vda` and pivots from its *own* init (`init.c`);
+we disable that init so lohar is PID 1 (`init=/init.krun`, `rootfstype=virtiofs`,
+`nomodule`, no `root=`), so a block root would need lohar to `switch_root` itself.
+
+**Decision (2026-06-16, supersedes §1's block-root call below): the fix is FUSE
+state persist on the existing virtio-fs root — NOT a block root.** The reference
+fork solves exec-after-restore exactly this way: capture the FUSE server's logical
+state (nodeid→`(dev,ino)` via volfs, open handles, the inode counter, writeback
+flags), and on restore rebuild the map on a fresh server (volfs makes inodes
+addressable by `(dev,ino)` with no held fd) and reopen handles — the guest's
+cached node-ids resolve and exec works. This **keeps bhatti's design intact**
+(virtio-fs + lohar-as-PID-1); the block-root detour and its PID-1 boot friction
+were self-inflicted. The port is tractable: libkrucible's macOS passthrough is
+volfs-compatible (the hard part — inode identity — ports directly); the
+`AugmentFs`/`inode_alloc` delta is small (`inode_alloc` is one `AtomicU64`, the
+virtual entries are deterministic). §1 below (block-root) is retained for history
+but is **not** the chosen path; block-root remains a *possible* future profile,
+and if pursued needs the guest-side `switch_root` noted above.
+
+**Separate strategic question (P4+, do not couple to the snapshot work):** our
+`lohar-as-PID-1` (`disable_implicit_init`) is a Firecracker-ism. The reference /
+idiomatic-libkrun model is libkrun's `init.c` → a real init → the agent as a
+*service* (not PID 1). That model makes block-root *and* virtio-fs work, frees the
+agent from PID-1 duties (mounts, zombie reaping, reboot/SIGHUP — the W4 bricked-Pi
+risks), and stops fighting the VMM. It is a guest-model change worth a deliberate
+evaluation — but on its own gate, not under cold-tier.
 
 ---
 
