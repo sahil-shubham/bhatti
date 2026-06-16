@@ -209,8 +209,10 @@ keys + quotas + `SubnetIndex`). The network half of the old tenancy (`SubnetInde
 TSI. krucible currently injects **no token** (`vm.Token == ""`).
 
 **Forward path** (each its own commits; not tangled with the engine):
-1. **Per-sandbox token = the first brick** — falls out of wiring the config drive (§6c): each sandbox boots with its own
-   token; the agent enforces it (empty token ⇒ no auth, as today). This alone gives per-sandbox isolation at the agent.
+1. **Per-sandbox token = the first brick** — **DONE (2026-06-16):** the config drive (§6c.1) carries a generated 128-bit
+   token; lohar enforces it (constant-time AUTH compare); the engine presents it; a wrong-token client is rejected
+   (`TestKrucibleConfigDrive/TokenEnforced`). Per-sandbox isolation at the agent is live on the block-root path. (Empty
+   token ⇒ no auth on the virtio-fs dev path, unchanged.)
 2. **Capability tokens** — `{id, sandbox_id, caps[], expires_at, revoked}`, minted on Create, enforced by route
    middleware, revoked on Destroy, per-token exec/egress **audit to `events`**.
 3. **Agent-context refinements** — **offline-mintable** (operator signs `{sandbox_id, caps, exp}` with their key; the
@@ -226,10 +228,12 @@ by lohar's `loadConfigDrive`). **krucible delivers none of it.** This is the mos
 the move that unblocks §6b's first brick.
 
 **Forward path:**
-1. **Wire the config drive on krucible** — reuse `configdrive.go` to build a RAW ext4 from `spec.{Env,Secrets,Files,
-   Token,Hostname}`; attach it as a **second block device** (`/dev/vdb`, `krun_add_disk2(..., RAW, read_only=true)`);
-   lohar already reads `/dev/vdb`. One mechanism, both engines. Under block-root, root stays `/dev/vda`, config is
-   `/dev/vdb`. (VMSpec gains a `ConfigDrive` path; the engine builds + passes it.)
+1. **Wire the config drive on krucible** — **DONE (2026-06-16):** new cross-platform `pkg/configdrive` (mke2fs -d, no
+   mount) builds the `config.json` ext4 from `spec.{Env,Files}` + a generated token + hostname; `cmd/vmm` attaches it via
+   `krun_set_data_disk` (`/dev/vdb`, pairs with `krun_set_root_disk` root=`/dev/vda` on the block-root path); lohar's
+   `loadConfigDrive` reads it. Secrets arrive pre-resolved into `spec.Env` by the server (same contract as FC).
+   `TestKrucibleConfigDrive` (real VM): env reaches exec, files materialize, token enforced. virtio-fs path stays
+   config-less. (`VMSpec.ConfigDrive`; survives cold Stop/Start.)
 2. **Env precedence + dynamic env** — keep the resolved precedence (env < secrets); per-exec merge already exists
    (`configEnv`); units read `/run/bhatti/config-env`. Add a path to set env *after* boot via the agent (agents mutate
    sandbox env without a reboot).
@@ -291,9 +295,8 @@ the VM snapshot, or disk and RAM disagree on restore — tie it to the cold-tier
 
 ### Sequencing within §6
 
-**Config drive (6c.1) first** — it unblocks env/secrets *and* the per-sandbox token (6b.1) *and* volume mount-metadata
-(6e), and real use cases need secrets. Then **host↔guest forward (6a.1)** (self-contained dev win + the mesh building
-block). Then they fan out: inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream
+**Config drive (6c.1) — DONE.** It unblocked env/secrets *and* the per-sandbox token (6b.1, also done) *and* the path for
+volume mount-metadata (6e). **Next: host↔guest forward (6a.1)** (self-contained dev win + the mesh building block). Then they fan out: inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream
 (6d) as a low-risk track. The **agent-state timeline (6e)** rides the cold/fork tier — the checkpoint/bookmark workflow
 lands once `fork` does; the volume attach/resize cleanup is small and rides the config drive. Track J (6b.4) and the
 cold-tier secret-hygiene hardening (6c.3) follow.
