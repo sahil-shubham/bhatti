@@ -75,10 +75,20 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
-	croot := C.CString(spec.RootfsDir)
-	defer C.free(unsafe.Pointer(croot))
-	if r := C.krun_set_root(cid, croot); r != 0 {
-		fail("krun_set_root: %d", int(r))
+	// Root: a raw ext4 block image (cold/fork tier — snapshot-friendly, no FUSE
+	// inode map) or a virtio-fs host dir (warm/dev fast path).
+	if spec.RootDisk != "" {
+		cdisk := C.CString(spec.RootDisk)
+		defer C.free(unsafe.Pointer(cdisk))
+		if r := C.krun_set_root_disk(cid, cdisk); r != 0 {
+			fail("krun_set_root_disk: %d", int(r))
+		}
+	} else {
+		croot := C.CString(spec.RootfsDir)
+		defer C.free(unsafe.Pointer(croot))
+		if r := C.krun_set_root(cid, croot); r != 0 {
+			fail("krun_set_root: %d", int(r))
+		}
 	}
 
 	// TSI is auto-enabled (no NIC added). Bridge host<->guest vsock ports.
@@ -103,6 +113,15 @@ func run(spec krucible.VMSpec) {
 		defer C.free(unsafe.Pointer(c))
 		if r := C.krun_set_control_socket(cid, c); r != 0 {
 			fail("krun_set_control_socket: %d", int(r))
+		}
+	}
+
+	// Cold restore: boot from a snapshot bundle instead of cold-booting.
+	if spec.SnapshotDir != "" {
+		c := C.CString(spec.SnapshotDir)
+		defer C.free(unsafe.Pointer(c))
+		if r := C.krun_set_snapshot(cid, c); r != 0 {
+			fail("krun_set_snapshot: %d", int(r))
 		}
 	}
 

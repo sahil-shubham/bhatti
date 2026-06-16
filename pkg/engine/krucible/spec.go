@@ -20,7 +20,13 @@ type VMSpec struct {
 	// RootfsDir is a host directory exposed to the guest as the virtiofs root
 	// (krun_set_root). For the POC there is no ext4/qcow2 image; qcow2 CoW
 	// overlays arrive with snapshot in P3.
-	RootfsDir string `json:"rootfs_dir"`
+	RootfsDir string `json:"rootfs_dir,omitempty"`
+
+	// RootDisk, if set, boots from a raw ext4 block image (krun_set_root_disk)
+	// instead of a virtio-fs host dir. This is the cold/fork-tier root: its
+	// snapshot state is just queue config (no FUSE inode map), and the image is
+	// the portable cold artifact. Mutually exclusive with RootfsDir.
+	RootDisk string `json:"root_disk,omitempty"`
 
 	Vcpus  uint8  `json:"vcpus"`
 	MemMiB uint32 `json:"mem_mib"`
@@ -42,6 +48,12 @@ type VMSpec struct {
 	// commands (PAUSE/RESUME/STATUS). One newline command in, one line out, then
 	// close. See krun_set_control_socket.
 	ControlSocketUDS string `json:"control_socket_uds,omitempty"`
+
+	// SnapshotDir, if set, cold-restores the VM from a snapshot bundle
+	// (memory.img + checkpoint.bin + manifest.json) instead of cold booting:
+	// guest RAM, device, and vCPU state are loaded and the guest resumes from
+	// the snapshot point. See krun_set_snapshot. macOS/HVF only.
+	SnapshotDir string `json:"snapshot_dir,omitempty"`
 
 	// LogLevel is the libkrun log level (0=off .. 5=trace). 2=warn keeps the
 	// guest console readable.
