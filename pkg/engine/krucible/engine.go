@@ -3,6 +3,8 @@ package krucible
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent"
+	"github.com/sahil-shubham/bhatti/pkg/configdrive"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
@@ -196,13 +199,30 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		LogLevel:         2,
 	}
 
-	// Rootfs: a CoW-cloned ext4 block image (cold-capable) or a virtio-fs dir.
+	name := spec.Name
+	if name == "" {
+		name = id
+	}
+
+	// Per-sandbox auth token, carried into the guest via the config drive; the
+	// agent enforces it. Empty on the config-less virtio-fs dev path (no auth).
+	token := ""
+
+	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
+	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
 		rootImg := filepath.Join(sandboxDir, "root.img")
 		if err = e.cloneBaseImage(rootImg); err != nil {
 			return info, fmt.Errorf("clone base image: %w", err)
 		}
 		baseSpec.RootDisk = rootImg
+
+		token = genToken()
+		confPath := filepath.Join(sandboxDir, "config.ext4")
+		if err = buildConfigDrive(confPath, id, name, token, spec); err != nil {
+			return info, fmt.Errorf("build config drive: %w", err)
+		}
+		baseSpec.ConfigDrive = confPath
 	} else {
 		if err = cloneTree(e.cfg.BaseRootfs, rootfsDir); err != nil {
 			return info, fmt.Errorf("clone rootfs: %w", err)
@@ -210,15 +230,11 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		baseSpec.RootfsDir = rootfsDir
 	}
 
-	name := spec.Name
-	if name == "" {
-		name = id
-	}
 	vm = &VM{
 		ID: id, Name: name, UserID: spec.UserID,
 		SandboxDir: sandboxDir, RootfsDir: rootfsDir, SockDir: sockDir,
 		ControlUDS: controlUDS, ForwardUDS: forwardUDS, CtlSockUDS: ctlSockUDS,
-		MemMiB: memMiB, Thermal: "hot", Status: "stopped",
+		MemMiB: memMiB, Thermal: "hot", Status: "stopped", Token: token,
 		BundleDir: filepath.Join(sandboxDir, "bundle"),
 		baseSpec:  baseSpec,
 		logPath:   filepath.Join(sandboxDir, "vmm.log"),
@@ -450,6 +466,34 @@ func validateBundle(bundleDir string) error {
 		return fmt.Errorf("bundle arch %q != host %q (cross-arch restore not supported)", m.Arch, want)
 	}
 	return nil
+}
+
+// genToken returns a random 128-bit hex token (matches the FC engine's scheme).
+func genToken() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// buildConfigDrive writes the per-sandbox config drive (hostname, token, env,
+// files) that lohar reads at /dev/vdb. Secrets are expected to be pre-resolved
+// into spec.Env by the server layer (same contract as the FC engine).
+func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec) error {
+	files := make(map[string]configdrive.ConfigFile, len(spec.Files))
+	for p, f := range spec.Files {
+		files[p] = configdrive.ConfigFile{
+			Content: base64.StdEncoding.EncodeToString(f.Content),
+			Mode:    f.Mode,
+		}
+	}
+	return configdrive.Build(path, configdrive.SandboxConfig{
+		SandboxID: id,
+		Hostname:  name,
+		Token:     token,
+		Env:       spec.Env,
+		Files:     files,
+		User:      "lohar",
+	})
 }
 
 // cloneBaseImage CoW-clones the shared base ext4 image to dst (per-sandbox root

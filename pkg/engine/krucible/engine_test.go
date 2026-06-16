@@ -151,7 +151,7 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	if out, err := utilBuild.CombinedOutput(); err != nil {
 		t.Fatalf("build miniutil: %v\n%s", err, out)
 	}
-	for _, n := range []string{"echo", "errcho", "false", "sleep"} {
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -197,6 +197,10 @@ func main() {
 		if len(os.Args) > 1 {
 			n, _ := strconv.Atoi(os.Args[1])
 			time.Sleep(time.Duration(n) * time.Second)
+		}
+	case "printenv": // printenv KEY -> value of os.Getenv(KEY)
+		if len(os.Args) > 1 {
+			fmt.Println(os.Getenv(os.Args[1]))
 		}
 	default: // true
 	}

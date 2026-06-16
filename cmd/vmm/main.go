@@ -91,6 +91,18 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
+	// Config drive: a RAW ext4 attached as the data disk (/dev/vdb), which lohar
+	// mounts read-only at boot to read config.json (hostname, token, env, files,
+	// volumes). Pairs with krun_set_root_disk (root=/dev/vda) on the block-root
+	// path. lohar mounts it MS_RDONLY, so the RW device is harmless.
+	if spec.ConfigDrive != "" {
+		cconf := C.CString(spec.ConfigDrive)
+		defer C.free(unsafe.Pointer(cconf))
+		if r := C.krun_set_data_disk(cid, cconf); r != 0 {
+			fail("krun_set_data_disk: %d", int(r))
+		}
+	}
+
 	// TSI is auto-enabled (no NIC added). Bridge host<->guest vsock ports.
 	// listen=true: the host dials the UDS, libkrun forwards to the guest port
 	// where lohar listens.

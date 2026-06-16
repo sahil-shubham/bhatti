@@ -28,6 +28,12 @@ type VMSpec struct {
 	// the portable cold artifact. Mutually exclusive with RootfsDir.
 	RootDisk string `json:"root_disk,omitempty"`
 
+	// ConfigDrive, if set, is a RAW ext4 image attached as a read-only block
+	// device (/dev/vdb) carrying config.json (hostname, token, env, files,
+	// volumes). lohar reads it at boot before listening. See pkg/configdrive
+	// and lohar's loadConfigDrive.
+	ConfigDrive string `json:"config_drive,omitempty"`
+
 	Vcpus  uint8  `json:"vcpus"`
 	MemMiB uint32 `json:"mem_mib"`
 
