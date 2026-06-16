@@ -17,6 +17,16 @@ func injectLohar(rootDir, loharPath string) error {
 	}
 	os.Chmod(dst, 0755)
 
+	// /init.krun -> /usr/local/bin/lohar. The krucible block-root boot execs
+	// init=/init.krun (kernel-direct, no init-blob), while the FC engine execs
+	// init=/usr/local/bin/lohar. The symlink makes one OCI image bootable on
+	// both engines; FC simply ignores the extra link.
+	initLink := filepath.Join(rootDir, "init.krun")
+	os.Remove(initLink)
+	if err := os.Symlink("/usr/local/bin/lohar", initLink); err != nil {
+		return err
+	}
+
 	// Ensure boot directories exist (lohar mounts these)
 	for _, dir := range []string{
 		"proc", "sys", "dev", "dev/pts", "tmp", "run", "workspace",

@@ -39,9 +39,14 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		}
 	}
 
+	// A prebuilt base image implies the block-root (cold-capable) path.
+	blockRoot := cfg.KrucibleBlockRoot || cfg.KrucibleBaseImage != ""
+
 	return krucible.New(krucible.Config{
 		DataDir:    cfg.DataDir,
 		BaseRootfs: cfg.KrucibleRootfs,
+		BaseImage:  cfg.KrucibleBaseImage,
+		BlockRoot:  blockRoot,
 		VMMBinary:  vmm,
 		LibDir:     libDir,
 		SocketDir:  cfg.KrucibleSocketDir,

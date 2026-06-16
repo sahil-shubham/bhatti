@@ -247,6 +247,13 @@ func TestInjectLohar(t *testing.T) {
 		t.Fatal("lohar should exist")
 	}
 
+	// Check /init.krun -> /usr/local/bin/lohar (krucible block-root boot path)
+	if target, err := os.Readlink(filepath.Join(root, "init.krun")); err != nil {
+		t.Fatalf("/init.krun symlink should exist: %v", err)
+	} else if target != "/usr/local/bin/lohar" {
+		t.Fatalf("/init.krun -> %q, want /usr/local/bin/lohar", target)
+	}
+
 	// Check boot directories
 	for _, d := range []string{"proc", "sys", "dev", "dev/pts", "tmp", "run", "workspace"} {
 		if _, err := os.Stat(filepath.Join(root, d)); err != nil {

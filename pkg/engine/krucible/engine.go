@@ -22,6 +22,11 @@ import (
 type Config struct {
 	DataDir       string // sandboxes live under DataDir/sandboxes/<id>
 	BaseRootfs    string // host dir tree (virtiofs root): /init.krun=lohar + mountpoints
+	// BaseImage is a prebuilt ext4 root image (e.g. from oci.PullAndConvert: a
+	// real userland with /init.krun -> lohar). When set with BlockRoot, sandboxes
+	// CoW-clone it directly instead of building one from BaseRootfs via mke2fs.
+	// This is the production rootfs path.
+	BaseImage     string
 	VMMBinary     string // path to the bhatti-vmm helper (built with `make vmm`)
 	LibDir        string // dir with libkrun/libkrunfw (DYLD_FALLBACK_LIBRARY_PATH / LD_LIBRARY_PATH)
 	// SocketDir holds the per-VM vsock UDS. It must be SHORT: AF_UNIX paths cap
@@ -83,10 +88,14 @@ func New(cfg Config) (*Engine, error) {
 	if _, err := os.Stat(cfg.VMMBinary); err != nil {
 		return nil, fmt.Errorf("krucible: vmm helper not found at %s (run `make vmm`): %w", cfg.VMMBinary, err)
 	}
-	if cfg.BaseRootfs == "" {
-		return nil, fmt.Errorf("krucible: BaseRootfs not set")
-	}
-	if _, err := os.Stat(cfg.BaseRootfs); err != nil {
+	// Need a rootfs source: a prebuilt block image (production) or a dir tree.
+	if cfg.BaseImage != "" {
+		if _, err := os.Stat(cfg.BaseImage); err != nil {
+			return nil, fmt.Errorf("krucible: base image not found at %s: %w", cfg.BaseImage, err)
+		}
+	} else if cfg.BaseRootfs == "" {
+		return nil, fmt.Errorf("krucible: set BaseImage or BaseRootfs")
+	} else if _, err := os.Stat(cfg.BaseRootfs); err != nil {
 		return nil, fmt.Errorf("krucible: base rootfs not found at %s: %w", cfg.BaseRootfs, err)
 	}
 	if cfg.DefaultVcpus == 0 {
@@ -443,9 +452,13 @@ func validateBundle(bundleDir string) error {
 	return nil
 }
 
-// cloneBaseImage ensures the shared base ext4 image exists (built once from
-// BaseRootfs) and CoW-clones it to dst (per-sandbox root disk).
+// cloneBaseImage CoW-clones the shared base ext4 image to dst (per-sandbox root
+// disk). The base is either a prebuilt image (BaseImage, the production path) or
+// one built once from BaseRootfs via mke2fs (the dev path).
 func (e *Engine) cloneBaseImage(dst string) error {
+	if e.cfg.BaseImage != "" {
+		return cloneFile(e.cfg.BaseImage, dst)
+	}
 	base := filepath.Join(e.cfg.DataDir, "base.img")
 	e.baseImgMu.Lock()
 	if _, err := os.Stat(base); err != nil {
