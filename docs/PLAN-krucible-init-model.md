@@ -10,6 +10,34 @@ work surfaced friction between bhatti's `lohar-as-PID-1` model and libkrun's ini
 
 ---
 
+## DECISION (2026-06-16): we shipped M1′ (kernel-direct block root), and the lohar slim is moot
+
+The cold tier shipped a **variant of M1 — "M1′ kernel-direct block root"** — not the init-mediated M1 described below.
+The difference matters for the slimming question:
+
+- **M1 (as planned):** libkrun's bundled **init** (PID 1) mounts `/dev/vda`, pivots, then `execvp`s lohar → lohar could
+  shed its *early-boot* mounts/pivot to that init. Requires the **init-blob toolchain** (cross-compiled `init.c`).
+- **M1′ (what we shipped):** no init-blob. The kernel cmdline carries `root=/dev/vda rootfstype=ext4 ... init=/init.krun`,
+  so the **kernel** mounts the ext4 root and execs lohar directly as PID 1. The bundled kernel has virtio-blk+ext4 built
+  in (`nomodule`). lohar keeps **every** PID-1 duty — `/proc`,`/sys`,`devtmpfs`,`devpts`,`tmpfs`×3,`cgroup2`,`binfmt_misc`,
+  loopback, signals/reboot, reaping, vsock listeners — because the kernel only mounts the *root*, nothing else.
+
+**Consequence — the envisioned lohar slim does not apply:** there is no libkrun init to hand early boot to, so lohar's
+mount/pivot/PID-1 block stays as-is. We chose this deliberately: **avoiding the init-blob cross-compile toolchain is worth
+more than the marginal lohar reduction.** The cold tier is green with lohar unchanged.
+
+**The one piece of FC-era code in lohar (`setupNetworking`, the `ip=`/TAP path in `net.go`) is *not* deletable and needs
+no krucible change:** the FC engine still injects `ip=...::eth0:off:...` on its kernel cmdline (`create.go`), so it is
+load-bearing on Hetzner production; and on krucible there is no `ip=`, so it **self-skips** ("no ip= in cmdline, skipping")
+on every boot. The rest of `net.go` is the vsock-listener machinery (the snapshot-resume heartbeat included), shared and
+essential on both engines.
+
+**Net: lohar is already appropriately lean for the krucible path.** No slimming action is taken. The real lohar
+restructure (shedding PID-1 duties) only becomes relevant under **M2** (agent-as-service + a supervisor PID 1), which is
+still gated on the systemd-shim product question (below). The M0/M1/M2 analysis that follows is retained as the rationale.
+
+---
+
 ## TL;DR (the reframing)
 
 The framing "demote lohar to a non-PID-1 *service*" **does not fit what lohar is.** lohar is not just an agent — it is
