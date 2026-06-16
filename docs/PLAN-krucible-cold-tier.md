@@ -10,7 +10,25 @@ Companion: `docs/PLAN-krucible-v3.md` (the migration plan of record), `docs/ther
 
 ---
 
-## Status update (2026-06-16): core cold-wake VALIDATED end-to-end on HVF
+## Status update (2026-06-16): cold tier COMPLETE on HVF (exec-after-restore closed)
+
+**P3 gate met.** The full cold-wake-survives-restart works end-to-end through the engine, with exec **and** guest RAM
+intact across the round-trip. `TestKrucibleSnapshotSuite` (engine-level, FC-parity-ready `enginetest.RunSnapshotSuite`):
+`Create` (block root) → write a tmpfs marker → exec → `Stop` (PAUSE + `SNAPSHOT` + kill the helper, RAM freed) → `Start`
+(restore) → **exec-after-restore works** and **the tmpfs marker survived** (guest RAM round-tripped).
+
+The exec-after-restore gap was closed via the **block root** (the decision below): a CoW ext4 image (built once from the
+rootfs via `mke2fs -d`, cloned per-sandbox), booted **kernel-direct** (`root=/dev/vda rootfstype=ext4` in the cmdline —
+the bundled kernel has virtio-blk+ext4 built in, so no init-blob/init-toolchain and lohar stays PID 1). The block device
+persist + the block-backed rootfs survive the snapshot, so the restored guest's fs is consistent and exec works — no FUSE
+persist needed. virtio-fs remains the warm/dev profile (`BlockRoot=false`).
+
+What's left on the cold tier is hardening, not capability: bundle integrity/atomic-rename + tamper-refuse, the manifest
+arch/feature gate (Tier 2), and the lohar slimming (§ init-model doc). The core mechanism is done.
+
+---
+
+## (historical) Status update: core cold-wake VALIDATED end-to-end on HVF
 
 The VMM cold-wake machinery is **done and proven** by a loopback integration test
 (`TestColdLoopbackRestore`): boot → agent ready → `PAUSE` + `SNAPSHOT <dir>` →
