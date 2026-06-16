@@ -10,6 +10,31 @@ Companion: `docs/PLAN-krucible-v3.md` (the migration plan of record), `docs/ther
 
 ---
 
+## Status update (2026-06-16): core cold-wake VALIDATED end-to-end on HVF
+
+The VMM cold-wake machinery is **done and proven** by a loopback integration test
+(`TestColdLoopbackRestore`): boot → agent ready → `PAUSE` + `SNAPSHOT <dir>` →
+kill the helper (free RAM) → restore into a fresh helper from the bundle → **the
+guest resumes and lohar answers an `Activity` request.** Memory + vCPU + GIC
+(incl. the per-IRQ pending/active state — a guest paused mid-ISR EOIs cleanly) +
+vsock/console/rng device state all round-trip. Layers 1→7b are committed.
+
+**The one remaining gap is the rootfs after restore.** `exec`-after-restore hangs
+because the root is **virtio-fs**, whose FUSE inode map is not persisted (it goes
+stale on a fresh server). The fix is a block root (§1) — but with a new, concrete
+finding: **`krun_set_root_disk` alone does not boot a block root under PID-1.**
+libkrun's block-boot mounts `/dev/vda` and pivots from its *own* init
+(`init.c`); we disable that init so lohar is PID 1 (`init=/init.krun`,
+`rootfstype=virtiofs`, `nomodule`, no `root=`). So a block root needs **lohar to
+do the `switch_root`** itself (mount `/dev/vda` → move `/proc,/sys,/dev` →
+`switch_root` → continue as PID 1) — the libkrun-sanctioned pattern, just in lohar
+instead of `init.c`. After the pivot the guest's live root is the block device
+(persisted, no FUSE), so exec-after-restore works and the transient boot virtiofs
+is no longer referenced at snapshot time. That guest-side pivot is the next piece;
+the block device persist + `RootDisk`/`krun_set_root_disk` plumbing already exist.
+
+---
+
 ## 0. Where we are (what's committed)
 
 Warm tier (P2) is **done and green** on Mac/HVF. Cold tier (P3) is **in progress**, built as committed, compiling,
