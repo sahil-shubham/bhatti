@@ -382,13 +382,64 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 	}
 	bundleDir := vm.BundleDir
 	vm.mu.Unlock()
-	if _, err := os.Stat(filepath.Join(bundleDir, "checkpoint.bin")); err != nil {
-		return fmt.Errorf("start: no snapshot bundle at %s: %w", bundleDir, err)
+	if err := validateBundle(bundleDir); err != nil {
+		return fmt.Errorf("start: %w", err)
 	}
 	if err := e.launch(ctx, vm, bundleDir); err != nil {
 		return fmt.Errorf("start (cold restore): %w", err)
 	}
 	slog.Info("krucible sandbox started (cold restore)", "id", id)
+	return nil
+}
+
+// krucibleProtoVer is the snapshot bundle protocol version this build can
+// restore. Mirrors libkrun's CHECKPOINT_VERSION / the manifest proto_ver.
+const krucibleProtoVer = 1
+
+type bundleManifest struct {
+	ProtoVer  int    `json:"proto_ver"`
+	Arch      string `json:"arch"`
+	VcpuCount int    `json:"vcpu_count"`
+}
+
+// hostSnapshotArch maps Go's GOARCH to the arch string libkrun writes into a
+// bundle manifest.
+func hostSnapshotArch() string {
+	switch runtime.GOARCH {
+	case "arm64":
+		return "aarch64"
+	case "amd64":
+		return "x86_64"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+// validateBundle is bhatti's portability gate (Tier-2 of the cold/move design):
+// refuse a snapshot bundle that can't be restored on this host — incomplete,
+// wrong proto version, or cross-arch (a bundle moved from a different machine)
+// — before spawning the helper, so the failure is a clear error, not a guest
+// crash mid-restore.
+func validateBundle(bundleDir string) error {
+	for _, f := range []string{"manifest.json", "checkpoint.bin", "memory.img"} {
+		if _, err := os.Stat(filepath.Join(bundleDir, f)); err != nil {
+			return fmt.Errorf("incomplete snapshot bundle (missing %s): %w", f, err)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(bundleDir, "manifest.json"))
+	if err != nil {
+		return fmt.Errorf("read manifest: %w", err)
+	}
+	var m bundleManifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	if m.ProtoVer != krucibleProtoVer {
+		return fmt.Errorf("bundle proto_ver %d != %d (incompatible snapshot, re-snapshot)", m.ProtoVer, krucibleProtoVer)
+	}
+	if want := hostSnapshotArch(); m.Arch != want {
+		return fmt.Errorf("bundle arch %q != host %q (cross-arch restore not supported)", m.Arch, want)
+	}
 	return nil
 }
 
