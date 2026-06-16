@@ -11,7 +11,11 @@ PREFIX="${2:-$SRC/_install}"
 OS="$(uname -s)"
 
 echo "==> building libkrucible at $SRC (release, no-default-features)"
-( cd "$SRC" && CC_LINUX=cc cargo build --release -p libkrun --no-default-features )
+# --no-default-features drops the bundled init (lohar is /init.krun) so we don't
+# need the init cross-compile toolchain. --features blk enables the virtio-block
+# device + krun_set_root_disk/add_disk2 — the block/qcow2 root the cold tier
+# snapshots (see docs/PLAN-krucible-cold-tier.md §1).
+( cd "$SRC" && CC_LINUX=cc cargo build --release -p libkrun --no-default-features --features blk )
 
 echo "==> assembling install prefix at $PREFIX"
 rm -rf "$PREFIX"
