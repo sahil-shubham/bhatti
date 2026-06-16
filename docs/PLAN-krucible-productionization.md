@@ -194,8 +194,10 @@ is the guest's loopback). krucible sandboxes are currently **outbound-only islan
 
 **Forward path** (build on `Forward`, keep TSI — do *not* switch to a passt/gvproxy L3 backend, which would re-introduce
 the FC-style plumbing we shed):
-1. **Host↔guest forward** — expose `Tunnel` as a stable host-side listener: `bhatti forward <id> <guestPort> [hostPort]`.
-   Small (primitive exists), useful for dev, de-risks the transport. *The building block.*
+1. **Host↔guest forward** — **DONE (2026-06-16):** new engine-agnostic `pkg/forward` (host TCP listener → `Tunnel`
+   bridge, raw bytes, wake-on-connect hook); server `POST/GET/DELETE /sandboxes/:id/forward` (binds 127.0.0.1, torn
+   down on Destroy); CLI `bhatti forward <id> <guestPort> [hostPort]`. Real-VM tests (engine + full-daemon, no mock):
+   a guest HTTP server is reached from the host through the forward. *The mesh building block.*
 2. **Inter-sandbox connectivity** — the server assigns each sandbox a stable host endpoint (vsock-forwarded to a guest
    port) and brokers **name resolution** (inject `<name>.sb → gateway` — the krucible-native replacement for the FC DNS
    responder), so A reaches B by name, routed A→host→(vsock forward)→B. The multi-agent unlock.
@@ -295,8 +297,8 @@ the VM snapshot, or disk and RAM disagree on restore — tie it to the cold-tier
 
 ### Sequencing within §6
 
-**Config drive (6c.1) — DONE.** It unblocked env/secrets *and* the per-sandbox token (6b.1, also done) *and* the path for
-volume mount-metadata (6e). **Next: host↔guest forward (6a.1)** (self-contained dev win + the mesh building block). Then they fan out: inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream
+**Config drive (6c.1) — DONE** (env/secrets + per-sandbox token 6b.1 + the path for volume mount-metadata 6e).
+**Host↔guest forward (6a.1) — DONE** (pkg/forward + server API + CLI, real-VM tested). **Next:** they fan out — Then they fan out: inter-sandbox (6a.2) and capability tokens (6b.2) in parallel, with the unified event stream
 (6d) as a low-risk track. The **agent-state timeline (6e)** rides the cold/fork tier — the checkpoint/bookmark workflow
 lands once `fork` does; the volume attach/resize cleanup is small and rides the config drive. Track J (6b.4) and the
 cold-tier secret-hygiene hardening (6c.3) follow.
