@@ -20,7 +20,10 @@ Grounded in what's actually OS-gated in libkrucible today:
 | **Cold/fork (arm64-Linux / Pi)** | not implemented (Tier 3) | KVM-arm64 vCPU + **GICv2/v3** + arch-timer save/restore — the gnarly one | a Pi (cluster) |
 
 **Sequencing (all gated on home-cluster access):**
-1. **Warm-Linux bring-up** — build + run the `enginetest` warm/agent suites on `asus-i5` (x86 KVM) and a Pi (arm KVM). Low effort; mostly validation + the KVM clock fix. *This is the first Linux milestone.*
+1. **Warm-Linux bring-up** — **DONE (2026-06-17):** `scripts/krucible-linux-bringup.sh` builds libkrunfw + libkrucible +
+   bhatti-vmm on a node; **agent + warm-tier (pause/resume) + VM-level recovery suites are green on raspi-5a
+   (linux/arm64/KVM) and asus-i5 (linux/amd64/KVM).** krucible's first runs off macOS. (The KVM warm-resume clock fix is
+   still a TODO — the pause/resume suite passes without it; revisit for long-pause clock continuity.)
 2. **Cold-x86-Linux** — port the linux checkpoint/restore (bounded; the reference has it, device persist is shared). `RunSnapshotSuite` green on x86 KVM.
 3. **Tier-3 arm64-Linux cold/fork** — GIC save/restore. Deferred; warm works on Pi meanwhile.
 
@@ -315,7 +318,7 @@ Tunnel, **config drive** (env/secrets/files/token), **host↔guest forward**, **
 
 | FC functionality | krucible | status |
 |---|---|---|
-| **Recovery / restart-safety** (`VMStateProvider`) | per-sandbox `state.json` + detached helper + `New()` rehydrate (adopt live / relaunch dead) | **DONE (2026-06-16)** — real-VM adopt-live + dead-helper tests on Mac; logic unit-tested on darwin/arm64 + linux/arm64 + linux/amd64 (cluster) |
+| **Recovery / restart-safety** (`VMStateProvider`) | per-sandbox `state.json` + detached helper + `New()` rehydrate (adopt live / relaunch dead) | **DONE (2026-06-17)** — **VM-level adopt-live + dead-helper green on all three: darwin/arm64 (HVF), linux/arm64 (Pi/KVM), linux/amd64 (asus/KVM)**; logic unit-tested on the same three |
 | **Volumes** (persistent + ephemeral attach/mount, resize) | not wired (config-drive contract supports it) | TODO (§6e; mount-metadata path now unblocked by the config drive) |
 | **SaveImage / named snapshots** | cold bundle exists; no image-save surface | TODO (§6e checkpoint/timeline) |
 | **Inter-sandbox networking + DNS** | TSI outbound + host↔guest forward | TODO (§6a.2/6a.3) |
@@ -324,9 +327,11 @@ Tunnel, **config drive** (env/secrets/files/token), **host↔guest forward**, **
 
 **Correctly NOT ported** (TSI obsoletes them): `CleanupOrphanedTaps`, per-user subnets/DNS plumbing.
 
-**Full cross-arch recovery** (VM-level adopt-live on Linux) is gated on the **Linux krucible bring-up** (rust toolchain +
-libkrunfw + `bhatti-vmm` on the cluster) — the recovery *logic* is already proven on all three OS/arch; only the
-VM-level Linux run awaits the engine running there.
+**Full cross-arch recovery is DONE** — VM-level adopt-live validated on darwin/arm64 + linux/arm64 + linux/amd64 via the
+cluster bring-up (`scripts/krucible-linux-bringup.sh`). The Linux bring-up also brought up the **agent + warm tier** on
+both Linux arches. **Still macOS-only on Linux:** the **cold tier** (the 13 `cfg(macos,aarch64)` checkpoint/restore
+blocks) — so on Linux the cold/snapshot/config-drive/forward suites are skipped; porting cold to linux/x86 (and arm64
+GIC) is the next Linux milestone (§1, E2/E3).
 
 ---
 
