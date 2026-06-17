@@ -56,8 +56,11 @@ if [ ! -e "$PREFIX/lib/libkrunfw.so" ] && [ ! -e "$PREFIX/lib64/libkrunfw.so" ];
   log "building libkrunfw $LIBKRUNFW_REF (kernel build — slow)"
   SRC=/tmp/libkrunfw
   [ -d "$SRC" ] || git clone --depth 1 --branch "$LIBKRUNFW_REF" https://github.com/containers/libkrunfw "$SRC"
-  make -C "$SRC" -j"$(nproc)"
-  sudo make -C "$SRC" install PREFIX="$PREFIX"
+  # Build via `cd && make` (NOT `make -C`): libkrunfw's Makefile passes
+  # $(MAKEFLAGS) straight into the kernel sub-make, and `-C` auto-adds the `-w`
+  # print-directory flag, which then becomes a bogus `make w` kernel target.
+  ( cd "$SRC" && make -j"$(nproc)" )
+  ( cd "$SRC" && sudo make install PREFIX="$PREFIX" )
   sudo ldconfig
 else
   log "libkrunfw already installed — skipping"
