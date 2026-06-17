@@ -34,6 +34,7 @@ func (e *Engine) Pause(ctx context.Context, id string) error {
 		return fmt.Errorf("pause: %w", err)
 	}
 	vm.Thermal = "warm"
+	vm.persistLocked()
 	return nil
 }
 
@@ -53,6 +54,7 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 		return fmt.Errorf("resume: %w", err)
 	}
 	vm.Thermal = "hot"
+	vm.persistLocked()
 	return nil
 }
 

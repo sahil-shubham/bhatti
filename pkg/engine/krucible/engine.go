@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent"
@@ -69,6 +70,7 @@ type VM struct {
 	BundleDir  string // cold-snapshot bundle dir (Stop writes, Start restores from)
 	baseSpec   VMSpec // the spec to (re-)launch with; Start adds SnapshotDir
 	logPath    string
+	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
 }
@@ -116,7 +118,9 @@ func New(cfg Config) (*Engine, error) {
 	if err := os.MkdirAll(cfg.SocketDir, 0700); err != nil {
 		return nil, fmt.Errorf("krucible: create socket dir: %w", err)
 	}
-	return &Engine{vms: make(map[string]*VM), cfg: cfg}, nil
+	eng := &Engine{vms: make(map[string]*VM), cfg: cfg}
+	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
+	return eng, nil
 }
 
 func (e *Engine) getVM(id string) (*VM, error) {
@@ -280,6 +284,9 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	cmd := exec.CommandContext(vmCtx, e.cfg.VMMBinary, specPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	// Detach the helper into its own process group so it survives a daemon
+	// restart/crash — recovery can then re-adopt the live VM. (darwin + linux.)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if e.cfg.LibDir != "" {
 		cmd.Env = append(os.Environ(),
 			"DYLD_FALLBACK_LIBRARY_PATH="+e.cfg.LibDir,
@@ -302,26 +309,33 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	vm.mu.Lock()
 	vm.cmd = cmd
 	vm.cancel = vmCancel
+	vm.HelperPID = cmd.Process.Pid
 	vm.Agent = ag
 	vm.Status = "running"
 	vm.Thermal = "hot"
 	vm.mu.Unlock()
+	vm.persist()
 	return nil
 }
 
-// kill terminates the helper (best effort).
+// kill terminates the helper (best effort). Uses the Cmd handle when we own the
+// process, else the persisted pid (a helper adopted across a daemon restart).
 func (vm *VM) kill() {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 	if vm.cmd != nil && vm.cmd.Process != nil {
 		_ = vm.cmd.Process.Kill()
 		_, _ = vm.cmd.Process.Wait()
+	} else if vm.HelperPID > 0 {
+		// Adopted helper (not our child) — signal by pid; init reaps it.
+		_ = syscall.Kill(vm.HelperPID, syscall.SIGKILL)
 	}
 	if vm.cancel != nil {
 		vm.cancel()
 	}
 	vm.cmd = nil
 	vm.cancel = nil
+	vm.HelperPID = 0
 }
 
 // Destroy kills the helper and removes the sandbox dir.
@@ -388,6 +402,7 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 	vm.Thermal = "cold"
 	vm.Agent = nil
 	vm.mu.Unlock()
+	vm.persist()
 	slog.Info("krucible sandbox stopped (cold)", "id", id, "bundle", bundleDir)
 	return nil
 }
@@ -407,13 +422,17 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 	}
 	bundleDir := vm.BundleDir
 	vm.mu.Unlock()
-	if err := validateBundle(bundleDir); err != nil {
-		return fmt.Errorf("start: %w", err)
+	// Restore from the cold bundle if present; otherwise cold-boot fresh — a
+	// crashed or never-snapshotted sandbox whose RAM is gone but whose rootfs
+	// image persists. Recovery relies on this for restart-safety.
+	snapshot, mode := "", "fresh boot"
+	if validateBundle(bundleDir) == nil {
+		snapshot, mode = bundleDir, "cold restore"
 	}
-	if err := e.launch(ctx, vm, bundleDir); err != nil {
-		return fmt.Errorf("start (cold restore): %w", err)
+	if err := e.launch(ctx, vm, snapshot); err != nil {
+		return fmt.Errorf("start (%s): %w", mode, err)
 	}
-	slog.Info("krucible sandbox started (cold restore)", "id", id)
+	slog.Info("krucible sandbox started", "id", id, "mode", mode)
 	return nil
 }
 
