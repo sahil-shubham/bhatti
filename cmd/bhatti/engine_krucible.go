@@ -31,7 +31,8 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 
 	libDir := cfg.KrucibleLibDir
 	if libDir == "" {
-		for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"} {
+		// libkrunfw lives in Homebrew on macOS, /usr/local/lib64 (or lib) on Linux.
+		for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib64", "/usr/local/lib", "/usr/lib64", "/usr/lib"} {
 			if m, _ := filepath.Glob(filepath.Join(d, "libkrunfw*")); len(m) > 0 {
 				libDir = d
 				break

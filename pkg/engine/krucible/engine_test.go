@@ -102,12 +102,16 @@ func hasLibkrun() bool {
 // DYLD_FALLBACK_LIBRARY_PATH / LD_LIBRARY_PATH.
 func libDir() string {
 	var dirs []string
-	if fork, err := filepath.Abs("../../../../libkrucible/_install/lib"); err == nil {
-		if _, err := os.Stat(fork); err == nil {
-			dirs = append(dirs, fork)
+	// libkrucible install prefix: libkrun.so lands in lib64 on Linux, lib on macOS.
+	for _, sub := range []string{"lib64", "lib"} {
+		if p, err := filepath.Abs("../../../../libkrucible/_install/" + sub); err == nil {
+			if m, _ := filepath.Glob(filepath.Join(p, "libkrun.*")); len(m) > 0 {
+				dirs = append(dirs, p)
+			}
 		}
 	}
-	for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"} {
+	// libkrunfw: Homebrew on macOS, /usr/local/lib64 (or lib) on Linux.
+	for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib64", "/usr/local/lib", "/usr/lib64", "/usr/lib"} {
 		if matches, _ := filepath.Glob(filepath.Join(d, "libkrunfw*")); len(matches) > 0 {
 			dirs = append(dirs, d)
 			break
