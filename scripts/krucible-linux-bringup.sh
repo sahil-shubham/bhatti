@@ -72,16 +72,20 @@ log "building libkrucible (cargo release, --features blk)"
 KPREFIX="$LIBKRUCIBLE/_install"
 rm -rf "$KPREFIX"; mkdir -p "$KPREFIX/lib/pkgconfig" "$KPREFIX/include"
 ( cd "$LIBKRUCIBLE" && make libkrun.pc PREFIX="$KPREFIX" >/dev/null )
+# libkrun.pc's libdir is lib64 on Linux, lib on macOS — install libkrun.so where
+# the .pc (and thus the cgo linker) expects it.
+LIBDIR="$(awk -F= '/^libdir=/{print $2}' "$LIBKRUCIBLE/libkrun.pc")"
+mkdir -p "$LIBDIR"
 cp "$LIBKRUCIBLE/include/libkrun.h" "$KPREFIX/include/"
 cp "$LIBKRUCIBLE/libkrun.pc" "$KPREFIX/lib/pkgconfig/"
 VER="$(grep -E '^FULL_VERSION' "$LIBKRUCIBLE/Makefile" | head -1 | sed 's/.*= *//')"
-cp "$LIBKRUCIBLE/target/release/libkrun.so" "$KPREFIX/lib/libkrun.so.$VER"
-( cd "$KPREFIX/lib" && ln -sf "libkrun.so.$VER" libkrun.so.1 && ln -sf libkrun.so.1 libkrun.so )
+cp "$LIBKRUCIBLE/target/release/libkrun.so" "$LIBDIR/libkrun.so.$VER"
+( cd "$LIBDIR" && ln -sf "libkrun.so.$VER" libkrun.so.1 && ln -sf libkrun.so.1 libkrun.so )
 
 # --- 4. bhatti-vmm (cgo helper; no codesigning on Linux) ---
 log "building bhatti-vmm"
 export PKG_CONFIG_PATH="$KPREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export LD_LIBRARY_PATH="$KPREFIX/lib:$PREFIX/lib:$PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$LIBDIR:$PREFIX/lib64:$PREFIX/lib:${LD_LIBRARY_PATH:-}"
 CGO_ENABLED=1 go build -tags krucible -o "$REPO/bhatti-vmm" ./cmd/vmm
 
 cat <<EOF
@@ -92,6 +96,6 @@ cat <<EOF
     helper:      $REPO/bhatti-vmm
 
 Run the krucible suite (warm + agent + recovery; cold tier is macOS-gated):
-  export LD_LIBRARY_PATH=$KPREFIX/lib:$PREFIX/lib:$PREFIX/lib64
+  export LD_LIBRARY_PATH=$LIBDIR:$PREFIX/lib64:$PREFIX/lib
   go test -tags krucible ./pkg/engine/krucible/ -run 'TestKrucibleAgentSuite|TestKrucibleThermalSuite|TestKrucibleRecovery' -v
 EOF
