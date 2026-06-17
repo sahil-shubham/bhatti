@@ -305,7 +305,32 @@ cold-tier secret-hygiene hardening (6c.3) follow.
 
 ---
 
-## 7. Open questions
+## 7. FC → krucible parity tracker
+
+Migrating *off* FC means krucible reaches feature parity. Audited by diffing the engines' method sets.
+
+**At parity (done + real-VM tested):** Create/Destroy, Exec (+Detached/Stream), Shell + sessions + piped, Files
+(read/write/list/stat), Status/List, warm tier (Pause/Resume/EnsureHot/Thermal), cold tier (Stop/Start), ListeningPorts,
+Tunnel, **config drive** (env/secrets/files/token), **host↔guest forward**, **recovery**.
+
+| FC functionality | krucible | status |
+|---|---|---|
+| **Recovery / restart-safety** (`VMStateProvider`) | per-sandbox `state.json` + detached helper + `New()` rehydrate (adopt live / relaunch dead) | **DONE (2026-06-16)** — real-VM adopt-live + dead-helper tests on Mac; logic unit-tested on darwin/arm64 + linux/arm64 + linux/amd64 (cluster) |
+| **Volumes** (persistent + ephemeral attach/mount, resize) | not wired (config-drive contract supports it) | TODO (§6e; mount-metadata path now unblocked by the config drive) |
+| **SaveImage / named snapshots** | cold bundle exists; no image-save surface | TODO (§6e checkpoint/timeline) |
+| **Inter-sandbox networking + DNS** | TSI outbound + host↔guest forward | TODO (§6a.2/6a.3) |
+| **Volume backup** (S3 + chunked CDC) | n/a until volumes | downstream of volumes |
+| **Publish / public proxy** | engine-agnostic (`Tunnel`+`ensureHot`) | likely works, **needs a verification test** |
+
+**Correctly NOT ported** (TSI obsoletes them): `CleanupOrphanedTaps`, per-user subnets/DNS plumbing.
+
+**Full cross-arch recovery** (VM-level adopt-live on Linux) is gated on the **Linux krucible bring-up** (rust toolchain +
+libkrunfw + `bhatti-vmm` on the cluster) — the recovery *logic* is already proven on all three OS/arch; only the
+VM-level Linux run awaits the engine running there.
+
+---
+
+## 8. Open questions
 1. **Daemonless registry** — lockfile + per-VM state dir, or a tiny always-on supervisor? (Lean: state dir + adopt-by-pid.)
 2. **Production rootfs base** — build from an OCI image (like the FC path) or a from-scratch minimal userland? Tier split.
 3. **Is `publish`/share ever daemonless?** (Lean: no — it needs the resident proxy; CLI-direct is exec/attach only.)
