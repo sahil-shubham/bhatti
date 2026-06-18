@@ -308,6 +308,27 @@ cold-tier secret-hygiene hardening (6c.3) follow.
 
 ---
 
+## 6f. Verified cross-platform feature matrix (2026-06-18)
+
+Every cell run as a test on that platform (darwin/arm64 = HVF, linux/* = KVM on the cluster):
+
+| Feature | darwin/arm64 | linux/amd64 | linux/arm64 |
+|---|:---:|:---:|:---:|
+| Agent (exec/shell/files/sessions) | ✓ | ✓ | ✓ |
+| Warm pause/resume | ✓ | ✓ | ✓ |
+| Warm clock continuity (freeze) | ✓ | ✗ TODO (KVM clock) | ✗ TODO (KVM clock) |
+| Cold snapshot/restore | ✓ | ✓ | ✗ Tier-3 (KVM-arm64 GIC) |
+| Config drive (env/secrets/token) | ✓ | ✓ | ✓ |
+| Host↔guest forward | ✓ | ✓ | ✓ |
+| Recovery (restart-safe) | ✓ | ✓ | ✓ |
+
+**Two gaps, both well-understood:** (1) **cold tier on linux/arm64** — deferred Tier-3 (KVM-arm64 GIC save/restore); the
+Pi cleanly reports `snapshot not supported` (Stop leaves the guest running). (2) **warm clock continuity** is the macOS
+CNTVOFF feature; linux pause/resume works but the guest clock advances by the pause interval (KVM_SET_CLOCK/kvmclock
+TODO). Everything else is green on all three.
+
+---
+
 ## 7. FC → krucible parity tracker
 
 Migrating *off* FC means krucible reaches feature parity. Audited by diffing the engines' method sets.
