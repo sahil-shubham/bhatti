@@ -11,3 +11,5 @@ docs/PLAN-learning.md
 docs/internal/
 /bhatti-vmm
 /bhatti-vmm-krucible
+/krucible-mkimage
+bench/results-krucible-mac/
