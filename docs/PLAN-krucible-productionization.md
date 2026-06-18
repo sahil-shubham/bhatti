@@ -316,16 +316,16 @@ Every cell run as a test on that platform (darwin/arm64 = HVF, linux/* = KVM on 
 |---|:---:|:---:|:---:|
 | Agent (exec/shell/files/sessions) | ✓ | ✓ | ✓ |
 | Warm pause/resume | ✓ | ✓ | ✓ |
-| Warm clock continuity (freeze) | ✓ | ✗ TODO (KVM clock) | ✗ TODO (KVM clock) |
+| Warm clock continuity (freeze) | ✓ | ✓ | ✗ Tier-3 (CNTVOFF) |
 | Cold snapshot/restore | ✓ | ✓ | ✗ Tier-3 (KVM-arm64 GIC) |
 | Config drive (env/secrets/token) | ✓ | ✓ | ✓ |
 | Host↔guest forward | ✓ | ✓ | ✓ |
 | Recovery (restart-safe) | ✓ | ✓ | ✓ |
 
-**Two gaps, both well-understood:** (1) **cold tier on linux/arm64** — deferred Tier-3 (KVM-arm64 GIC save/restore); the
-Pi cleanly reports `snapshot not supported` (Stop leaves the guest running). (2) **warm clock continuity** is the macOS
-CNTVOFF feature; linux pause/resume works but the guest clock advances by the pause interval (KVM_SET_CLOCK/kvmclock
-TODO). Everything else is green on all three.
+**Remaining gaps are both linux/arm64 (Tier-3):** cold snapshot/restore (KVM-arm64 GIC save/restore) and warm clock
+continuity (per-vCPU CNTVOFF). Everything else is green on all three. **Warm clock continuity on linux/x86 is DONE
+(2026-06-18):** forced `clocksource=kvm-clock` + VM-level `KVM_SET_CLOCK` rewind + per-vCPU `KVM_KVMCLOCK_CTRL` —
+`TestKrucibleClockFreeze` passes with delta=0.01s across a 3s pause on amd64.
 
 ---
 
