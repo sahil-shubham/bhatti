@@ -15,11 +15,12 @@ import (
 // clock by 3s (the vtimer offset is nudged on resume). Reads /proc/uptime via
 // the agent before and after a paused interval.
 func TestKrucibleClockFreeze(t *testing.T) {
-	// Freeze semantics: macOS uses the HVF CNTVOFF vtimer adjust; linux/x86 uses
-	// the VM-level kvmclock rewind (KVM_SET_CLOCK). linux/arm64 continuity needs
-	// per-vCPU CNTVOFF and lands with the Tier-3 arm64 cold work — skip there.
+	// Freeze semantics: macOS HVF CNTVOFF; linux/x86 kvmclock rewind
+	// (KVM_SET_CLOCK + clocksource=kvm-clock). linux/arm64 is skipped: our KVM
+	// kernel doesn't expose CNTVOFF_EL2 via ONE_REG (ENOENT), so the freeze is a
+	// graceful no-op there — pending the KVM_ARM vCPU timer-offset attribute.
 	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" {
-		t.Skip("linux/arm64 warm-clock continuity (CNTVOFF) pending Tier-3 arm64 work")
+		t.Skip("linux/arm64 warm-clock freeze pending the KVM_ARM timer-offset attr (CNTVOFF_EL2 one-reg ENOENT)")
 	}
 	eng := newSuiteEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
