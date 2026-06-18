@@ -2,7 +2,6 @@ package krucible
 
 import (
 	"context"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,13 +14,10 @@ import (
 // clock by 3s (the vtimer offset is nudged on resume). Reads /proc/uptime via
 // the agent before and after a paused interval.
 func TestKrucibleClockFreeze(t *testing.T) {
-	// Freeze semantics: macOS HVF CNTVOFF; linux/x86 kvmclock rewind
-	// (KVM_SET_CLOCK + clocksource=kvm-clock). linux/arm64 is skipped: our KVM
-	// kernel doesn't expose CNTVOFF_EL2 via ONE_REG (ENOENT), so the freeze is a
-	// graceful no-op there — pending the KVM_ARM vCPU timer-offset attribute.
-	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" {
-		t.Skip("linux/arm64 warm-clock freeze pending the KVM_ARM timer-offset attr (CNTVOFF_EL2 one-reg ENOENT)")
-	}
+	// Freeze semantics, per platform: macOS HVF CNTVOFF; linux/x86 kvmclock
+	// rewind (KVM_SET_CLOCK + clocksource=kvm-clock); linux/arm64 rewinds the
+	// guest virtual counter via KVM_REG_ARM_TIMER_CNT (CNTVOFF_EL2 itself is an
+	// EL2 reg KVM won't surface to an EL1 guest vCPU).
 	eng := newSuiteEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

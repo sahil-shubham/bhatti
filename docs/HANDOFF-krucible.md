@@ -32,15 +32,18 @@ Feature matrix — every cell run as a test on that platform (see
 |---|:---:|:---:|:---:|
 | Agent (exec/shell/files/sessions) | ✓ | ✓ | ✓ |
 | Warm pause/resume | ✓ | ✓ | ✓ |
-| Warm clock continuity (freeze) | ✓ | ✓ | ✗ (see 5.1) |
+| Warm clock continuity (freeze) | ✓ | ✓ | ✓ (KVM_REG_ARM_TIMER_CNT) |
 | Cold snapshot/restore | ✓ | ✓ | ✗ (see 5.2) |
 | Config drive (env/secrets/token) | ✓ | ✓ | ✓ |
 | Host↔guest forward | ✓ | ✓ | ✓ |
 | Recovery (restart-safe) | ✓ | ✓ | ✓ |
 
-**Two gaps, both linux/arm64 (Tier-3): warm clock freeze and cold tier.** Everything
-else is green on all three. Recovery (restart-safety) and the cold tier on x86 are
-done this cycle.
+**One gap left, linux/arm64 (Tier-3): the cold tier.** Everything else is green on
+all three. The arm64 warm-clock freeze landed (§5.1, 2026-06-18): the EL2
+CNTVOFF_EL2 one-reg ENOENTs, so we rewind the guest-visible virtual counter
+(`KVM_REG_ARM_TIMER_CNT`, applied once on vCPU 0) instead — `TestKrucibleClockFreeze`
+is green on raspi-5a (delta 0.01s over a 3s pause). Recovery (restart-safety) and
+the cold tier on x86 are done.
 
 ## 3. Build & test
 
@@ -97,29 +100,31 @@ Ordered: the two arm64 Tier-3 gaps first (what was asked), then the smaller wins
 then the larger capability tracks. Each item: **goal · status · files · next ·
 validate · gotchas.**
 
-### 5.1 arm64 warm-clock freeze  (bounded; the tractable arm64 gap)
+### 5.1 arm64 warm-clock freeze  — **DONE (2026-06-18)**
 - **Goal:** a warm pause must not advance the guest's `CLOCK_MONOTONIC` by the
-  pause duration on linux/arm64 (it does today).
-- **Status:** wired but a graceful no-op. The freeze path exists
-  (`VcpuEvent::Resume { paused_ns }` → per-vcpu `adjust_guest_clock_after_pause` →
-  `arch::aarch64::regs::adjust_virtual_timer_offset`, which nudges `CNTVOFF_EL2`).
-  But **`CNTVOFF_EL2` via `KVM_GET_ONE_REG` returns ENOENT** on our 6.12 KVM kernel
-  (it's an EL2 reg, not exposed to the EL1-guest vcpu). The adjust skips gracefully;
-  resume works, clock unfrozen.
-- **Files:** `libkrucible/src/arch/src/aarch64/linux/regs.rs`
-  (`adjust_virtual_timer_offset`), `libkrucible/src/vmm/src/linux/vstate.rs`
-  (`Vcpu::adjust_guest_clock_after_pause`, aarch64 branch).
-- **Next:** use the **KVM_ARM vcpu timer-offset interface** instead of the
-  `CNTVOFF_EL2` sysreg one-reg. Investigate `KVM_REG_ARM_TIMER_OFFSET` (kernel ≥6.4,
-  a VM-wide virtual-counter offset) or the `KVM_ARM_VCPU_TIMER_CTRL` attr group. The
-  macОS analogue (working) is `hvf::vcpu_adjust_vtimer_offset`
-  (`libkrucible/src/hvf/src/lib.rs`) — same intent (shift the virtual counter),
-  different API.
-- **Validate:** un-skip `TestKrucibleClockFreeze` for linux/arm64 (the skip is in
-  `pkg/engine/krucible/clock_test.go`); expect delta < 1.5 s across a 3 s pause on
-  raspi-5a. The amd64 path (`kvmclock` rewind) is the proven sibling.
-- **Gotcha:** the offset is in counter ticks (scale by `CNTFRQ_EL0`); must be set
-  while the vcpu is paused.
+  pause duration on linux/arm64.
+- **Outcome:** **green on raspi-5a** — `TestKrucibleClockFreeze` reports delta
+  0.01 s across a 3 s pause (threshold 1.5 s). No regression in the warm
+  pause/resume suites.
+- **What worked (and why the original attempt didn't):** `CNTVOFF_EL2` is an EL2
+  register KVM does not surface to an EL1 guest vCPU via `KVM_GET_ONE_REG`
+  (ENOENT), so the original CNTVOFF approach was a graceful no-op. The fix rewinds
+  the **guest-visible virtual counter** `KVM_REG_ARM_TIMER_CNT` instead
+  (read at resume, subtract `paused_ns` worth of ticks, write back). NB: the kernel
+  ABI accidentally swapped the CVAL/CNT encodings — the counter is the fixed
+  `ARM64_SYS_REG(3,3,14,3,2)` slot, used as-is (see the uapi WARNING). The offset
+  is VM-wide on modern KVM, so the rewind is applied **once, on vCPU 0**
+  (`self.id == 0`) to avoid N× compounding across vCPUs.
+- **Files (changed):** `libkrucible/src/arch/src/aarch64/linux/regs.rs`
+  (`adjust_virtual_timer_offset` now uses `KVM_REG_ARM_TIMER_CNT`),
+  `libkrucible/src/vmm/src/linux/vstate.rs` (`Vcpu::adjust_guest_clock_after_pause`
+  aarch64 branch, gated `self.id == 0`), `pkg/engine/krucible/clock_test.go`
+  (un-skipped for linux/arm64). Also fixed `scripts/krucible-build-lib.sh` (it
+  hardcoded `lib`, breaking the Linux link — `cannot find -lkrun`; now derives
+  libdir from the .pc like the bringup script).
+- **Follow-up (not blocking):** the test uses 1 vCPU, so the `self.id == 0`
+  compounding gate isn't exercised by CI — a multi-vCPU clock-freeze case would
+  lock it in.
 
 ### 5.2 arm64 cold tier (snapshot/restore)  (large; the gnarly arm64 gap)
 - **Goal:** `Stop`/`Start` (snapshot → free RAM → restore) on linux/arm64. Today
