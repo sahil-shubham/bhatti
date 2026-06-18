@@ -322,10 +322,17 @@ Every cell run as a test on that platform (darwin/arm64 = HVF, linux/* = KVM on 
 | Host↔guest forward | ✓ | ✓ | ✓ |
 | Recovery (restart-safe) | ✓ | ✓ | ✓ |
 
-**Remaining gaps are both linux/arm64 (Tier-3):** cold snapshot/restore (KVM-arm64 GIC save/restore) and warm clock
-continuity (per-vCPU CNTVOFF). Everything else is green on all three. **Warm clock continuity on linux/x86 is DONE
-(2026-06-18):** forced `clocksource=kvm-clock` + VM-level `KVM_SET_CLOCK` rewind + per-vCPU `KVM_KVMCLOCK_CTRL` —
-`TestKrucibleClockFreeze` passes with delta=0.01s across a 3s pause on amd64.
+**Remaining gaps are both linux/arm64 (Tier-3), both genuinely hard:**
+- **Cold snapshot/restore** — from-scratch KVM-arm64 GICv3 (distributor/redistributor) + vCPU sysreg save/restore. No
+  reference (the reference fork only does cold on linux/x86 + macOS/aarch64). The big one.
+- **Warm clock continuity** — *attempted (2026-06-18):* the CNTVOFF freeze is wired (Resume{paused_ns} → per-vCPU
+  `adjust_virtual_timer_offset`), but our KVM kernel returns **ENOENT** for `CNTVOFF_EL2` via `KVM_GET_ONE_REG` (an EL2
+  reg not exposed to the EL1 guest vcpu). It skips gracefully (resume works, clock unfrozen). The real fix is the
+  **KVM_ARM vCPU timer-offset device attribute** — a bounded follow-up needing the correct KVM-arm64 API.
+
+**Warm clock continuity on linux/x86 is DONE (2026-06-18):** forced `clocksource=kvm-clock` + VM-level `KVM_SET_CLOCK`
+rewind + per-vCPU `KVM_KVMCLOCK_CTRL` — `TestKrucibleClockFreeze` passes (delta≤0.05s across a 3s pause) on amd64.
+Everything outside the two arm64 cells is green on all three.
 
 ---
 
