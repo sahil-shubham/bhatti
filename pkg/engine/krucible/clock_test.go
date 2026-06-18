@@ -1,7 +1,6 @@
 package krucible
 
 import (
-	"bytes"
 	"context"
 	"runtime"
 	"strconv"
@@ -16,11 +15,11 @@ import (
 // clock by 3s (the vtimer offset is nudged on resume). Reads /proc/uptime via
 // the agent before and after a paused interval.
 func TestKrucibleClockFreeze(t *testing.T) {
-	// Freeze semantics come from the macOS HVF CNTVOFF vtimer adjust on resume.
-	// The Linux/KVM warm-resume clock-continuity fix (KVM_SET_CLOCK/kvmclock) is
-	// a documented TODO, so the guest clock still advances across a pause there.
-	if runtime.GOOS != "darwin" {
-		t.Skip("clock freeze is macOS-only today; linux KVM warm-resume clock continuity is a TODO")
+	// Freeze semantics: macOS uses the HVF CNTVOFF vtimer adjust; linux/x86 uses
+	// the VM-level kvmclock rewind (KVM_SET_CLOCK). linux/arm64 continuity needs
+	// per-vCPU CNTVOFF and lands with the Tier-3 arm64 cold work — skip there.
+	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" {
+		t.Skip("linux/arm64 warm-clock continuity (CNTVOFF) pending Tier-3 arm64 work")
 	}
 	eng := newSuiteEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -30,12 +29,17 @@ func TestKrucibleClockFreeze(t *testing.T) {
 	id := info.ID
 	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
+	// Read uptime via exec+cat (Go's os.ReadFile handles 0-size procfs files),
+	// not FileRead (which can't size a procfs file).
 	uptime := func() float64 {
-		var buf bytes.Buffer
-		if _, _, err := eng.FileRead(ctx, id, "/proc/uptime", &buf); err != nil {
-			t.Fatalf("read /proc/uptime: %v", err)
+		r, err := eng.Exec(ctx, id, []string{"cat", "/proc/uptime"})
+		if err != nil {
+			t.Fatalf("exec cat /proc/uptime: %v", err)
 		}
-		f := strings.Fields(buf.String())
+		f := strings.Fields(r.Stdout)
+		if len(f) == 0 {
+			t.Fatalf("empty /proc/uptime: %q", r.Stdout)
+		}
 		v, _ := strconv.ParseFloat(f[0], 64)
 		return v
 	}
