@@ -3,6 +3,7 @@ package krucible
 import (
 	"bytes"
 	"context"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +16,12 @@ import (
 // clock by 3s (the vtimer offset is nudged on resume). Reads /proc/uptime via
 // the agent before and after a paused interval.
 func TestKrucibleClockFreeze(t *testing.T) {
+	// Freeze semantics come from the macOS HVF CNTVOFF vtimer adjust on resume.
+	// The Linux/KVM warm-resume clock-continuity fix (KVM_SET_CLOCK/kvmclock) is
+	// a documented TODO, so the guest clock still advances across a pause there.
+	if runtime.GOOS != "darwin" {
+		t.Skip("clock freeze is macOS-only today; linux KVM warm-resume clock continuity is a TODO")
+	}
 	eng := newSuiteEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

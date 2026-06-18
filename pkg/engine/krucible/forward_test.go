@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +31,10 @@ func TestKrucibleForward(t *testing.T) {
 	id := info.ID
 	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
-	const guestPort = 8080
+	// High port: under TSI the guest shares the host's port namespace, so a
+	// guest listen can't bind a port the host already uses (e.g. 8080 on a
+	// dev/CI box). Pick one the host is unlikely to occupy.
+	const guestPort = 18080
 	// Start a real HTTP server inside the guest (detached, keeps running).
 	// (The toy rootfs has no `ss`, so we can't poll ListeningPorts; instead we
 	// retry the forwarded GET, which fails fast until the guest server is up.)
@@ -46,35 +50,41 @@ func TestKrucibleForward(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Hit the host port — the response must come from inside the guest.
+	// Hit the host port — the response must come from inside the guest. Retry
+	// until the guest's server answers: TSI shares the host's network stack, so a
+	// guest connect to :8080 before netcheck has bound it can transiently fall
+	// through to a host process on the same port — wait for the real guest body.
 	url := "http://" + ln.Addr().String() + "/"
-	body := httpGetRetry(t, url, 25*time.Second)
-	if body != "hello-from-guest\n" {
-		t.Fatalf("forwarded response = %q, want %q", body, "hello-from-guest\n")
+	body := httpGetRetry(t, url, "hello-from-guest", 25*time.Second)
+	if !strings.Contains(body, "hello-from-guest") {
+		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
 	}
 }
 
-func httpGetRetry(t *testing.T, url string, within time.Duration) string {
+// httpGetRetry GETs url until the response body contains want (or it times
+// out). Retrying until the EXPECTED body — not just any non-empty body — makes
+// the forward tests robust to the TSI host-stack fall-through described above
+// and to the guest server still coming up.
+func httpGetRetry(t *testing.T, url, want string, within time.Duration) string {
 	t.Helper()
 	client := &http.Client{Timeout: 3 * time.Second}
 	deadline := time.Now().Add(within)
-	var lastErr error
+	var last string
 	for time.Now().Before(deadline) {
 		resp, err := client.Get(url)
 		if err != nil {
-			lastErr = err
+			last = err.Error()
 			time.Sleep(300 * time.Millisecond)
 			continue
 		}
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if len(b) == 0 {
-			lastErr = fmt.Errorf("empty body")
-			time.Sleep(300 * time.Millisecond)
-			continue
+		last = string(b)
+		if strings.Contains(last, want) {
+			return last
 		}
-		return string(b)
+		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatalf("GET %s never succeeded: %v", url, lastErr)
+	t.Fatalf("GET %s never returned %q (last: %q)", url, want, last)
 	return ""
 }

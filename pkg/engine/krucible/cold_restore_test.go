@@ -38,6 +38,13 @@ func launch(t *testing.T, spec string) (*exec.Cmd, context.CancelFunc) {
 // survives the helper process exiting. (exec-after-restore needs a block root.)
 func TestColdLoopbackRestore(t *testing.T) {
 	if !hasLibkrun() { t.Skip("no libkrun") }
+	// Manual/dev helper test: cold restore over a virtio-fs root from a
+	// pre-built /tmp/kr-rootfs. Superseded by the cross-platform, block-root
+	// TestKrucibleSnapshotSuite (which builds its own rootfs). Skip unless the
+	// fixture exists.
+	if _, err := os.Stat("/tmp/kr-rootfs"); err != nil {
+		t.Skip("no /tmp/kr-rootfs fixture; use TestKrucibleSnapshotSuite for cold-tier coverage")
+	}
 	dir := "/tmp/bhatti-kr-cold"; os.RemoveAll(dir); os.MkdirAll(dir, 0700)
 	snap := "/tmp/bhatti-kr-cold/bundle"
 	c := dir + "/c.sock"; f := dir + "/f.sock"; k := dir + "/k.sock"

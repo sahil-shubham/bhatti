@@ -394,6 +394,10 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 		return fmt.Errorf("stop: bundle dir: %w", err)
 	}
 	if _, err := controlCmd(sctx, ctlUDS, "SNAPSHOT "+bundleDir); err != nil {
+		// Snapshot failed (e.g. out of disk for memory.img). The guest is still
+		// PAUSED from above — un-pause it so it isn't left frozen (a frozen guest
+		// hangs the next exec). Then surface the error; the sandbox stays usable.
+		_, _ = controlCmd(sctx, ctlUDS, "RESUME")
 		return fmt.Errorf("stop: snapshot: %w", err)
 	}
 	vm.kill()

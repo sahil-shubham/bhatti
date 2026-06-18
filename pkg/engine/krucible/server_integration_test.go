@@ -29,7 +29,7 @@ func TestKrucibleServerIntegration(t *testing.T) {
 	_, do := krucibleServer(t) // skips if libkrun/vmm/mke2fs unavailable
 
 	// --- create over HTTP ---
-	resp := do("POST", "/sandboxes", map[string]any{"name": "srv-it"})
+	resp := do("POST", "/sandboxes", map[string]any{"name": "srv-it", "memory_mb": 512})
 	if resp.StatusCode != 201 {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("create: want 201, got %d: %s", resp.StatusCode, b)
@@ -136,9 +136,10 @@ func TestKrucibleServerForward(t *testing.T) {
 	resp.Body.Close()
 	t.Cleanup(func() { do("DELETE", "/sandboxes/"+sb.ID, nil) })
 
-	// Start a real HTTP server inside the guest (detached).
+	// Start a real HTTP server inside the guest (detached). High port: under TSI
+	// the guest shares the host's port namespace, so avoid host-occupied ports.
 	resp = do("POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
-		"cmd": []string{"/bin/netcheck", "serve", "8080"}, "detach": true, "output_file": "/tmp/serve.log",
+		"cmd": []string{"/bin/netcheck", "serve", "18080"}, "detach": true, "output_file": "/tmp/serve.log",
 	})
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
@@ -147,7 +148,7 @@ func TestKrucibleServerForward(t *testing.T) {
 	resp.Body.Close()
 
 	// Ask the daemon to forward a host port to guest :8080.
-	resp = do("POST", "/sandboxes/"+sb.ID+"/forward", map[string]any{"guest_port": 8080})
+	resp = do("POST", "/sandboxes/"+sb.ID+"/forward", map[string]any{"guest_port": 18080})
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("forward: want 200, got %d: %s", resp.StatusCode, b)
@@ -161,8 +162,8 @@ func TestKrucibleServerForward(t *testing.T) {
 		t.Fatal("forward returned no host_addr")
 	}
 
-	body := httpGetRetry(t, "http://"+fwd.HostAddr+"/", 25*time.Second)
-	if body != "hello-from-guest\n" {
-		t.Fatalf("forwarded response = %q, want %q", body, "hello-from-guest\n")
+	body := httpGetRetry(t, "http://"+fwd.HostAddr+"/", "hello-from-guest", 25*time.Second)
+	if !strings.Contains(body, "hello-from-guest") {
+		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
 	}
 }
