@@ -53,6 +53,14 @@ const maxUnixPath = 104
 // stop it and the agent client to drive lohar.
 type VM struct {
 	mu         sync.Mutex
+	// launchMu serializes lifecycle transitions (Create's launch / Start / Stop /
+	// Pause / Resume / Destroy) for this VM. Held for the whole transition so a
+	// burst of concurrent wake-on-request calls (the public proxy + exec handlers
+	// all call ensureHot uncoalesced) can't double-spawn the helper, racing on the
+	// same vsock UDS paths and orphaning processes. Ordering rule: acquire
+	// launchMu BEFORE mu, never the reverse (mu guards field reads/writes and is
+	// also taken by read-only Status/List, which must not block on a transition).
+	launchMu   sync.Mutex
 	ID         string
 	Name       string
 	UserID     string
@@ -344,14 +352,13 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
+	// kill() handles both an owned helper (vm.cmd) and one adopted across a daemon
+	// restart (only vm.HelperPID set) — the inlined cmd-only kill here used to leak
+	// the latter, leaving a live VM with its backing files deleted.
+	vm.kill()
 	vm.mu.Lock()
-	if vm.cmd != nil && vm.cmd.Process != nil {
-		_ = vm.cmd.Process.Kill()
-		_, _ = vm.cmd.Process.Wait()
-	}
-	if vm.cancel != nil {
-		vm.cancel()
-	}
 	dir := vm.SandboxDir
 	sockDir := vm.SockDir
 	vm.Status = "stopped"
@@ -376,6 +383,8 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
 	if vm.Status != "running" {
 		vm.mu.Unlock()
@@ -419,6 +428,8 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
 	if vm.Status == "running" {
 		vm.mu.Unlock()

@@ -22,6 +22,8 @@ func (e *Engine) Pause(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 	if vm.Status != "running" {
@@ -30,6 +32,8 @@ func (e *Engine) Pause(ctx context.Context, id string) error {
 	if vm.Thermal == "warm" {
 		return nil
 	}
+	// controlCmd briefly holds vm.mu; acceptable (bounded by the socket deadline)
+	// and serialized against Start/Stop/Resume by launchMu (acquired below).
 	if _, err := controlCmd(ctx, vm.CtlSockUDS, "PAUSE"); err != nil {
 		return fmt.Errorf("pause: %w", err)
 	}
@@ -45,6 +49,8 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 	if vm.Thermal == "hot" {
