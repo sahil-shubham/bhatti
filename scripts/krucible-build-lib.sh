@@ -6,7 +6,7 @@
 #
 # Usage: scripts/krucible-build-lib.sh [LIBKRUCIBLE_SRC] [PREFIX]
 set -euo pipefail
-SRC="$(cd "${1:-../libkrucible}" && pwd)"
+SRC="$(cd "${1:-libkrucible}" && pwd)"
 PREFIX="${2:-$SRC/_install}"
 OS="$(uname -s)"
 

@@ -20,7 +20,7 @@ PORT="${PORT:-8097}"
 WORK="${KRUCIBLE_WORK:-/tmp/krucible-bench}"
 BASE_IMAGE="${BASE_IMAGE:-$REPO/dist/krucible-base-alpine.img}"
 RESULTS="${RESULTS_DIR:-$REPO/bench/results-krucible-mac}"
-FORK_LIB="$(cd "$REPO/.." && pwd)/libkrucible/_install/lib"
+FORK_LIB="$REPO/libkrucible/_install/lib"
 
 # Sample sizes. create is rate-limited to 30/min server-side, so N_LIFECYCLE is
 # paced; exec/file are cheap (read bucket 1200/min).

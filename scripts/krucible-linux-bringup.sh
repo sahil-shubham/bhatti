@@ -12,15 +12,15 @@
 # This is the long pole: (2) is a Linux kernel build and (3) a Rust release
 # build — tens of minutes on a 4-core Pi. Run under nohup/tmux and tail the log.
 #
-# Layout (mirror the Mac dev tree): this script lives in the bhatti repo; it
-# expects a sibling ../libkrucible (rsync it from the Mac). libkrunfw is cloned
-# from its public upstream and pinned to the version the guest kernel matches.
+# Layout: this script lives in the bhatti repo; libkrucible is a git submodule
+# at ./libkrucible (`git submodule update --init` after clone). libkrunfw is
+# cloned from its public upstream and pinned to the version the guest kernel matches.
 #
 # Usage: scripts/krucible-linux-bringup.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
-LIBKRUCIBLE="${LIBKRUCIBLE:-$REPO/../libkrucible}"
+LIBKRUCIBLE="${LIBKRUCIBLE:-$REPO/libkrucible}"
 LIBKRUNFW_REF="${LIBKRUNFW_REF:-v5.0.0}"            # match the guest kernel (linux-6.12.x)
 PREFIX="${PREFIX:-/usr/local}"
 ARCH="$(uname -m)"   # aarch64 | x86_64

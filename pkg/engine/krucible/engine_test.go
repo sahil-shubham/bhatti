@@ -104,7 +104,7 @@ func libDir() string {
 	var dirs []string
 	// libkrucible install prefix: libkrun.so lands in lib64 on Linux, lib on macOS.
 	for _, sub := range []string{"lib64", "lib"} {
-		if p, err := filepath.Abs("../../../../libkrucible/_install/" + sub); err == nil {
+		if p, err := filepath.Abs("../../../libkrucible/_install/" + sub); err == nil {
 			if m, _ := filepath.Glob(filepath.Join(p, "libkrun.*")); len(m) > 0 {
 				dirs = append(dirs, p)
 			}

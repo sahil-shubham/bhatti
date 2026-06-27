@@ -25,7 +25,7 @@ make vmm >/dev/null
 
 # libkrun comes from the libkrucible prefix; libkrunfw from Homebrew. The daemon
 # passes krucible_libdir to bhatti-vmm as its dyld search path.
-FORK_LIB="$(cd "$REPO/.." && pwd)/libkrucible/_install/lib"
+FORK_LIB="$REPO/libkrucible/_install/lib"
 
 # Isolated config — never read/written by the system bhatti.
 cat > "$CFG" <<EOF

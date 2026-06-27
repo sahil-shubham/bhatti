@@ -4,7 +4,7 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 
 # libkrucible (our libkrun fork). KRUCIBLE_PREFIX is the link prefix `make vmm`
 # points at; if unbuilt, vmm falls back to the system (Homebrew) libkrun.
-LIBKRUCIBLE ?= ../libkrucible
+LIBKRUCIBLE ?= libkrucible
 KRUCIBLE_PREFIX ?= $(abspath $(LIBKRUCIBLE)/_install)
 
 # Build the bhatti binary with version injection
