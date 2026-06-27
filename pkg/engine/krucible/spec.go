@@ -61,6 +61,15 @@ type VMSpec struct {
 	// the snapshot point. See krun_set_snapshot. macOS/HVF only.
 	SnapshotDir string `json:"snapshot_dir,omitempty"`
 
+	// KernelImage, if set, boots an external kernel (e.g. a lean one) via
+	// krun_set_kernel instead of libkrunfw's bundled kernel — setting it makes
+	// libkrun skip libkrunfw entirely. Block-root only: the cmdline roots on
+	// /dev/vda. arm64 expects a raw `Image`; x86 an ELF vmlinux.
+	KernelImage string `json:"kernel_image,omitempty"`
+	// KernelCmdline overrides the default block-root cmdline used with
+	// KernelImage. Empty = the built-in default (root=/dev/vda … init=ExecPath).
+	KernelCmdline string `json:"kernel_cmdline,omitempty"`
+
 	// LogLevel is the libkrun log level (0=off .. 5=trace). 2=warn keeps the
 	// guest console readable.
 	LogLevel uint32 `json:"log_level"`

@@ -28,10 +28,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"unsafe"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 )
+
+// defaultExtCmdline mirrors libkrun's bundled block-root cmdline for the
+// external-kernel path (we supply it ourselves since libkrun won't auto-build
+// one). Drops the x86-only clocksource=kvm-clock — arm64 uses the arch timer.
+func defaultExtCmdline(initPath string) string {
+	if initPath == "" {
+		initPath = "/init.krun"
+	}
+	return "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 " +
+		"root=/dev/vda rootfstype=ext4 rw quiet no-kvmapf init=" + initPath
+}
 
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "vmm: "+format+"\n", args...)
@@ -67,9 +79,35 @@ func run(spec krucible.VMSpec) {
 		fail("krun_set_vm_config: %d", int(r))
 	}
 
+	// External kernel: load our own (lean) kernel instead of libkrunfw's bundle.
+	// Setting it makes krun_start_enter skip libkrunfw entirely (it only loads
+	// krunfw when external_kernel + kernel_bundle are both unset). We supply the
+	// full cmdline (root=/dev/vda + init=ExecPath), so the bundled implicit-init
+	// and set_exec calls are skipped below.
+	externalKernel := spec.KernelImage != ""
+	if externalKernel {
+		ckernel := C.CString(spec.KernelImage)
+		defer C.free(unsafe.Pointer(ckernel))
+		cmdline := spec.KernelCmdline
+		if cmdline == "" {
+			cmdline = defaultExtCmdline(spec.ExecPath)
+		}
+		ccmd := C.CString(cmdline)
+		defer C.free(unsafe.Pointer(ccmd))
+		// arm64 = raw Image (0); x86 = ELF vmlinux (1).
+		format := C.uint32_t(0)
+		if runtime.GOARCH == "amd64" {
+			format = C.uint32_t(1)
+		}
+		if r := C.krun_set_kernel(cid, ckernel, format, nil, ccmd); r != 0 {
+			fail("krun_set_kernel: %d", int(r))
+		}
+	}
+
 	// PID-1 mode: stop libkrun injecting /init.krun so the rootfs's own
-	// /init.krun (= lohar) boots as PID 1. Must precede krun_set_root.
-	if spec.Pid1 {
+	// /init.krun (= lohar) boots as PID 1. Must precede krun_set_root. Only for
+	// the bundled kernel — the external kernel boots init= from the cmdline.
+	if spec.Pid1 && !externalKernel {
 		if r := C.krun_disable_implicit_init(cid); r != 0 {
 			fail("krun_disable_implicit_init: %d", int(r))
 		}
@@ -138,13 +176,16 @@ func run(spec krucible.VMSpec) {
 	}
 
 	// In PID-1 mode the kernel boots ExecPath directly; KRUN_INIT is ignored
-	// by lohar. We still set it (with env) for parity / non-PID1 use.
-	cexec := C.CString(spec.ExecPath)
-	defer C.free(unsafe.Pointer(cexec))
-	argv := cStrArray(nil)
-	envp := cStrArray(spec.Env)
-	if r := C.krun_set_exec(cid, cexec, argv, envp); r != 0 {
-		fail("krun_set_exec: %d", int(r))
+	// by lohar. We still set it (with env) for parity / non-PID1 use. Skipped
+	// for the external kernel, which carries init= in the cmdline.
+	if !externalKernel {
+		cexec := C.CString(spec.ExecPath)
+		defer C.free(unsafe.Pointer(cexec))
+		argv := cStrArray(nil)
+		envp := cStrArray(spec.Env)
+		if r := C.krun_set_exec(cid, cexec, argv, envp); r != 0 {
+			fail("krun_set_exec: %d", int(r))
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "vmm: start_enter pid1=%v vcpus=%d mem=%dMiB rootfs=%s\n",

@@ -44,6 +44,10 @@ type Config struct {
 	// host dir. Required for the cold tier (Stop/Start): the block image is the
 	// self-contained, snapshot-surviving rootfs (see docs/PLAN-krucible-cold-tier.md).
 	BlockRoot bool
+	// KernelImage, if set, boots an external kernel (e.g. a lean one) instead of
+	// libkrunfw's bundled kernel. Block-root only (the cmdline roots on
+	// /dev/vda). arm64 = raw `Image`, x86 = ELF vmlinux.
+	KernelImage string
 }
 
 // maxUnixPath is the conservative AF_UNIX sun_path cap (macOS = 104).
@@ -228,6 +232,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 			return info, fmt.Errorf("clone base image: %w", err)
 		}
 		baseSpec.RootDisk = rootImg
+		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
 
 		token = genToken()
 		confPath := filepath.Join(sandboxDir, "config.ext4")
