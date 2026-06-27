@@ -1,0 +1,78 @@
+name: Krucible Integration
+
+# Full krucible VM suite on real KVM — the parity gate that ci.yml's
+# krucible-build job can't run (GitHub-hosted runners have no /dev/kvm).
+# Runs on the self-hosted arc-runner-set (k3s cluster, has /dev/kvm), the
+# same pool the Firecracker integration uses. Kept in its own workflow so it
+# doesn't inherit integration.yml's `v*`-tag triggers.
+#
+# These steps are the ones validated by hand on the cluster (raspi-5a arm64 +
+# asus-i5 x86): bring up libkrun + libkrunfw + bhatti-vmm via the bring-up
+# script, build lohar, then run the `-tags krucible` suite. The cold-tier
+# suite self-runs on x86 and is n/a on arm64; the VM suites self-skip only if
+# there's no hypervisor (there is here), via hasHypervisor().
+#
+# First-run follow-ups (need a real trigger to tune): cache the slow libkrunfw
+# kernel build, and split into an arm64 + x86 runner-arch matrix once the
+# arc-runner-set labels are wired.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [krucible]
+    paths:
+      - 'pkg/engine/krucible/**'
+      - 'cmd/vmm/**'
+      - 'cmd/lohar/**'
+      - 'scripts/krucible-*'
+      - '.github/workflows/krucible-integration.yml'
+
+concurrency:
+  group: krucible-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Krucible Integration (KVM)
+    runs-on: arc-runner-set
+    if: github.repository == 'sahil-shubham/bhatti'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Init libkrucible submodule (public, over https)
+        run: |
+          git config submodule.libkrucible.url https://github.com/sahil-shubham/libkrucible.git
+          git submodule update --init --recursive libkrucible
+
+      - name: Bring up krucible (apt deps + Rust + Go + libkrunfw + libkrun + bhatti-vmm)
+        # Self-contained: the bring-up script is the proven node-provisioning
+        # path. libkrunfw is a slow kernel build on first run (cache TODO).
+        run: ./scripts/krucible-linux-bringup.sh
+
+      - name: Build lohar (the guest agent / init.krun)
+        run: |
+          export PATH=/usr/local/go/bin:$PATH
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+
+      - name: Setup /dev/kvm + TMPDIR
+        run: |
+          ls -la /dev/kvm
+          test -w /dev/kvm || sudo chmod 666 /dev/kvm
+          mkdir -p "$HOME/krtmp"   # disk-backed: /tmp is a small tmpfs on the Pis
+
+      - name: Run krucible suite (-tags krucible)
+        # PKG_CONFIG_PATH points pkg-config at our fork's libkrun; TMPDIR keeps
+        # the RAM snapshots off the small /tmp tmpfs. VM suites run here (real
+        # KVM); cold tier runs on x86, is n/a on arm64.
+        run: |
+          export PATH=/usr/local/go/bin:$HOME/.cargo/bin:$PATH
+          export PKG_CONFIG_PATH="$PWD/libkrucible/_install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export TMPDIR="$HOME/krtmp"
+          go test -tags krucible ./pkg/engine/krucible/ -count=1 -timeout=0 -v
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo pkill -f bhatti-vmm 2>/dev/null || true
+          rm -rf "$HOME/krtmp"/* 2>/dev/null || true
