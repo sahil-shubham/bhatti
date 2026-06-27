@@ -36,13 +36,18 @@ import (
 
 // defaultExtCmdline mirrors libkrun's bundled block-root cmdline for the
 // external-kernel path (we supply it ourselves since libkrun won't auto-build
-// one). Drops the x86-only clocksource=kvm-clock — arm64 uses the arch timer.
+// one). x86 keeps clocksource=kvm-clock (the warm-clock freeze rewinds it);
+// arm64 omits it (the arch timer is the clocksource there).
 func defaultExtCmdline(initPath string) string {
 	if initPath == "" {
 		initPath = "/init.krun"
 	}
-	return "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 " +
-		"root=/dev/vda rootfstype=ext4 rw quiet no-kvmapf init=" + initPath
+	cmd := "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 " +
+		"root=/dev/vda rootfstype=ext4 rw quiet no-kvmapf"
+	if runtime.GOARCH == "amd64" {
+		cmd += " clocksource=kvm-clock"
+	}
+	return cmd + " init=" + initPath
 }
 
 func fail(format string, args ...any) {

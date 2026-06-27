@@ -68,6 +68,10 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 		VMMBinary:  vmm,
 		LibDir:     libDir(),
 		BlockRoot:  true,
+		// Opt-in: boot the external lean kernel instead of the libkrunfw bundle,
+		// so the block-root suites (snapshot, concurrent-wake) double as the
+		// lean-kernel parity gate when KRUCIBLE_LEAN_KERNEL is set.
+		KernelImage: os.Getenv("KRUCIBLE_LEAN_KERNEL"),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -79,6 +83,14 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 // Start (restore) round-trip with RAM + rootfs intact and exec-after-restore.
 func TestKrucibleSnapshotSuite(t *testing.T) {
 	enginetest.RunSnapshotSuite(t, newBlockRootEngine)
+}
+
+// TestKrucibleBlockRootAgentSuite runs the agent suite on a block-root engine.
+// With KRUCIBLE_LEAN_KERNEL set it doubles as the cross-arch lean-kernel
+// boot+agent gate, independent of the cold tier — so it runs on linux/arm64
+// (where the cold tier isn't wired yet) as well as macOS + linux/x86.
+func TestKrucibleBlockRootAgentSuite(t *testing.T) {
+	enginetest.RunAgentSuite(t, newBlockRootEngine)
 }
 
 // --- test helpers ---
