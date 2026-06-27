@@ -1,10 +1,22 @@
 # PLAN — arm64-linux cold tier (§5.2, the last parity gap)
 
-Status: **In progress (2026-06-18).** Closes the final strict-parity cell: cold
-snapshot/restore (`Stop`/`Start`) on linux/arm64 (KVM). Warm tier + the arm64
-warm-clock freeze (§5.1) are already green on raspi-5a. Companion:
-`HANDOFF-krucible.md` §5.2, `PLAN-krucible-cold-tier.md` (the x86/macOS design
-this extends).
+Status: **DONE (2026-06-27).** Closed the final strict-parity cell: cold
+snapshot/restore (`Stop`/`Start`) on linux/arm64 (KVM) is green on raspi-5a —
+`TestKrucibleSnapshotSuite` + `TestKrucibleColdTierMultiVcpu` (2 vCPUs, vtimer
+fires after restore, both CPUs online, two cold cycles), full suite green, no
+regression, x86 unaffected. The cold tier is now green on all three platforms.
+Companion: `HANDOFF-krucible.md` §5.2, `PLAN-krucible-cold-tier.md`.
+
+**What shipped:** the cfg-gate refactor (libkrucible `c43991b`), the vCPU +
+device + state plumbing (`e91b14a`), and the GICv2 register save/restore
+(`9edd3ac` — `KvmGicV2::{save_state,restore_state}`: GICD + per-vCPU GICC with
+per-vCPU SGI/PPI banking, GICD_CTLR restored last, raw `KVM_GET_DEVICE_ATTR` for
+the read path, `GV2\x01`-tagged blob). GICv3 stays the default-unsupported stub
+until there's hardware.
+
+---
+
+_Original plan below, kept for reference._
 
 **Progress:** steps 0–2 done + step 3 all but the GIC register table
 (libkrucible `c43991b` cfg refactor, `e91b14a` vCPU + device + state plumbing).

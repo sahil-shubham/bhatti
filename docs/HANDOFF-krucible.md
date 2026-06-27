@@ -36,16 +36,17 @@ Feature matrix — every cell run as a test on that platform (see
 | Agent (exec/shell/files/sessions) | ✓ | ✓ | ✓ |
 | Warm pause/resume | ✓ | ✓ | ✓ |
 | Warm clock continuity (freeze) | ✓ | ✓ | ✓ (KVM_REG_ARM_TIMER_CNT) |
-| Cold snapshot/restore | ✓ | ✓ | ✗ (see 5.2) |
+| Cold snapshot/restore | ✓ | ✓ | ✓ |
 | Config drive (env/secrets/token) | ✓ | ✓ | ✓ |
 | Host↔guest forward | ✓ | ✓ | ✓ |
 | Recovery (restart-safe) | ✓ | ✓ | ✓ |
 | Lean external kernel (~2x cold-start) | ✓ | ✓ | ✓ |
 
-**One gap left, linux/arm64 (Tier-3): the cold tier.** Everything else is green on
-all three. The arm64 warm-clock freeze landed (§5.1): the EL2 CNTVOFF_EL2 one-reg
-ENOENTs, so we rewind the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`,
-once on vCPU 0) — `TestKrucibleClockFreeze` green on raspi-5a (delta 0.01s/3s).
+**Every cell is green on all three platforms — full cross-arch parity.** The last
+gap, the linux/arm64 cold tier, closed with the GICv2 save/restore (§5.2). The
+arm64 warm-clock freeze (§5.1): the EL2 CNTVOFF_EL2 one-reg ENOENTs, so we rewind
+the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
+`TestKrucibleClockFreeze` green on raspi-5a (delta 0.01s/3s).
 
 **New this cycle (2026-06-27):**
 - **Lean external kernel** (§5.9) — `krun_set_kernel` boots our own kernel,
@@ -150,12 +151,18 @@ validate · gotchas.**
   compounding gate isn't exercised by CI — a multi-vCPU clock-freeze case would
   lock it in.
 
-### 5.2 arm64 cold tier (snapshot/restore)  — **PARTIAL; one piece left (GICv2 regs)**
+### 5.2 arm64 cold tier (snapshot/restore)  — **DONE (2026-06-27)**
 - **Goal:** `Stop`/`Start` (snapshot → free RAM → restore) on linux/arm64.
-- **Status (see `PLAN-krucible-arm64-cold-tier.md`):** the cfg-gate refactor +
-  vCPU save/restore + device persist + VM/GIC plumbing are **done**; the **GICv2
-  register save/restore is the single remaining piece** (a clearly-marked TODO in
-  `KvmGicV2`). Compiles + the warm path is green on raspi-5a.
+- **Outcome:** **green on raspi-5a** — `TestKrucibleSnapshotSuite` +
+  `TestKrucibleColdTierMultiVcpu` (2 vCPUs, vtimer fires after restore, both CPUs
+  online, two cold cycles). Full krucible suite green, no regression; x86 cold
+  tier unaffected. The cold tier is now green on all three platforms.
+- **What landed:** `KvmGicV2::{save_state,restore_state}` (libkrucible) capture/
+  replay the in-kernel vGIC — GICD (group/priority/SPI-targets/config → enable →
+  pending → active, GICD_CTLR last) + per-vCPU GICC (CTLR/PMR/BPR/ABPR/APR),
+  honoring the per-vCPU banking of the 32 private IRQs (SGI/PPI) via the attr
+  CPUID field. Read path uses a raw `KVM_GET_DEVICE_ATTR` ioctl (kvm-ioctls 0.24
+  wraps only SET); blob tagged `GV2\x01`, restore refuses any other tag.
 - **Key finding (reshapes the original plan): it's GICv2, not GICv3.** raspi-5a's
   host is a GIC-400 (`/proc/interrupts`: `GICv2 … vgic`), so KVM gives the guest a
   **vGICv2** — `KvmGicV3::new` fails and the builder falls back to `KvmGicV2`.
