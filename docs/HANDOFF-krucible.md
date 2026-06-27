@@ -20,8 +20,11 @@ bhatti runs agent sandboxes in microVMs. Two engines implement `engine.Engine`:
   block-root boot. The daemon never links libkrun; it spawns one cgo helper
   (`bhatti-vmm`, from `cmd/vmm`) per sandbox and talks to it over UDS.
 
-Repos: **`bhatti`** (Go daemon, branch `krucible`) + **`libkrucible`** (Rust fork,
-branch `main`, builds `--no-default-features --features blk`).
+Repos: **`bhatti`** (Go daemon, branch `krucible`) + **`libkrucible`** — now a
+**git submodule** at `./libkrucible` (branch `krucible`, the gitlink SHA is the
+version-of-record; `make krucible` builds it `--no-default-features --features
+blk`). The fork delta lives on `origin/krucible`; bump the gitlink to advance,
+rebase onto upstream libkrun on your own cadence.
 
 ## 2. Current state (verified)
 
@@ -37,25 +40,40 @@ Feature matrix — every cell run as a test on that platform (see
 | Config drive (env/secrets/token) | ✓ | ✓ | ✓ |
 | Host↔guest forward | ✓ | ✓ | ✓ |
 | Recovery (restart-safe) | ✓ | ✓ | ✓ |
+| Lean external kernel (~2x cold-start) | ✓ | ✓ | ✓ |
 
 **One gap left, linux/arm64 (Tier-3): the cold tier.** Everything else is green on
-all three. The arm64 warm-clock freeze landed (§5.1, 2026-06-18): the EL2
-CNTVOFF_EL2 one-reg ENOENTs, so we rewind the guest-visible virtual counter
-(`KVM_REG_ARM_TIMER_CNT`, applied once on vCPU 0) instead — `TestKrucibleClockFreeze`
-is green on raspi-5a (delta 0.01s over a 3s pause). Recovery (restart-safety) and
-the cold tier on x86 are done.
+all three. The arm64 warm-clock freeze landed (§5.1): the EL2 CNTVOFF_EL2 one-reg
+ENOENTs, so we rewind the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`,
+once on vCPU 0) — `TestKrucibleClockFreeze` green on raspi-5a (delta 0.01s/3s).
+
+**New this cycle (2026-06-27):**
+- **Lean external kernel** (§5.9) — `krun_set_kernel` boots our own kernel,
+  bypassing libkrunfw: **~2x faster cold-start** (boot→agent 312ms vs 610ms on
+  HVF), validated cross-arch (mac/HVF + linux/arm64,x86 under KVM). Owned,
+  reproducible config + build (`scripts/lean-kernel/`, `build-lean-kernel.sh`).
+- **libkrucible vendored as a submodule** (§5.10) — gitlink = version-of-record.
+- **Concurrency hardening** (§5.11) — fixed the concurrent wake-on-request
+  double-launch race (per-VM `launchMu`) + a `Destroy` adopted-helper leak;
+  regression test added. Surfaced under benchmarking.
+- **Packaging/release/testing eval** (§5.12) — the pipeline is 100% FC; krucible
+  has zero CI/release coverage. Expand testing next; design release later.
 
 ## 3. Build & test
 
 ### macOS (dev box, HVF)
 ```bash
+git submodule update --init libkrucible   # fork is a submodule now (branch krucible)
 make krucible   # builds libkrucible (cargo --features blk) + the install prefix
 make vmm        # builds + codesigns bhatti-vmm (HVF entitlement)
 make build      # the pure-Go daemon/CLI
+./scripts/build-lean-kernel.sh aarch64    # lean kernel -> dist/kernel/ (Docker; daemon autodetects it)
 go test -tags krucible ./pkg/engine/krucible/ -count=1   # full krucible suite
 ```
 - `timeout(1)` is NOT available on the Mac.
-- Toolchain: rustc 1.96, go 1.25.7, Homebrew libkrun/libkrunfw.
+- Toolchain: rustc 1.96, go 1.25.7, Docker (lean-kernel build), Homebrew libkrun/libkrunfw.
+- The lean kernel is opt-in-by-presence: build it and the daemon autodetects
+  `dist/kernel/*-lean-*`; absent, it falls back to the libkrunfw bundle.
 
 ### Linux cluster (KVM)
 `scripts/krucible-linux-bringup.sh` builds everything on a node (apt deps + rustup
@@ -69,16 +87,22 @@ go test -tags krucible ./pkg/engine/krucible/ -count=1
 Iterate after a code change: `rsync` the changed sources to the node, re-run the
 bring-up (libkrunfw is cached; only libkrucible relinks), `go test`.
 
-## 4. The cluster (Tailscale)
+## 4. The cluster
 
-| Node | Tailscale IP | arch | notes |
-|---|---|---|---|
-| asus-i5 | 100.108.101.22 | amd64 | primary x86 test box |
-| raspi-5a | 100.119.145.44 | arm64 | primary arm64 test box |
-| raspi-4b / raspi-5b | 100.66.66.124 / 100.79.148.43 | arm64 | spare |
+**On the home network use the LAN IPs directly (no Tailscale needed)** — from
+`../another-attempt-at-local-infra/ansible/inventory.yml`:
 
-SSH: `ssh -i ~/.ssh/id_ed25519 user@<ip>` (Tailscale SSH may prompt a one-time
-browser auth). Sources live under `~/kr/{bhatti,libkrucible}` on each node.
+| Node | LAN IP | Tailscale IP | arch | notes |
+|---|---|---|---|---|
+| asus-i5 | 192.168.1.4 (DHCP, floats) | 100.108.101.22 | x86_64 | primary x86 test box |
+| raspi-5a | 192.168.1.201 | 100.119.145.44 | arm64 | primary arm64 test box |
+| raspi-4b / raspi-5b | 192.168.1.200 / .202 | 100.66.66.124 / 100.79.148.43 | arm64 | spare (4b = k3s master) |
+
+SSH: `ssh -i ~/.ssh/id_ed25519 user@<ip>` (LAN or Tailscale). Sources live under
+`~/kr/{bhatti,libkrucible}` on each node. With the submodule layout, symlink the
+in-repo path to the sibling on each node: `ln -sfn ~/kr/libkrucible ~/kr/bhatti/libkrucible`.
+The k3s cluster also hosts the GitHub Actions `arc-runner-set` (self-hosted, has
+`/dev/kvm`) that `integration.yml` uses — the natural home for a krucible CI job (§5.12).
 
 **Operational gotchas (these cost real debugging time):**
 - **`/tmp` is a small tmpfs (~3.6 G) on the Pis.** A 1 GiB `memory.img` snapshot +
@@ -126,29 +150,29 @@ validate · gotchas.**
   compounding gate isn't exercised by CI — a multi-vCPU clock-freeze case would
   lock it in.
 
-### 5.2 arm64 cold tier (snapshot/restore)  (large; the gnarly arm64 gap)
-- **Goal:** `Stop`/`Start` (snapshot → free RAM → restore) on linux/arm64. Today
-  the SNAPSHOT verb returns `not supported on this platform` (cold-tier `Vmm` gates
-  are `any(macos+aarch64, linux+x86_64)`; arm64-linux is excluded).
-- **Status:** not started.
-- **Scope (three parts):**
-  1. **arm64 vcpu state save/restore** via KVM — core regs + the sysreg set
-     enumerated with `KVM_GET_REG_LIST`, each via `KVM_GET/SET_ONE_REG`. The x86
-     `VcpuState` (`libkrucible/src/vmm/src/linux/vstate.rs`) is the structural
-     template; the arm64 register set differs.
-  2. **GICv3 save/restore** — distributor + redistributor (and ITS if used) via the
-     KVM vGIC device ioctls (`KVM_DEV_ARM_VGIC_GRP_*`). This is the hard part.
-  3. **arch-timer state** (`CNTV_CVAL`, `CNTVOFF`).
-  Then widen the cold-tier `cfg` gates (the ~15 in `vmm/src/lib.rs` + builder +
-  `libkrun/src/lib.rs`) to include `(linux, aarch64)`.
-- **Reference (important — it is NOT unreferenced):** **Firecracker supports arm64
-  snapshot** (GICv3 + vcpu), and libkrucible's `vmm` crate is FC-derived. Study
-  Firecracker's (and cloud-hypervisor's) arm64 snapshot code for the
-  `KVM_GET_REG_LIST` sysreg enumeration and the GICv3 device-attr save/restore. The
-  macОS/HVF GIC capture (`libkrucible/src/hvf/src/lib.rs`, GIC distributor/
-  redistributor save/restore) is the conceptual analogue but a different API.
-- **Validate:** `TestKrucibleSnapshotSuite` green on raspi-5a (Stop/Start/
-  exec-after-restore + RAM-survived). The x86 cold tier is the proven sibling.
+### 5.2 arm64 cold tier (snapshot/restore)  — **PARTIAL; one piece left (GICv2 regs)**
+- **Goal:** `Stop`/`Start` (snapshot → free RAM → restore) on linux/arm64.
+- **Status (see `PLAN-krucible-arm64-cold-tier.md`):** the cfg-gate refactor +
+  vCPU save/restore + device persist + VM/GIC plumbing are **done**; the **GICv2
+  register save/restore is the single remaining piece** (a clearly-marked TODO in
+  `KvmGicV2`). Compiles + the warm path is green on raspi-5a.
+- **Key finding (reshapes the original plan): it's GICv2, not GICv3.** raspi-5a's
+  host is a GIC-400 (`/proc/interrupts`: `GICv2 … vgic`), so KVM gives the guest a
+  **vGICv2** — `KvmGicV3::new` fails and the builder falls back to `KvmGicV2`.
+  GICv2 save/restore is *simpler* than v3 (distributor + CPU-interface regs; no
+  redistributor/LPI/ITS). No GICv3 hardware exists in the cluster.
+- **Done:** single `cold_tier` build cfg (`build.rs`, replacing ~21 copied gates);
+  aarch64 `VcpuState` via `KVM_GET_REG_LIST` → `GET/SET_ONE_REG` + `mp_state`
+  (`vstate.rs`); device persist widened to `cold_tier` (`device_manager/kvm/mmio.rs`);
+  `Vmm` now owns the `intc`, and checkpoint/restore route VM-level state through
+  `GICDevice::save_state/restore_state` on linux/aarch64 (`lib.rs`, `gic.rs`,
+  `irqchip.rs`, `kvmgicv2.rs`).
+- **Next:** implement `KvmGicV2::{save_state,restore_state}` — distributor
+  (`KVM_DEV_ARM_VGIC_GRP_DIST_REGS`) + per-vCPU CPU interface (`…_CPU_REGS`),
+  honoring the per-vCPU banking of the first 32 IRQs (SGI/PPI). Version-tagged
+  opaque blob. (GICv3 left as the default-unsupported stub until there's hardware.)
+- **Validate:** `TestKrucibleSnapshotSuite` green on raspi-5a. The x86 cold tier
+  + the macOS HVF GIC capture are the proven siblings.
 
 ### 5.3 publish / public-proxy verification on krucible  (small)
 - **Goal:** confirm `publish` + the wake-then-serve public proxy work on krucible
@@ -189,6 +213,57 @@ validate · gotchas.**
 ### 5.8 Unified event stream  (small-medium) — §6d
 - The `EventRecorder` pub/sub bus exists. Next: a live fleet SSE/WS endpoint +
   richer event types (output/log/thermal/network).
+
+### 5.9 Lean external kernel  — **DONE (2026-06-27); two follow-ups**
+- **Outcome:** `krun_set_kernel` boots our own lean kernel, bypassing libkrunfw —
+  **~2x faster cold-start** (boot→agent 312ms vs 610ms on HVF), validated
+  cross-arch: mac/HVF + linux/arm64,x86 under KVM (`TestKrucibleLeanKernel*`,
+  `TestKrucibleBlockRootAgentSuite`). The kernel is *ours* now — pinned,
+  reproducible, 2x faster; libkrunfw bypassed on the block-root path (build+runtime).
+- **What/why:** same 6.12.91 kernel as libkrunfw but a lean config (998 vs 1433
+  `=y`) — less driver/subsystem init = faster boot + smaller footprint. Setting an
+  external kernel makes `krun_start_enter` skip libkrunfw entirely.
+- **Files:** `cmd/vmm/main.go` (`krun_set_kernel`, arch-aware cmdline),
+  `pkg/engine/krucible/{engine,spec}.go` (`Config.KernelImage`),
+  `cmd/bhatti/engine_krucible.go` + `pkg/config.go` (`krucible_kernel_image` +
+  autodetect of `dist/kernel/*-lean-*`, fallback to bundle),
+  `scripts/lean-kernel/config-lean_{aarch64,x86_64}` + `scripts/build-lean-kernel.sh`.
+- **Follow-ups:** (1) **ship it** — build the lean kernel in `release.yml` + place
+  it in `install.sh` (until then the 2x win is local-build-only). (2) drop the
+  libkrunfw fallback once the lean kernel ships on all arches (the migration
+  plan's "no libkrunfw" end-state). Per-tier fat kernel (docker/k8s) is future.
+
+### 5.10 libkrucible as a submodule  — **DONE (2026-06-27)**
+- libkrucible is a git submodule at `./libkrucible` (branch `krucible`); the
+  gitlink SHA is the version-of-record, `make krucible` builds it from source
+  (local == CI by construction). Matches the migration plan's packaging model.
+
+### 5.11 Concurrency hardening  — **DONE (2026-06-27)**
+- Fixed the concurrent wake-on-request **double-launch race** (the public proxy +
+  every exec/file handler call `ensureHot` uncoalesced — a request burst on a
+  non-hot sandbox spawned N helpers racing the same vsock UDS): per-VM `launchMu`
+  serializes Start/Stop/Pause/Resume/Destroy. Also fixed a `Destroy`
+  adopted-helper leak. Regression test `TestKrucibleConcurrentWakeNoDoubleLaunch`.
+  Pure-Go — fixes all arches. Surfaced under benchmarking (`bench/krucible-mac.sh`).
+- **Still open** (lower severity): exec-vs-Stop race (§2.3 of the review), a guard
+  refusing cold `Stop` on a non-block-root VM, and cold-bundle integrity
+  (fsync+atomic+hash).
+
+### 5.12 Packaging / release / testing expansion  — **EVALUATED; testing next**
+- **Finding:** the pipeline is 100% Firecracker. `release.yml` builds CLI + FC
+  kernel + tiers; `install.sh` installs an FC server (or macOS CLI-only);
+  `ci.yml`/`integration.yml` have **zero krucible coverage** (krucible VM tests
+  skip without libkrun; the cgo helper isn't even build-checked).
+- **Do next (low-cost, infra exists):** (1) a **krucible CI build job** —
+  `submodule update` + `make krucible`/`vmm` + cross-`cargo check` + no-VM units;
+  (2) a **krucible integration job** on the `arc-runner-set` cluster runners
+  (both arm64 + x86 have `/dev/kvm`), mirroring `integration.yml`; (3) the
+  **lean-kernel build** in CI (reproducible via `build-lean-kernel.sh`).
+- **Design now, build later (gated on parity + a macOS-distribution decision):**
+  the release/install expansion — per-platform `libkrun` + `bhatti-vmm` + lean
+  kernel, the macOS full-stack install, a krucible `config.yaml`. **The gating
+  decision is macOS codesigning/notarization** (ad-hoc `-s -` + `xattr`
+  quarantine-strip like the CLI, vs an Apple Developer cert).
 
 ## 6. Constraints & conventions (don't relitigate)
 
