@@ -249,7 +249,25 @@ validate · gotchas.**
   refusing cold `Stop` on a non-block-root VM, and cold-bundle integrity
   (fsync+atomic+hash).
 
-### 5.12 Packaging / release / testing expansion  — **EVALUATED; testing next**
+### 5.12 Packaging / release / testing expansion  — **CI safety net DONE; release deferred**
+- **CI safety net landed (2026-06-27):** (1) `krucible-build` job in `ci.yml`
+  — builds the fork (libkrun) + cgo helper (bhatti-vmm) + krucible-tagged Go +
+  pure-unit tests on GitHub-hosted runners (no KVM; VM suites self-skip via
+  `hasHypervisor()`). (2) `krucible-integration.yml` — the full `-tags krucible`
+  VM suite on the self-hosted `arc-runner-set` (real KVM), reusing
+  `krucible-linux-bringup.sh`. Both gated to the `krucible` branch; **nothing is
+  pushed yet** (the branch carries the migration history, scrubbed but unpublished).
+  Steps were validated by hand on the cluster: raspi-5a (arm64) + asus-i5 (x86)
+  agent/block-root/cold(x86)/clock all green.
+- **First-run follow-ups (need a push to tune):** cache the libkrunfw kernel
+  build in the integration job; split it into an arm64+x86 runner-arch matrix.
+- **Release/install still deferred** (design locked, build later): per-platform
+  `libkrun` + `bhatti-vmm` + lean kernel in `release.yml`/`install.sh`; the macOS
+  full-stack install. **macOS distribution is now unblocked** — the operator has
+  an Apple Developer membership, so notarization (not just ad-hoc + quarantine
+  strip) is on the table. Ship the lean kernel here too (§5.9 follow-up).
+
+### 5.12b (historical) Packaging / release / testing evaluation
 - **Finding:** the pipeline is 100% Firecracker. `release.yml` builds CLI + FC
   kernel + tiers; `install.sh` installs an FC server (or macOS CLI-only);
   `ci.yml`/`integration.yml` have **zero krucible coverage** (krucible VM tests
