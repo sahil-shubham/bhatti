@@ -12,7 +12,41 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
 )
+
+// leanColdEngine builds a block-root engine that boots the external lean kernel,
+// for the shared cold-tier suite. Skips unless the lean-kernel env is set.
+func leanColdEngine(t *testing.T) engine.Engine {
+	repo := repoRoot(t)
+	if !hasLibkrun() {
+		t.Skip("libkrun not installed; skipping")
+	}
+	vmm := filepath.Join(repo, "bhatti-vmm")
+	if _, err := os.Stat(vmm); err != nil {
+		t.Skip("bhatti-vmm not built; skipping")
+	}
+	img := os.Getenv("KRUCIBLE_TEST_BASE_IMAGE")
+	lean := os.Getenv("KRUCIBLE_LEAN_KERNEL")
+	if img == "" || lean == "" {
+		t.Skip("set KRUCIBLE_TEST_BASE_IMAGE + KRUCIBLE_LEAN_KERNEL")
+	}
+	eng, err := New(Config{
+		DataDir: t.TempDir(), BaseImage: img, BlockRoot: true,
+		VMMBinary: vmm, LibDir: libDir(), KernelImage: lean,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return eng
+}
+
+// TestKrucibleLeanKernelColdTier proves the cold tier (Stop=snapshot+free RAM /
+// Start=restore) composes with the external lean kernel — exec-after-restore and
+// guest-RAM survival, the same assertions as the bundled-kernel cold tier.
+func TestKrucibleLeanKernelColdTier(t *testing.T) {
+	enginetest.RunSnapshotSuite(t, leanColdEngine)
+}
 
 // TestKrucibleLeanKernel boots a real block-root image under (a) our own
 // external lean kernel and (b) libkrunfw's bundled kernel, and compares

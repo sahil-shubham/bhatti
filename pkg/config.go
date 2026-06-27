@@ -43,6 +43,7 @@ type Config struct {
 	KrucibleBaseImage string `yaml:"krucible_base_image"` // prebuilt ext4 root image (oci.PullAndConvert output); enables the production block-root path
 	KrucibleBlockRoot bool   `yaml:"krucible_block_root"` // boot from a CoW ext4 block image (required for the cold tier); implied when KrucibleBaseImage is set
 	KrucibleLibDir    string `yaml:"krucible_libdir"`     // dir with libkrun/libkrunfw (default: autodetect)
+	KrucibleKernelImage string `yaml:"krucible_kernel_image"` // lean external kernel (block-root only; ~2x faster cold-start). Empty = autodetect dist/kernel/*-lean-*, else libkrunfw bundle
 	KrucibleSocketDir string `yaml:"krucible_socket_dir"` // short dir for vsock UDS (default: /tmp/bhatti-kr)
 
 	// Jailer (empty = bare mode, no isolation)
