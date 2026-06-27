@@ -2,7 +2,7 @@
 
 Status: **Design doc (2026-06-16).** Scopes what the "lohar → service" restructure concretely takes, after the cold-tier
 work surfaced friction between bhatti's `lohar-as-PID-1` model and libkrun's init-centric design. Companion:
-`docs/PLAN-krucible-cold-tier.md` (the cold tier + the block-root-vs-FUSE decision), `docs/PLAN-krucible-v3.md` (P1's
+`docs/PLAN-krucible-cold-tier.md` (the cold tier + the block-root-vs-FUSE decision), `docs/internal/PLAN-krucible-v3.md` (P1's
 "lohar is the asset" decision), `docs/guest-agent.md`.
 
 > Reference points: the libkrun upstream README (its security model + intended init usage) and the reference fork /

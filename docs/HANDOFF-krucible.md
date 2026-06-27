@@ -5,7 +5,7 @@ VMM). Read this first, then the design docs it links. **The actionable backlog i
 §5.**
 
 Companion docs (design rationale, deeper context):
-`PLAN-krucible-v3.md` (plan of record), `PLAN-krucible-productionization.md`
+`internal/PLAN-krucible-v3.md` (plan of record), `PLAN-krucible-productionization.md`
 (Linux/topology/capabilities/parity + the **verified feature matrix** in §6f),
 `PLAN-krucible-cold-tier.md`, `PLAN-krucible-init-model.md`.
 
@@ -204,7 +204,7 @@ validate · gotchas.**
   Next: server-brokered per-sandbox host endpoints + name resolution (`<name>.sb`),
   and a sandbox→host gateway address.
 
-### 5.7 Agent-first capability tokens  (medium) — §6b / `PLAN-krucible-v3.md` §12
+### 5.7 Agent-first capability tokens  (medium) — §6b / `internal/PLAN-krucible-v3.md` §12
 - Per-sandbox token is **done** (config drive, enforced by lohar). Next: scoped
   caps `{exec, files:*, publish, net:egress, snapshot, fork}`, route middleware,
   audit to `events`, offline-mint, scoped share URLs. Track-J jail for hostile

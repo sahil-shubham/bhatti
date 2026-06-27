@@ -1,11 +1,11 @@
 # krucible cold tier (P3) — architecture & plan of record
 
-Status: **Draft (2026-06-15).** Detailed design for the cold-to-disk / snapshot tier, expanding `docs/PLAN-krucible-v3.md`
+Status: **Draft (2026-06-15).** Detailed design for the cold-to-disk / snapshot tier, expanding `docs/internal/PLAN-krucible-v3.md`
 §5 (tier ladder), §7.1 (owned snapshot change), and §8 (P3 gate). Written after scoping the full snapshot port against
 libkrucible's *actual* code (not the reference fork's), which surfaced one load-bearing architectural decision (the rootfs
 model) that this doc settles.
 
-Companion: `docs/PLAN-krucible-v3.md` (the migration plan of record), `docs/thermal-management.md` (the tier model),
+Companion: `docs/internal/PLAN-krucible-v3.md` (the migration plan of record), `docs/thermal-management.md` (the tier model),
 `docs/archive/PLAN-snapshot-reliability-fixes.md` (FC scar tissue — the behaviors we must not re-pay for).
 
 ---
@@ -115,7 +115,7 @@ virtio-fs.** Rationale, in first-principles order:
 - **Block persist is trivial and robust.** A block device's entire snapshot state is `acked_features` + `activated` + one
   `QueueState`; the data lives in the backing image on disk, already consistent at a quiesced checkpoint. No inode map, no
   handle reopen, no `ESTALE` class of bugs. This is the dominant correctness argument.
-- **It is what the plan already intends.** `docs/PLAN-krucible-v3.md` §2/§6 maps the krucible rootfs to
+- **It is what the plan already intends.** `docs/internal/PLAN-krucible-v3.md` §2/§6 maps the krucible rootfs to
   `krun_create_disk_overlay` **qcow2 CoW** (the FC reflink-`cp` replacement) and explicitly defers it to P3 "for
   CoW/snapshot." The krucible engine's own `spec.go` comment already says *"qcow2 CoW overlays arrive with snapshot in
   P3."* virtio-fs (`krun_set_root` on a host dir) was the **S0/P1 fast-boot path**, never the snapshot path.
@@ -204,7 +204,7 @@ image).
 
 ## 4. Tier ladder & portability gates (manifest-driven)
 
-Maps `PLAN-krucible-v3.md` §5 onto the bundle:
+Maps `internal/PLAN-krucible-v3.md` §5 onto the bundle:
 
 | Tier | Capability | Gate | Status |
 |---|---|---|---|

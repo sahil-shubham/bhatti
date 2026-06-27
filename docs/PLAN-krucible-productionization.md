@@ -3,7 +3,7 @@
 Status: **Plan (2026-06-16).** With warm + cold tiers validated on Mac/HVF, this scopes the four things needed to make
 krucible a production engine: (1) **Linux support**, (2) a **rethink of the CLI/daemon/HTTPS topology** now that the VMM
 is an in-process library, (3) the **leftover actionables** (prioritized), and (4) **moving the integration suite to
-krucible + production-testing real use cases.** Companion: `PLAN-krucible-v3.md` (plan of record), `PLAN-krucible-cold-tier.md`,
+krucible + production-testing real use cases.** Companion: `internal/PLAN-krucible-v3.md` (plan of record), `PLAN-krucible-cold-tier.md`,
 `PLAN-krucible-init-model.md`.
 
 ---
