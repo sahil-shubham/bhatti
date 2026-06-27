@@ -31,6 +31,9 @@ func TestKrucibleProductionImage(t *testing.T) {
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
+	if !hasHypervisor() {
+		t.Skip("no hypervisor (/dev/kvm or HVF); skipping")
+	}
 
 	img := os.Getenv("KRUCIBLE_TEST_BASE_IMAGE")
 	if img == "" {

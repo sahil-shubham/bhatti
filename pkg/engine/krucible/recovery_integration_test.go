@@ -24,6 +24,9 @@ func recoveryEngine(t *testing.T, dataDir, baseRootfs string) *Engine {
 	if !hasLibkrun() {
 		t.Skip("libkrun not installed; skipping")
 	}
+	if !hasHypervisor() {
+		t.Skip("no hypervisor (/dev/kvm or HVF); skipping")
+	}
 	if _, err := exec.LookPath("mke2fs"); err != nil {
 		t.Skip("mke2fs not found; skipping")
 	}

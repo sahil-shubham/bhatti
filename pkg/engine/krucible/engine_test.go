@@ -20,6 +20,9 @@ func newSuiteEngine(t *testing.T) engine.Engine {
 	if !hasLibkrun() {
 		t.Skip("libkrun not installed (pkg-config libkrun); skipping")
 	}
+	if !hasHypervisor() {
+		t.Skip("no hypervisor (/dev/kvm or HVF); skipping VM suite")
+	}
 	vmm := filepath.Join(repo, "bhatti-vmm")
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
@@ -54,6 +57,9 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 	repo := repoRoot(t)
 	if !hasLibkrun() {
 		t.Skip("libkrun not installed (pkg-config libkrun); skipping")
+	}
+	if !hasHypervisor() {
+		t.Skip("no hypervisor (/dev/kvm or HVF); skipping VM suite")
 	}
 	if _, err := exec.LookPath("mke2fs"); err != nil {
 		t.Skip("mke2fs not found (e2fsprogs); skipping block-root suite")
@@ -106,6 +112,30 @@ func repoRoot(t *testing.T) string {
 
 func hasLibkrun() bool {
 	return exec.Command("pkg-config", "--exists", "libkrun").Run() == nil
+}
+
+// hasHypervisor reports whether a usable hypervisor is present, so the VM suites
+// skip (rather than fail) on hosts that have libkrun + bhatti-vmm built but no
+// accelerator — e.g. a GitHub-hosted CI runner with no /dev/kvm. On linux we
+// require an openable /dev/kvm (KVM); on darwin HVF is always available on the
+// supported hardware (the entitlement/codesign is the real gate, enforced when
+// the helper launches). The VM integration suites run on the self-hosted KVM
+// cluster / a dev Mac; the build job (no accelerator) compiles everything and
+// runs the pure-unit tests, with the VM suites skipping here.
+func hasHypervisor() bool {
+	switch runtime.GOOS {
+	case "linux":
+		f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+		if err != nil {
+			return false
+		}
+		_ = f.Close()
+		return true
+	case "darwin":
+		return true
+	default:
+		return false
+	}
 }
 
 // libDir returns a dyld search path covering libkrun + libkrunfw. Prefers the

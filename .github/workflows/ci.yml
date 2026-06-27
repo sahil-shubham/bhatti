@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, krucible]
   pull_request:
-    branches: [main]
+    branches: [main, krucible]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -50,6 +50,60 @@ jobs:
         run: |
           go test -race -count=1 -timeout=120s ./cmd/lohar/ \
             -skip '^(TestAgent|TestHelperAgent|TestSession|TestPipedSession)'
+
+  krucible-build:
+    # The krucible engine's safety net: build the Rust fork (libkrun) + the cgo
+    # helper (bhatti-vmm) + the krucible-tagged Go, then run the pure-unit tests.
+    # This is a build/link + unit gate only — the VM suites need a hypervisor and
+    # self-skip here (no /dev/kvm on GitHub-hosted runners); they run on the
+    # self-hosted KVM cluster in integration.yml. No libkrunfw is needed: libkrun
+    # dlopen's it lazily and the external/lean-kernel path skips it entirely.
+    name: Krucible Build & Unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Init libkrucible submodule (public, over https)
+        # libkrucible is public, so fetch it over https with the default token
+        # rather than the .gitmodules ssh url (which would need a deploy key on
+        # a GitHub-hosted runner). Override the url for this run only; .gitmodules
+        # is left as-is for local (ssh) dev.
+        run: |
+          git config submodule.libkrucible.url https://github.com/sahil-shubham/libkrucible.git
+          git submodule update --init --recursive libkrucible
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build deps + toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config
+          rustc --version && cargo --version   # Rust is preinstalled on ubuntu-latest
+
+      - name: Build libkrucible (libkrun --no-default-features --features blk)
+        # Catches Rust / cfg breakage in the fork on x86-linux.
+        run: make krucible
+
+      - name: Build bhatti-vmm (cgo link against libkrun)
+        # Catches cgo/link breakage in the helper (the class that's been invisible
+        # to CI). No codesigning on Linux (the Makefile gates that on Darwin).
+        run: make vmm
+
+      - name: Build & vet (krucible tag)
+        run: |
+          export PKG_CONFIG_PATH="$PWD/libkrucible/_install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          CGO_ENABLED=1 go build -tags krucible ./...
+          CGO_ENABLED=1 go vet -tags krucible ./pkg/engine/krucible/ ./cmd/vmm/
+
+      - name: Unit tests (krucible tag; VM suites self-skip without /dev/kvm)
+        # hasHypervisor() makes the VM suites skip on this KVM-less runner; the
+        # pure-unit tests (bundle/capability/recovery/state) run for real.
+        run: |
+          export PKG_CONFIG_PATH="$PWD/libkrucible/_install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          CGO_ENABLED=1 go test -tags krucible ./pkg/engine/krucible/ -count=1
 
   shellcheck:
     name: Shellcheck
