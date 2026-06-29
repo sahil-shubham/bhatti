@@ -118,12 +118,21 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
-	// Root: a raw ext4 block image (cold/fork tier — snapshot-friendly, no FUSE
-	// inode map) or a virtio-fs host dir (warm/dev fast path).
+	// Root: a block image (raw ext4, or a qcow2 CoW overlay — the Phase-0
+	// substrate spike) or a virtio-fs host dir (warm/dev fast path). qcow2 uses
+	// krun_set_root_disk2 so it is still the *designated root* (kernel cmdline
+	// gets root=/dev/vda) — unlike krun_add_disk2, which only adds a general
+	// partition. The guest still sees a raw ext4 at /dev/vda; libkrun (imago)
+	// translates qcow2 host-side.
 	if spec.RootDisk != "" {
 		cdisk := C.CString(spec.RootDisk)
 		defer C.free(unsafe.Pointer(cdisk))
-		if r := C.krun_set_root_disk(cid, cdisk); r != 0 {
+		if spec.RootDiskFormat == "qcow2" {
+			// C.uint32_t(1) == KRUN_DISK_FORMAT_QCOW2
+			if r := C.krun_set_root_disk2(cid, cdisk, C.uint32_t(1)); r != 0 {
+				fail("krun_set_root_disk2(qcow2): %d", int(r))
+			}
+		} else if r := C.krun_set_root_disk(cid, cdisk); r != 0 {
 			fail("krun_set_root_disk: %d", int(r))
 		}
 	} else {
@@ -136,8 +145,8 @@ func run(spec krucible.VMSpec) {
 
 	// Config drive: a RAW ext4 attached as the data disk (/dev/vdb), which lohar
 	// mounts read-only at boot to read config.json (hostname, token, env, files,
-	// volumes). Pairs with krun_set_root_disk (root=/dev/vda) on the block-root
-	// path. lohar mounts it MS_RDONLY, so the RW device is harmless.
+	// volumes). Pairs with the root disk (root=/dev/vda). lohar mounts it
+	// MS_RDONLY, so the RW device is harmless.
 	if spec.ConfigDrive != "" {
 		cconf := C.CString(spec.ConfigDrive)
 		defer C.free(unsafe.Pointer(cconf))

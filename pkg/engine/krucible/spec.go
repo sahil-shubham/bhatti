@@ -28,6 +28,13 @@ type VMSpec struct {
 	// the portable cold artifact. Mutually exclusive with RootfsDir.
 	RootDisk string `json:"root_disk,omitempty"`
 
+	// RootDiskFormat selects how RootDisk is opened: "" / "raw" = a raw ext4
+	// image via krun_set_root_disk (today's path); "qcow2" = a qcow2 CoW overlay
+	// via krun_add_disk2 (the Phase-0 substrate spike). The add_disk family is
+	// mutually exclusive with set_root_disk/set_data_disk, so on the qcow2 path
+	// the config drive also moves to krun_add_disk (read-only).
+	RootDiskFormat string `json:"root_disk_format,omitempty"`
+
 	// ConfigDrive, if set, is a RAW ext4 image attached as a read-only block
 	// device (/dev/vdb) carrying config.json (hostname, token, env, files,
 	// volumes). lohar reads it at boot before listening. See pkg/configdrive

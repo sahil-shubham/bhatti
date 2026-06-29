@@ -24,15 +24,15 @@ import (
 // Config holds paths and defaults for the krucible engine. All pure Go — the
 // engine spawns the cgo `bhatti-vmm` helper and talks to lohar over sockets.
 type Config struct {
-	DataDir       string // sandboxes live under DataDir/sandboxes/<id>
-	BaseRootfs    string // host dir tree (virtiofs root): /init.krun=lohar + mountpoints
+	DataDir    string // sandboxes live under DataDir/sandboxes/<id>
+	BaseRootfs string // host dir tree (virtiofs root): /init.krun=lohar + mountpoints
 	// BaseImage is a prebuilt ext4 root image (e.g. from oci.PullAndConvert: a
 	// real userland with /init.krun -> lohar). When set with BlockRoot, sandboxes
 	// CoW-clone it directly instead of building one from BaseRootfs via mke2fs.
 	// This is the production rootfs path.
-	BaseImage     string
-	VMMBinary     string // path to the bhatti-vmm helper (built with `make vmm`)
-	LibDir        string // dir with libkrun/libkrunfw (DYLD_FALLBACK_LIBRARY_PATH / LD_LIBRARY_PATH)
+	BaseImage string
+	VMMBinary string // path to the bhatti-vmm helper (built with `make vmm`)
+	LibDir    string // dir with libkrun/libkrunfw (DYLD_FALLBACK_LIBRARY_PATH / LD_LIBRARY_PATH)
 	// SocketDir holds the per-VM vsock UDS. It must be SHORT: AF_UNIX paths cap
 	// at ~104 bytes (macOS) / 108 (Linux), and macOS $TMPDIR/DataDir can be deep.
 	// Empty defaults to /tmp/bhatti-kr.
@@ -56,7 +56,7 @@ const maxUnixPath = 104
 // VM is per-sandbox state. The helper process IS the VM; we hold its cmd to
 // stop it and the agent client to drive lohar.
 type VM struct {
-	mu         sync.Mutex
+	mu sync.Mutex
 	// launchMu serializes lifecycle transitions (Create's launch / Start / Stop /
 	// Pause / Resume / Destroy) for this VM. Held for the whole transition so a
 	// burst of concurrent wake-on-request calls (the public proxy + exec handlers
@@ -227,9 +227,20 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
-		rootImg := filepath.Join(sandboxDir, "root.img")
-		if err = e.cloneBaseImage(rootImg); err != nil {
-			return info, fmt.Errorf("clone base image: %w", err)
+		var rootImg string
+		if rootQcow2() {
+			// Phase-0 substrate spike: boot the root from a qcow2 CoW overlay
+			// over the shared base (instant, host-FS-independent).
+			rootImg = filepath.Join(sandboxDir, "root.qcow2")
+			if err = e.createRootOverlayQcow2(rootImg); err != nil {
+				return info, fmt.Errorf("create qcow2 root overlay: %w", err)
+			}
+			baseSpec.RootDiskFormat = "qcow2"
+		} else {
+			rootImg = filepath.Join(sandboxDir, "root.img")
+			if err = e.cloneBaseImage(rootImg); err != nil {
+				return info, fmt.Errorf("clone base image: %w", err)
+			}
 		}
 		baseSpec.RootDisk = rootImg
 		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
@@ -539,19 +550,50 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec) err
 // disk). The base is either a prebuilt image (BaseImage, the production path) or
 // one built once from BaseRootfs via mke2fs (the dev path).
 func (e *Engine) cloneBaseImage(dst string) error {
+	base, err := e.baseImagePath()
+	if err != nil {
+		return err
+	}
+	return cloneFile(base, dst)
+}
+
+// baseImagePath resolves the shared base ext4 image, building it once from
+// BaseRootfs (dev path) if there's no prebuilt BaseImage (production path).
+func (e *Engine) baseImagePath() (string, error) {
 	if e.cfg.BaseImage != "" {
-		return cloneFile(e.cfg.BaseImage, dst)
+		return e.cfg.BaseImage, nil
 	}
 	base := filepath.Join(e.cfg.DataDir, "base.img")
 	e.baseImgMu.Lock()
+	defer e.baseImgMu.Unlock()
 	if _, err := os.Stat(base); err != nil {
 		if berr := buildBaseImage(e.cfg.BaseRootfs, base); berr != nil {
-			e.baseImgMu.Unlock()
-			return berr
+			return "", berr
 		}
 	}
-	e.baseImgMu.Unlock()
-	return cloneFile(base, dst)
+	return base, nil
+}
+
+// rootQcow2 reports whether to boot the block root from a qcow2 CoW overlay
+// (Phase-0 substrate spike) instead of a reflink-cloned raw ext4. Env-gated so
+// it can be flipped per-run without a config change.
+func rootQcow2() bool { return os.Getenv("KRUCIBLE_ROOT_QCOW2") == "1" }
+
+// createRootOverlayQcow2 creates a qcow2 CoW overlay over the shared base ext4
+// at dst (the per-sandbox root) — instant + host-FS-independent. Uses qemu-img
+// for the Phase-0 spike; the production path will create overlays via imago
+// (a krun_create_disk_overlay helper) with no external tool.
+func (e *Engine) createRootOverlayQcow2(dst string) error {
+	base, err := e.baseImagePath()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("qemu-img", "create", "-q",
+		"-f", "qcow2", "-F", "raw", "-b", base, dst)
+	if out, cerr := cmd.CombinedOutput(); cerr != nil {
+		return fmt.Errorf("qemu-img create overlay (%s -> %s): %w: %s", base, dst, cerr, out)
+	}
+	return nil
 }
 
 func (e *Engine) Status(ctx context.Context, id string) (engine.SandboxInfo, error) {
