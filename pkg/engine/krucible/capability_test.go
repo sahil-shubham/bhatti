@@ -26,6 +26,9 @@ func TestEngineCapabilities(t *testing.T) {
 	if !hasLibkrun() {
 		t.Skip("libkrun not installed; skipping")
 	}
+	if !hasHypervisor() {
+		t.Skip("no hypervisor (/dev/kvm or HVF); skipping VM suite")
+	}
 	vmm := filepath.Join(repo, "bhatti-vmm")
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
