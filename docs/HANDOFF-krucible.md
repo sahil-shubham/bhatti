@@ -290,6 +290,19 @@ validate · gotchas.**
   decision is macOS codesigning/notarization** (ad-hoc `-s -` + `xattr`
   quarantine-strip like the CLI, vs an Apple Developer cert).
 
+### 5.13 macOS/HVF multi-vCPU cold restore  — **BUG (pre-existing, found 2026-06-30)**
+- **Symptom:** a **2-vCPU** cold restore on macOS/HVF fails with `vCPU snapshot
+  error: vCPU restore not acknowledged` (`TestKrucibleColdTierMultiVcpu`).
+  1-vCPU cold restore is fine; **KVM (arm64 + x86) multi-vCPU is fine.**
+- **Not storage-related:** reproduces identically with raw *and* qcow2 roots —
+  it's an HVF vcpu-restore handshake issue, surfaced only now because the
+  multi-vCPU cold test had previously run on the KVM cluster, not on a Mac.
+- **Impact:** today the **HVF cold tier is effectively 1-vCPU only**. Warm tier
+  + 1-vCPU cold are unaffected; KVM is unaffected.
+- **Next:** investigate the HVF vcpu save/restore acknowledgement path
+  (`libkrucible/src/hvf/src/lib.rs` `vcpu_restore_state` + the restore barrier /
+  per-vCPU ack) for a multi-vCPU race or a missing per-vCPU sync.
+
 ## 6. Constraints & conventions (don't relitigate)
 
 - **Never name third parties** (the comparable agent-sandbox runtimes, or the
