@@ -41,6 +41,11 @@ Feature matrix — every cell run as a test on that platform (see
 | Host↔guest forward | ✓ | ✓ | ✓ |
 | Recovery (restart-safe) | ✓ | ✓ | ✓ |
 | Lean external kernel (~2x cold-start) | ✓ | ✓ | ✓ |
+| qcow2 CoW root + overlay (default substrate) | ✓ | ✓ | ✓ |
+| Image save + `create --image` | ✓ | ✓ | ✓ |
+| Named snapshot create/resume (memory) | ✓ | ✓ | ✓ |
+| Filesystem snapshot (`--type`, disk-only) | ✓ | ✓ | ✓ |
+| Fork (`create --from`, instant memory clone) | ✓ | ✓ | ✓ |
 
 **Every cell is green on all three platforms — full cross-arch parity.** The last
 gap, the linux/arm64 cold tier, closed with the GICv2 save/restore (§5.2). The
@@ -59,6 +64,29 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   regression test added. Surfaced under benchmarking.
 - **Packaging/release/testing eval** (§5.12) — the pipeline is 100% FC; krucible
   has zero CI/release coverage. Expand testing next; design release later.
+
+**New this cycle (2026-06-30) — storage rework + Phase 2:**
+- **qcow2 CoW substrate, default** — images/snapshots/volumes unify on one
+  copy-on-write format (host-FS-independent; no btrfs needed). `krun_set_root_disk2`
+  (qcow2-capable root) + `krun_create_disk_overlay` (imago-backed overlay) in the
+  fork; `KRUCIBLE_ROOT_RAW=1` opts out. ~0.5% overhead on agent workloads.
+- **Phase 2 capture/instantiate** — per-create image selection + `SaveImage`;
+  named memory snapshots (`Checkpoint`) + `ResumeFromManifestJSON`; **fork**
+  (`create --from`, instant memory clone — checkpoint+restore into a fresh
+  identity); `snapshot create --type filesystem|memory` (filesystem = disk-only,
+  cold-boot restore). All wired end-to-end (CLI→server→engine; FC unaffected via
+  optional capabilities) with integration tests.
+- **HVF multi-vCPU cold-restore deadlock fixed** — secondary vCPU no longer
+  blocks on a PSCI bring-up that never comes on restore (skip `boot_receiver`
+  when `start_paused`). Cold tier now full multi-vCPU on all three platforms.
+- **Validated cross-arch (2026-06-30)** — full krucible suite green on darwin/arm64
+  (HVF), linux/arm64 (KVM, raspi-5a: 25 PASS/4 SKIP), linux/amd64 (KVM, asus-i5:
+  25 PASS/4 SKIP). libkrucible `4e82af6`, bhatti `origin/krucible`.
+- **CI** — `krucible-build` (GitHub-hosted, VM suites self-skip without a
+  hypervisor) green; `krucible-integration` (self-hosted arc-runner-set) is the
+  KVM gate. NOTE: the Firecracker homelab integration workflow was **retired**
+  from the cluster (its `10/8` host-iptables collided with k3s/flannel and broke
+  cross-node DNS); arc-runner-set now serves krucible only.
 
 ## 3. Build & test
 
