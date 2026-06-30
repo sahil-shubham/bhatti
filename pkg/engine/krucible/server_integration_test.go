@@ -167,3 +167,47 @@ func TestKrucibleServerForward(t *testing.T) {
 		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
 	}
 }
+
+// TestKrucibleServerFork exercises `create --from` end-to-end (Phase 2 #4):
+// POST /sandboxes with {from} forks a running sandbox via the engine's Fork
+// capability; the fork is a distinct, working, independent VM.
+func TestKrucibleServerFork(t *testing.T) {
+	_, do := krucibleServer(t) // skips if libkrun/vmm/mke2fs unavailable
+
+	resp := do("POST", "/sandboxes", map[string]any{"name": "fork-src", "memory_mb": 512})
+	if resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create source: want 201, got %d: %s", resp.StatusCode, b)
+	}
+	var src store.Sandbox
+	json.NewDecoder(resp.Body).Decode(&src)
+	resp.Body.Close()
+	t.Cleanup(func() { do("DELETE", "/sandboxes/"+src.ID, nil) })
+
+	// Fork by name via create --from.
+	resp = do("POST", "/sandboxes", map[string]any{"name": "fork-child", "from": "fork-src"})
+	if resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("fork: want 201, got %d: %s", resp.StatusCode, b)
+	}
+	var child store.Sandbox
+	json.NewDecoder(resp.Body).Decode(&child)
+	resp.Body.Close()
+	t.Cleanup(func() { do("DELETE", "/sandboxes/"+child.ID, nil) })
+	if child.ID == src.ID {
+		t.Fatal("fork returned the source sandbox, not a new one")
+	}
+
+	// The fork is a working, independent VM.
+	resp = do("POST", "/sandboxes/"+child.ID+"/exec", map[string]any{"cmd": []string{"echo", "fork-alive"}})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("exec on fork: want 200, got %d: %s", resp.StatusCode, b)
+	}
+	var res engine.ExecResult
+	json.NewDecoder(resp.Body).Decode(&res)
+	if !strings.Contains(res.Stdout, "fork-alive") {
+		t.Fatalf("exec on fork: stdout %q lacks fork-alive", res.Stdout)
+	}
+}

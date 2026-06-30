@@ -86,6 +86,7 @@ with its own kernel, filesystem, and network.`,
 
 		name, _ := cmd.Flags().GetString("name")
 		image, _ := cmd.Flags().GetString("image")
+		from, _ := cmd.Flags().GetString("from")
 		cpus, _ := cmd.Flags().GetFloat64("cpus")
 		memory, _ := cmd.Flags().GetInt("memory")
 		diskSize, _ := cmd.Flags().GetInt("disk-size")
@@ -112,6 +113,9 @@ with its own kernel, filesystem, and network.`,
 		}
 		if image != "" {
 			req["image"] = image
+		}
+		if from != "" {
+			req["from"] = from
 		}
 		if diskSize > 0 {
 			req["disk_size_mb"] = diskSize
@@ -193,7 +197,9 @@ with its own kernel, filesystem, and network.`,
 		defer resp.Body.Close()
 		checkServerVersion(resp)
 		if resp.StatusCode >= 400 {
-			var errBody struct{ Error string `json:"error"` }
+			var errBody struct {
+				Error string `json:"error"`
+			}
 			json.NewDecoder(resp.Body).Decode(&errBody)
 			return fmt.Errorf("%s: %s", resp.Status, errBody.Error)
 		}
@@ -241,6 +247,7 @@ with its own kernel, filesystem, and network.`,
 func init() {
 	createCmd.Flags().String("name", "", "Sandbox name")
 	createCmd.Flags().String("image", "", "Rootfs image name")
+	createCmd.Flags().String("from", "", "Fork an existing sandbox (instant memory copy)")
 	createCmd.Flags().Float64("cpus", 1, "Number of vCPUs")
 	createCmd.Flags().Int("memory", 0, "Memory in MB (0 = server default: 1024)")
 	createCmd.Flags().Int("disk-size", 0, "Rootfs disk size in MB (0 = use image size)")
@@ -639,9 +646,9 @@ var listCmd = &cobra.Command{
 // --- destroy ---
 
 var destroyCmd = &cobra.Command{
-	Use:               "destroy <id|name>",
-	Aliases:           []string{"rm"},
-	Short:             "Destroy a sandbox",
+	Use:     "destroy <id|name>",
+	Aliases: []string{"rm"},
+	Short:   "Destroy a sandbox",
 	Long: `Permanently destroy a sandbox and all its data. This cannot be undone.
 Persistent volumes are detached but not deleted.`,
 	Example: `  bhatti destroy dev
@@ -672,4 +679,3 @@ Persistent volumes are detached but not deleted.`,
 		return nil
 	},
 }
-

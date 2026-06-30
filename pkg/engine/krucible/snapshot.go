@@ -142,6 +142,28 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 	})
 }
 
+// Fork creates a new sandbox that is an instant copy of a running sandbox,
+// including its in-memory process state (the "clone" of `create --from`):
+// memory-checkpoint the source to a throwaway bundle and immediately restore it
+// into a new sandbox, then discard the bundle. The fork's disk + config are
+// copies, so it diverges from the source; the source is undisturbed.
+func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.SandboxInfo, error) {
+	tmp, err := os.MkdirTemp(e.cfg.DataDir, "fork-")
+	if err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("fork: temp dir: %w", err)
+	}
+	// Safe to remove once Resume returns: the new sandbox has its own root +
+	// config copies and the helper has already loaded memory.img.
+	defer os.RemoveAll(tmp)
+
+	manifest, err := e.Checkpoint(ctx, sandboxID, "", 0, "snap", tmp)
+	if err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("fork: checkpoint: %w", err)
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+	return e.ResumeFromManifestJSON(ctx, filepath.Join(tmp, "snap"), manifestJSON, newName)
+}
+
 // SaveImage captures the sandbox's current filesystem as a reusable bootable
 // image at destPath, without stopping the sandbox. Implements the server's
 // imageSaver capability (Phase 2). The image is a qcow2 CoW node over the

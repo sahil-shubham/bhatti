@@ -23,6 +23,7 @@ type createSandboxReq struct {
 	Name       string               `json:"name"`
 	TemplateID string               `json:"template_id,omitempty"`
 	Image      string               `json:"image,omitempty"` // v0.3: image name
+	From       string               `json:"from,omitempty"`  // fork: clone this running sandbox (memory copy)
 	CPUs       float64              `json:"cpus,omitempty"`
 	MemoryMB   int                  `json:"memory_mb,omitempty"`
 	DiskSizeMB int                  `json:"disk_size_mb,omitempty"` // v0.3: resize rootfs
@@ -37,7 +38,7 @@ type createSandboxReq struct {
 	PersistentVolumes []engine.PersistentVolume `json:"persistent_volumes,omitempty"`
 
 	// B15: secrets and files on create
-	Secrets []string       `json:"secrets,omitempty"` // secret names to resolve from store
+	Secrets []string        `json:"secrets,omitempty"` // secret names to resolve from store
 	Files   []createFileReq `json:"files,omitempty"`   // files to inject via config drive
 
 	// G1.6: operator-controlled labels for fleet enumeration
@@ -47,8 +48,8 @@ type createSandboxReq struct {
 // createFileReq describes a file to inject at sandbox creation.
 type createFileReq struct {
 	GuestPath string `json:"guest_path"`
-	Content   string `json:"content"`          // base64-encoded
-	Mode      string `json:"mode,omitempty"`   // default "0644"
+	Content   string `json:"content"`        // base64-encoded
+	Mode      string `json:"mode,omitempty"` // default "0644"
 }
 
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -473,7 +474,31 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 		handlerPhase("volumes_resolved")
 		handlerPhase("engine_create_start")
-		info, err := s.engine.Create(r.Context(), spec)
+		var info engine.SandboxInfo
+		var err error
+		if req.From != "" {
+			// Fork: clone a running sandbox (memory copy) instead of a fresh boot.
+			forker, ok := s.engine.(interface {
+				Fork(ctx context.Context, sandboxID, newName string) (engine.SandboxInfo, error)
+			})
+			if !ok {
+				errResp(w, 501, "engine does not support fork (--from)")
+				return
+			}
+			src, serr := s.store.GetSandbox(user.ID, req.From)
+			if serr != nil {
+				errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
+				return
+			}
+			// The fork inherits the source's image + resources (the record matches
+			// the actual forked VM, which restores the source's vCPU/mem).
+			spec.Image = src.Image
+			spec.CPUs = src.CPUs
+			spec.MemoryMB = src.MemoryMB
+			info, err = forker.Fork(r.Context(), src.EngineID, spec.Name)
+		} else {
+			info, err = s.engine.Create(r.Context(), spec)
+		}
 		handlerPhase("engine_create_done")
 		if err != nil {
 			// Rollback persistent volume attachments on engine failure
@@ -681,10 +706,10 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			KeepHot       *bool             `json:"keep_hot"`
-			Name          *string           `json:"name"`
-			LabelsAdd     map[string]string `json:"labels_add,omitempty"`
-			LabelsRemove  []string          `json:"labels_remove,omitempty"`
+			KeepHot      *bool             `json:"keep_hot"`
+			Name         *string           `json:"name"`
+			LabelsAdd    map[string]string `json:"labels_add,omitempty"`
+			LabelsRemove []string          `json:"labels_remove,omitempty"`
 		}
 		if err := readJSON(r, &req); err != nil {
 			errResp(w, 400, "invalid json: "+err.Error())
@@ -744,7 +769,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			s.RecordEvent(store.Event{
 				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
 				Meta: map[string]any{
-					"name": sb.Name,
+					"name":           sb.Name,
 					"labels_added":   len(req.LabelsAdd),
 					"labels_removed": len(req.LabelsRemove),
 				},
