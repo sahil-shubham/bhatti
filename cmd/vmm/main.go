@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"unsafe"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
@@ -57,7 +58,13 @@ func fail(format string, args ...any) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage: vmm <spec.json>")
+		fail("usage: vmm <spec.json>  |  vmm create-overlay <overlay> <backing> <size_bytes>")
+	}
+	// Storage create primitive: the daemon (pure Go, never links libkrun) shells
+	// to this to provision a qcow2 CoW overlay via libkrun/imago.
+	if os.Args[1] == "create-overlay" {
+		createOverlay(os.Args[2:])
+		return
 	}
 	data, err := os.ReadFile(os.Args[1])
 	if err != nil {
@@ -69,6 +76,26 @@ func main() {
 	}
 	run(spec)
 	fail("krun_start_enter returned — boot failed") // only reached on error
+}
+
+// createOverlay provisions a qcow2 copy-on-write overlay at args[0] backed by
+// the raw image at args[1] (of args[2] bytes), via krun_create_disk_overlay
+// (imago). Instant + host-FS-independent. Exits 0 on success.
+func createOverlay(args []string) {
+	if len(args) != 3 {
+		fail("usage: vmm create-overlay <overlay> <backing> <size_bytes>")
+	}
+	size, err := strconv.ParseUint(args[2], 10, 64)
+	if err != nil {
+		fail("create-overlay: bad size %q: %v", args[2], err)
+	}
+	cOverlay := C.CString(args[0])
+	defer C.free(unsafe.Pointer(cOverlay))
+	cBacking := C.CString(args[1])
+	defer C.free(unsafe.Pointer(cBacking))
+	if r := C.krun_create_disk_overlay(cOverlay, cBacking, C.uint64_t(size)); r != 0 {
+		fail("krun_create_disk_overlay: %d", int(r))
+	}
 }
 
 func run(spec krucible.VMSpec) {

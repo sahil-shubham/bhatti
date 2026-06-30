@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -229,8 +230,9 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	if e.cfg.BlockRoot {
 		var rootImg string
 		if rootQcow2() {
-			// Phase-0 substrate spike: boot the root from a qcow2 CoW overlay
-			// over the shared base (instant, host-FS-independent).
+			// Default: boot the root from a qcow2 CoW overlay over the shared
+			// base — instant + host-FS-independent (no reflink/btrfs). Raw is
+			// the opt-out (KRUCIBLE_ROOT_RAW=1).
 			rootImg = filepath.Join(sandboxDir, "root.qcow2")
 			if err = e.createRootOverlayQcow2(rootImg); err != nil {
 				return info, fmt.Errorf("create qcow2 root overlay: %w", err)
@@ -575,23 +577,34 @@ func (e *Engine) baseImagePath() (string, error) {
 }
 
 // rootQcow2 reports whether to boot the block root from a qcow2 CoW overlay
-// (Phase-0 substrate spike) instead of a reflink-cloned raw ext4. Env-gated so
-// it can be flipped per-run without a config change.
-func rootQcow2() bool { return os.Getenv("KRUCIBLE_ROOT_QCOW2") == "1" }
+// (the default — host-FS-independent CoW, no reflink/btrfs requirement) instead
+// of a reflink-cloned raw ext4. Set KRUCIBLE_ROOT_RAW=1 to force the raw path
+// (the native-perf / mountable escape hatch, until `flatten` lands).
+func rootQcow2() bool { return os.Getenv("KRUCIBLE_ROOT_RAW") != "1" }
 
 // createRootOverlayQcow2 creates a qcow2 CoW overlay over the shared base ext4
-// at dst (the per-sandbox root) — instant + host-FS-independent. Uses qemu-img
-// for the Phase-0 spike; the production path will create overlays via imago
-// (a krun_create_disk_overlay helper) with no external tool.
+// at dst (the per-sandbox root) — instant + host-FS-independent. The daemon is
+// pure Go (never links libkrun), so it shells to the cgo helper, which creates
+// the overlay via libkrun/imago (krun_create_disk_overlay) — reusing the same
+// library that opens these images, with no external tool (no qemu-img).
 func (e *Engine) createRootOverlayQcow2(dst string) error {
 	base, err := e.baseImagePath()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("qemu-img", "create", "-q",
-		"-f", "qcow2", "-F", "raw", "-b", base, dst)
+	fi, err := os.Stat(base)
+	if err != nil {
+		return fmt.Errorf("stat base image %s: %w", base, err)
+	}
+	cmd := exec.Command(e.cfg.VMMBinary, "create-overlay", dst, base, strconv.FormatInt(fi.Size(), 10))
+	if e.cfg.LibDir != "" {
+		cmd.Env = append(os.Environ(),
+			"DYLD_FALLBACK_LIBRARY_PATH="+e.cfg.LibDir,
+			"LD_LIBRARY_PATH="+e.cfg.LibDir,
+		)
+	}
 	if out, cerr := cmd.CombinedOutput(); cerr != nil {
-		return fmt.Errorf("qemu-img create overlay (%s -> %s): %w: %s", base, dst, cerr, out)
+		return fmt.Errorf("create qcow2 overlay (%s -> %s): %w: %s", base, dst, cerr, out)
 	}
 	return nil
 }
