@@ -290,18 +290,18 @@ validate · gotchas.**
   decision is macOS codesigning/notarization** (ad-hoc `-s -` + `xattr`
   quarantine-strip like the CLI, vs an Apple Developer cert).
 
-### 5.13 macOS/HVF multi-vCPU cold restore  — **BUG (pre-existing, found 2026-06-30)**
-- **Symptom:** a **2-vCPU** cold restore on macOS/HVF fails with `vCPU snapshot
-  error: vCPU restore not acknowledged` (`TestKrucibleColdTierMultiVcpu`).
-  1-vCPU cold restore is fine; **KVM (arm64 + x86) multi-vCPU is fine.**
-- **Not storage-related:** reproduces identically with raw *and* qcow2 roots —
-  it's an HVF vcpu-restore handshake issue, surfaced only now because the
-  multi-vCPU cold test had previously run on the KVM cluster, not on a Mac.
-- **Impact:** today the **HVF cold tier is effectively 1-vCPU only**. Warm tier
-  + 1-vCPU cold are unaffected; KVM is unaffected.
-- **Next:** investigate the HVF vcpu save/restore acknowledgement path
-  (`libkrucible/src/hvf/src/lib.rs` `vcpu_restore_state` + the restore barrier /
-  per-vCPU ack) for a multi-vCPU race or a missing per-vCPU sync.
+### 5.13 macOS/HVF multi-vCPU cold restore  — **FIXED (2026-06-30)**
+- **Was:** a 2-vCPU cold restore on macOS/HVF failed with `vCPU restore not
+  acknowledged` (`TestKrucibleColdTierMultiVcpu`); 1-vCPU + KVM were fine.
+- **Root cause:** on restore all vCPUs start paused, but a secondary vCPU blocked
+  on `boot_receiver.recv()` (its PSCI-CPU_ON boot address) *before* reaching the
+  paused loop — and on restore there's no PSCI bring-up (it was already online in
+  the snapshot) and vCPU 0 is itself parked and never signals. So the secondary
+  deadlocked, never acked RestoreState → 5s timeout.
+- **Fix (libkrucible `4e82af6`, `vmm/macos/vstate.rs`):** when `start_paused`,
+  skip the `boot_receiver` wait and use a placeholder entry (RestoreState
+  overwrites PC). HVF-only. `TestKrucibleColdTierMultiVcpu` + full suite green on
+  HVF; **cold tier is now full multi-vCPU on all three platforms.**
 
 ## 6. Constraints & conventions (don't relitigate)
 
