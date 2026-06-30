@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -228,19 +229,30 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
+		// Per-create image (image pull / image save / snapshot), falling back to
+		// the engine's default base. The image is the root's CoW backing.
+		base, berr := e.resolveBase(spec)
+		if berr != nil {
+			return info, berr
+		}
 		var rootImg string
 		if rootQcow2() {
-			// Default: boot the root from a qcow2 CoW overlay over the shared
-			// base — instant + host-FS-independent (no reflink/btrfs). Raw is
-			// the opt-out (KRUCIBLE_ROOT_RAW=1).
+			// Default: a qcow2 CoW root — instant + host-FS-independent (no
+			// reflink/btrfs). Raw is the opt-out (KRUCIBLE_ROOT_RAW=1).
 			rootImg = filepath.Join(sandboxDir, "root.qcow2")
-			if err = e.createRootOverlayQcow2(rootImg); err != nil {
+			if isQcow2(base) {
+				// A saved qcow2 image is already a CoW node over the raw base;
+				// copy it as this sandbox's root (it keeps backing that base).
+				if err = cloneFile(base, rootImg); err != nil {
+					return info, fmt.Errorf("clone qcow2 image: %w", err)
+				}
+			} else if err = e.createRootOverlayQcow2(rootImg, base); err != nil {
 				return info, fmt.Errorf("create qcow2 root overlay: %w", err)
 			}
 			baseSpec.RootDiskFormat = "qcow2"
 		} else {
 			rootImg = filepath.Join(sandboxDir, "root.img")
-			if err = e.cloneBaseImage(rootImg); err != nil {
+			if err = cloneFile(base, rootImg); err != nil {
 				return info, fmt.Errorf("clone base image: %w", err)
 			}
 		}
@@ -551,17 +563,15 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec) err
 // cloneBaseImage CoW-clones the shared base ext4 image to dst (per-sandbox root
 // disk). The base is either a prebuilt image (BaseImage, the production path) or
 // one built once from BaseRootfs via mke2fs (the dev path).
-func (e *Engine) cloneBaseImage(dst string) error {
-	base, err := e.baseImagePath()
-	if err != nil {
-		return err
+// resolveBase returns the CoW backing image for a new sandbox's root: the
+// per-create image (spec.BaseImage — set by the server for `image pull`,
+// `image save`, snapshot), else the engine's default BaseImage, else a dev base
+// built once from BaseRootfs. May be raw (a fresh base) or qcow2 (a saved image
+// / snapshot, itself a CoW node over a raw base).
+func (e *Engine) resolveBase(spec engine.SandboxSpec) (string, error) {
+	if spec.BaseImage != "" {
+		return spec.BaseImage, nil
 	}
-	return cloneFile(base, dst)
-}
-
-// baseImagePath resolves the shared base ext4 image, building it once from
-// BaseRootfs (dev path) if there's no prebuilt BaseImage (production path).
-func (e *Engine) baseImagePath() (string, error) {
 	if e.cfg.BaseImage != "" {
 		return e.cfg.BaseImage, nil
 	}
@@ -576,6 +586,22 @@ func (e *Engine) baseImagePath() (string, error) {
 	return base, nil
 }
 
+// isQcow2 reports whether path is a qcow2 image (magic "QFI\xfb"), so a saved
+// image/snapshot (a CoW node) is copied as a root rather than overlaid as a raw
+// backing.
+func isQcow2(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return false
+	}
+	return magic == [4]byte{'Q', 'F', 'I', 0xfb}
+}
+
 // rootQcow2 reports whether to boot the block root from a qcow2 CoW overlay
 // (the default — host-FS-independent CoW, no reflink/btrfs requirement) instead
 // of a reflink-cloned raw ext4. Set KRUCIBLE_ROOT_RAW=1 to force the raw path
@@ -587,11 +613,7 @@ func rootQcow2() bool { return os.Getenv("KRUCIBLE_ROOT_RAW") != "1" }
 // pure Go (never links libkrun), so it shells to the cgo helper, which creates
 // the overlay via libkrun/imago (krun_create_disk_overlay) — reusing the same
 // library that opens these images, with no external tool (no qemu-img).
-func (e *Engine) createRootOverlayQcow2(dst string) error {
-	base, err := e.baseImagePath()
-	if err != nil {
-		return err
-	}
+func (e *Engine) createRootOverlayQcow2(dst, base string) error {
 	fi, err := os.Stat(base)
 	if err != nil {
 		return fmt.Errorf("stat base image %s: %w", base, err)

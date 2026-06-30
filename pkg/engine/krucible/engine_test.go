@@ -197,7 +197,7 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	if out, err := utilBuild.CombinedOutput(); err != nil {
 		t.Fatalf("build miniutil: %v\n%s", err, out)
 	}
-	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat"} {
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -228,11 +228,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 func main() {
 	switch filepath.Base(os.Args[0]) {
+	case "sync": // flush the guest page cache to the block device
+		syscall.Sync()
 	case "echo":
 		fmt.Println(strings.Join(os.Args[1:], " "))
 	case "errcho":
