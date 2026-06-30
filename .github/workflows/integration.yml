@@ -1,9 +1,16 @@
-name: Integration Tests
+name: Integration Tests (Firecracker — RETIRED on the homelab cluster)
 
+# RETIRED on the self-hosted cluster. This Firecracker suite ran on
+# `arc-runner-set` and, via pkg/engine/firecracker setupGlobalFirewall, installs
+# host-wide iptables rules for 10.0.0.0/8 (microVM egress isolation). On the
+# shared k3s nodes those collide with flannel's pod/service networks
+# (10.42/10.43 ⊂ 10/8): if a run is killed before its `if: always()` cleanup,
+# the leftover `FORWARD -s 10/8 -d 10/8 -j DROP` silently kills cross-node pod
+# DNS and takes down ARC itself. The krucible engine supersedes Firecracker and
+# touches no host iptables — see krucible-integration.yml. Auto-triggers removed
+# so it never lands on asus-i5 again; dispatch-only for ad-hoc runs on a
+# DEDICATED (non-cluster) host — do NOT point `runs-on` back at arc-runner-set.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 concurrency:
