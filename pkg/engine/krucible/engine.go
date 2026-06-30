@@ -161,9 +161,23 @@ func (e *Engine) agentFor(id string) (*agent.AgentClient, error) {
 	return vm.Agent, nil
 }
 
+// createOpts carries restore hints for create(): cold-restore from a snapshot
+// bundle (snapshotDir), reuse a memory snapshot's in-guest token (forcedToken),
+// and use a prebuilt config drive (configDrive) so the restored VM's /dev/vdb
+// matches the captured device state. All empty = a fresh boot.
+type createOpts struct {
+	snapshotDir string
+	forcedToken string
+	configDrive string
+}
+
 // Create boots a new sandbox: prepare the rootfs (block image clone or
 // virtio-fs dir), spawn bhatti-vmm, wait for lohar's agent over the bridged vsock.
-func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engine.SandboxInfo, err error) {
+func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.SandboxInfo, error) {
+	return e.create(ctx, spec, createOpts{})
+}
+
+func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts createOpts) (info engine.SandboxInfo, err error) {
 	id := generateID()
 	sandboxDir := filepath.Join(e.cfg.DataDir, "sandboxes", id)
 	rootfsDir := filepath.Join(sandboxDir, "rootfs")
@@ -224,7 +238,9 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 
 	// Per-sandbox auth token, carried into the guest via the config drive; the
 	// agent enforces it. Empty on the config-less virtio-fs dev path (no auth).
-	token := ""
+	// On a memory-snapshot restore, reuse the snapshot's token (the restored guest
+	// enforces it from RAM).
+	token := opts.forcedToken
 
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
@@ -259,9 +275,18 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		baseSpec.RootDisk = rootImg
 		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
 
-		token = genToken()
+		if token == "" {
+			token = genToken()
+		}
 		confPath := filepath.Join(sandboxDir, "config.ext4")
-		if err = buildConfigDrive(confPath, id, name, token, spec); err != nil {
+		if opts.configDrive != "" {
+			// Restore: reuse the snapshot's config drive so the restored VM's
+			// /dev/vdb matches the captured device state (the guest resumes from
+			// RAM and never re-reads it).
+			if err = cloneFile(opts.configDrive, confPath); err != nil {
+				return info, fmt.Errorf("copy snapshot config drive: %w", err)
+			}
+		} else if err = buildConfigDrive(confPath, id, name, token, spec); err != nil {
 			return info, fmt.Errorf("build config drive: %w", err)
 		}
 		baseSpec.ConfigDrive = confPath
@@ -282,7 +307,7 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (info engi
 		logPath:   filepath.Join(sandboxDir, "vmm.log"),
 	}
 
-	if err = e.launch(ctx, vm, ""); err != nil {
+	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
 		return info, err
 	}
 

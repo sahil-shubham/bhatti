@@ -2,11 +2,145 @@ package krucible
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
+
+	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
+
+// krucibleSnapManifest is the krucible snapshot manifest the server stores
+// (SnapshotRecord.ManifestJSON) and hands back to ResumeFromManifestJSON. It
+// records the captured disk + config drive (within the snapshot dir) and the
+// in-guest token to reuse on a memory restore.
+type krucibleSnapManifest struct {
+	ProtoVer    int    `json:"proto_ver"`
+	Arch        string `json:"arch"`
+	Vcpus       uint8  `json:"vcpus"`
+	MemMiB      uint32 `json:"mem_mib"`
+	DiskFile    string `json:"disk_file"`
+	ConfigFile  string `json:"config_file"`
+	Token       string `json:"token"`
+	KernelImage string `json:"kernel_image,omitempty"`
+}
+
+// Checkpoint captures a named, sandbox-independent memory snapshot (the server's
+// `checkpointer` capability): the running guest's RAM + device + vCPU state plus
+// a copy of its disk and config drive, into snapDir/snapName/, WITHOUT stopping
+// the sandbox. Restore into a new sandbox via ResumeFromManifestJSON.
+func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir string) (any, error) {
+	finalDir := filepath.Join(snapDir, snapName)
+	if _, err := os.Stat(finalDir); err == nil {
+		return nil, fmt.Errorf("snapshot %q already exists", snapName)
+	}
+	if err := e.EnsureHot(ctx, sandboxID); err != nil {
+		return nil, fmt.Errorf("checkpoint: ensure hot: %w", err)
+	}
+	vm, err := e.getVM(sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	vm.mu.Lock()
+	spec := vm.baseSpec
+	token := vm.Token
+	vm.mu.Unlock()
+	if spec.RootDiskFormat != "qcow2" || spec.RootDisk == "" {
+		return nil, fmt.Errorf("snapshot requires a qcow2 block-root sandbox")
+	}
+
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
+
+	if err := os.MkdirAll(finalDir, 0o700); err != nil {
+		return nil, fmt.Errorf("checkpoint: snapshot dir: %w", err)
+	}
+	done := false
+	defer func() {
+		if !done {
+			os.RemoveAll(finalDir)
+		}
+	}()
+
+	// Flush the guest page cache to the device.
+	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
+	_, _ = e.Exec(syncCtx, sandboxID, []string{"sync"})
+	syncCancel()
+
+	cctx, ccancel := context.WithTimeout(ctx, 60*time.Second)
+	defer ccancel()
+	if _, err := controlCmd(cctx, vm.CtlSockUDS, "PAUSE"); err != nil {
+		return nil, fmt.Errorf("checkpoint: pause: %w", err)
+	}
+	defer func() {
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer rcancel()
+		_, _ = controlCmd(rctx, vm.CtlSockUDS, "RESUME")
+	}()
+
+	// RAM + device + vCPU state (libkrun writes manifest.json/checkpoint.bin/memory.img).
+	if _, err := controlCmd(cctx, vm.CtlSockUDS, "SNAPSHOT "+finalDir); err != nil {
+		return nil, fmt.Errorf("checkpoint: snapshot: %w", err)
+	}
+	// Freeze the disk + config drive (the VM is paused; a host sync makes the
+	// overlay file on disk complete).
+	_ = exec.CommandContext(cctx, "sync").Run()
+	if err := cloneFile(spec.RootDisk, filepath.Join(finalDir, "rootfs.qcow2")); err != nil {
+		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
+	}
+	if spec.ConfigDrive != "" {
+		if err := cloneFile(spec.ConfigDrive, filepath.Join(finalDir, "config.ext4")); err != nil {
+			return nil, fmt.Errorf("checkpoint: copy config drive: %w", err)
+		}
+	}
+
+	done = true
+	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "dir", finalDir)
+	return krucibleSnapManifest{
+		ProtoVer: krucibleProtoVer, Arch: hostSnapshotArch(),
+		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
+		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
+		Token: token, KernelImage: spec.KernelImage,
+	}, nil
+}
+
+// ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
+// (the server's `snapshotResumer` capability): copy the snapshot's disk + config
+// drive, cold-restore its RAM/device/vCPU state, reusing the in-guest token (the
+// restored guest enforces it from RAM).
+func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName string) (engine.SandboxInfo, error) {
+	var m krucibleSnapManifest
+	if err := json.Unmarshal(manifestJSON, &m); err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("parse snapshot manifest: %w", err)
+	}
+	if m.Arch != "" && m.Arch != hostSnapshotArch() {
+		return engine.SandboxInfo{}, fmt.Errorf("snapshot arch %q != host %q (cross-arch restore not supported)", m.Arch, hostSnapshotArch())
+	}
+	if err := validateBundle(snapDir); err != nil {
+		return engine.SandboxInfo{}, err
+	}
+	diskFile, configFile := m.DiskFile, m.ConfigFile
+	if diskFile == "" {
+		diskFile = "rootfs.qcow2"
+	}
+	if configFile == "" {
+		configFile = "config.ext4"
+	}
+	spec := engine.SandboxSpec{
+		Name:      newName,
+		CPUs:      float64(m.Vcpus),
+		MemoryMB:  int(m.MemMiB),
+		BaseImage: filepath.Join(snapDir, diskFile), // the frozen disk; create() copies it as the root
+	}
+	return e.create(ctx, spec, createOpts{
+		snapshotDir: snapDir,
+		forcedToken: m.Token,
+		configDrive: filepath.Join(snapDir, configFile),
+	})
+}
 
 // SaveImage captures the sandbox's current filesystem as a reusable bootable
 // image at destPath, without stopping the sandbox. Implements the server's
