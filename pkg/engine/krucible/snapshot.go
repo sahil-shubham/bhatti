@@ -20,6 +20,7 @@ import (
 type krucibleSnapManifest struct {
 	ProtoVer    int    `json:"proto_ver"`
 	Arch        string `json:"arch"`
+	Type        string `json:"type"` // "memory" (RAM+disk) | "filesystem" (disk-only)
 	Vcpus       uint8  `json:"vcpus"`
 	MemMiB      uint32 `json:"mem_mib"`
 	DiskFile    string `json:"disk_file"`
@@ -28,11 +29,29 @@ type krucibleSnapManifest struct {
 	KernelImage string `json:"kernel_image,omitempty"`
 }
 
-// Checkpoint captures a named, sandbox-independent memory snapshot (the server's
-// `checkpointer` capability): the running guest's RAM + device + vCPU state plus
-// a copy of its disk and config drive, into snapDir/snapName/, WITHOUT stopping
-// the sandbox. Restore into a new sandbox via ResumeFromManifestJSON.
+// Checkpoint captures a named, sandbox-independent snapshot (the server's
+// `checkpointer` capability): a copy of the running sandbox's disk + config
+// drive, plus — for a "memory" snapshot — its RAM + device + vCPU state, into
+// snapDir/snapName/, WITHOUT stopping the sandbox. Restore via
+// ResumeFromManifestJSON. Defaults to "memory".
 func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir string) (any, error) {
+	return e.checkpoint(ctx, sandboxID, snapName, snapDir, "memory")
+}
+
+// CheckpointTyped is Checkpoint with an explicit type ("memory" | "filesystem")
+// — the server's optional typedCheckpointer capability for `snapshot create
+// --type`. "filesystem" is disk-only (restores with a cold boot).
+func (e *Engine) CheckpointTyped(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir, snapType string) (any, error) {
+	if snapType == "" {
+		snapType = "memory"
+	}
+	if snapType != "memory" && snapType != "filesystem" {
+		return nil, fmt.Errorf("unknown snapshot type %q (want memory|filesystem)", snapType)
+	}
+	return e.checkpoint(ctx, sandboxID, snapName, snapDir, snapType)
+}
+
+func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (any, error) {
 	finalDir := filepath.Join(snapDir, snapName)
 	if _, err := os.Stat(finalDir); err == nil {
 		return nil, fmt.Errorf("snapshot %q already exists", snapName)
@@ -81,9 +100,12 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 		_, _ = controlCmd(rctx, vm.CtlSockUDS, "RESUME")
 	}()
 
-	// RAM + device + vCPU state (libkrun writes manifest.json/checkpoint.bin/memory.img).
-	if _, err := controlCmd(cctx, vm.CtlSockUDS, "SNAPSHOT "+finalDir); err != nil {
-		return nil, fmt.Errorf("checkpoint: snapshot: %w", err)
+	// A memory snapshot captures RAM + device + vCPU state (libkrun writes
+	// manifest.json/checkpoint.bin/memory.img). A filesystem snapshot is disk-only.
+	if snapType == "memory" {
+		if _, err := controlCmd(cctx, vm.CtlSockUDS, "SNAPSHOT "+finalDir); err != nil {
+			return nil, fmt.Errorf("checkpoint: snapshot: %w", err)
+		}
 	}
 	// Freeze the disk + config drive (the VM is paused; a host sync makes the
 	// overlay file on disk complete).
@@ -98,9 +120,9 @@ func (e *Engine) Checkpoint(ctx context.Context, sandboxID, userID string, subne
 	}
 
 	done = true
-	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "dir", finalDir)
+	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir)
 	return krucibleSnapManifest{
-		ProtoVer: krucibleProtoVer, Arch: hostSnapshotArch(),
+		ProtoVer: krucibleProtoVer, Arch: hostSnapshotArch(), Type: snapType,
 		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
 		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
 		Token: token, KernelImage: spec.KernelImage,
@@ -119,9 +141,6 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 	if m.Arch != "" && m.Arch != hostSnapshotArch() {
 		return engine.SandboxInfo{}, fmt.Errorf("snapshot arch %q != host %q (cross-arch restore not supported)", m.Arch, hostSnapshotArch())
 	}
-	if err := validateBundle(snapDir); err != nil {
-		return engine.SandboxInfo{}, err
-	}
 	diskFile, configFile := m.DiskFile, m.ConfigFile
 	if diskFile == "" {
 		diskFile = "rootfs.qcow2"
@@ -134,6 +153,17 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 		CPUs:      float64(m.Vcpus),
 		MemoryMB:  int(m.MemMiB),
 		BaseImage: filepath.Join(snapDir, diskFile), // the frozen disk; create() copies it as the root
+	}
+	if m.Type == "filesystem" {
+		// Disk-only snapshot: cold-boot a fresh sandbox from the frozen disk
+		// (new identity/config, no RAM restore) — the same path as `create
+		// --image` on a captured node.
+		return e.create(ctx, spec, createOpts{})
+	}
+	// Memory snapshot: cold-restore RAM/device/vCPU, reusing the in-guest token +
+	// the captured config drive so the restored devices match.
+	if err := validateBundle(snapDir); err != nil {
+		return engine.SandboxInfo{}, err
 	}
 	return e.create(ctx, spec, createOpts{
 		snapshotDir: snapDir,

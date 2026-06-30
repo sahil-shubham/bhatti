@@ -35,14 +35,18 @@ var snapshotCreateCmd = &cobra.Command{
 		if name == "" {
 			return fmt.Errorf("--name is required")
 		}
+		snapType, _ := cmd.Flags().GetString("type")
 
 		var snap struct {
 			ID     string `json:"id"`
 			Name   string `json:"name"`
 			SizeMB int    `json:"size_mb"`
 		}
-		if err := apiJSON("POST", "/sandboxes/"+id+"/checkpoint",
-			map[string]any{"name": name}, &snap); err != nil {
+		body := map[string]any{"name": name}
+		if snapType != "" {
+			body["type"] = snapType
+		}
+		if err := apiJSON("POST", "/sandboxes/"+id+"/checkpoint", body, &snap); err != nil {
 			return err
 		}
 		if isJSON(cmd) {
@@ -134,6 +138,7 @@ var snapshotDeleteCmd = &cobra.Command{
 
 func init() {
 	snapshotCreateCmd.Flags().String("name", "", "Snapshot name (required)")
+	snapshotCreateCmd.Flags().String("type", "", "Snapshot type: memory (default, RAM+disk) | filesystem (disk-only)")
 	snapshotResumeCmd.Flags().String("name", "", "New sandbox name")
 
 	snapshotCmd.AddCommand(snapshotCreateCmd)

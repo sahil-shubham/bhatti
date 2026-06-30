@@ -380,6 +380,7 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 
 	var req struct {
 		Name string `json:"name"`
+		Type string `json:"type,omitempty"` // "memory" (default) | "filesystem"
 	}
 	if err := readJSON(r, &req); err != nil {
 		errResp(w, 400, "invalid json: "+err.Error())
@@ -402,19 +403,32 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	type checkpointer interface {
-		Checkpoint(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir string) (any, error)
-	}
-	cp, ok := s.engine.(checkpointer)
-	if !ok {
-		errResp(w, 501, "engine does not support checkpoint")
-		return
-	}
-
 	snapDir := filepath.Join(s.dataDir, "snapshots", user.ID)
 	os.MkdirAll(snapDir, 0700)
 
-	manifestIface, err := cp.Checkpoint(r.Context(), sb.EngineID, user.ID, user.SubnetIndex, req.Name, snapDir)
+	var manifestIface any
+	var err error
+	if req.Type != "" {
+		// Typed snapshot (memory|filesystem) — optional capability; FC implements
+		// only the untyped Checkpoint below, so this 501s there.
+		tc, ok := s.engine.(interface {
+			CheckpointTyped(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir, snapType string) (any, error)
+		})
+		if !ok {
+			errResp(w, 501, "engine does not support typed snapshots (--type)")
+			return
+		}
+		manifestIface, err = tc.CheckpointTyped(r.Context(), sb.EngineID, user.ID, user.SubnetIndex, req.Name, snapDir, req.Type)
+	} else {
+		cp, ok := s.engine.(interface {
+			Checkpoint(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir string) (any, error)
+		})
+		if !ok {
+			errResp(w, 501, "engine does not support checkpoint")
+			return
+		}
+		manifestIface, err = cp.Checkpoint(r.Context(), sb.EngineID, user.ID, user.SubnetIndex, req.Name, snapDir)
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			errResp(w, 409, err.Error())
