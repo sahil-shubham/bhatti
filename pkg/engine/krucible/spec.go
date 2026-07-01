@@ -16,6 +16,15 @@ package krucible
 //
 // Kept deliberately small for P1: virtiofs root + TSI networking + vsock
 // bridges, no snapshot/control-socket/egress yet (those land in P2+).
+// VMFsMount is one virtio-fs host-dir bind as the VMM sees it: a tag + the host
+// directory + read-only flag. The guest-side mount path travels in the config
+// drive (configdrive.FsMountConfig), keyed by the same tag.
+type VMFsMount struct {
+	Tag      string `json:"tag"`
+	HostPath string `json:"host_path"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
 type VMSpec struct {
 	// RootfsDir is a host directory exposed to the guest as the virtiofs root
 	// (krun_set_root). For the POC there is no ext4/qcow2 image; qcow2 CoW
@@ -73,6 +82,12 @@ type VMSpec struct {
 	// libkrun skip libkrunfw entirely. Block-root only: the cmdline roots on
 	// /dev/vda. arm64 expects a raw `Image`; x86 an ELF vmlinux.
 	KernelImage string `json:"kernel_image,omitempty"`
+
+	// Mounts are live virtio-fs host-dir binds (create --mount). The VMM exposes
+	// each Tag→HostPath via krun_add_virtiofs3; lohar mounts Tag at its guest path
+	// (carried separately in the config drive). Boot-time only (libkrun device set
+	// is fixed at boot).
+	Mounts []VMFsMount `json:"mounts,omitempty"`
 	// KernelCmdline overrides the default block-root cmdline used with
 	// KernelImage. Empty = the built-in default (root=/dev/vda … init=ExecPath).
 	KernelCmdline string `json:"kernel_cmdline,omitempty"`

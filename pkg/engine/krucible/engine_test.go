@@ -12,6 +12,22 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
 )
 
+// ensureVMMSigned keeps the dev loop robust on darwin: HVF requires bhatti-vmm
+// to carry the hypervisor entitlement, but a plain `go build -o bhatti-vmm`
+// (instead of `make vmm`) strips the ad-hoc signature, so hv_vm_create then
+// fails for EVERY VM (VmSetup(VmCreate)) — an easy, silent way to lose an hour.
+// Re-apply it here (idempotent, ~50ms) so tests pass regardless of how the
+// binary was built. No-op off darwin (Linux/KVM needs no signing).
+func ensureVMMSigned(t *testing.T, vmm string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	ent := filepath.Join(repoRoot(t), "cmd", "vmm", "hvf-entitlements.plist")
+	if out, err := exec.Command("codesign", "--force", "--entitlements", ent, "-s", "-", vmm).CombinedOutput(); err != nil {
+		t.Logf("ensureVMMSigned: codesign %s failed (%v): %s", vmm, err, out)
+	}
+}
+
 // newSuiteEngine builds a krucible engine for the shared enginetest suite,
 // self-skipping if libkrun / bhatti-vmm aren't available (so `go test ./...`
 // stays green on hosts without libkrun). Build the helper with `make vmm`.
@@ -27,6 +43,7 @@ func newSuiteEngine(t *testing.T) engine.Engine {
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
+	ensureVMMSigned(t, vmm)
 	eng, err := New(Config{
 		DataDir:    t.TempDir(),
 		BaseRootfs: buildBaseRootfs(t, repo),
@@ -68,6 +85,7 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
+	ensureVMMSigned(t, vmm)
 	eng, err := New(Config{
 		DataDir:    t.TempDir(),
 		BaseRootfs: buildBaseRootfs(t, repo),

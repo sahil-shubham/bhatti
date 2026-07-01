@@ -146,6 +146,7 @@ func runAgent() {
 		configEnv = cfg.Env
 		writeConfigFiles(cfg.Files)
 		mountVolumes(cfg.Volumes)
+		mountFsMounts(cfg.Mounts)
 		syscall.Unmount("/run/bhatti/config", 0)
 		os.RemoveAll("/run/bhatti/config")
 		bp("config_applied")
@@ -448,6 +449,12 @@ type VolumeMountConfig struct {
 	ReadOnly bool   `json:"read_only"`
 }
 
+type FsMountConfig struct {
+	Tag      string `json:"tag"`
+	Mount    string `json:"mount"`
+	ReadOnly bool   `json:"read_only"`
+}
+
 type SandboxConfig struct {
 	SandboxID string            `json:"sandbox_id"`
 	Hostname  string            `json:"hostname"`
@@ -458,6 +465,7 @@ type SandboxConfig struct {
 		Mode    string `json:"mode"`
 	} `json:"files"`
 	Volumes []VolumeMountConfig `json:"volumes"`
+	Mounts  []FsMountConfig     `json:"mounts,omitempty"`
 	Init    string              `json:"init,omitempty"`
 	DNS     []string            `json:"dns"`
 	// DNSInternal is the per-user bridge gateway IP hosting the
@@ -467,7 +475,7 @@ type SandboxConfig struct {
 	// with hosts running an older bhatti daemon. G1.1 of
 	// PLAN-bhatti-v2.md.
 	DNSInternal string `json:"dns_internal,omitempty"`
-	User    string              `json:"user"`
+	User        string `json:"user"`
 }
 
 func loadConfigDrive() *SandboxConfig {
@@ -498,15 +506,15 @@ func loadConfigDrive() *SandboxConfig {
 // chosen by the host (engine) based on whether the per-user DNS
 // responder bound successfully:
 //
-//   1. Responder up (the normal case): internal != "", public empty.
-//      We write ONLY the in-cluster responder. It is authoritative for
-//      sibling sandbox names AND forwards everything else upstream
-//      itself (see pkg/dns Server.Upstreams), so it's the only resolver
-//      the sandbox needs.
+//  1. Responder up (the normal case): internal != "", public empty.
+//     We write ONLY the in-cluster responder. It is authoritative for
+//     sibling sandbox names AND forwards everything else upstream
+//     itself (see pkg/dns Server.Upstreams), so it's the only resolver
+//     the sandbox needs.
 //
-//   2. Responder bind failed (degraded): internal == "", public set.
-//      We write the public resolvers directly so the sandbox still has
-//      working name resolution — just without sibling names.
+//  2. Responder bind failed (degraded): internal == "", public set.
+//     We write the public resolvers directly so the sandbox still has
+//     working name resolution — just without sibling names.
 //
 // IMPORTANT: we do NOT list internal AND public together. An earlier
 // version did, on the assumption that a non-sandbox name would "fall
@@ -579,6 +587,30 @@ func writeConfigFiles(files map[string]struct {
 		}
 		os.Chown(path, 1000, 1000)
 		os.Chown(filepath.Dir(path), 1000, 1000)
+	}
+}
+
+// mountFsMounts mounts each virtio-fs bind (create --mount) by tag at its guest
+// path. Non-fatal (log + continue) so a bad/absent mount never blocks boot —
+// e.g. a snapshot restored without its host dirs still comes up.
+func mountFsMounts(mounts []FsMountConfig) {
+	for _, m := range mounts {
+		if m.Tag == "" || m.Mount == "" {
+			continue
+		}
+		os.MkdirAll(m.Mount, 0755)
+		var flags uintptr
+		if m.ReadOnly {
+			flags |= syscall.MS_RDONLY
+		}
+		if err := syscall.Mount(m.Tag, m.Mount, "virtiofs", flags, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "lohar: mount virtiofs %s → %s: %v\n", m.Tag, m.Mount, err)
+			continue
+		}
+		if !m.ReadOnly {
+			os.Chown(m.Mount, 1000, 1000)
+		}
+		fmt.Fprintf(os.Stderr, "lohar: mounted virtiofs %s → %s (ro=%v)\n", m.Tag, m.Mount, m.ReadOnly)
 	}
 }
 

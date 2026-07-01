@@ -57,20 +57,21 @@ type FileSpec struct {
 
 // SandboxSpec describes what to create.
 type SandboxSpec struct {
-	Name       string               `json:"name"`
-	Image      string               `json:"image"`
-	CPUs       float64              `json:"cpus"`
-	MemoryMB   int                  `json:"memory_mb"`
-	DiskSizeMB int                  `json:"disk_size_mb"`
-	Env        map[string]string    `json:"env"`
-	Labels     map[string]string    `json:"labels,omitempty"`     // deprecated: only used by template path
-	UserData   string               `json:"userdata,omitempty"`   // deprecated: only used by template path
-	Volumes    []VolumeMount        `json:"volumes,omitempty"`
-	Secrets    []SecretRef          `json:"secrets,omitempty"`
-	Files      map[string]FileSpec  `json:"files,omitempty"` // path → content
-	NewVolumes []VolumeSpec         `json:"new_volumes,omitempty"`
-	Init       string               `json:"init,omitempty"`
-	Hugepages  bool                 `json:"hugepages,omitempty"` // 2MB hugepages, faster boot, no Diff snapshots
+	Name       string              `json:"name"`
+	Image      string              `json:"image"`
+	CPUs       float64             `json:"cpus"`
+	MemoryMB   int                 `json:"memory_mb"`
+	DiskSizeMB int                 `json:"disk_size_mb"`
+	Env        map[string]string   `json:"env"`
+	Labels     map[string]string   `json:"labels,omitempty"`   // deprecated: only used by template path
+	UserData   string              `json:"userdata,omitempty"` // deprecated: only used by template path
+	Volumes    []VolumeMount       `json:"volumes,omitempty"`
+	Mounts     []FsMount           `json:"mounts,omitempty"` // live virtio-fs host-dir binds (create --mount)
+	Secrets    []SecretRef         `json:"secrets,omitempty"`
+	Files      map[string]FileSpec `json:"files,omitempty"` // path → content
+	NewVolumes []VolumeSpec        `json:"new_volumes,omitempty"`
+	Init       string              `json:"init,omitempty"`
+	Hugepages  bool                `json:"hugepages,omitempty"` // 2MB hugepages, faster boot, no Diff snapshots
 
 	// v0.3: Persistent volume references (replaces VolumeMount for persistent vols)
 	PersistentVolumes []PersistentVolume `json:"persistent_volumes,omitempty"`
@@ -80,6 +81,17 @@ type SandboxSpec struct {
 	SubnetIndex     int              `json:"-"` // owner's subnet index for network isolation
 	BaseImage       string           `json:"-"` // resolved image file path
 	ResolvedVolumes []ResolvedVolume `json:"-"` // resolved volume file paths
+}
+
+// FsMount is a live virtio-fs host-directory bind (create --mount): the host
+// directory is exposed to the guest at GuestPath — shared, bidirectional, and
+// N-writer (the host FS arbitrates). Distinct from a volume (an owned, versioned,
+// portable block disk). FC ignores this; krucible wires it via krun_add_virtiofs3
+// (host side) + a guest virtio-fs mount (lohar, from the config drive).
+type FsMount struct {
+	HostPath  string `json:"host_path"`
+	GuestPath string `json:"guest_path"`
+	ReadOnly  bool   `json:"read_only,omitempty"`
 }
 
 // SandboxInfo is the runtime state of a sandbox.
@@ -112,7 +124,7 @@ type VMStateProvider interface {
 
 // StreamEvent is emitted during streaming exec.
 type StreamEvent struct {
-	Type     string `json:"type"`               // "stdout", "stderr", "exit", "error"
+	Type     string `json:"type"`                // "stdout", "stderr", "exit", "error"
 	Data     string `json:"data,omitempty"`      // output text
 	ExitCode *int   `json:"exit_code,omitempty"` // only for type="exit"
 }

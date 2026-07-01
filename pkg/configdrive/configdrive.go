@@ -26,6 +26,7 @@ type SandboxConfig struct {
 	Env         map[string]string     `json:"env"`
 	Files       map[string]ConfigFile `json:"files"`
 	Volumes     []VolumeMountConfig   `json:"volumes"`
+	Mounts      []FsMountConfig       `json:"mounts,omitempty"` // virtio-fs binds: tag → guest mount path
 	Init        string                `json:"init,omitempty"`
 	DNS         []string              `json:"dns"`
 	DNSInternal string                `json:"dns_internal,omitempty"`
@@ -45,6 +46,15 @@ type VolumeMountConfig struct {
 	Mount    string `json:"mount"`     // e.g. "/workspace"
 	FS       string `json:"fs"`        // e.g. "ext4"
 	ReadOnly bool   `json:"read_only"` // mount MS_RDONLY in the guest
+}
+
+// FsMountConfig tells the guest (lohar) to mount a virtio-fs device (by Tag,
+// matching the VMM's krun_add_virtiofs3) at Mount. The host directory lives on
+// the VMM side; the guest only needs the tag + where to mount it.
+type FsMountConfig struct {
+	Tag      string `json:"tag"`
+	Mount    string `json:"mount"`
+	ReadOnly bool   `json:"read_only"`
 }
 
 // Build writes config.json into a fresh ext4 image at path via `mke2fs -d`

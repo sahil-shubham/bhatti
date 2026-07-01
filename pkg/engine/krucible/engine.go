@@ -242,6 +242,16 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// enforces it from RAM).
 	token := opts.forcedToken
 
+	// virtio-fs --mount binds: assign a per-mount tag; the VMM exposes each host
+	// dir (krun_add_virtiofs3) and lohar mounts the tag at its guest path (carried
+	// in the config drive). Live + shared, unlike an owned/versioned volume.
+	var cdMounts []configdrive.FsMountConfig
+	for i, m := range spec.Mounts {
+		tag := fmt.Sprintf("mnt%d", i)
+		baseSpec.Mounts = append(baseSpec.Mounts, VMFsMount{Tag: tag, HostPath: m.HostPath, ReadOnly: m.ReadOnly})
+		cdMounts = append(cdMounts, configdrive.FsMountConfig{Tag: tag, Mount: m.GuestPath, ReadOnly: m.ReadOnly})
+	}
+
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
@@ -286,7 +296,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			if err = cloneFile(opts.configDrive, confPath); err != nil {
 				return info, fmt.Errorf("copy snapshot config drive: %w", err)
 			}
-		} else if err = buildConfigDrive(confPath, id, name, token, spec); err != nil {
+		} else if err = buildConfigDrive(confPath, id, name, token, spec, cdMounts); err != nil {
 			return info, fmt.Errorf("build config drive: %w", err)
 		}
 		baseSpec.ConfigDrive = confPath
@@ -567,7 +577,7 @@ func genToken() string {
 // buildConfigDrive writes the per-sandbox config drive (hostname, token, env,
 // files) that lohar reads at /dev/vdb. Secrets are expected to be pre-resolved
 // into spec.Env by the server layer (same contract as the FC engine).
-func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec) error {
+func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig) error {
 	files := make(map[string]configdrive.ConfigFile, len(spec.Files))
 	for p, f := range spec.Files {
 		files[p] = configdrive.ConfigFile{
@@ -581,6 +591,7 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec) err
 		Token:     token,
 		Env:       spec.Env,
 		Files:     files,
+		Mounts:    mounts,
 		User:      "lohar",
 	})
 }

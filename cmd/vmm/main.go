@@ -182,6 +182,21 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
+	// virtio-fs --mount binds: expose host dirs to the guest, live + shared +
+	// bidirectional. lohar mounts each tag at its guest path (from the config
+	// drive). shm_size=0 → no DAX window (standard FUSE-over-virtio). Boot-time
+	// only — the device set is fixed once the VM starts.
+	for _, m := range spec.Mounts {
+		ctag := C.CString(m.Tag)
+		cpath := C.CString(m.HostPath)
+		r := C.krun_add_virtiofs3(cid, ctag, cpath, C.uint64_t(0), C._Bool(m.ReadOnly))
+		C.free(unsafe.Pointer(ctag))
+		C.free(unsafe.Pointer(cpath))
+		if r != 0 {
+			fail("krun_add_virtiofs3(%s): %d", m.Tag, int(r))
+		}
+	}
+
 	// TSI is auto-enabled (no NIC added). Bridge host<->guest vsock ports.
 	// listen=true: the host dials the UDS, libkrun forwards to the guest port
 	// where lohar listens.
