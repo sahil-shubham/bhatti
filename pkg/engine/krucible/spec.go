@@ -25,6 +25,16 @@ type VMFsMount struct {
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
+// VMVolume is one block data disk as the VMM sees it: an id + host image path +
+// format ("qcow2" | "raw") + read-only flag. The guest device name + mount path
+// travel in the config drive (configdrive.VolumeMountConfig).
+type VMVolume struct {
+	BlockID  string `json:"block_id"`
+	Path     string `json:"path"`
+	Format   string `json:"format"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
 type VMSpec struct {
 	// RootfsDir is a host directory exposed to the guest as the virtiofs root
 	// (krun_set_root). For the POC there is no ext4/qcow2 image; qcow2 CoW
@@ -88,6 +98,12 @@ type VMSpec struct {
 	// (carried separately in the config drive). Boot-time only (libkrun device set
 	// is fixed at boot).
 	Mounts []VMFsMount `json:"mounts,omitempty"`
+
+	// Volumes are block data disks attached AFTER the root (vda) + config drive
+	// (vdb), so they enumerate as /dev/vdc+ in order. Each is added via
+	// krun_add_disk2 (which composes with the root/data setters); the guest device
+	// name + mount path travel in the config drive (VolumeMountConfig).
+	Volumes []VMVolume `json:"volumes,omitempty"`
 	// KernelCmdline overrides the default block-root cmdline used with
 	// KernelImage. Empty = the built-in default (root=/dev/vda … init=ExecPath).
 	KernelCmdline string `json:"kernel_cmdline,omitempty"`

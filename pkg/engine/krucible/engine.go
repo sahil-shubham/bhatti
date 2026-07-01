@@ -252,6 +252,20 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		cdMounts = append(cdMounts, configdrive.FsMountConfig{Tag: tag, Mount: m.GuestPath, ReadOnly: m.ReadOnly})
 	}
 
+	// Data volumes (create --volume / persistent): attach each resolved volume as a
+	// block disk AFTER root (vda) + config (vdb) — so /dev/vdc+ in order — and tell
+	// lohar where to mount it. krucible previously ignored spec.ResolvedVolumes; the
+	// libkrun get_block_cfg fix lets add_disk2 compose with the root/data setters.
+	var cdVolumes []configdrive.VolumeMountConfig
+	for i, v := range spec.ResolvedVolumes {
+		format := "raw"
+		if isQcow2(v.FilePath) {
+			format = "qcow2"
+		}
+		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", i), Path: v.FilePath, Format: format, ReadOnly: v.ReadOnly})
+		cdVolumes = append(cdVolumes, configdrive.VolumeMountConfig{Device: fmt.Sprintf("/dev/vd%c", 'c'+rune(i)), Mount: v.Mount, FS: "ext4", ReadOnly: v.ReadOnly})
+	}
+
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
@@ -296,7 +310,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			if err = cloneFile(opts.configDrive, confPath); err != nil {
 				return info, fmt.Errorf("copy snapshot config drive: %w", err)
 			}
-		} else if err = buildConfigDrive(confPath, id, name, token, spec, cdMounts); err != nil {
+		} else if err = buildConfigDrive(confPath, id, name, token, spec, cdMounts, cdVolumes); err != nil {
 			return info, fmt.Errorf("build config drive: %w", err)
 		}
 		baseSpec.ConfigDrive = confPath
@@ -577,7 +591,7 @@ func genToken() string {
 // buildConfigDrive writes the per-sandbox config drive (hostname, token, env,
 // files) that lohar reads at /dev/vdb. Secrets are expected to be pre-resolved
 // into spec.Env by the server layer (same contract as the FC engine).
-func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig) error {
+func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig, volumes []configdrive.VolumeMountConfig) error {
 	files := make(map[string]configdrive.ConfigFile, len(spec.Files))
 	for p, f := range spec.Files {
 		files[p] = configdrive.ConfigFile{
@@ -592,6 +606,7 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mou
 		Env:       spec.Env,
 		Files:     files,
 		Mounts:    mounts,
+		Volumes:   volumes,
 		User:      "lohar",
 	})
 }

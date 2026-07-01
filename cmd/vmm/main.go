@@ -197,6 +197,24 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
+	// Data volumes: block disks attached AFTER root (vda) + config (vdb), so they
+	// enumerate as /dev/vdc+ in order. krun_add_disk2 composes with the root/data
+	// setters (get_block_cfg). lohar mounts each at its guest path (config drive).
+	for _, v := range spec.Volumes {
+		cbid := C.CString(v.BlockID)
+		cpath := C.CString(v.Path)
+		format := C.uint32_t(0) // KRUN_DISK_FORMAT_RAW
+		if v.Format == "qcow2" {
+			format = C.uint32_t(1) // KRUN_DISK_FORMAT_QCOW2
+		}
+		r := C.krun_add_disk2(cid, cbid, cpath, format, C._Bool(v.ReadOnly))
+		C.free(unsafe.Pointer(cbid))
+		C.free(unsafe.Pointer(cpath))
+		if r != 0 {
+			fail("krun_add_disk2(%s): %d", v.BlockID, int(r))
+		}
+	}
+
 	// TSI is auto-enabled (no NIC added). Bridge host<->guest vsock ports.
 	// listen=true: the host dials the UDS, libkrun forwards to the guest port
 	// where lohar listens.
