@@ -48,6 +48,7 @@ Feature matrix — every cell run as a test on that platform (see
 | Fork (`create --from`, instant memory clone) | ✓ | ✓ | ✓ |
 | Live `--mount` (virtio-fs host-dir bind) | ✓ | ✓ | ✓ |
 | Block `volume` (persistent data disk, `/dev/vdc+`) | ✓ | ✓ | ✓ |
+| Fork/snapshot restores the device set (volumes) | ✓ | ✓ | ✓ |
 
 **Every cell is green on all three platforms — full cross-arch parity.** The last
 gap, the linux/arm64 cold tier, closed with the GICv2 save/restore (§5.2). The
@@ -111,10 +112,23 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   ...adds]` so a block-root sandbox keeps `root=/dev/vda` (is_block_root keys on
   root_block_cfg) *and* attaches volumes. `TestKrucibleVolume` (attach + mount +
   persist across sandboxes) green on all three platforms.
-- **Next (storage, deferred):** migrate the volume store to qcow2 (CoW
-  clone/fork/version of volumes) — today's volumes are raw ext4 files; and the
-  unified-node DAG/listing UX. Restore-with-mounts/volumes (the snapshot manifest
-  doesn't yet capture the device set).
+- **Snapshot/fork restores the device set (volumes)** — a memory snapshot/fork now
+  reproduces attached volumes, not just RAM+root: Checkpoint freezes each volume
+  (independent copy, consistent with the paused VM) + records it in the manifest;
+  Resume clones each into the new sandbox and re-attaches it as `/dev/vdc+`, so the
+  restored RAM's disk view stays valid. **Fork-your-whole-environment:** the fork
+  gets independent CoW copies (`cloneFile` — instant on APFS/btrfs, a full copy on
+  ext4; libkrun block devices are boot-fixed so a live source can't be rebased).
+  `TestKrucibleForkWithVolume` green on all three platforms.
+- **Honest limit — virtio-fs `--mount` + memory snapshot:** libkrun can't restore a
+  virtio-fs device from a memory snapshot (the resume hangs), so memory-snapshot/
+  fork of a *mounted* sandbox is **refused cleanly** (fast error → use `--type
+  filesystem`). `TestKrucibleForkMountedRefused`.
+- **Next (storage, deferred):** (1) volume-management commands — offline `volume
+  clone` (instant qcow2 overlay of a stopped volume) + `volume snapshot`/version;
+  requires migrating fresh volumes to qcow2 (the raw-ext4 store today gives instant
+  clone only on CoW host FS via cloneFile). (2) restore-with-mounts (needs a libkrun
+  fix for virtio-fs snapshot restore). (3) the unified-node DAG/listing UX.
 
 ## 3. Build & test
 
