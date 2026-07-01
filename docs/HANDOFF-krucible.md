@@ -46,6 +46,7 @@ Feature matrix — every cell run as a test on that platform (see
 | Named snapshot create/resume (memory) | ✓ | ✓ | ✓ |
 | Filesystem snapshot (`--type`, disk-only) | ✓ | ✓ | ✓ |
 | Fork (`create --from`, instant memory clone) | ✓ | ✓ | ✓ |
+| Live `--mount` (virtio-fs host-dir bind) | ✓ | ✓ | ✓ |
 
 **Every cell is green on all three platforms — full cross-arch parity.** The last
 gap, the linux/arm64 cold tier, closed with the GICv2 save/restore (§5.2). The
@@ -87,6 +88,21 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   KVM gate. NOTE: the Firecracker homelab integration workflow was **retired**
   from the cluster (its `10/8` host-iptables collided with k3s/flannel and broke
   cross-node DNS); arc-runner-set now serves krucible only.
+
+**New this cycle (2026-07-01) — storage Phase 3 (mounts):**
+- **Live `--mount host:guest[:ro]`** — a virtio-fs host-directory bind
+  (`krun_add_virtiofs3` host-side + a guest mount by lohar from the config
+  drive). Shared, bidirectional, N-writer — edit on the host, run in the sandbox
+  (and vice-versa) live. Wired end-to-end (engine.FsMount → CLI/server → vmm +
+  lohar); FC ignores it. `TestKrucibleMount` green on all three platforms.
+- **Codesign safety-net** — a plain `go build -o bhatti-vmm` strips the HVF
+  hypervisor entitlement that `make vmm` applies, so `hv_vm_create` fails for
+  every VM on darwin (this masqueraded as a bogus “--mount HVF limitation” for a
+  while). The test harness now re-signs on darwin (idempotent) so tests pass
+  regardless of how the binary was built. **Always `make vmm` on macOS.**
+- **Next:** block `volume` wiring (krucible ignores `spec.ResolvedVolumes` —
+  attach via `krun_add_disk2`), minding add_disk vs set_root/data_disk
+  substrate exclusivity on the qcow2 path.
 
 ## 3. Build & test
 
