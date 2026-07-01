@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -95,6 +96,7 @@ with its own kernel, filesystem, and network.`,
 		keepHot, _ := cmd.Flags().GetBool("keep-hot")
 		hugepages, _ := cmd.Flags().GetBool("hugepages")
 		volFlags, _ := cmd.Flags().GetStringSlice("volume")
+		mountFlags, _ := cmd.Flags().GetStringSlice("mount")
 		secretFlags, _ := cmd.Flags().GetStringSlice("secret")
 		fileFlags, _ := cmd.Flags().GetStringSlice("file")
 		labelFlags, _ := cmd.Flags().GetStringSlice("label")
@@ -189,6 +191,27 @@ with its own kernel, filesystem, and network.`,
 			req["persistent_volumes"] = pvols
 		}
 
+		// Parse --mount flags: host:guest[:ro] (live virtio-fs host-dir bind)
+		if len(mountFlags) > 0 {
+			var mounts []map[string]any
+			for _, mf := range mountFlags {
+				parts := strings.SplitN(mf, ":", 3)
+				if len(parts) < 2 {
+					return fmt.Errorf("invalid --mount format %q (expected host:guest[:ro])", mf)
+				}
+				hostAbs, err := filepath.Abs(parts[0])
+				if err != nil {
+					return fmt.Errorf("--mount %q: %w", mf, err)
+				}
+				m := map[string]any{"host_path": hostAbs, "guest_path": parts[1], "read_only": false}
+				if len(parts) == 3 && parts[2] == "ro" {
+					m["read_only"] = true
+				}
+				mounts = append(mounts, m)
+			}
+			req["mounts"] = mounts
+		}
+
 		var sb map[string]any
 		resp, err := apiRequest("POST", "/sandboxes", req)
 		if err != nil {
@@ -257,6 +280,7 @@ func init() {
 	createCmd.Flags().Bool("hugepages", false, "Use 2MB hugepages (faster boot, no diff snapshots)")
 	createCmd.Flags().String("template", "", "Template name or ID")
 	createCmd.Flags().StringSlice("volume", nil, "Persistent volume (name:mount[:ro])")
+	createCmd.Flags().StringSlice("mount", nil, "Live host-dir bind, virtio-fs (host:guest[:ro]) — krucible only")
 	createCmd.Flags().StringSlice("secret", nil, "Secret name from store (repeatable)")
 	createCmd.Flags().StringSlice("file", nil, "Inject file (local_path:guest_path, repeatable)")
 	createCmd.Flags().StringSlice("label", nil, "Set label key=value (repeatable)")

@@ -31,6 +31,7 @@ type createSandboxReq struct {
 	Init       string               `json:"init,omitempty"`
 	NewVolumes []engine.VolumeSpec  `json:"new_volumes,omitempty"`
 	Volumes    []engine.VolumeMount `json:"volumes,omitempty"`
+	Mounts     []engine.FsMount     `json:"mounts,omitempty"` // live virtio-fs host-dir binds (create --mount)
 	KeepHot    bool                 `json:"keep_hot,omitempty"`
 	Hugepages  bool                 `json:"hugepages,omitempty"` // 2MB hugepages (faster boot, no Diff snapshots)
 
@@ -258,6 +259,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				Init:              req.Init,
 				Files:             files,
 				Volumes:           volumes,
+				Mounts:            req.Mounts,
 				PersistentVolumes: req.PersistentVolumes,
 				Hugepages:         req.Hugepages,
 			}
@@ -320,6 +322,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				Files:             files,
 				NewVolumes:        req.NewVolumes,
 				Volumes:           req.Volumes,
+				Mounts:            req.Mounts,
 				PersistentVolumes: req.PersistentVolumes,
 				Hugepages:         req.Hugepages,
 			}
