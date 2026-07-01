@@ -27,6 +27,27 @@ type krucibleSnapManifest struct {
 	ConfigFile  string `json:"config_file"`
 	Token       string `json:"token"`
 	KernelImage string `json:"kernel_image,omitempty"`
+
+	// Device set (so a restore/fork reproduces it — a memory restore's RAM view of
+	// its disks/mounts must stay valid). Mounts are re-bound to the same host dirs;
+	// volumes are frozen into the snapshot dir and cloned into the restored sandbox.
+	Mounts  []snapMount  `json:"mounts,omitempty"`
+	Volumes []snapVolume `json:"volumes,omitempty"`
+}
+
+// snapMount records a virtio-fs bind for restore. Only HostPath + ReadOnly are
+// needed: the tag is positional (reassigned by order) and the guest mount path
+// lives in the captured config drive (and, for a memory restore, in guest RAM).
+type snapMount struct {
+	HostPath string `json:"host_path"`
+	ReadOnly bool   `json:"read_only"`
+}
+
+// snapVolume records a frozen data volume: its file within the snapshot dir +
+// read-only flag. The guest mount path lives in the captured config drive.
+type snapVolume struct {
+	File     string `json:"file"`
+	ReadOnly bool   `json:"read_only"`
 }
 
 // Checkpoint captures a named, sandbox-independent snapshot (the server's
@@ -69,6 +90,14 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	vm.mu.Unlock()
 	if spec.RootDiskFormat != "qcow2" || spec.RootDisk == "" {
 		return nil, fmt.Errorf("snapshot requires a qcow2 block-root sandbox")
+	}
+	// A memory snapshot captures device + vCPU state; libkrun cannot restore a
+	// virtio-fs device from that state (the resume hangs/fails), so refuse rather
+	// than produce an unrestorable snapshot. Block volumes are fine. A filesystem
+	// snapshot (disk-only, cold-boot restore) has no captured device state and
+	// works for mounted sandboxes.
+	if snapType == "memory" && len(spec.Mounts) > 0 {
+		return nil, fmt.Errorf("cannot memory-snapshot/fork a sandbox with a virtio-fs --mount (the device cannot be restored); use a filesystem snapshot (--type filesystem)")
 	}
 
 	vm.launchMu.Lock()
@@ -119,13 +148,33 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		}
 	}
 
+	// Capture the device set (memory snapshots only — the restored RAM's view of
+	// its disks + mounts must stay valid; a filesystem snapshot is disk-only).
+	// Volumes are frozen as independent copies, consistent with the paused VM +
+	// the RAM snapshot; virtio-fs mounts are re-bound to the same host dirs.
+	var snapVols []snapVolume
+	var snapMounts []snapMount
+	if snapType == "memory" {
+		for i, v := range spec.Volumes {
+			file := fmt.Sprintf("vol%d.img", i)
+			if err := cloneFile(v.Path, filepath.Join(finalDir, file)); err != nil {
+				return nil, fmt.Errorf("checkpoint: copy volume %d: %w", i, err)
+			}
+			snapVols = append(snapVols, snapVolume{File: file, ReadOnly: v.ReadOnly})
+		}
+		for _, mnt := range spec.Mounts {
+			snapMounts = append(snapMounts, snapMount{HostPath: mnt.HostPath, ReadOnly: mnt.ReadOnly})
+		}
+	}
+
 	done = true
-	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir)
+	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir, "volumes", len(snapVols), "mounts", len(snapMounts))
 	return krucibleSnapManifest{
 		ProtoVer: krucibleProtoVer, Arch: hostSnapshotArch(), Type: snapType,
 		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
 		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
 		Token: token, KernelImage: spec.KernelImage,
+		Mounts: snapMounts, Volumes: snapVols,
 	}, nil
 }
 
@@ -165,10 +214,19 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 	if err := validateBundle(snapDir); err != nil {
 		return engine.SandboxInfo{}, err
 	}
+	// Reproduce the captured device set. Block volumes restore cleanly: clone each
+	// frozen volume into the new sandbox (independent copy — fork/restore diverges
+	// from the source). Memory snapshots of mounted sandboxes are refused at
+	// checkpoint (virtio-fs can't be restored), so m.Mounts is empty here.
+	var restoreVols []restoreVol
+	for _, v := range m.Volumes {
+		restoreVols = append(restoreVols, restoreVol{path: filepath.Join(snapDir, v.File), readOnly: v.ReadOnly})
+	}
 	return e.create(ctx, spec, createOpts{
-		snapshotDir: snapDir,
-		forcedToken: m.Token,
-		configDrive: filepath.Join(snapDir, configFile),
+		snapshotDir:    snapDir,
+		forcedToken:    m.Token,
+		configDrive:    filepath.Join(snapDir, configFile),
+		restoreVolumes: restoreVols,
 	})
 }
 

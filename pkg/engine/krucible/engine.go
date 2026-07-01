@@ -166,9 +166,20 @@ func (e *Engine) agentFor(id string) (*agent.AgentClient, error) {
 // and use a prebuilt config drive (configDrive) so the restored VM's /dev/vdb
 // matches the captured device state. All empty = a fresh boot.
 type createOpts struct {
-	snapshotDir string
-	forcedToken string
-	configDrive string
+	snapshotDir    string
+	forcedToken    string
+	configDrive    string
+	restoreVolumes []restoreVol // frozen volume images to clone in + re-attach (restore/fork)
+}
+
+// restoreVol is a frozen volume image (from a snapshot dir) to clone into a
+// restored/forked sandbox and re-attach as /dev/vdc+, reproducing the snapshot's
+// device set. An independent copy — libkrun block devices are boot-fixed, so the
+// running source can't be CoW-rebased; cloneFile is instant on CoW FS (APFS/
+// btrfs), a full copy elsewhere.
+type restoreVol struct {
+	path     string
+	readOnly bool
 }
 
 // Create boots a new sandbox: prepare the rootfs (block image clone or
@@ -264,6 +275,23 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		}
 		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", i), Path: v.FilePath, Format: format, ReadOnly: v.ReadOnly})
 		cdVolumes = append(cdVolumes, configdrive.VolumeMountConfig{Device: fmt.Sprintf("/dev/vd%c", 'c'+rune(i)), Mount: v.Mount, FS: "ext4", ReadOnly: v.ReadOnly})
+	}
+
+	// Restore/fork: clone each frozen volume into this sandbox and re-attach it as
+	// /dev/vdc+, reproducing the snapshot's device set (so a memory restore's RAM
+	// view of its disks stays valid). Independent copy; the captured config drive
+	// already carries the guest mount points, so no cdVolumes entry is needed.
+	for _, rv := range opts.restoreVolumes {
+		idx := len(baseSpec.Volumes)
+		dst := filepath.Join(sandboxDir, fmt.Sprintf("restorevol%d.img", idx))
+		if err = cloneFile(rv.path, dst); err != nil {
+			return info, fmt.Errorf("restore volume %d: %w", idx, err)
+		}
+		format := "raw"
+		if isQcow2(dst) {
+			format = "qcow2"
+		}
+		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", idx), Path: dst, Format: format, ReadOnly: rv.readOnly})
 	}
 
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
