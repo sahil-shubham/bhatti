@@ -47,6 +47,7 @@ Feature matrix — every cell run as a test on that platform (see
 | Filesystem snapshot (`--type`, disk-only) | ✓ | ✓ | ✓ |
 | Fork (`create --from`, instant memory clone) | ✓ | ✓ | ✓ |
 | Live `--mount` (virtio-fs host-dir bind) | ✓ | ✓ | ✓ |
+| Block `volume` (persistent data disk, `/dev/vdc+`) | ✓ | ✓ | ✓ |
 
 **Every cell is green on all three platforms — full cross-arch parity.** The last
 gap, the linux/arm64 cold tier, closed with the GICv2 save/restore (§5.2). The
@@ -100,9 +101,20 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   every VM on darwin (this masqueraded as a bogus “--mount HVF limitation” for a
   while). The test harness now re-signs on darwin (idempotent) so tests pass
   regardless of how the binary was built. **Always `make vmm` on macOS.**
-- **Next:** block `volume` wiring (krucible ignores `spec.ResolvedVolumes` —
-  attach via `krun_add_disk2`), minding add_disk vs set_root/data_disk
-  substrate exclusivity on the qcow2 path.
+- **Block `volume` wiring** — krucible now honors `spec.ResolvedVolumes`: each
+  attaches as a block disk after root (vda) + config (vdb) → `/dev/vdc+` via
+  `krun_add_disk2`, mounted by lohar from the config drive. `create --volume
+  name:mount[:ro]` works end-to-end (server volume resolution was already
+  engine-agnostic). **Substrate fix (libkrun `175f28c`):** `get_block_cfg()`
+  treated `set_root_disk*`/`set_data_disk` and `add_disk*` as mutually exclusive
+  (any add_disk silently dropped root/data); now it composes `[root?, data?,
+  ...adds]` so a block-root sandbox keeps `root=/dev/vda` (is_block_root keys on
+  root_block_cfg) *and* attaches volumes. `TestKrucibleVolume` (attach + mount +
+  persist across sandboxes) green on all three platforms.
+- **Next (storage, deferred):** migrate the volume store to qcow2 (CoW
+  clone/fork/version of volumes) — today's volumes are raw ext4 files; and the
+  unified-node DAG/listing UX. Restore-with-mounts/volumes (the snapshot manifest
+  doesn't yet capture the device set).
 
 ## 3. Build & test
 
