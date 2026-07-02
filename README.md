@@ -40,30 +40,27 @@ bhatti destroy dev
 
 ## Install
 
-On any Linux box with KVM — a Raspberry Pi 5, a Hetzner AX, a cloud VM with nested virtualization:
+Pick a line — both are on the **[releases page](https://github.com/sahil-shubham/bhatti/releases)**.
+
+**v2 (krucible) — Linux + macOS · pre-release.** The self-owned-VMM line (see above).
+Download the signed, relocatable tarball for your platform from the
+[latest release](https://github.com/sahil-shubham/bhatti/releases) —
+`bhatti-<ver>-{darwin-arm64,linux-amd64,linux-arm64}.tar.zst`, a `bin/ lib/ kernel/`
+prefix — plus a rootfs tier image. A `curl bhatti.sh/install` one-liner ships with the
+first stable v2; until then it's an early-adopter setup.
+
+**v1 (Firecracker) — Linux + KVM · stable (frozen).** On any Linux box with KVM
+(Raspberry Pi 5, Hetzner AX, a cloud VM with nested virtualization):
 
 ```bash
-curl -fsSL bhatti.sh/install | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/firecracker/scripts/install.sh | sudo BHATTI_VERSION=v1.11.12 bash
 ```
 
-That downloads the daemon + agent + Firecracker + jailer + kernel + a minimal Ubuntu 24.04 rootfs (~200MB total), creates an `admin` user, and wires the CLI on the same box to use it. After it finishes you can run `bhatti create --name dev` immediately — no `bhatti setup` needed.
-
-For a CLI-only install on a different machine (driving a remote bhatti server):
-
-```bash
-curl -fsSL bhatti.sh/install | bash
-bhatti setup --url https://your-server:8080 --token bht_...
-# or:
-bhatti setup    # interactive
-```
-
-<details>
-<summary>Fallback if bhatti.sh is unreachable</summary>
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/main/scripts/install.sh | bash
-```
-</details>
+Installs the daemon + agent + Firecracker + jailer + kernel + a minimal Ubuntu 24.04
+rootfs, creates an `admin` user, and wires the local CLI — `bhatti create` works
+immediately. Prefer a manual grab? Take the binaries from the
+[v1.11.12 release](https://github.com/sahil-shubham/bhatti/releases/tag/v1.11.12).
+CLI-only on another machine: run the script without `sudo`, then `bhatti setup --url … --token …`.
 
 > **Full documentation: [bhatti.sh](https://bhatti.sh).** This README is a snapshot. The website is the source of truth and is updated with each release. The pages most worth reading are the [Quickstart](https://bhatti.sh/docs/quickstart/), the [Architecture](https://bhatti.sh/docs/under-the-hood/architecture/) overview, and [Decisions & learnings](https://bhatti.sh/docs/under-the-hood/decisions/).
 
@@ -77,7 +74,9 @@ sudo bhatti update              # Server: updates all components
 sudo bhatti update --tiers all  # Server: also pull additional tiers
 ```
 
-> **Note:** `bhatti update` updating all server components requires v1.7.3+. On older versions, re-run the install command: `curl -fsSL bhatti.sh/install | sudo bash`
+> **v1 is frozen.** Pin it: `sudo BHATTI_VERSION=v1.11.12 bhatti update`. A bare
+> `bhatti update` tracks the latest release, so once v2.0.0 ships it would jump a v1
+> server to v2 (a different VMM — not an in-place upgrade). v2 gets its own update flow.
 
 ## Rootfs Tiers
 
