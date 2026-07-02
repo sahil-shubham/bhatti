@@ -236,6 +236,22 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 // into a new sandbox, then discard the bundle. The fork's disk + config are
 // copies, so it diverges from the source; the source is undisturbed.
 func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.SandboxInfo, error) {
+	// Fast, friendly refusal: a --mount sandbox can't be memory-forked (libkrun
+	// can't restore a virtio-fs device from a memory snapshot). Check up front so
+	// the caller gets a clear error immediately, instead of one surfacing from deep
+	// inside checkpoint after an EnsureHot + PAUSE. checkpoint() enforces the same
+	// invariant as the backstop.
+	vm, err := e.getVM(sandboxID)
+	if err != nil {
+		return engine.SandboxInfo{}, err
+	}
+	vm.mu.Lock()
+	hasMount := len(vm.baseSpec.Mounts) > 0
+	vm.mu.Unlock()
+	if hasMount {
+		return engine.SandboxInfo{}, fmt.Errorf("cannot fork a sandbox with a virtio-fs --mount (the device cannot be memory-restored); use a filesystem snapshot (snapshot create --type filesystem) then create --snapshot")
+	}
+
 	tmp, err := os.MkdirTemp(e.cfg.DataDir, "fork-")
 	if err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("fork: temp dir: %w", err)

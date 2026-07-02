@@ -189,7 +189,10 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 }
 
 func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts createOpts) (info engine.SandboxInfo, err error) {
-	id := generateID()
+	id, err := generateID()
+	if err != nil {
+		return info, err
+	}
 	sandboxDir := filepath.Join(e.cfg.DataDir, "sandboxes", id)
 	rootfsDir := filepath.Join(sandboxDir, "rootfs")
 	sockDir := filepath.Join(e.cfg.SocketDir, id)
@@ -328,7 +331,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
 
 		if token == "" {
-			token = genToken()
+			if token, err = genToken(); err != nil {
+				return info, err
+			}
 		}
 		confPath := filepath.Join(sandboxDir, "config.ext4")
 		if opts.configDrive != "" {
@@ -610,10 +615,14 @@ func validateBundle(bundleDir string) error {
 }
 
 // genToken returns a random 128-bit hex token (matches the FC engine's scheme).
-func genToken() string {
+// A failed system RNG is surfaced, never silently swallowed — the token is a
+// security boundary (the guest agent enforces it).
+func genToken() (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // buildConfigDrive writes the per-sandbox config drive (hostname, token, env,
@@ -732,7 +741,14 @@ func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
 	return out, nil
 }
 
-// Shutdown stops all running helpers (called on daemon SIGTERM).
+// Shutdown kills every helper (called on daemon SIGTERM, after the server has
+// snapshotted running VMs so they cold-restore on the next start). It terminates
+// BOTH helpers this engine owns (vm.cmd) AND ones adopted across a prior daemon
+// restart (only HelperPID set) via vm.kill() — the same path Destroy uses. The
+// former inline cmd-only kill leaked adopted helpers, orphaning live VMs whose
+// daemon had restarted at least once. Serialized per-VM against an in-flight
+// Start/Stop/Pause/Resume via launchMu (lock order: launchMu before mu), so a
+// SIGTERM can't SIGKILL a helper mid-transition (e.g. mid-snapshot).
 func (e *Engine) Shutdown() {
 	e.mu.RLock()
 	vms := make([]*VM, 0, len(e.vms))
@@ -741,23 +757,20 @@ func (e *Engine) Shutdown() {
 	}
 	e.mu.RUnlock()
 	for _, vm := range vms {
-		vm.mu.Lock()
-		if vm.Status == "running" && vm.cmd != nil && vm.cmd.Process != nil {
-			_ = vm.cmd.Process.Kill()
-		}
-		if vm.cancel != nil {
-			vm.cancel()
-		}
-		vm.mu.Unlock()
+		vm.launchMu.Lock()
+		vm.kill() // no-op if already stopped; handles owned + adopted helpers
+		vm.launchMu.Unlock()
 	}
 }
 
 // --- helpers ---
 
-func generateID() string {
+func generateID() (string, error) {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate id: %w", err)
+	}
+	return fmt.Sprintf("%x", b), nil
 }
 
 // cloneTree copies src/* into dst, preferring a CoW clone (APFS clonefile on
