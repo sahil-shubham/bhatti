@@ -99,7 +99,9 @@ func createOverlay(args []string) {
 }
 
 func run(spec krucible.VMSpec) {
-	C.krun_set_log_level(C.uint32_t(spec.LogLevel))
+	// libkrun 2.0 replaced krun_set_log_level with krun_init_log; default target
+	// (-1 == stderr), AUTO style, no options.
+	C.krun_init_log(C.int(-1), C.uint32_t(spec.LogLevel), C.uint32_t(0), C.uint32_t(0))
 
 	ctx := C.krun_create_ctx()
 	if ctx < 0 {
@@ -154,19 +156,25 @@ func run(spec krucible.VMSpec) {
 	if spec.RootDisk != "" {
 		cdisk := C.CString(spec.RootDisk)
 		defer C.free(unsafe.Pointer(cdisk))
+		// libkrun 2.0 dropped krun_set_root_disk; krun_set_root_disk2 designates the
+		// root block device (block_id "root" -> /dev/vda) for BOTH raw and qcow2.
+		// Added first, so root enumerates as /dev/vda ahead of config/volumes.
+		format := C.uint32_t(0) // KRUN_DISK_FORMAT_RAW
 		if spec.RootDiskFormat == "qcow2" {
-			// C.uint32_t(1) == KRUN_DISK_FORMAT_QCOW2
-			if r := C.krun_set_root_disk2(cid, cdisk, C.uint32_t(1)); r != 0 {
-				fail("krun_set_root_disk2(qcow2): %d", int(r))
-			}
-		} else if r := C.krun_set_root_disk(cid, cdisk); r != 0 {
-			fail("krun_set_root_disk: %d", int(r))
+			format = C.uint32_t(1) // KRUN_DISK_FORMAT_QCOW2
+		}
+		if r := C.krun_set_root_disk2(cid, cdisk, format); r != 0 {
+			fail("krun_set_root_disk2: %d", int(r))
 		}
 	} else {
+		// virtio-fs root: libkrun 2.0 replaced krun_set_root with an explicit
+		// krun_add_virtiofs3 tagged "/dev/root" (the guest's root-fs tag).
 		croot := C.CString(spec.RootfsDir)
 		defer C.free(unsafe.Pointer(croot))
-		if r := C.krun_set_root(cid, croot); r != 0 {
-			fail("krun_set_root: %d", int(r))
+		crootTag := C.CString("/dev/root")
+		defer C.free(unsafe.Pointer(crootTag))
+		if r := C.krun_add_virtiofs3(cid, crootTag, croot, C.uint64_t(0), C._Bool(false)); r != 0 {
+			fail("krun_add_virtiofs3(root): %d", int(r))
 		}
 	}
 
@@ -177,8 +185,12 @@ func run(spec krucible.VMSpec) {
 	if spec.ConfigDrive != "" {
 		cconf := C.CString(spec.ConfigDrive)
 		defer C.free(unsafe.Pointer(cconf))
-		if r := C.krun_set_data_disk(cid, cconf); r != 0 {
-			fail("krun_set_data_disk: %d", int(r))
+		cconfID := C.CString("config")
+		defer C.free(unsafe.Pointer(cconfID))
+		// libkrun 2.0 dropped krun_set_data_disk; add the config drive as a raw data
+		// disk. Added after the root -> enumerates as /dev/vdb (lohar reads it there).
+		if r := C.krun_add_disk(cid, cconfID, cconf, C._Bool(false)); r != 0 {
+			fail("krun_add_disk(config): %d", int(r))
 		}
 	}
 
@@ -215,9 +227,20 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
-	// TSI is auto-enabled (no NIC added). Bridge host<->guest vsock ports.
-	// listen=true: the host dials the UDS, libkrun forwards to the guest port
-	// where lohar listens.
+	// libkrun 2.0 removed implicit console + vsock creation, so add them
+	// explicitly. Console: the guest cmdline roots on console=hvc0; wire it to our
+	// stdio (the daemon captures it to vmm.log). Vsock: a device with TSI inet
+	// hijack (guest host-networking with no NIC) — AF_UNIX hijack is macOS-
+	// unsupported and unused here, so INET only. Both must precede the port bridges.
+	if r := C.krun_add_virtio_console_default(cid, C.int(0), C.int(1), C.int(2)); r != 0 {
+		fail("krun_add_virtio_console_default: %d", int(r))
+	}
+	if r := C.krun_add_vsock(cid, C.uint32_t(1)); r != 0 { // 1 == KRUN_TSI_HIJACK_INET
+		fail("krun_add_vsock: %d", int(r))
+	}
+
+	// Bridge host<->guest vsock ports. listen=true: the host dials the UDS,
+	// libkrun forwards to the guest port where lohar listens.
 	addVsock := func(port uint32, uds string) {
 		if uds == "" {
 			return

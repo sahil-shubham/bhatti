@@ -132,10 +132,13 @@ jobs:
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cp -R libkrucible/_install/lib/libkrun*.dylib stage/lib/
             DYLIB=$(find stage/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
-            install_name_tool -id @rpath/libkrun.1.dylib "$DYLIB"
-            install_name_tool -change libkrun.1.dylib @rpath/libkrun.1.dylib stage/bin/bhatti-vmm
+            # Derive the soname (e.g. libkrun.2.dylib) from the dylib's own install-name so
+            # the rpath rewrite tracks the ABI major (libkrun 2.0 = libkrun.2.dylib), not a pin.
+            SONAME=$(basename "$(otool -D "$DYLIB" | tail -1)")
+            install_name_tool -id "@rpath/$SONAME" "$DYLIB"
+            install_name_tool -change "$SONAME" "@rpath/$SONAME" stage/bin/bhatti-vmm
             install_name_tool -add_rpath @loader_path/../lib stage/bin/bhatti-vmm
-            echo "=== otool -L (expect @rpath/libkrun.1.dylib) ===" && otool -L stage/bin/bhatti-vmm | grep -i krun
+            echo "=== otool -L (expect @rpath/$SONAME) ===" && otool -L stage/bin/bhatti-vmm | grep -i krun
           else
             cp -P libkrucible/_install/lib64/libkrun.so* stage/lib/ 2>/dev/null || cp -P libkrucible/_install/lib/libkrun.so* stage/lib/
             patchelf --set-rpath '$ORIGIN/../lib' stage/bin/bhatti-vmm

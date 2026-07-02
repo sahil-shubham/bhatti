@@ -32,12 +32,16 @@ cp "$SRC/libkrun.pc" "$PREFIX/lib/pkgconfig/"
 LIBDIR="$(awk -F= '/^libdir=/{print $2}' "$SRC/libkrun.pc")"
 mkdir -p "$LIBDIR"
 VER="$(grep -E '^FULL_VERSION' "$SRC/Makefile" | head -1 | sed 's/.*= *//')"
+# The soname/install-name major must track the fork's ABI_VERSION (libkrun 2.0
+# bumped it to 2 -> libkrun.2.dylib / libkrun.so.2). Hardcoding ".1" silently
+# breaks the dlopen once upstream bumps the major, so derive it.
+ABI="$(grep -E '^ABI_VERSION' "$SRC/Makefile" | head -1 | sed 's/.*= *//')"
 if [ "$OS" = "Darwin" ]; then
   cp "$SRC/target/release/libkrun.dylib" "$LIBDIR/libkrun.$VER.dylib"
-  ( cd "$LIBDIR" && ln -sf "libkrun.$VER.dylib" libkrun.1.dylib && ln -sf libkrun.1.dylib libkrun.dylib )
+  ( cd "$LIBDIR" && ln -sf "libkrun.$VER.dylib" "libkrun.$ABI.dylib" && ln -sf "libkrun.$ABI.dylib" libkrun.dylib )
 else
   cp "$SRC/target/release/libkrun.so" "$LIBDIR/libkrun.so.$VER"
-  ( cd "$LIBDIR" && ln -sf "libkrun.so.$VER" libkrun.so.1 && ln -sf libkrun.so.1 libkrun.so )
+  ( cd "$LIBDIR" && ln -sf "libkrun.so.$VER" "libkrun.so.$ABI" && ln -sf "libkrun.so.$ABI" libkrun.so )
 fi
 
 echo "==> done. libkrucible libkrun: $LIBDIR"
