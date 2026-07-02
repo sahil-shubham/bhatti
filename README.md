@@ -14,6 +14,29 @@ bhatti shell dev                          # Ctrl+\ to detach
 bhatti destroy dev
 ```
 
+> ## 🔭 Where bhatti is heading (v1 → v2)
+>
+> **`main` now tracks bhatti v2**, which replaces Firecracker with **krucible** —
+> our own fork of [libkrun](https://github.com/containers/libkrun),
+> [**libkrucible**](https://github.com/sahil-shubham/libkrucible) — as the VM
+> engine. Owning the VMM lets bhatti run **natively on macOS (Apple Silicon) as
+> well as Linux**, which drastically lowers the barrier to trying it on a laptop,
+> and gives us room to revisit early design decisions. **v2 is pre-release** — the
+> installer and signed macOS/Linux artifacts are still being built, so there's no
+> `curl | install` for it yet.
+>
+> **For a stable, battle-tested bhatti today, use v1 (Firecracker).** It's Linux +
+> KVM, documented in this README and at [bhatti.sh](https://bhatti.sh), and the
+> `curl … | install` below installs it. The source lives on the
+> [`firecracker`](https://github.com/sahil-shubham/bhatti/tree/firecracker) branch
+> (latest release
+> [**v1.11.12**](https://github.com/sahil-shubham/bhatti/releases/tag/v1.11.12));
+> check out that branch to build it from source. v1 is preserved and installable,
+> but new work happens on v2.
+>
+> Follow along or weigh in on the v2 direction in
+> **[Discussions](https://github.com/sahil-shubham/bhatti/discussions)**.
+
 ## Install
 
 On any Linux box with KVM — a Raspberry Pi 5, a Hetzner AX, a cloud VM with nested virtualization:
