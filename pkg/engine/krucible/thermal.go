@@ -70,6 +70,7 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 //   - warm: RESUME over the control socket (helper alive, vCPUs paused)
 //   - cold: Start (re-launch the helper + restore the snapshot bundle) — the
 //     helper was killed at Stop, so a socket RESUME would fail.
+//
 // This lets a single wake-on-request transparently revive both warm and cold
 // sandboxes.
 func (e *Engine) EnsureHot(ctx context.Context, id string) error {

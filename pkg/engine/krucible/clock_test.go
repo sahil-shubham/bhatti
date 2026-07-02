@@ -22,7 +22,9 @@ func TestKrucibleClockFreeze(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "clk", CPUs: 1, MemoryMB: 512})
-	if err != nil { t.Fatalf("Create: %v", err) }
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
 	id := info.ID
 	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
@@ -42,9 +44,13 @@ func TestKrucibleClockFreeze(t *testing.T) {
 	}
 
 	before := uptime()
-	if err := eng.Pause(ctx, id); err != nil { t.Fatalf("Pause: %v", err) }
+	if err := eng.Pause(ctx, id); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
 	time.Sleep(3 * time.Second)
-	if err := eng.EnsureHot(ctx, id); err != nil { t.Fatalf("EnsureHot: %v", err) }
+	if err := eng.EnsureHot(ctx, id); err != nil {
+		t.Fatalf("EnsureHot: %v", err)
+	}
 	after := uptime()
 
 	delta := after - before
