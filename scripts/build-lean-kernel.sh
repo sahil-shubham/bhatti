@@ -18,18 +18,11 @@ REPO="$(pwd)"
 
 host_arch="$(uname -m)"; [ "$host_arch" = "arm64" ] && host_arch="aarch64"
 ARCH="${1:-$host_arch}"
-
-# Resolve the exact kernel patch at build time. kernel.org's CDN keeps only the
-# CURRENT patch of each stable series (older ones 404), so a hardcoded patch rots.
-# Pin the LTS SERIES and look up its current patch from releases.json; an explicit
-# KERNEL_VERSION still overrides (local reproducibility).
-KERNEL_SERIES="${KERNEL_SERIES:-6.12}"
-if [ -z "${KERNEL_VERSION:-}" ]; then
-  KERNEL_VERSION="$(curl -fsSL https://www.kernel.org/releases.json \
-    | grep -oE "linux-${KERNEL_SERIES//./\\.}\.[0-9]+\.tar\.xz" | head -1 \
-    | sed -E 's/^linux-//; s/\.tar\.xz$//')"
-  [ -n "$KERNEL_VERSION" ] || { echo "ERROR: could not resolve latest ${KERNEL_SERIES}.x from kernel.org releases.json" >&2; exit 1; }
-fi
+# Pinned for reproducibility. Override with KERNEL_VERSION=<x.y.z> (must be a
+# linux-stable tag). Source is the official kernel.org git origin (git.kernel.org),
+# whose tags are permanent — NOT the Fastly CDN (/pub/linux/kernel/*.tar.xz), whose
+# tarball subtree is unreachable from CI egress here (returns 404 for every patch).
+KERNEL_VERSION="${KERNEL_VERSION:-6.12.94}"
 
 case "$ARCH" in
   aarch64) PLATFORM="linux/arm64"; MAKETARGET="Image"; KIMG="arch/arm64/boot/Image"; OUTBASE="Image-lean" ;;
@@ -53,7 +46,7 @@ docker run --rm --platform "$PLATFORM" \
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc curl xz-utils >/dev/null 2>&1
-curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz | tar xJ
+curl -fsSL https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/linux-${KERNEL_VERSION}.tar.gz | tar xz
 cd linux-${KERNEL_VERSION}
 cp /lean.config .config
 make olddefconfig >/dev/null
