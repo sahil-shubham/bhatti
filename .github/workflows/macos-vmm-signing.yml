@@ -1,0 +1,139 @@
+name: macOS VMM — sign + notarize (dry-run)
+
+# The macOS signing building block for the Phase-1 release pipeline, and the CI
+# counterpart of the local 0c spike (proven Accepted 2026-07-02): build the macOS
+# krucible runtime closure (libkrun + bhatti-vmm), Developer-ID sign it with the
+# hardened runtime + the com.apple.security.hypervisor entitlement, and notarize
+# via notarytool. Manual dispatch only; it does NOT publish — it uploads the
+# signed/notarized artifacts for inspection before any real v2 tag.
+#
+# Out of scope on purpose: a real HVF boot-smoke. macos-14 runners are VMs with
+# no nested virtualization, so booting a guest must happen on physical Apple
+# Silicon (see PLAN-krucible-release.md §5 Phase 1 "boot-smoke runners").
+#
+# Secrets used (PLAN-krucible-release.md §7): APPLE_DEVID_CERT_P12_BASE64,
+# APPLE_DEVID_CERT_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_KEYCHAIN_PASSWORD,
+# APPLE_NOTARY_KEY_P8_BASE64, APPLE_NOTARY_KEY_ID, APPLE_NOTARY_ISSUER_ID.
+
+on:
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: "Submit to Apple notary (uncheck to sign-only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  macos-vmm:
+    name: Build + sign + notarize (darwin-arm64)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # libkrucible is a public submodule, but .gitmodules uses an SSH URL —
+      # rewrite it to https so the default GITHUB_TOKEN can fetch it (mirrors
+      # ci.yml; §7.4 is only "solved" for that workflow).
+      - name: Fetch libkrucible submodule (https)
+        run: |
+          git config submodule.libkrucible.url https://github.com/sahil-shubham/libkrucible.git
+          git submodule update --init --recursive libkrucible
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Ensure Rust toolchain
+        run: rustup show >/dev/null 2>&1 || rustup default stable
+
+      - name: Build libkrun (krucible fork) + bhatti-vmm
+        # make vmm ad-hoc signs on darwin; we replace that with a Developer ID
+        # signature below.
+        run: |
+          make krucible
+          make vmm
+
+      - name: Import Developer ID cert into a temp keychain
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVID_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/bhatti-signing.keychain-db"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Developer ID "G2" intermediate — chains the leaf to the pre-trusted
+          # Apple Root so the identity is valid for codesign (this is the exact
+          # step that flipped `0 valid identities` locally during 0c).
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN" || true
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Prepend the temp keychain to the search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Developer-ID sign (hardened runtime + hypervisor entitlement)
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/bhatti-signing.keychain-db"
+          DYLIB=$(find libkrucible/_install/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
+          echo "signing dylib: $DYLIB"
+          # dylib: hardened runtime + secure timestamp, same Team ID as bhatti-vmm
+          # so hardened-runtime library validation is satisfied (no
+          # disable-library-validation needed). Dylibs carry no entitlements.
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+            --sign "$IDENTITY" "$DYLIB"
+          # bhatti-vmm: + the hypervisor entitlement (required for HVF).
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+            --entitlements cmd/vmm/hvf-entitlements.plist \
+            --sign "$IDENTITY" bhatti-vmm
+          echo "=== verify ==="
+          codesign -dv --verbose=4 bhatti-vmm 2>&1 | grep -iE 'Authority|TeamIdentifier|flags|Timestamp='
+          codesign -d --entitlements - bhatti-vmm 2>&1 | grep -i hypervisor
+          codesign --verify --strict --verbose=2 "$DYLIB"
+          codesign --verify --strict --verbose=2 bhatti-vmm
+
+      - name: Notarize (notarytool)
+        if: ${{ inputs.notarize }}
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          DYLIB=$(find libkrucible/_install/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
+          echo "$NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          mkdir -p "$RUNNER_TEMP/notarize"
+          cp bhatti-vmm "$DYLIB" "$RUNNER_TEMP/notarize/"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/notarize" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 15m
+          rm -f "$RUNNER_TEMP/notary.p8"
+          # Bare CLI binaries/dylibs can't be stapled (only .pkg/.dmg/.app), so
+          # first-run trust relies on the online Gatekeeper check. Whether to ship
+          # inside a stapleable .pkg is OQ7 (Phase 2).
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/bhatti-signing.keychain-db" || true
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-vmm-signed-arm64
+          path: |
+            bhatti-vmm
+            libkrucible/_install/lib/libkrun.*.dylib
