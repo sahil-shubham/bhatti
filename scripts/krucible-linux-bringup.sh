@@ -56,10 +56,17 @@ if [ ! -e "$PREFIX/lib/libkrunfw.so" ] && [ ! -e "$PREFIX/lib64/libkrunfw.so" ];
   log "building libkrunfw $LIBKRUNFW_REF (kernel build — slow)"
   SRC=/tmp/libkrunfw
   [ -d "$SRC" ] || git clone --depth 1 --branch "$LIBKRUNFW_REF" https://github.com/containers/libkrunfw "$SRC"
+  # libkrunfw pins a specific kernel patch (KERNEL_VERSION); cdn.kernel.org prunes
+  # superseded patches (404 from CI egress once a newer patch ships), so override
+  # KERNEL_REMOTE to the git.kernel.org origin, whose stable tags are permanent.
+  # Its snapshots are .tar.gz, but libkrunfw's `tar xf` auto-detects compression,
+  # so the .tar.xz tarball name is harmless.
+  KVER_FULL="$(awk -F'= *' '/^KERNEL_VERSION/{print $2; exit}' "$SRC/Makefile")"
+  KREMOTE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/${KVER_FULL}.tar.gz"
   # Build via `cd && make` (NOT `make -C`): libkrunfw's Makefile passes
   # $(MAKEFLAGS) straight into the kernel sub-make, and `-C` auto-adds the `-w`
   # print-directory flag, which then becomes a bogus `make w` kernel target.
-  ( cd "$SRC" && make -j"$(nproc)" )
+  ( cd "$SRC" && make -j"$(nproc)" KERNEL_REMOTE="$KREMOTE" )
   ( cd "$SRC" && sudo make install PREFIX="$PREFIX" )
   sudo ldconfig
 else
@@ -79,8 +86,11 @@ mkdir -p "$LIBDIR"
 cp "$LIBKRUCIBLE/include/libkrun.h" "$KPREFIX/include/"
 cp "$LIBKRUCIBLE/libkrun.pc" "$KPREFIX/lib/pkgconfig/"
 VER="$(grep -E '^FULL_VERSION' "$LIBKRUCIBLE/Makefile" | head -1 | sed 's/.*= *//')"
+# soname major tracks the fork's ABI_VERSION (libkrun 2.0 -> libkrun.so.2); a
+# hardcoded ".1" breaks the cgo/dlopen link once upstream bumps the major.
+ABI="$(grep -E '^ABI_VERSION' "$LIBKRUCIBLE/Makefile" | head -1 | sed 's/.*= *//')"
 cp "$LIBKRUCIBLE/target/release/libkrun.so" "$LIBDIR/libkrun.so.$VER"
-( cd "$LIBDIR" && ln -sf "libkrun.so.$VER" libkrun.so.1 && ln -sf libkrun.so.1 libkrun.so )
+( cd "$LIBDIR" && ln -sf "libkrun.so.$VER" "libkrun.so.$ABI" && ln -sf "libkrun.so.$ABI" libkrun.so )
 
 # --- 4. bhatti-vmm (cgo helper; no codesigning on Linux) ---
 log "building bhatti-vmm"
