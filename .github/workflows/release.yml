@@ -26,7 +26,9 @@ permissions:
   contents: write
 
 env:
-  LEAN_KERNEL_VERSION: "6.12.91"
+  # kernel.org keeps only the latest patch of each longterm series on the CDN, so
+  # this must track the current 6.12.x LTS (older patches 404). Bump when it moves.
+  LEAN_KERNEL_VERSION: "6.12.94"
 
 jobs:
   cli:

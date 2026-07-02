@@ -18,7 +18,7 @@ REPO="$(pwd)"
 
 host_arch="$(uname -m)"; [ "$host_arch" = "arm64" ] && host_arch="aarch64"
 ARCH="${1:-$host_arch}"
-KERNEL_VERSION="${KERNEL_VERSION:-6.12.91}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.12.94}"  # current 6.12.x LTS (kernel.org prunes older patches)
 
 case "$ARCH" in
   aarch64) PLATFORM="linux/arm64"; MAKETARGET="Image"; KIMG="arch/arm64/boot/Image"; OUTBASE="Image-lean" ;;
