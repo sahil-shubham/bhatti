@@ -207,6 +207,12 @@ jobs:
   rootfs:
     name: Rootfs (${{ matrix.tier }}-${{ matrix.arch }})
     needs: cli
+    # ⚠️ TEMPORARY (remove before v2.0.0): skip the slow rootfs tier builds
+    # (~25–32 min each) on `-rc` pre-release tags so we can iterate on the new
+    # runtime/kernel/packaging plumbing fast. Final (non-rc) tags still build them.
+    # REMOVE THIS `if:` and restore package's hard dependency once the pipeline
+    # is validated. See docs/internal/PLAN-krucible-release.md.
+    if: ${{ !contains(github.ref_name, '-rc') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -246,6 +252,10 @@ jobs:
   package:
     name: Package + release
     needs: [cli, lean-kernel, runtime, rootfs]
+    # Runs even when `rootfs` is skipped on `-rc` tags (TEMP, see the rootfs job):
+    # require only cli/lean-kernel/runtime; the pack script tolerates absent
+    # rootfs artifacts. Restore to a plain `needs`-gated job when the TEMP skip is removed.
+    if: ${{ !cancelled() && needs.cli.result == 'success' && needs.lean-kernel.result == 'success' && needs.runtime.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
