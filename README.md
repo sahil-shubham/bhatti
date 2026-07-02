@@ -31,11 +31,12 @@ bhatti destroy dev
 > [`firecracker`](https://github.com/sahil-shubham/bhatti/tree/firecracker) branch
 > (latest release
 > [**v1.11.12**](https://github.com/sahil-shubham/bhatti/releases/tag/v1.11.12));
-> check out that branch to build it from source. v1 is preserved and installable,
-> but new work happens on v2.
+> check out that branch to build it from source. v1 is **frozen** — preserved and
+> installable, but we're putting our energy into v2 rather than maintaining two
+> engines.
 >
-> Follow along or weigh in on the v2 direction in
-> **[Discussions](https://github.com/sahil-shubham/bhatti/discussions)**.
+> The why (self-owned VMM, macOS, the rethink) and where to weigh in:
+> **[Discussions → bhatti v2](https://github.com/sahil-shubham/bhatti/discussions/22)**.
 
 ## Install
 
