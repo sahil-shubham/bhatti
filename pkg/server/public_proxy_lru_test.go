@@ -178,6 +178,12 @@ func TestPublicRateLimiter_SizeBoundEnforced(t *testing.T) {
 // entry survives; the actual LRU is gone.
 func TestPublicRateLimiter_LRUEvictsLeastRecentlyUsed(t *testing.T) {
 	rl := newPublicRateLimiter()
+	// Isolate the per-IP LRU from the GLOBAL token bucket: its burst is 10_000
+	// (== publicRateLimiterMaxSize), so the capacity fill loop below would drain it
+	// exactly, making the later touch + insert return early at the global gate
+	// (never reaching the LRU bookkeeping) and falsely failing this test. This test
+	// is about per-IP LRU eviction, not global limiting, so remove the global gate.
+	rl.global = newTokenBucket(1e12, 1e12)
 
 	// Fill per-IP map to capacity with distinct IPs.
 	for i := 0; i < publicRateLimiterMaxSize; i++ {
