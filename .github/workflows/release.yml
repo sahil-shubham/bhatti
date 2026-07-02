@@ -26,9 +26,10 @@ permissions:
   contents: write
 
 env:
-  # kernel.org keeps only the latest patch of each longterm series on the CDN, so
-  # this must track the current 6.12.x LTS (older patches 404). Bump when it moves.
-  LEAN_KERNEL_VERSION: "6.12.94"
+  # LTS series for the lean guest kernel; build-lean-kernel.sh resolves the exact
+  # patch at build time (kernel.org's CDN keeps only the current patch of a series,
+  # so a hardcoded patch 404s once superseded).
+  LEAN_KERNEL_SERIES: "6.12"
 
 jobs:
   cli:
@@ -74,7 +75,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Build lean kernel (Docker)
-        run: KERNEL_VERSION="${LEAN_KERNEL_VERSION}" scripts/build-lean-kernel.sh ${{ matrix.arch }}
+        run: KERNEL_SERIES="${LEAN_KERNEL_SERIES}" scripts/build-lean-kernel.sh ${{ matrix.arch }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

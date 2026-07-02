@@ -18,7 +18,18 @@ REPO="$(pwd)"
 
 host_arch="$(uname -m)"; [ "$host_arch" = "arm64" ] && host_arch="aarch64"
 ARCH="${1:-$host_arch}"
-KERNEL_VERSION="${KERNEL_VERSION:-6.12.94}"  # current 6.12.x LTS (kernel.org prunes older patches)
+
+# Resolve the exact kernel patch at build time. kernel.org's CDN keeps only the
+# CURRENT patch of each stable series (older ones 404), so a hardcoded patch rots.
+# Pin the LTS SERIES and look up its current patch from releases.json; an explicit
+# KERNEL_VERSION still overrides (local reproducibility).
+KERNEL_SERIES="${KERNEL_SERIES:-6.12}"
+if [ -z "${KERNEL_VERSION:-}" ]; then
+  KERNEL_VERSION="$(curl -fsSL https://www.kernel.org/releases.json \
+    | grep -oE "linux-${KERNEL_SERIES//./\\.}\.[0-9]+\.tar\.xz" | head -1 \
+    | sed -E 's/^linux-//; s/\.tar\.xz$//')"
+  [ -n "$KERNEL_VERSION" ] || { echo "ERROR: could not resolve latest ${KERNEL_SERIES}.x from kernel.org releases.json" >&2; exit 1; }
+fi
 
 case "$ARCH" in
   aarch64) PLATFORM="linux/arm64"; MAKETARGET="Image"; KIMG="arch/arm64/boot/Image"; OUTBASE="Image-lean" ;;
