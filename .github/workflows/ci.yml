@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, krucible]
+    branches: [main]
   pull_request:
-    branches: [main, krucible]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -56,7 +56,7 @@ jobs:
     # helper (bhatti-vmm) + the krucible-tagged Go, then run the pure-unit tests.
     # This is a build/link + unit gate only — the VM suites need a hypervisor and
     # self-skip here (no /dev/kvm on GitHub-hosted runners); they run on the
-    # self-hosted KVM cluster in integration.yml. No libkrunfw is needed: libkrun
+    # self-hosted KVM cluster in krucible-integration.yml. No libkrunfw is needed: libkrun
     # dlopen's it lazily and the external/lean-kernel path skips it entirely.
     name: Krucible Build & Unit
     runs-on: ubuntu-latest

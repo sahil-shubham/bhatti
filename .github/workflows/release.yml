@@ -1,19 +1,36 @@
 name: Release
 
+# krucible (v2) release pipeline. Replaces the Firecracker-era pipeline (which
+# lives on the `firecracker` branch): instead of a static Linux-only binary set,
+# it ships a relocatable, signed native runtime closure per host platform —
+# {bhatti CLI, bhatti-vmm (cgo), libkrun (our fork), lean guest kernel} — across
+# linux/amd64, linux/arm64, darwin/arm64, plus separately-versioned guest rootfs
+# tiers. See docs/internal/PLAN-krucible-release.md.
+#
+# Triggers: a `v*` tag runs the whole thing and publishes a GitHub release; a
+# manual dispatch is a DRY-RUN (builds + packages + uploads artifacts, never
+# publishes) so we validate artifacts on real runners before cutting v2.0.0.
+#
+# Proven building blocks: macOS sign+notarize is validated in
+# macos-vmm-signing.yml (notarization Accepted); the rpath/​install_name_tool
+# rewrite is the 0b recipe. What a dispatch dry-run still needs to shake out is
+# the cross-job packaging + the Linux relocatability on a clean box.
+
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  KERNEL_VERSION: "6.1.155"
+  LEAN_KERNEL_VERSION: "6.12.91"
 
 jobs:
-  binaries:
-    name: Build Binaries
+  cli:
+    name: CLI + lohar (cross-compile)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -25,26 +42,28 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build bhatti (all platforms)
+      - name: Build bhatti CLI (all platforms, pure Go)
         run: make release
 
-      - name: Build lohar (linux amd64 + arm64)
+      - name: Build lohar (guest agent, linux amd64 + arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-amd64 ./cmd/lohar/
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-arm64 ./cmd/lohar/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: binaries
+          name: cli
           path: dist/*
 
-  kernel:
-    name: Build Kernel (${{ matrix.arch }})
+  lean-kernel:
+    name: Lean kernel (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
+          # Native docker per arch — build-lean-kernel.sh runs in a container and
+          # its cross-arch path is emulated (slow), so match runner arch to target.
           - arch: x86_64
             runner: ubuntu-latest
           - arch: aarch64
@@ -52,60 +71,143 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install build deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc
-
-      - name: Cache kernel source
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: linux-${{ env.KERNEL_VERSION }}
-          key: kernel-src-${{ env.KERNEL_VERSION }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh') }}
-
-      - name: Build kernel
-        run: ./scripts/build-kernel.sh ${{ matrix.arch }}
+      - name: Build lean kernel (Docker)
+        run: KERNEL_VERSION="${LEAN_KERNEL_VERSION}" scripts/build-lean-kernel.sh ${{ matrix.arch }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: kernel-${{ matrix.arch }}
-          path: dist/vmlinux-*
+          name: lean-kernel-${{ matrix.arch }}
+          path: dist/kernel/*
 
-  lohar:
-    name: Build Lohar (${{ matrix.arch }})
+  runtime:
+    name: libkrun + bhatti-vmm (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
+          # ubuntu-22.04 sets the glibc floor (2.35) for the Linux runtime closure (0d).
+          - target: linux-amd64
+            runner: ubuntu-22.04
+            os: linux
+          - target: linux-arm64
             runner: ubuntu-24.04-arm
+            os: linux
+          - target: darwin-arm64
+            runner: macos-14
+            os: darwin
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Fetch libkrucible submodule (https)
+        run: |
+          git config submodule.libkrucible.url https://github.com/sahil-shubham/libkrucible.git
+          git submodule update --init --recursive libkrucible
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Build lohar
-        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+      - name: Linux build deps (patchelf for rpath, pkg-config for cgo)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config patchelf
+
+      - name: Ensure Rust toolchain
+        run: rustc --version >/dev/null 2>&1 || rustup default stable
+
+      - name: Build libkrun (krucible fork) + bhatti-vmm
+        run: |
+          make krucible
+          make vmm
+
+      - name: Make the closure relocatable (0b)
+        # Rewrite the runtime lib references to a relative rpath so the shipped
+        # prefix resolves libkrun via bin/../lib with no LD_LIBRARY_PATH/DYLD_*.
+        # MUST run before codesign on macOS (install_name_tool invalidates the
+        # signature). Stage the closure into stage/{bin,lib}.
+        run: |
+          set -euo pipefail
+          mkdir -p stage/bin stage/lib
+          cp bhatti-vmm stage/bin/bhatti-vmm
+          if [ "${{ matrix.os }}" = "darwin" ]; then
+            cp -R libkrucible/_install/lib/libkrun*.dylib stage/lib/
+            DYLIB=$(find stage/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
+            install_name_tool -id @rpath/libkrun.1.dylib "$DYLIB"
+            install_name_tool -change libkrun.1.dylib @rpath/libkrun.1.dylib stage/bin/bhatti-vmm
+            install_name_tool -add_rpath @loader_path/../lib stage/bin/bhatti-vmm
+            echo "=== otool -L (expect @rpath/libkrun.1.dylib) ===" && otool -L stage/bin/bhatti-vmm | grep -i krun
+          else
+            cp -P libkrucible/_install/lib64/libkrun.so* stage/lib/ 2>/dev/null || cp -P libkrucible/_install/lib/libkrun.so* stage/lib/
+            patchelf --set-rpath '$ORIGIN/../lib' stage/bin/bhatti-vmm
+            echo "=== rpath (expect \$ORIGIN/../lib) ===" && patchelf --print-rpath stage/bin/bhatti-vmm
+          fi
+
+      # --- macOS Developer ID signing + notarization (proven in macos-vmm-signing.yml) ---
+      - name: Import Developer ID cert into a temp keychain
+        if: matrix.os == 'darwin'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVID_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/bhatti-signing.keychain-db"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN" || true
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Developer-ID sign (hardened runtime + hypervisor entitlement)
+        if: matrix.os == 'darwin'
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/bhatti-signing.keychain-db"
+          DYLIB=$(find stage/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+            --sign "$IDENTITY" "$DYLIB"
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+            --entitlements cmd/vmm/hvf-entitlements.plist \
+            --sign "$IDENTITY" stage/bin/bhatti-vmm
+          codesign -dv --verbose=4 stage/bin/bhatti-vmm 2>&1 | grep -iE 'Authority|TeamIdentifier|flags|Timestamp='
+          codesign --verify --strict stage/bin/bhatti-vmm
+
+      - name: Notarize (notarytool)
+        if: matrix.os == 'darwin'
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          echo "$NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --sequesterRsrc --keepParent stage "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" --wait --timeout 15m
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Clean up keychain
+        if: always() && matrix.os == 'darwin'
+        run: security delete-keychain "$RUNNER_TEMP/bhatti-signing.keychain-db" || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: lohar-${{ matrix.arch }}
-          path: lohar
+          name: runtime-${{ matrix.target }}
+          path: stage/**
 
   rootfs:
-    name: Build Rootfs (${{ matrix.tier }}-${{ matrix.arch }})
-    needs: lohar
+    name: Rootfs (${{ matrix.tier }}-${{ matrix.arch }})
+    needs: cli
     runs-on: ${{ matrix.runner }}
-    # amd64 rootfs builds on the GitHub-free ubuntu-latest runners take
-    # ~25-32 minutes for the heavier tiers (computer, browser) because of
-    # debootstrap + apt-get. arm64 finishes in 4-14 minutes on
-    # ubuntu-24.04-arm. 30m put amd64 right at the timeout edge — the
-    # v1.10.2/v1.10.3/v1.10.4 release runs all timed out on at least one
-    # amd64 tier even though nothing meaningful changed in the build.
-    # 60 minutes gives 2x headroom without affecting fast jobs.
     timeout-minutes: 60
     strategy:
       matrix:
@@ -121,10 +223,11 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: lohar-${{ matrix.arch }}
+          name: cli
 
       - name: Build rootfs
         run: |
+          mv lohar-linux-${{ matrix.arch }} lohar
           chmod +x lohar
           sudo apt-get update -qq
           sudo apt-get install -y -qq debootstrap
@@ -140,35 +243,57 @@ jobs:
           name: rootfs-${{ matrix.tier }}-${{ matrix.arch }}
           path: dist/rootfs-*.ext4.zst
 
-  release:
-    name: Create Release
-    needs: [binaries, kernel, rootfs]
+  package:
+    name: Package + release
+    needs: [cli, lean-kernel, runtime, rootfs]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
-      - name: Collect artifacts and generate checksums
+      - name: Assemble per-platform tarballs + checksums
         run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          VER="${GITHUB_REF_NAME}"
+          case "$VER" in v*) : ;; *) VER="dev-$(date +%Y%m%d)-${GITHUB_SHA::7}" ;; esac
           mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
+          # target -> (cli os/arch, guest-kernel arch)
+          pack() {  # $1=target  $2=cli-os  $3=cli-arch  $4=kernel-arch
+            local target="$1" os="$2" arch="$3" karch="$4"
+            local dir="bhatti-${VER}-${target}"
+            mkdir -p "$dir/bin" "$dir/lib" "$dir/kernel"
+            cp "artifacts/cli/bhatti-${os}-${arch}" "$dir/bin/bhatti"
+            cp -R artifacts/runtime-${target}/bin/* "$dir/bin/"
+            cp -R artifacts/runtime-${target}/lib/* "$dir/lib/"
+            cp artifacts/lean-kernel-${karch}/* "$dir/kernel/"
+            chmod +x "$dir/bin/"*
+            tar --zstd -cf "release/${dir}.tar.zst" "$dir"
+            rm -rf "$dir"
+          }
+          pack linux-amd64  linux  amd64 x86_64
+          pack linux-arm64  linux  arm64 aarch64
+          pack darwin-arm64 darwin arm64 aarch64
+          # Guest rootfs tiers ship separately (guest-arch, large, cache well).
+          find artifacts -name 'rootfs-*.ext4.zst' -exec cp {} release/ \;
           cd release
           sha256sum * > checksums-sha256.txt
-          echo "=== Release artifacts ==="
-          ls -lh
-          echo ""
-          echo "=== SHA256 checksums ==="
-          cat checksums-sha256.txt
+          echo "=== release artifacts ===" && ls -lh
 
-      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: release/*
+
+      # Publish only on a real tag; a workflow_dispatch dry-run stops at the
+      # uploaded artifact above (validate before cutting v2.0.0).
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           files: release/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-rc') }}
-          # Immutable releases lock assets after publication. Standard
-          # releases upload before publishing (fine). But prereleases
-          # publish immediately, so assets can't be uploaded after.
-          # Draft only for pre-releases — publish manually from GitHub UI.
           draft: ${{ contains(github.ref_name, '-rc') }}
