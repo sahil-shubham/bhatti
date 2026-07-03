@@ -16,7 +16,7 @@ import (
 
 // Config holds all bhatti configuration.
 type Config struct {
-	Engine    string `yaml:"engine"`     // "firecracker" (default)
+	Engine    string `yaml:"engine"`     // "krucible" (default; v2). Firecracker is v1 (firecracker branch).
 	Listen    string `yaml:"listen"`     // e.g. ":8080"
 	APIURL    string `yaml:"api_url"`    // CLI: remote API endpoint (e.g. https://api.bhatti.sh)
 	AuthToken string `yaml:"auth_token"` // CLI: API key for remote requests
@@ -32,11 +32,6 @@ type Config struct {
 	// Domain mode (Phase 2: host-based routing + TLS)
 	Domain *DomainConfig `yaml:"domain,omitempty"`
 
-	// Firecracker-specific
-	FirecrackerBin    string `yaml:"firecracker_bin"`    // path to firecracker binary
-	FirecrackerKernel string `yaml:"firecracker_kernel"` // path to vmlinux
-	FirecrackerRootfs string `yaml:"firecracker_rootfs"` // path to base rootfs.ext4
-
 	// Krucible-specific (libkrun engine; macOS + Linux)
 	KrucibleVMM       string `yaml:"krucible_vmm"`        // path to the bhatti-vmm helper (default: next to binary / PATH)
 	KrucibleRootfs    string `yaml:"krucible_rootfs"`     // base rootfs dir (virtiofs root) with /init.krun=lohar
@@ -45,18 +40,6 @@ type Config struct {
 	KrucibleLibDir    string `yaml:"krucible_libdir"`     // dir with libkrun/libkrunfw (default: autodetect)
 	KrucibleKernelImage string `yaml:"krucible_kernel_image"` // lean external kernel (block-root only; ~2x faster cold-start). Empty = autodetect dist/kernel/*-lean-*, else libkrunfw bundle
 	KrucibleSocketDir string `yaml:"krucible_socket_dir"` // short dir for vsock UDS (default: /tmp/bhatti-kr)
-
-	// Jailer (empty = bare mode, no isolation)
-	FirecrackerJailer string `yaml:"firecracker_jailer,omitempty"` // path to jailer binary
-	JailUID           int    `yaml:"jail_uid,omitempty"`           // uid for jailed FC (e.g. 10000)
-	JailGID           int    `yaml:"jail_gid,omitempty"`           // gid for jailed FC (e.g. 10000)
-
-	// DNSUpstreams is the ordered list of upstream resolvers each
-	// per-user in-cluster DNS responder forwards non-sandbox queries
-	// to (G1.1). Empty → engine default (1.1.1.1, 8.8.8.8). Set this
-	// for a homelab that runs its own resolver (e.g. Pi-hole) so
-	// sandboxes inherit the host's view of the world.
-	DNSUpstreams []string `yaml:"dns_upstreams,omitempty"`
 
 	// Backup to S3-compatible storage
 	Backup *BackupConfig `yaml:"backup,omitempty"`
@@ -200,7 +183,7 @@ func InvokingUID() int {
 func LoadConfig() (*Config, error) {
 	dir := DefaultDataDir()
 	cfg := &Config{
-		Engine:  "firecracker",
+		Engine:  "krucible",
 		Listen:  ":8080",
 		DataDir: dir,
 	}

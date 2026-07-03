@@ -99,10 +99,11 @@ func runDaemon() {
 	// Create engine
 	var eng engine.Engine
 	switch cfg.Engine {
-	case "firecracker", "":
-		eng, err = newFirecrackerEngine(cfg)
-	case "krucible":
+	case "krucible", "":
 		eng, err = newKrucibleEngine(cfg)
+	case "firecracker":
+		slog.Error("the firecracker engine was removed in v2 (krucible). For Firecracker, use the `firecracker` branch / a v1.x release; otherwise set engine: krucible")
+		os.Exit(1)
 	default:
 		slog.Error("unknown engine", "engine", cfg.Engine)
 		os.Exit(1)
@@ -112,48 +113,10 @@ func runDaemon() {
 		os.Exit(1)
 	}
 
-	// Pre-upgrade check: refuse to start if jailer is configured but
-	// bare-mode sandboxes exist (their snapshots have absolute paths
-	// that don't work inside a chroot). Skip sandboxes that already
-	// have a jail dir — those were created with the jailer and are safe
-	// to recover.
-	if cfg.FirecrackerJailer != "" {
-		if sandboxes, err := st.ListAllSandboxes(); err == nil {
-			for _, sb := range sandboxes {
-				if sb.Status == "destroyed" {
-					continue
-				}
-				if sb.Status == "running" || sb.Status == "stopped" {
-					// Check if this sandbox was jailed — its engine_id is
-					// the FC process ID and jail dirs live under jails/firecracker/<id>.
-					// Sandboxes dir also uses engine_id as the dir name.
-					jailDir := filepath.Join(cfg.DataDir, "jails", "firecracker", sb.EngineID)
-					if _, err := os.Stat(jailDir); err == nil {
-						continue // was jailed, safe to recover
-					}
-					slog.Error("jailer is configured but bare-mode sandboxes exist",
-						"sandbox", sb.Name, "id", sb.ID, "status", sb.Status)
-					fmt.Fprintf(os.Stderr, "\nERROR: jailer is configured but bare-mode sandboxes exist.\n"+
-						"Destroy all sandboxes and snapshots before enabling the jailer:\n\n"+
-						"  bhatti list --json | jq -r '.[].id' | xargs -I{} bhatti destroy {} --yes\n"+
-						"  bhatti snapshot list --json | jq -r '.[].name' | xargs -I{} bhatti snapshot delete {} --yes\n\n"+
-						"Then restart bhatti. Volumes and images are safe.\n")
-					os.Exit(1)
-				}
-			}
-		}
-	}
-
-	// Recover Firecracker VMs from store if applicable
-	if provider, ok := eng.(engine.VMStateProvider); ok {
-		recoverVMs(st, provider)
-	}
-
-	// Clean up orphaned TAP devices AFTER recovery so that restored VMs'
-	// TAPs are preserved. Before this point, all TAPs look like orphans.
-	if cleaner, ok := eng.(interface{ CleanupOrphanedTaps() }); ok {
-		cleaner.CleanupOrphanedTaps()
-	}
+	// krucible recovers its own VMs internally (New() rehydrates from each
+	// sandbox's state.json); it does not implement VMStateProvider, and there are
+	// no host TAP devices to reclaim (TSI networking). The FC store-based recovery
+	// + TAP cleanup were removed with the engine (Phase 3).
 
 	// v0.3: Detach volumes orphaned by crashed sandboxes.
 	// MUST run after recoverVMs (which marks dead-process sandboxes as stopped/unknown).

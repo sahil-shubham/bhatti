@@ -15,8 +15,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Engine != "firecracker" {
-		t.Fatalf("expected firecracker, got %s", cfg.Engine)
+	if cfg.Engine != "krucible" {
+		t.Fatalf("expected krucible, got %s", cfg.Engine)
 	}
 	if cfg.Listen != ":8080" {
 		t.Fatalf("expected :8080, got %s", cfg.Listen)
@@ -24,12 +24,12 @@ func TestLoadConfigDefaults(t *testing.T) {
 }
 
 func TestConfigYAMLParsing(t *testing.T) {
-	content := []byte("engine: firecracker\nlisten: :9090\nauth_token: secret123\n")
+	content := []byte("engine: krucible\nlisten: :9090\nauth_token: secret123\n")
 	cfg := &Config{}
 	if err := yaml.Unmarshal(content, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Engine != "firecracker" || cfg.Listen != ":9090" || cfg.AuthToken != "secret123" {
+	if cfg.Engine != "krucible" || cfg.Listen != ":9090" || cfg.AuthToken != "secret123" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
@@ -233,8 +233,8 @@ func TestLoadConfigNoFile(t *testing.T) {
 		// That's OK — this test just verifies no crash on missing config.
 		t.Logf("found config at %s (dev machine has config)", cfg.ConfigPath)
 	}
-	if cfg.Engine != "firecracker" {
-		t.Errorf("engine=%q, want firecracker", cfg.Engine)
+	if cfg.Engine != "krucible" {
+		t.Errorf("engine=%q, want krucible", cfg.Engine)
 	}
 }
 
