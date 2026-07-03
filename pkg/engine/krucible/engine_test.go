@@ -109,6 +109,15 @@ func TestKrucibleSnapshotSuite(t *testing.T) {
 	enginetest.RunSnapshotSuite(t, newBlockRootEngine)
 }
 
+// TestKrucibleReliabilitySuite is the cold-tier HARDENING gate (migration plan
+// P1): N stop→start cycles stay stable (RAM + rootfs survive each), lifecycle
+// transitions are idempotent, and a concurrent Stop/Start/Exec storm converges
+// to a usable VM. The engine-internal failure injections (snapshot-write
+// failure, agent-timeout cleanup) live in reliability_test.go.
+func TestKrucibleReliabilitySuite(t *testing.T) {
+	enginetest.RunReliabilitySuite(t, newBlockRootEngine)
+}
+
 // TestKrucibleBlockRootAgentSuite runs the agent suite on a block-root engine.
 // With KRUCIBLE_LEAN_KERNEL set it doubles as the cross-arch lean-kernel
 // boot+agent gate, independent of the cold tier — so it runs on linux/arm64
@@ -185,7 +194,9 @@ func libDir() string {
 func buildBaseRootfs(t *testing.T, repo string) string {
 	t.Helper()
 	root := t.TempDir()
-	for _, d := range []string{"bin", "proc", "sys", "dev/pts", "tmp", "run", "etc", "root", "usr/local/bin"} {
+	// "workspace" is init's working dir (runInitSession sets cmd.Dir=/workspace);
+	// without it `sh -c` chdir fails and --init never runs.
+	for _, d := range []string{"bin", "proc", "sys", "dev/pts", "tmp", "run", "etc", "root", "workspace", "usr/local/bin"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0755); err != nil {
 			t.Fatal(err)
 		}
@@ -215,7 +226,11 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	if out, err := utilBuild.CombinedOutput(); err != nil {
 		t.Fatalf("build miniutil: %v\n%s", err, out)
 	}
-	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync"} {
+	// sh: init runs `sh -c <script>`; our multi-call util handles the -c form by
+	// splitting on whitespace and dispatching in-process (no real shell needed).
+	// writeuid: writes the caller's uid to a file — lets a test observe that
+	// --init (and exec) ran as uid 1000 without a full userland.
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -251,28 +266,47 @@ import (
 )
 
 func main() {
-	switch filepath.Base(os.Args[0]) {
+	name := filepath.Base(os.Args[0])
+	args := os.Args[1:]
+	// sh -c "<cmd>": init runs 'sh -c <script>'. No real shell in this rootfs, so
+	// split the script on whitespace and dispatch back into the multi-call switch.
+	if name == "sh" && len(args) >= 2 && args[0] == "-c" {
+		fields := strings.Fields(args[1])
+		if len(fields) == 0 {
+			return
+		}
+		name, args = fields[0], fields[1:]
+	}
+	dispatch(name, args)
+}
+
+func dispatch(name string, args []string) {
+	switch name {
 	case "sync": // flush the guest page cache to the block device
 		syscall.Sync()
 	case "echo":
-		fmt.Println(strings.Join(os.Args[1:], " "))
+		fmt.Println(strings.Join(args, " "))
 	case "errcho":
-		fmt.Fprintln(os.Stderr, strings.Join(os.Args[1:], " "))
+		fmt.Fprintln(os.Stderr, strings.Join(args, " "))
 	case "false":
 		os.Exit(1)
 	case "sleep":
-		if len(os.Args) > 1 {
-			n, _ := strconv.Atoi(os.Args[1])
+		if len(args) > 0 {
+			n, _ := strconv.Atoi(args[0])
 			time.Sleep(time.Duration(n) * time.Second)
 		}
 	case "printenv": // printenv KEY -> value of os.Getenv(KEY)
-		if len(os.Args) > 1 {
-			fmt.Println(os.Getenv(os.Args[1]))
+		if len(args) > 0 {
+			fmt.Println(os.Getenv(args[0]))
 		}
 	case "cat": // cat FILE -> contents (os.ReadFile handles 0-size procfs files)
-		if len(os.Args) > 1 {
-			b, _ := os.ReadFile(os.Args[1])
+		if len(args) > 0 {
+			b, _ := os.ReadFile(args[0])
 			os.Stdout.Write(b)
+		}
+	case "writeuid": // writeuid PATH -> write the caller's uid to PATH (observe --init/exec uid)
+		if len(args) > 0 {
+			os.WriteFile(args[0], []byte(strconv.Itoa(os.Getuid())), 0644)
 		}
 	default: // true
 	}
@@ -320,6 +354,19 @@ func main() {
 		}
 		r.Body.Close()
 		fmt.Println("OK http", r.Status)
+	case "dial": // dial ADDR -> exit 0 if a TCP connect succeeds within 3s, else 1.
+		// Used to assert isolation: the guest must NOT reach a host-only service.
+		if len(os.Args) < 3 {
+			fmt.Println("usage: netcheck dial ADDR")
+			os.Exit(2)
+		}
+		c, err := net.DialTimeout("tcp", os.Args[2], 3*time.Second)
+		if err != nil {
+			fmt.Println("ERR", err)
+			os.Exit(1)
+		}
+		c.Close()
+		fmt.Println("OK dial", os.Args[2])
 	case "serve":
 		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			io.WriteString(w, "hello-from-guest\n")
