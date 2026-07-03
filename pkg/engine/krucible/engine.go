@@ -644,7 +644,11 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mou
 		Files:     files,
 		Mounts:    mounts,
 		Volumes:   volumes,
-		User:      "lohar",
+		// Init is the once-after-boot command (create --init); lohar runs it as a
+		// TTY session named "init", as the sandbox user. Was silently dropped here
+		// (never copied onto SandboxConfig), so --init was a no-op on krucible.
+		Init: spec.Init,
+		User: "lohar",
 	})
 }
 
