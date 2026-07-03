@@ -1,4 +1,4 @@
 [submodule "libkrucible"]
 	path = libkrucible
 	url = git@github.com:sahil-shubham/libkrucible.git
-	branch = krucible
+	branch = main
