@@ -103,6 +103,31 @@ func TestSubstituteNoAliasUnchanged(t *testing.T) {
 	}
 }
 
+func TestAliasRemoveRevokes(t *testing.T) {
+	tbl := NewAliasTable()
+	alias, _ := MintAlias("sk-")
+	tbl.Add(alias, bindingFor(t, "K", "real", "api.example.com"))
+
+	req := []byte("Authorization: Bearer " + alias)
+	if r, _ := tbl.Substitute("api.example.com", req); len(r.Used) != 1 {
+		t.Fatal("precondition: alias should substitute before removal")
+	}
+
+	// Revoke (the destroy-a-sandbox / rotate path): the alias no longer resolves,
+	// so it's treated as an unknown token — left verbatim, never substituted.
+	tbl.Remove(alias)
+	r, err := tbl.Substitute("api.example.com", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Used) != 0 || len(r.Exfil) != 0 {
+		t.Errorf("after Remove: used=%v exfil=%v, want none", r.Used, r.Exfil)
+	}
+	if string(r.Body) != string(req) {
+		t.Error("after Remove the alias must be left untouched (unknown token)")
+	}
+}
+
 func TestSubstituteMultipleAliases(t *testing.T) {
 	tbl := NewAliasTable()
 	a1, _ := MintAlias("sk-")

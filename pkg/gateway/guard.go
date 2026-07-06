@@ -213,6 +213,21 @@ type Dialer struct {
 	Resolver Resolver                                        // nil → net.DefaultResolver
 	Net      *net.Dialer                                     // nil → &net.Dialer{}
 	OnDeny   func(host string, ip netip.Addr, reason string) // optional audit hook
+
+	// dialAddr connects to an already-vetted ip:port; a test seam (nil → Net).
+	// Unexported so the vetting can never be bypassed by a caller.
+	dialAddr func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+func (d *Dialer) dialOne(ctx context.Context, network, addr string) (net.Conn, error) {
+	if d.dialAddr != nil {
+		return d.dialAddr(ctx, network, addr)
+	}
+	nd := d.Net
+	if nd == nil {
+		nd = &net.Dialer{}
+	}
+	return nd.DialContext(ctx, network, addr)
 }
 
 func (d *Dialer) resolver() Resolver {
@@ -257,13 +272,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		return nil, &DeniedError{Host: addrForErr(host, addr), Reason: lastReason}
 	}
 
-	nd := d.Net
-	if nd == nil {
-		nd = &net.Dialer{}
-	}
 	var dialErr error
 	for _, ip := range vetted { // try vetted addrs in order → failover preserved
-		conn, err := nd.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		conn, err := d.dialOne(ctx, network, net.JoinHostPort(ip.String(), port))
 		if err == nil {
 			return conn, nil
 		}

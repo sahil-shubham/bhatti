@@ -205,6 +205,18 @@ func TestDialerVetsResolvedIP(t *testing.T) {
 	}
 }
 
+func TestDialerErrors(t *testing.T) {
+	d := &Dialer{Policy: &EgressPolicy{Default: PosturePublic}, Resolver: fakeResolver{}}
+	// Malformed address.
+	if _, err := d.DialContext(context.Background(), "tcp", "no-port"); err == nil {
+		t.Error("bad address should error")
+	}
+	// Host resolves to nothing → denied (no vetted addresses).
+	if _, err := d.DialContext(context.Background(), "tcp", "unknown.host:443"); err == nil {
+		t.Error("host with no addresses should be denied/errored")
+	}
+}
+
 func asDenied(err error, target **DeniedError) bool {
 	for err != nil {
 		if de, ok := err.(*DeniedError); ok {
