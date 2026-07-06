@@ -27,6 +27,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
@@ -235,8 +236,38 @@ func run(spec krucible.VMSpec) {
 	if r := C.krun_add_virtio_console_default(cid, C.int(0), C.int(1), C.int(2)); r != 0 {
 		fail("krun_add_virtio_console_default: %d", int(r))
 	}
-	if r := C.krun_add_vsock(cid, C.uint32_t(1)); r != 0 { // 1 == KRUN_TSI_HIJACK_INET
+	// TSI inet hijack only when there's no virtio-net backend. With a net device
+	// (spec.NetUDS) the guest's inet goes over eth0 via the gateway, so we add a
+	// PLAIN vsock (features=0) for the agent port bridges only — no TSI.
+	tsiFeatures := C.uint32_t(1) // KRUN_TSI_HIJACK_INET
+	if spec.NetUDS != "" {
+		tsiFeatures = 0
+	}
+	if r := C.krun_add_vsock(cid, tsiFeatures); r != 0 {
 		fail("krun_add_vsock: %d", int(r))
+	}
+
+	// virtio-net wired to the per-owner gateway (bhatti-netd) over a unixstream
+	// socket. Adding this disables the implicit TSI backend (see libkrun.h). The
+	// guest gets eth0; lohar configures its IP/gw/dns from the config drive.
+	if spec.NetUDS != "" {
+		mac, merr := net.ParseMAC(spec.NetMAC)
+		if merr != nil || len(mac) != 6 {
+			fail("bad net_mac %q: %v", spec.NetMAC, merr)
+		}
+		var cmac [6]C.uint8_t
+		for i := 0; i < 6; i++ {
+			cmac[i] = C.uint8_t(mac[i])
+		}
+		cnet := C.CString(spec.NetUDS)
+		features := C.uint32_t(C.NET_FEATURE_CSUM | C.NET_FEATURE_GUEST_CSUM |
+			C.NET_FEATURE_GUEST_TSO4 | C.NET_FEATURE_GUEST_UFO |
+			C.NET_FEATURE_HOST_TSO4 | C.NET_FEATURE_HOST_UFO)
+		r := C.krun_add_net_unixstream(cid, cnet, C.int(-1), &cmac[0], features, C.uint32_t(0))
+		C.free(unsafe.Pointer(cnet))
+		if r != 0 {
+			fail("krun_add_net_unixstream: %d", int(r))
+		}
 	}
 
 	// Bridge host<->guest vsock ports. listen=true: the host dials the UDS,
