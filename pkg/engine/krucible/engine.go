@@ -50,10 +50,40 @@ type Config struct {
 	// libkrunfw's bundled kernel. Block-root only (the cmdline roots on
 	// /dev/vda). arm64 = raw `Image`, x86 = ELF vmlinux.
 	KernelImage string
+	// NetBackend switches the guest off TSI onto a virtio-net device wired to a
+	// per-sandbox userspace gateway (bhatti-netd). Requires NetdBinary. Egress
+	// policy + host-isolation + (later) secret substitution live in the gateway.
+	NetBackend bool
+	// NetdBinary is the path to the bhatti-netd gateway helper (built from
+	// cmd/bhatti-netd). Required when NetBackend is set.
+	NetdBinary string
 }
 
 // maxUnixPath is the conservative AF_UNIX sun_path cap (macOS = 104).
 const maxUnixPath = 104
+
+// Per-sandbox virtio-net gateway addressing. Each sandbox gets its own netd +
+// vnet, so fixed addresses are fine (per-owner grouping for siblings is a
+// follow-on). gw=.1, guest=.2/24.
+const (
+	netGatewayIP  = "100.64.0.1"
+	netGuestCIDR  = "100.64.0.2/24"
+	netGatewayMAC = "52:54:00:00:00:01"
+	netGuestMAC   = "52:54:00:00:00:02"
+	netPrefixLen  = 24
+)
+
+// waitForSocket blocks until path exists (a listening UDS) or the deadline.
+func waitForSocket(path string, d time.Duration) error {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("socket %s not present after %s", path, d)
+}
 
 // VM is per-sandbox state. The helper process IS the VM; we hold its cmd to
 // stop it and the agent client to drive lohar.
@@ -87,6 +117,7 @@ type VM struct {
 	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
+	netdCmd    *exec.Cmd // bhatti-netd gateway (net backend); nil on the TSI path
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -106,6 +137,14 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if _, err := os.Stat(cfg.VMMBinary); err != nil {
 		return nil, fmt.Errorf("krucible: vmm helper not found at %s (run `make vmm`): %w", cfg.VMMBinary, err)
+	}
+	if cfg.NetBackend {
+		if cfg.NetdBinary == "" {
+			return nil, fmt.Errorf("krucible: NetBackend set but NetdBinary is empty")
+		}
+		if _, err := os.Stat(cfg.NetdBinary); err != nil {
+			return nil, fmt.Errorf("krucible: bhatti-netd not found at %s: %w", cfg.NetdBinary, err)
+		}
 	}
 	// Need a rootfs source: a prebuilt block image (production) or a dir tree.
 	if cfg.BaseImage != "" {
@@ -225,11 +264,15 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	controlUDS := filepath.Join(sockDir, "c.sock")
 	forwardUDS := filepath.Join(sockDir, "f.sock")
 	ctlSockUDS := filepath.Join(sockDir, "k.sock")
+	netUDS := ""
+	if e.cfg.NetBackend {
+		netUDS = filepath.Join(sockDir, "n.sock")
+	}
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
 		return info, fmt.Errorf("create socket dir: %w", err)
 	}
-	for _, p := range []string{controlUDS, forwardUDS, ctlSockUDS} {
-		if len(p) >= maxUnixPath {
+	for _, p := range []string{controlUDS, forwardUDS, ctlSockUDS, netUDS} {
+		if p != "" && len(p) >= maxUnixPath {
 			return info, fmt.Errorf("vsock path too long (%d >= %d): %s — set a shorter SocketDir", len(p), maxUnixPath, p)
 		}
 	}
@@ -243,6 +286,14 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		VsockForwardUDS:  forwardUDS,
 		ControlSocketUDS: ctlSockUDS,
 		LogLevel:         2,
+	}
+	// virtio-net gateway backend (opt-in): the guest gets eth0 wired to a
+	// per-sandbox bhatti-netd; lohar configures it from cdNet.
+	var cdNet *configdrive.NetConfig
+	if netUDS != "" {
+		baseSpec.NetUDS = netUDS
+		baseSpec.NetMAC = netGuestMAC
+		cdNet = &configdrive.NetConfig{IP: netGuestCIDR, Gateway: netGatewayIP}
 	}
 
 	name := spec.Name
@@ -343,7 +394,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			if err = cloneFile(opts.configDrive, confPath); err != nil {
 				return info, fmt.Errorf("copy snapshot config drive: %w", err)
 			}
-		} else if err = buildConfigDrive(confPath, id, name, token, spec, cdMounts, cdVolumes); err != nil {
+		} else if err = buildConfigDrive(confPath, id, name, token, spec, cdMounts, cdVolumes, cdNet); err != nil {
 			return info, fmt.Errorf("build config drive: %w", err)
 		}
 		baseSpec.ConfigDrive = confPath
@@ -400,6 +451,27 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	}
 	defer logFile.Close()
 
+	// virtio-net gateway: spawn bhatti-netd LISTENING on the net UDS before the
+	// VMM (which connects to it). Detached pgroup like the helper.
+	var netd *exec.Cmd
+	if spec.NetUDS != "" {
+		_ = os.Remove(spec.NetUDS)
+		netd = exec.Command(e.cfg.NetdBinary,
+			"--net-uds", spec.NetUDS, "--gw-ip", netGatewayIP,
+			"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC)
+		netd.Stdout = logFile
+		netd.Stderr = logFile
+		netd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := netd.Start(); err != nil {
+			return fmt.Errorf("start bhatti-netd: %w", err)
+		}
+		if werr := waitForSocket(spec.NetUDS, 5*time.Second); werr != nil {
+			_ = netd.Process.Kill()
+			_, _ = netd.Process.Wait()
+			return fmt.Errorf("bhatti-netd not listening: %w", werr)
+		}
+	}
+
 	vmCtx, vmCancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(vmCtx, e.cfg.VMMBinary, specPath)
 	cmd.Stdout = logFile
@@ -422,12 +494,17 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	if werr := ag.WaitReady(ctx, 30*time.Second); werr != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		if netd != nil {
+			_ = netd.Process.Kill()
+			_, _ = netd.Process.Wait()
+		}
 		vmCancel()
 		return fmt.Errorf("agent not ready: %w\nvmm log:\n%s", werr, tailFile(vm.logPath, 4096))
 	}
 
 	vm.mu.Lock()
 	vm.cmd = cmd
+	vm.netdCmd = netd
 	vm.cancel = vmCancel
 	vm.HelperPID = cmd.Process.Pid
 	vm.Agent = ag
@@ -449,6 +526,11 @@ func (vm *VM) kill() {
 	} else if vm.HelperPID > 0 {
 		// Adopted helper (not our child) — signal by pid; init reaps it.
 		_ = syscall.Kill(vm.HelperPID, syscall.SIGKILL)
+	}
+	if vm.netdCmd != nil && vm.netdCmd.Process != nil {
+		_ = vm.netdCmd.Process.Kill()
+		_, _ = vm.netdCmd.Process.Wait()
+		vm.netdCmd = nil
 	}
 	if vm.cancel != nil {
 		vm.cancel()
@@ -628,7 +710,7 @@ func genToken() (string, error) {
 // buildConfigDrive writes the per-sandbox config drive (hostname, token, env,
 // files) that lohar reads at /dev/vdb. Secrets are expected to be pre-resolved
 // into spec.Env by the server layer (same contract as the FC engine).
-func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig, volumes []configdrive.VolumeMountConfig) error {
+func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig, volumes []configdrive.VolumeMountConfig, net *configdrive.NetConfig) error {
 	files := make(map[string]configdrive.ConfigFile, len(spec.Files))
 	for p, f := range spec.Files {
 		files[p] = configdrive.ConfigFile{
@@ -644,6 +726,7 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mou
 		Files:     files,
 		Mounts:    mounts,
 		Volumes:   volumes,
+		Net:       net,
 		// Init is the once-after-boot command (create --init); lohar runs it as a
 		// TTY session named "init", as the sandbox user. Was silently dropped here
 		// (never copied onto SandboxConfig), so --init was a no-op on krucible.

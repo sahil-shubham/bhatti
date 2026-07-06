@@ -137,6 +137,15 @@ func runAgent() {
 			hostname = cfg.Hostname
 		}
 		applyHostname(hostname)
+		// virtio-net gateway path: bring eth0 up from the config drive (netlink,
+		// no `ip` binary / IP autoconfig). Before DNS so egress is ready.
+		if cfg.Net != nil && cfg.Net.IP != "" {
+			if err := configureEth0("eth0", cfg.Net.IP, cfg.Net.Gateway); err != nil {
+				fmt.Fprintf(os.Stderr, "lohar: configure eth0: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "lohar: eth0 %s gw %s (netlink)\n", cfg.Net.IP, cfg.Net.Gateway)
+			}
+		}
 		if cfg.DNSInternal != "" || len(cfg.DNS) > 0 {
 			applyDNS(cfg.DNSInternal, cfg.DNS)
 		} else {
@@ -474,8 +483,16 @@ type SandboxConfig struct {
 	// fallbacks. Empty string skips the install — backwards-compatible
 	// with hosts running an older bhatti daemon. G1.1 of
 	// PLAN-bhatti-v2.md.
-	DNSInternal string `json:"dns_internal,omitempty"`
-	User        string `json:"user"`
+	DNSInternal string     `json:"dns_internal,omitempty"`
+	User        string     `json:"user"`
+	Net         *NetConfig `json:"net,omitempty"`
+}
+
+// NetConfig mirrors configdrive.NetConfig: eth0 addressing for the virtio-net
+// gateway path, applied via netlink (see netlink.go).
+type NetConfig struct {
+	IP      string `json:"ip"`
+	Gateway string `json:"gateway"`
 }
 
 func loadConfigDrive() *SandboxConfig {

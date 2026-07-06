@@ -31,6 +31,15 @@ type SandboxConfig struct {
 	DNS         []string              `json:"dns"`
 	DNSInternal string                `json:"dns_internal,omitempty"`
 	User        string                `json:"user"`
+	// Net, if set, tells lohar to configure eth0 (virtio-net gateway path) from
+	// the config drive via netlink — no `ip` binary / kernel IP autoconfig needed.
+	Net *NetConfig `json:"net,omitempty"`
+}
+
+// NetConfig is the guest's eth0 addressing on the per-owner gateway network.
+type NetConfig struct {
+	IP      string `json:"ip"`      // CIDR, e.g. "100.64.0.2/24"
+	Gateway string `json:"gateway"` // e.g. "100.64.0.1"
 }
 
 // ConfigFile is a file to materialize in the guest filesystem at boot.
