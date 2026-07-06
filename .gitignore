@@ -13,3 +13,4 @@ docs/internal/
 /bhatti-vmm-krucible
 /krucible-mkimage
 bench/results-krucible-mac/
+/cmd/bhatti-netd/bhatti-netd
