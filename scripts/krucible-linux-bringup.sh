@@ -74,8 +74,8 @@ else
 fi
 
 # --- 3. libkrucible (our libkrun fork) ---
-log "building libkrucible (cargo release, --features blk)"
-( cd "$LIBKRUCIBLE" && CC_LINUX=cc cargo build --release -p libkrun --no-default-features --features blk )
+log "building libkrucible (cargo release, --features blk,net)"
+( cd "$LIBKRUCIBLE" && CC_LINUX=cc cargo build --release -p libkrun --no-default-features --features blk,net )
 KPREFIX="$LIBKRUCIBLE/_install"
 rm -rf "$KPREFIX"; mkdir -p "$KPREFIX/lib/pkgconfig" "$KPREFIX/include"
 ( cd "$LIBKRUCIBLE" && make libkrun.pc PREFIX="$KPREFIX" >/dev/null )
