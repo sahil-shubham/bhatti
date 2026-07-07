@@ -74,26 +74,29 @@ func parseConfig(gwIP string, prefix int, macStr string) (gwConfig, error) {
 	}, nil
 }
 
-// serve accepts the VM's connection and runs the gateway on it until ctx is
-// cancelled or the link drops. (Accept-one for now; thermal/fork re-attach is a
-// follow-on.) Closing the listener on ctx.Done unblocks a pending Accept.
+// serve builds the owner's gateway and accepts guest links as the owner's VMs
+// connect (each libkrun virtio-net backend dials this socket). Every accepted
+// connection becomes a switch port; siblings on the same netd reach each other.
+// Closing the listener on ctx.Done unblocks a pending Accept.
 func serve(ctx context.Context, ln net.Listener, cfg gwConfig) error {
+	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac)
+	if err != nil {
+		return err
+	}
 	go func() {
 		<-ctx.Done()
 		ln.Close()
 	}()
+	go gw.Run(ctx) // pump the stack (gateway) port
 
-	conn, err := ln.Accept()
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
 		}
-		return err
+		gw.AddGuest(gateway.NewFrameConn(conn))
 	}
-	gw, err := NewGateway(gateway.NewFrameConn(conn), cfg.ip, cfg.prefix, cfg.mac)
-	if err != nil {
-		conn.Close()
-		return err
-	}
-	return gw.Run(ctx)
 }

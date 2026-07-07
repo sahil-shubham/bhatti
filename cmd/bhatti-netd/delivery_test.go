@@ -61,10 +61,11 @@ func forwardedDest(t *testing.T, dst [4]byte, dport uint16, corrupt bool) string
 	guestSide, netdSide := net.Pipe()
 	t.Cleanup(func() { guestSide.Close(); netdSide.Close() })
 
-	gw, err := NewGateway(gateway.NewFrameConn(netdSide), tcpip.AddrFrom4(testGwIP), 24, testGwMAC)
+	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC)
 	if err != nil {
 		t.Fatalf("NewGateway: %v", err)
 	}
+	gw.AddGuest(gateway.NewFrameConn(netdSide))
 	got := make(chan string, 1)
 	fwd := tcp.NewForwarder(gw.stack, 0, 16, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
