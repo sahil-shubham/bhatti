@@ -4,6 +4,7 @@ package krucible
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
+	"github.com/sahil-shubham/bhatti/pkg/forward"
 )
 
 // newNetEngine builds a block-root engine with the virtio-net gateway backend
@@ -100,6 +102,41 @@ func TestKrucibleNetHostIsolation(t *testing.T) {
 	}
 	if r.ExitCode == 0 {
 		t.Fatalf("isolation breach: guest reached private 10.0.0.1 through the gateway: %q", strings.TrimSpace(r.Stdout))
+	}
+}
+
+// TestKrucibleNetForward is the inbound port-forward (dev-loop) gate on the
+// virtio-net backend: a real guest HTTP server is reached from the host through
+// forward.Serve over the vsock Tunnel. Under netd the guest has its OWN loopback
+// (unlike TSI's shared host stack), so there is no host-port fall-through — the
+// forwarded response can only come from inside the guest.
+func TestKrucibleNetForward(t *testing.T) {
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netfwd", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatalf("Create(net): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	const guestPort = 18080
+	de := eng.(engine.DetachedExecEngine)
+	if _, _, err := de.ExecDetached(ctx, id, []string{"/bin/netcheck", "serve", fmt.Sprintf("%d", guestPort)}, "/tmp/serve.log"); err != nil {
+		t.Fatalf("ExecDetached netcheck serve: %v", err)
+	}
+
+	ln, err := forward.Serve(eng, id, guestPort, "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("forward.Serve: %v", err)
+	}
+	defer ln.Close()
+
+	url := "http://" + ln.Addr().String() + "/"
+	if body := httpGetRetry(t, url, "hello-from-guest", 25*time.Second); !strings.Contains(body, "hello-from-guest") {
+		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
 	}
 }
 
