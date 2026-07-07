@@ -40,6 +40,41 @@ type vmRecord struct {
 	LogPath    string `json:"log_path"`
 	BaseSpec   VMSpec `json:"base_spec"`
 	HelperPID  int    `json:"helper_pid"`
+	NetdKey    string `json:"netd_key,omitempty"`   // owner key of the shared bhatti-netd (net backend)
+	SubnetIdx  int    `json:"subnet_idx,omitempty"` // owner's vnet subnet index
+}
+
+// netdRecord is the durable state of one owner's shared bhatti-netd, so recovery
+// can re-adopt the running gateway (survives daemon restarts, spawned detached)
+// rather than respawn onto a socket it still holds. Lives beside the socket.
+type netdRecord struct {
+	Owner     string `json:"owner"`
+	Sock      string `json:"sock"`
+	Dir       string `json:"dir"`
+	SubnetIdx int    `json:"subnet_idx"`
+	Pid       int    `json:"pid"`
+	NextGuest int    `json:"next_guest"`
+}
+
+func netdStatePath(dir string) string { return filepath.Join(dir, "netd.json") }
+
+// writeNetdRecord persists the instance. Caller must hold inst.mu (it reads
+// nextGuest + pid). Best-effort + atomic (temp + rename).
+func writeNetdRecord(inst *netdInstance) {
+	if inst.dir == "" {
+		return
+	}
+	rec := netdRecord{Owner: inst.owner, Sock: inst.sock, Dir: inst.dir,
+		SubnetIdx: inst.subnetIdx, Pid: inst.pid, NextGuest: inst.nextGuest}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(inst.dir, 0700)
+	tmp := netdStatePath(inst.dir) + ".tmp"
+	if os.WriteFile(tmp, data, 0600) == nil {
+		_ = os.Rename(tmp, netdStatePath(inst.dir))
+	}
 }
 
 func stateFilePath(sandboxDir string) string { return filepath.Join(sandboxDir, "state.json") }
@@ -52,7 +87,7 @@ func (vm *VM) toRecordLocked() vmRecord {
 		ControlUDS: vm.ControlUDS, ForwardUDS: vm.ForwardUDS, CtlSockUDS: vm.CtlSockUDS,
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
 		BundleDir: vm.BundleDir, LogPath: vm.logPath, BaseSpec: vm.baseSpec,
-		HelperPID: vm.HelperPID,
+		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx,
 	}
 }
 
@@ -96,8 +131,37 @@ func vmFromRecord(rec vmRecord) *VM {
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
 		BundleDir: rec.BundleDir, baseSpec: rec.BaseSpec, logPath: rec.LogPath,
-		HelperPID: rec.HelperPID,
+		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx,
 	}
+}
+
+// readoptNetd re-registers a recovered VM with its owner's shared bhatti-netd:
+// it rebuilds the per-owner instance from the persisted netd record, re-adopts
+// the still-running gateway (so ensureNetd reuses it instead of respawning onto a
+// socket it holds), and reference-counts it so Destroy of the owner's last
+// sandbox still tears it down.
+func (e *Engine) readoptNetd(vm *VM) {
+	if vm.netdKey == "" {
+		return
+	}
+	e.netdMu.Lock()
+	defer e.netdMu.Unlock()
+	if inst := e.netds[vm.netdKey]; inst != nil {
+		inst.refs++
+		return
+	}
+	dir := e.netdDir(vm.netdKey)
+	inst := &netdInstance{owner: vm.netdKey, sock: filepath.Join(dir, "n.sock"), dir: dir, subnetIdx: vm.subnetIdx, refs: 1}
+	if data, err := os.ReadFile(netdStatePath(dir)); err == nil {
+		var rec netdRecord
+		if json.Unmarshal(data, &rec) == nil {
+			inst.nextGuest = rec.NextGuest
+			if rec.Pid > 0 && pidAlive(rec.Pid) {
+				inst.pid = rec.Pid // adopt the live gateway
+			}
+		}
+	}
+	e.netds[vm.netdKey] = inst
 }
 
 // pidAlive reports whether a process exists. signal 0 probes without delivering:
@@ -160,7 +224,8 @@ func (e *Engine) recover() {
 		e.mu.Lock()
 		e.vms[rec.ID] = vm
 		e.mu.Unlock()
-		vm.persist() // write back the reconciled status/thermal
+		e.readoptNetd(vm) // re-adopt the owner's shared gateway (net backend)
+		vm.persist()      // write back the reconciled status/thermal
 		slog.Info("krucible recovered sandbox", "id", rec.ID, "name", rec.Name,
 			"alive", alive, "status", vm.Status, "thermal", vm.Thermal)
 	}

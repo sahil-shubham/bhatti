@@ -4,6 +4,7 @@ package krucible
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,17 @@ import (
 // newNetEngine builds a block-root engine with the virtio-net gateway backend
 // (bhatti-netd) instead of TSI. Skips if bhatti-netd isn't built.
 func newNetEngine(t *testing.T) engine.Engine {
+	dataDir := t.TempDir()
+	if d := os.Getenv("KRUCIBLE_NET_DATADIR"); d != "" {
+		dataDir = d // fixed dir so vmm.log survives for debugging
+	}
+	return newNetEngineAt(t, dataDir, t.TempDir())
+}
+
+// newNetEngineAt builds a net-backend engine on explicit dataDir + sockDir, so a
+// recovery test can spin up a SECOND engine over the same state (simulating a
+// daemon restart). Skips if the net backend prerequisites aren't present.
+func newNetEngineAt(t *testing.T, dataDir, sockDir string) engine.Engine {
 	repo := repoRoot(t)
 	if !hasLibkrun() {
 		t.Skip("libkrun not installed; skipping")
@@ -39,12 +51,9 @@ func newNetEngine(t *testing.T) engine.Engine {
 		t.Skip("bhatti-netd not built (go build ./cmd/bhatti-netd); skipping")
 	}
 	ensureVMMSigned(t, vmm)
-	dataDir := t.TempDir()
-	if d := os.Getenv("KRUCIBLE_NET_DATADIR"); d != "" {
-		dataDir = d // fixed dir so vmm.log survives for debugging
-	}
 	eng, err := New(Config{
 		DataDir:     dataDir,
+		SocketDir:   sockDir,
 		BaseRootfs:  buildBaseRootfs(t, repo),
 		VMMBinary:   vmm,
 		LibDir:      libDir(),
@@ -189,6 +198,73 @@ func TestKrucibleNetSiblings(t *testing.T) {
 	}
 	if r.ExitCode == 0 {
 		t.Fatalf("isolation breach: non-sibling C reached B at %s", bAddr)
+	}
+}
+
+// readNetdPid reads the pid from the (single) per-owner netd record under sockDir.
+func readNetdPid(t *testing.T, sockDir string) int {
+	t.Helper()
+	m, _ := filepath.Glob(filepath.Join(sockDir, "netd-*", "netd.json"))
+	if len(m) == 0 {
+		return 0
+	}
+	data, err := os.ReadFile(m[0])
+	if err != nil {
+		return 0
+	}
+	var rec netdRecord
+	if json.Unmarshal(data, &rec) != nil {
+		return 0
+	}
+	return rec.Pid
+}
+
+// TestKrucibleNetRecovery is the daemon-restart gate for the net backend: the
+// per-owner bhatti-netd survives a restart and is RE-ADOPTED (not respawned onto
+// the socket it still holds), so a recovered sandbox keeps its networking; and
+// it's still reference-counted, so destroying the owner's last sandbox tears it
+// down.
+func TestKrucibleNetRecovery(t *testing.T) {
+	dataDir := t.TempDir()
+	sockDir := t.TempDir()
+	eng1 := newNetEngineAt(t, dataDir, sockDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	info, err := eng1.Create(ctx, engine.SandboxSpec{Name: "rec", CPUs: 1, MemoryMB: 512, UserID: "recowner"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	id := info.ID
+
+	pid := readNetdPid(t, sockDir)
+	if pid == 0 || !pidAlive(pid) {
+		t.Fatalf("netd not running after create (pid=%d)", pid)
+	}
+	if r, err := eng1.Exec(ctx, id, []string{"netcheck", "tcp"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("pre-restart egress: err=%v exit=%d", err, r.ExitCode)
+	}
+
+	// Simulate a daemon restart: a fresh engine over the same DataDir + SocketDir.
+	eng2 := newNetEngineAt(t, dataDir, sockDir)
+	t.Cleanup(func() { eng2.Destroy(context.Background(), id) })
+
+	if _, err := eng2.Status(ctx, id); err != nil {
+		t.Fatalf("sandbox not recovered: %v", err)
+	}
+	if p2 := readNetdPid(t, sockDir); p2 != pid || !pidAlive(pid) {
+		t.Fatalf("netd not adopted across restart (pid %d -> %d, alive=%v)", pid, p2, pidAlive(pid))
+	}
+	if r, err := eng2.Exec(ctx, id, []string{"netcheck", "tcp"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("post-restart egress failed — recovered guest lost networking: err=%v exit=%d out=%q", err, r.ExitCode, strings.TrimSpace(r.Stdout))
+	}
+
+	if err := eng2.Destroy(context.Background(), id); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if pidAlive(pid) {
+		t.Fatalf("netd not torn down after the owner's last sandbox was destroyed (pid %d)", pid)
 	}
 }
 

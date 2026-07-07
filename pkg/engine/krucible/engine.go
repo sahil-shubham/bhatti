@@ -79,15 +79,26 @@ func netGuestCIDRFor(subnetIdx, guestIdx int) string {
 }
 func netGuestMACFor(guestIdx int) string { return fmt.Sprintf("52:54:00:00:00:%02x", 2+guestIdx) }
 
-// netdInstance is one owner's shared bhatti-netd gateway process.
+// netdInstance is one owner's shared bhatti-netd gateway process. It is spawned
+// detached (survives a daemon restart) and identified by pid so recovery can
+// re-adopt it instead of respawning onto a socket it still holds.
 type netdInstance struct {
+	owner     string
 	sock      string
 	dir       string
 	subnetIdx int
-	mu        sync.Mutex // guards cmd (spawn-once)
-	cmd       *exec.Cmd
+	mu        sync.Mutex // guards cmd/pid (spawn-once)
+	cmd       *exec.Cmd  // set when WE spawned it (nil when adopted across a restart)
+	pid       int        // the running netd's pid (source of truth for alive/kill)
 	nextGuest int
 	refs      int
+}
+
+// netdDir is the deterministic per-owner directory (so recovery finds the same
+// socket + state file the create path used).
+func (e *Engine) netdDir(ownerKey string) string {
+	h := sha256.Sum256([]byte(ownerKey))
+	return filepath.Join(e.cfg.SocketDir, "netd-"+hex.EncodeToString(h[:6]))
 }
 
 // waitForSocket blocks until path exists (a listening UDS) or the deadline.
@@ -118,17 +129,20 @@ func netdKeyFor(spec engine.SandboxSpec, id string) string {
 // Release with releaseNetd on Destroy.
 func (e *Engine) acquireNetd(ownerKey string, subnetIdx int) (*netdInstance, int) {
 	e.netdMu.Lock()
-	defer e.netdMu.Unlock()
 	inst := e.netds[ownerKey]
 	if inst == nil {
-		h := sha256.Sum256([]byte(ownerKey))
-		dir := filepath.Join(e.cfg.SocketDir, "netd-"+hex.EncodeToString(h[:6]))
-		inst = &netdInstance{sock: filepath.Join(dir, "n.sock"), dir: dir, subnetIdx: subnetIdx}
+		dir := e.netdDir(ownerKey)
+		inst = &netdInstance{owner: ownerKey, sock: filepath.Join(dir, "n.sock"), dir: dir, subnetIdx: subnetIdx}
 		e.netds[ownerKey] = inst
 	}
+	inst.refs++
+	e.netdMu.Unlock()
+
+	inst.mu.Lock()
 	idx := inst.nextGuest
 	inst.nextGuest++
-	inst.refs++
+	writeNetdRecord(inst) // persist address counter so recovery doesn't reissue a taken IP
+	inst.mu.Unlock()
 	return inst, idx
 }
 
@@ -151,10 +165,18 @@ func (e *Engine) releaseNetd(ownerKey string) {
 		return
 	}
 	inst.mu.Lock()
-	if inst.cmd != nil && inst.cmd.Process != nil {
-		_ = inst.cmd.Process.Kill()
-		_, _ = inst.cmd.Process.Wait()
+	if inst.pid > 0 {
+		_ = syscall.Kill(inst.pid, syscall.SIGKILL)
+		if inst.cmd != nil && inst.cmd.Process != nil {
+			_, _ = inst.cmd.Process.Wait() // reap our child
+		} else {
+			// Adopted across a restart: reap if it's still our child (same-process
+			// recovery / tests); a no-op (ECHILD) in production where init re-parented it.
+			var ws syscall.WaitStatus
+			_, _ = syscall.Wait4(inst.pid, &ws, 0, nil)
+		}
 	}
+	inst.pid = 0
 	inst.mu.Unlock()
 	os.RemoveAll(inst.dir)
 }
@@ -170,9 +192,10 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	}
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
-	if inst.cmd != nil && inst.cmd.Process != nil {
+	// Already running (we spawned it, or we adopted it across a daemon restart)?
+	if inst.pid > 0 && pidAlive(inst.pid) {
 		if _, err := os.Stat(inst.sock); err == nil {
-			return nil // already listening
+			return nil
 		}
 	}
 	if err := os.MkdirAll(inst.dir, 0700); err != nil {
@@ -199,6 +222,8 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		return fmt.Errorf("bhatti-netd not listening: %w", werr)
 	}
 	inst.cmd = cmd
+	inst.pid = cmd.Process.Pid
+	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
 	return nil
 }
 
@@ -235,6 +260,7 @@ type VM struct {
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
 	netdKey    string // owner key of the shared bhatti-netd (net backend); "" on TSI
+	subnetIdx  int    // owner's vnet subnet index (net backend); persisted for recovery
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -544,6 +570,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		baseSpec:  baseSpec,
 		logPath:   filepath.Join(sandboxDir, "vmm.log"),
 		netdKey:   netdKey,
+		subnetIdx: spec.SubnetIndex,
 	}
 
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
