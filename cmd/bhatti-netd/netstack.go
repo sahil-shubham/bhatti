@@ -59,6 +59,15 @@ func NewGateway(fc *gateway.FrameConn, gwIP tcpip.Address, prefixLen int, mac tc
 	})
 
 	ch := channel.New(channelQueueLen, mtu, mac)
+	// The guest's virtio-net offloads TX checksums (it writes only a partial /
+	// pseudo-header checksum and sets a flag in the virtio_net_hdr); libkrun
+	// strips that header, so the on-wire checksums reaching us are not final.
+	// We trust frames arriving over the local vsock, so advertise RX checksum
+	// offload — gVisor then marks received packets checksum-validated and skips
+	// its (otherwise failing) IP+TCP checksum verification (nic.go sets
+	// pkt.RXChecksumValidated from this capability on every rx). We do NOT set
+	// TX offload: netd must compute real checksums on frames sent to the guest.
+	ch.LinkEPCapabilities = stack.CapabilityRXChecksumOffload
 	linkEP := ethernet.New(ch)
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
 		return nil, fmt.Errorf("create NIC: %s", err)

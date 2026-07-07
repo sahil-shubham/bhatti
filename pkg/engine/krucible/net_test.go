@@ -3,10 +3,13 @@
 package krucible
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
@@ -55,28 +58,49 @@ func newNetEngine(t *testing.T) engine.Engine {
 }
 
 // TestKrucibleNetEgress is the virtio-net gateway end-to-end gate: a guest boots
-// with eth0 wired to bhatti-netd and egresses to the internet through the netd
-// TCP forwarder.
-//
-// KNOWN GAP (2026-07-06): SKIPs pending a gVisor↔libkrun-virtio-net delivery
-// quirk. netd receives the guest's SYN with the correct dst MAC + IP and
-// promiscuous mode is on, but the gVisor IP layer drops it as
-// InvalidDestinationAddressesReceived (the promiscuous temp-address local
-// delivery isn't happening) — ONLY on the real libkrun VM. It is NOT reproducible
-// in isolation: the byte-identical frame, over net.Pipe AND a real unix socket,
-// on both darwin and linux, is delivered to the forwarder (see cmd/bhatti-netd
-// delivery_test.go). Under investigation (next: gVisor sniffer verdict on the
-// live VM / compare gvproxy's exact stack setup). The agent (vsock) + eth0 boot
-// work (TestKrucibleNetAgentSuite).
+// with eth0 wired to bhatti-netd, and its TCP egress to the public internet flows
+// guest → eth0 → netstack → TCP forwarder → guard dialer → upstream.
 func TestKrucibleNetEgress(t *testing.T) {
-	t.Skip("KNOWN GAP: gVisor foreign-dst local delivery drops on the real libkrun VM (invalidDst); see doc comment")
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netegress", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatalf("Create(net): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	// Public egress works through the gateway (eth0 up + netstack + forwarder).
+	if r, err := eng.Exec(ctx, id, []string{"netcheck", "tcp"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("guest egress via netd failed: err=%v exit=%d out=%q", err, r.ExitCode, strings.TrimSpace(r.Stdout))
+	}
 }
 
-// TestKrucibleNetHostIsolation would assert the gateway's egress guard denies
-// private/host space. SKIPped with egress: until foreign-dst delivery works, a
-// denied dial can't be distinguished from the delivery gap (both fail).
+// TestKrucibleNetHostIsolation asserts the gateway's egress guard: a guest on the
+// virtio-net backend cannot reach private/host space — a dial to an RFC-1918
+// address is refused by the guard in netd's forwarder.
 func TestKrucibleNetHostIsolation(t *testing.T) {
-	t.Skip("KNOWN GAP: blocked on the same foreign-dst delivery gap as TestKrucibleNetEgress")
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netiso", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatalf("Create(net): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	// A private/host destination must be denied by the gateway guard.
+	r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", "10.0.0.1:80"})
+	if err != nil {
+		t.Fatalf("exec netcheck dial: %v", err)
+	}
+	if r.ExitCode == 0 {
+		t.Fatalf("isolation breach: guest reached private 10.0.0.1 through the gateway: %q", strings.TrimSpace(r.Stdout))
+	}
 }
 
 // TestKrucibleNetAgentSuite runs the shared agent suite on the virtio-net backend
