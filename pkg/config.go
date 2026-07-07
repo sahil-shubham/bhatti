@@ -33,13 +33,15 @@ type Config struct {
 	Domain *DomainConfig `yaml:"domain,omitempty"`
 
 	// Krucible-specific (libkrun engine; macOS + Linux)
-	KrucibleVMM       string `yaml:"krucible_vmm"`        // path to the bhatti-vmm helper (default: next to binary / PATH)
-	KrucibleRootfs    string `yaml:"krucible_rootfs"`     // base rootfs dir (virtiofs root) with /init.krun=lohar
-	KrucibleBaseImage string `yaml:"krucible_base_image"` // prebuilt ext4 root image (oci.PullAndConvert output); enables the production block-root path
-	KrucibleBlockRoot bool   `yaml:"krucible_block_root"` // boot from a CoW ext4 block image (required for the cold tier); implied when KrucibleBaseImage is set
-	KrucibleLibDir    string `yaml:"krucible_libdir"`     // dir with libkrun/libkrunfw (default: autodetect)
+	KrucibleVMM         string `yaml:"krucible_vmm"`          // path to the bhatti-vmm helper (default: next to binary / PATH)
+	KrucibleRootfs      string `yaml:"krucible_rootfs"`       // base rootfs dir (virtiofs root) with /init.krun=lohar
+	KrucibleBaseImage   string `yaml:"krucible_base_image"`   // prebuilt ext4 root image (oci.PullAndConvert output); enables the production block-root path
+	KrucibleBlockRoot   bool   `yaml:"krucible_block_root"`   // boot from a CoW ext4 block image (required for the cold tier); implied when KrucibleBaseImage is set
+	KrucibleLibDir      string `yaml:"krucible_libdir"`       // dir with libkrun/libkrunfw (default: autodetect)
 	KrucibleKernelImage string `yaml:"krucible_kernel_image"` // lean external kernel (block-root only; ~2x faster cold-start). Empty = autodetect dist/kernel/*-lean-*, else libkrunfw bundle
-	KrucibleSocketDir string `yaml:"krucible_socket_dir"` // short dir for vsock UDS (default: /tmp/bhatti-kr)
+	KrucibleSocketDir   string `yaml:"krucible_socket_dir"`   // short dir for vsock UDS (default: /tmp/bhatti-kr)
+	KrucibleNetBackend  bool   `yaml:"krucible_net_backend"`  // route guests through the per-owner bhatti-netd gateway (egress policy, siblings, L7 secrets) instead of TSI. Requires libkrun built with the net feature + the bhatti-netd helper.
+	KrucibleNetd        string `yaml:"krucible_netd"`         // path to the bhatti-netd gateway helper (default: next to binary / PATH)
 
 	// Backup to S3-compatible storage
 	Backup *BackupConfig `yaml:"backup,omitempty"`
@@ -47,8 +49,8 @@ type Config struct {
 
 // BackupConfig configures volume backup to S3-compatible object storage.
 type BackupConfig struct {
-	S3Endpoint  string           `yaml:"s3_endpoint"`   // e.g. "https://s3.eu-central-003.backblazeb2.com"
-	S3Region    string           `yaml:"s3_region"`     // e.g. "eu-central-003"
+	S3Endpoint  string           `yaml:"s3_endpoint"` // e.g. "https://s3.eu-central-003.backblazeb2.com"
+	S3Region    string           `yaml:"s3_region"`   // e.g. "eu-central-003"
 	S3Bucket    string           `yaml:"s3_bucket"`
 	S3AccessKey string           `yaml:"s3_access_key"`
 	S3SecretKey string           `yaml:"s3_secret_key"`

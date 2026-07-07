@@ -31,6 +31,13 @@ vmm:
 	fi
 	@echo "Built bhatti-vmm (links libkrucible if built, else system libkrun)"
 
+# Build the per-owner network gateway (krucible net backend). Pure Go (gVisor);
+# the daemon spawns it per owner when krucible_net_backend is set. Runs on the
+# host, so build it for the host platform like `bhatti`.
+netd:
+	go build -ldflags="-s -w" -o bhatti-netd ./cmd/bhatti-netd/
+	@echo "Built bhatti-netd"
+
 test:
 	go test ./... -count=1 -timeout 120s
 
@@ -48,5 +55,5 @@ release:
 	@echo "Built $(VERSION) for 4 platforms in dist/"
 
 clean:
-	rm -f bhatti lohar bhatti-vmm
+	rm -f bhatti lohar bhatti-vmm bhatti-netd
 	rm -rf dist/

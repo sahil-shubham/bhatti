@@ -30,6 +30,23 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		}
 	}
 
+	// bhatti-netd: the per-owner network gateway (pure Go). Autodetected next to
+	// the binary / on PATH when the net backend is enabled. Same discovery as vmm.
+	netd := cfg.KrucibleNetd
+	if netd == "" && cfg.KrucibleNetBackend {
+		if exe, err := os.Executable(); err == nil {
+			cand := filepath.Join(filepath.Dir(exe), "bhatti-netd")
+			if _, err := os.Stat(cand); err == nil {
+				netd = cand
+			}
+		}
+		if netd == "" {
+			if p, err := exec.LookPath("bhatti-netd"); err == nil {
+				netd = p
+			}
+		}
+	}
+
 	libDir := cfg.KrucibleLibDir
 	if libDir == "" {
 		// libkrunfw lives in Homebrew on macOS, /usr/local/lib64 (or lib) on Linux.
@@ -78,5 +95,7 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		LibDir:      libDir,
 		SocketDir:   cfg.KrucibleSocketDir,
 		KernelImage: kernelImage,
+		NetBackend:  cfg.KrucibleNetBackend,
+		NetdBinary:  netd,
 	})
 }
