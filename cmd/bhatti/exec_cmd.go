@@ -96,7 +96,9 @@ Sleeping sandboxes wake automatically.`,
 			defer resp.Body.Close()
 			checkServerVersion(resp)
 			if resp.StatusCode >= 400 {
-				var errBody struct{ Error string `json:"error"` }
+				var errBody struct {
+					Error string `json:"error"`
+				}
 				json.NewDecoder(resp.Body).Decode(&errBody)
 				return &apiError{status: resp.Status, message: errBody.Error}
 			}
@@ -195,7 +197,7 @@ the shell keeps running. Reconnect with 'bhatti shell' again.`,
 		if apiToken != "" {
 			header.Set("Authorization", "Bearer "+apiToken)
 		}
-		conn, _, err := websocket.DefaultDialer.Dial(endpoint, header)
+		conn, _, err := wsDialer().Dial(endpoint, header)
 		if err != nil {
 			return err
 		}

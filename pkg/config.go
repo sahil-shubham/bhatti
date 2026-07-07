@@ -17,7 +17,8 @@ import (
 // Config holds all bhatti configuration.
 type Config struct {
 	Engine    string `yaml:"engine"`     // "krucible" (default; v2). Firecracker is v1 (firecracker branch).
-	Listen    string `yaml:"listen"`     // e.g. ":8080"
+	Listen    string `yaml:"listen"`     // TCP control API, e.g. ":8080". Empty disables TCP (unix socket only).
+	APISocket string `yaml:"api_socket"` // unix socket for the local control API (default: <DataDir>/api.sock). Never reachable from a sandbox.
 	APIURL    string `yaml:"api_url"`    // CLI: remote API endpoint (e.g. https://api.bhatti.sh)
 	AuthToken string `yaml:"auth_token"` // CLI: API key for remote requests
 	DataDir   string `yaml:"data_dir"`   // defaults to ~/.bhatti
@@ -71,6 +72,16 @@ type DomainConfig struct {
 	ACMEEmail string `yaml:"acme_email"` // for per-alias autocert (fallback)
 	TLSCert   string `yaml:"tls_cert"`   // wildcard cert path (recommended)
 	TLSKey    string `yaml:"tls_key"`    // wildcard key path
+}
+
+// APISocketPath is the unix socket for the local control API. Defaults to
+// <DataDir>/api.sock. The CLI and daemon both derive it here so they agree on
+// the path without extra config.
+func (c *Config) APISocketPath() string {
+	if c.APISocket != "" {
+		return c.APISocket
+	}
+	return filepath.Join(c.DataDir, "api.sock")
 }
 
 // DefaultDataDir returns ~/.bhatti for the *invoking* user.

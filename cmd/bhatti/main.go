@@ -192,8 +192,8 @@ func runDaemon() {
 
 	// Start thermal manager to transition idle VMs: hot → warm → cold
 	srv.StartThermalManager(server.ThermalConfig{
-		WarmTimeout: 30 * time.Second,  // hot → warm after 30s idle
-		ColdTimeout: 30 * time.Minute,  // warm → cold after 30min idle
+		WarmTimeout: 30 * time.Second, // hot → warm after 30s idle
+		ColdTimeout: 30 * time.Minute, // warm → cold after 30min idle
 	})
 
 	// Start metrics snapshots after thermal manager and public proxy are
@@ -297,30 +297,55 @@ func runDaemon() {
 	slog.Info("shutdown complete")
 }
 
-// startPlainMode starts the API on :8080 + optional path-based public proxy.
-func startPlainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *server.Server) []*http.Server {
-	var servers []*http.Server
-
-	httpServer := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: srv,
+// serveControlSocket serves the full control mux on a unix socket — the local
+// CLI channel, never reachable from a sandbox (unlike a loopback TCP port, which
+// TSI proxies through). Returned so the caller can add it to the shutdown set.
+func serveControlSocket(cfg *pkg.Config, srv *server.Server) *http.Server {
+	sock := cfg.APISocketPath()
+	_ = os.MkdirAll(filepath.Dir(sock), 0700)
+	_ = os.Remove(sock) // clear a stale socket from a prior run
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		slog.Error("control socket listen", "path", sock, "error", err)
+		os.Exit(1)
 	}
-	servers = append(servers, httpServer)
-
-	port := cfg.Listen
+	_ = os.Chmod(sock, 0600) // owner-only
+	s := &http.Server{Handler: srv}
 	go func() {
-		slog.Info("bhatti listening", "addr", cfg.Listen)
-		if lanIP := getLanIP(); lanIP != "" {
-			slog.Info("endpoints",
-				"local", "http://localhost"+port,
-				"network", "http://"+lanIP+port,
-			)
-		}
-		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			slog.Error("server failed", "error", err)
-			os.Exit(1)
+		slog.Info("control API listening", "socket", sock)
+		if err := s.Serve(ln); err != http.ErrServerClosed {
+			slog.Error("control socket server failed", "error", err)
 		}
 	}()
+	return s
+}
+
+// startPlainMode serves the control API on the unix socket (always) and,
+// optionally, on cfg.Listen (TCP) for dev/remote; empty Listen = socket only.
+func startPlainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *server.Server) []*http.Server {
+	servers := []*http.Server{serveControlSocket(cfg, srv)}
+
+	if cfg.Listen != "" {
+		httpServer := &http.Server{
+			Addr:    cfg.Listen,
+			Handler: srv,
+		}
+		servers = append(servers, httpServer)
+		port := cfg.Listen
+		go func() {
+			slog.Info("bhatti listening", "addr", cfg.Listen)
+			if lanIP := getLanIP(); lanIP != "" {
+				slog.Info("endpoints",
+					"local", "http://localhost"+port,
+					"network", "http://"+lanIP+port,
+				)
+			}
+			if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+				slog.Error("server failed", "error", err)
+				os.Exit(1)
+			}
+		}()
+	}
 
 	// Optional path-based public proxy (dev/testing)
 	if cfg.PublicProxyListen != "" {
@@ -457,18 +482,9 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 		}
 	}()
 
-	// 127.0.0.1:8080 — internal API (health checks, monitoring, local tools)
-	loopback := &http.Server{
-		Addr:    "127.0.0.1:8080",
-		Handler: srv,
-	}
-	servers = append(servers, loopback)
-	go func() {
-		slog.Info("internal API listening", "addr", "127.0.0.1:8080")
-		if err := loopback.ListenAndServe(); err != http.ErrServerClosed {
-			slog.Error("loopback server failed", "error", err)
-		}
-	}()
+	// Internal API on a unix socket (was 127.0.0.1:8080, which TSI let sandboxes
+	// reach — the vulnerability that triggered the v2 networking rewrite).
+	servers = append(servers, serveControlSocket(cfg, srv))
 
 	return servers
 }
@@ -611,7 +627,7 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 }
 
 // registerTierImages discovers rootfs tier images on disk and registers them
-// as admin images (user_id='') so users can reference them with --image.
+// as admin images (user_id=”) so users can reference them with --image.
 // Tiers are discovered by globbing for rootfs-*-{arch}.ext4 in the images
 // directory — no hardcoded list. Adding a new tier only requires the file
 // to exist on disk (placed there by install.sh).

@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -22,6 +25,9 @@ import (
 var (
 	apiURL   = "http://localhost:8080"
 	apiToken = ""
+	// unixSocketPath, when set, routes the CLI's HTTP + websocket traffic over the
+	// daemon's local control socket instead of TCP (apiURL becomes http://unix).
+	unixSocketPath = ""
 )
 
 // rootCmd is the top-level cobra command. All subcommands attach here.
@@ -148,6 +154,16 @@ func loadConfig(cmd *cobra.Command) {
 		apiURL = cfg.APIURL
 	} else if v := os.Getenv("BHATTI_URL"); v != "" {
 		apiURL = v
+	} else if cfg != nil {
+		// No explicit remote endpoint: prefer the daemon's local unix control
+		// socket (not reachable from a sandbox). Fall back to the default TCP URL if
+		// the socket isn't there (no daemon / older daemon).
+		if sock := cfg.APISocketPath(); sock != "" {
+			if _, err := os.Stat(sock); err == nil {
+				unixSocketPath = sock
+				apiURL = "http://unix"
+			}
+		}
 	}
 
 	// Token: same order
@@ -342,10 +358,10 @@ type requestTiming struct {
 
 func (t *requestTiming) trace() *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
-		DNSStart:              func(_ httptrace.DNSStartInfo) { t.mu.Lock(); t.dnsStart = time.Now(); t.mu.Unlock() },
-		DNSDone:               func(_ httptrace.DNSDoneInfo) { t.mu.Lock(); t.dnsDone = time.Now(); t.mu.Unlock() },
-		ConnectStart:          func(_, _ string) { t.mu.Lock(); t.connectStart = time.Now(); t.mu.Unlock() },
-		ConnectDone:           func(_, _ string, _ error) { t.mu.Lock(); t.connectDone = time.Now(); t.mu.Unlock() },
+		DNSStart:             func(_ httptrace.DNSStartInfo) { t.mu.Lock(); t.dnsStart = time.Now(); t.mu.Unlock() },
+		DNSDone:              func(_ httptrace.DNSDoneInfo) { t.mu.Lock(); t.dnsDone = time.Now(); t.mu.Unlock() },
+		ConnectStart:         func(_, _ string) { t.mu.Lock(); t.connectStart = time.Now(); t.mu.Unlock() },
+		ConnectDone:          func(_, _ string, _ error) { t.mu.Lock(); t.connectDone = time.Now(); t.mu.Unlock() },
 		TLSHandshakeStart:    func() { t.mu.Lock(); t.tlsStart = time.Now(); t.mu.Unlock() },
 		TLSHandshakeDone:     func(_ tls.ConnectionState, _ error) { t.mu.Lock(); t.tlsDone = time.Now(); t.mu.Unlock() },
 		GotFirstResponseByte: func() { t.mu.Lock(); t.firstByte = time.Now(); t.mu.Unlock() },
@@ -438,16 +454,36 @@ func (t *timingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // currentTiming is set per-command when --timing is active.
 var currentTiming *requestTiming
 
-func httpClient() *http.Client {
-	if currentTiming != nil {
-		return &http.Client{
-			Transport: &timingTransport{
-				inner:  http.DefaultTransport,
-				timing: currentTiming,
+// baseTransport dials the unix control socket when configured, else default TCP.
+func baseTransport() http.RoundTripper {
+	if unixSocketPath != "" {
+		return &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", unixSocketPath)
 			},
 		}
 	}
-	return http.DefaultClient
+	return http.DefaultTransport
+}
+
+func httpClient() *http.Client {
+	tr := baseTransport()
+	if currentTiming != nil {
+		return &http.Client{Transport: &timingTransport{inner: tr, timing: currentTiming}}
+	}
+	return &http.Client{Transport: tr}
+}
+
+// wsDialer returns a websocket dialer that honors the unix control socket.
+func wsDialer() *websocket.Dialer {
+	if unixSocketPath != "" {
+		return &websocket.Dialer{
+			NetDialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", unixSocketPath)
+			},
+		}
+	}
+	return websocket.DefaultDialer
 }
 
 func setupTiming(cmd *cobra.Command) {
@@ -616,4 +652,3 @@ func minimumArgs(n int) cobra.PositionalArgs {
 // =====================================================================
 
 // --- create ---
-
