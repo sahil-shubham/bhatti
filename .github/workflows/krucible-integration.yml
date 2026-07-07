@@ -56,6 +56,13 @@ jobs:
           export PATH=/usr/local/go/bin:$PATH
           CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
 
+      - name: Build bhatti-netd (the per-owner network gateway)
+        # Required for the TestKrucibleNet* suite to run instead of skipping. The
+        # bring-up builds libkrun with --features blk,net (krun_add_net_unixstream).
+        run: |
+          export PATH=/usr/local/go/bin:$PATH
+          go build -ldflags="-s -w" -o bhatti-netd ./cmd/bhatti-netd/
+
       - name: Setup /dev/kvm + TMPDIR
         run: |
           ls -la /dev/kvm

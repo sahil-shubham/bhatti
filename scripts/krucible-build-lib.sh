@@ -12,10 +12,13 @@ OS="$(uname -s)"
 
 echo "==> building libkrucible at $SRC (release, no-default-features)"
 # --no-default-features drops the bundled init (lohar is /init.krun) so we don't
-# need the init cross-compile toolchain. --features blk enables the virtio-block
+# need the init cross-compile toolchain. --features blk,net enables the virtio-block
+# device (block-root/cold tier) AND virtio-net over a unixstream socket
+# (krun_add_net_unixstream), which the bhatti-netd gateway backend requires. net
+# is additive (adds the symbol; blk-only bhatti-vmm is unaffected). Original: blk
 # device + krun_set_root_disk/add_disk2 — the block/qcow2 root the cold tier
 # snapshots (see docs/PLAN-krucible-cold-tier.md §1).
-( cd "$SRC" && CC_LINUX=cc cargo build --release -p libkrun --no-default-features --features blk )
+( cd "$SRC" && CC_LINUX=cc cargo build --release -p libkrun --no-default-features --features blk,net )
 
 echo "==> assembling install prefix at $PREFIX"
 rm -rf "$PREFIX"

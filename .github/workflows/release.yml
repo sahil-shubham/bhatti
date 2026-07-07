@@ -115,10 +115,11 @@ jobs:
       - name: Ensure Rust toolchain
         run: rustc --version >/dev/null 2>&1 || rustup default stable
 
-      - name: Build libkrun (krucible fork) + bhatti-vmm
+      - name: Build libkrun (krucible fork) + bhatti-vmm + bhatti-netd
         run: |
           make krucible
           make vmm
+          make netd
 
       - name: Make the closure relocatable (0b)
         # Rewrite the runtime lib references to a relative rpath so the shipped
@@ -129,6 +130,10 @@ jobs:
           set -euo pipefail
           mkdir -p stage/bin stage/lib
           cp bhatti-vmm stage/bin/bhatti-vmm
+          # bhatti-netd (opt-in net-backend gateway): Linux/KVM-focused; ship it
+          # only on Linux for now (macOS/HVF net is unvalidated and an unsigned
+          # helper would fail notarization). Pure Go, no libkrun linkage.
+          if [ "${{ matrix.os }}" = "linux" ]; then cp bhatti-netd stage/bin/bhatti-netd; fi
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cp -R libkrucible/_install/lib/libkrun*.dylib stage/lib/
             DYLIB=$(find stage/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
