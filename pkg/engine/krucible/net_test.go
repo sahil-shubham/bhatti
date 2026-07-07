@@ -140,6 +140,58 @@ func TestKrucibleNetForward(t *testing.T) {
 	}
 }
 
+// TestKrucibleNetSiblings is the sibling-reachability gate: two sandboxes of the
+// SAME owner share one bhatti-netd and reach each other across the L2 switch,
+// while a sandbox of a DIFFERENT owner (separate netd) cannot.
+func TestKrucibleNetSiblings(t *testing.T) {
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	mk := func(name, owner string) string {
+		info, err := eng.Create(ctx, engine.SandboxSpec{Name: name, CPUs: 1, MemoryMB: 512, UserID: owner})
+		if err != nil {
+			t.Fatalf("Create %s: %v", name, err)
+		}
+		t.Cleanup(func() { eng.Destroy(context.Background(), info.ID) })
+		return info.ID
+	}
+	// owner1 gets two sandboxes → 100.64.0.2 (a) and 100.64.0.3 (b).
+	a := mk("sib-a", "owner1")
+	b := mk("sib-b", "owner1")
+
+	const port = 18090
+	const bAddr = "100.64.0.3:18090"
+	de := eng.(engine.DetachedExecEngine)
+	if _, _, err := de.ExecDetached(ctx, b, []string{"/bin/netcheck", "serve", fmt.Sprintf("%d", port)}, "/tmp/serve.log"); err != nil {
+		t.Fatalf("serve in B: %v", err)
+	}
+
+	// A reaches B across the sibling link (retry until B's server is up).
+	dialOK := func(id, addr string) bool {
+		for i := 0; i < 40; i++ {
+			if r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", addr}); err == nil && r.ExitCode == 0 {
+				return true
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return false
+	}
+	if !dialOK(a, bAddr) {
+		t.Fatalf("sibling A could not reach B at %s", bAddr)
+	}
+
+	// A different owner is isolated: separate netd, must NOT reach B's address.
+	c := mk("other", "owner2")
+	r, err := eng.Exec(ctx, c, []string{"netcheck", "dial", bAddr})
+	if err != nil {
+		t.Fatalf("exec dial from C: %v", err)
+	}
+	if r.ExitCode == 0 {
+		t.Fatalf("isolation breach: non-sibling C reached B at %s", bAddr)
+	}
+}
+
 // TestKrucibleNetAgentSuite runs the shared agent suite on the virtio-net backend
 // — proves exec/files/etc. still work when the guest is on eth0 (agent stays on
 // vsock, decoupled from the data plane).

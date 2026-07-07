@@ -3,6 +3,7 @@ package krucible
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -62,16 +63,32 @@ type Config struct {
 // maxUnixPath is the conservative AF_UNIX sun_path cap (macOS = 104).
 const maxUnixPath = 104
 
-// Per-sandbox virtio-net gateway addressing. Each sandbox gets its own netd +
-// vnet, so fixed addresses are fine (per-owner grouping for siblings is a
-// follow-on). gw=.1, guest=.2/24.
+// Per-owner virtio-net gateway addressing. One bhatti-netd serves all of an
+// owner's sandboxes on 100.64.<subnetIdx>.0/24 as an L2 switch: gw=.1, guests=
+// .2, .3, ... Siblings on the same netd reach each other; different owners get
+// separate netds (isolation). Sandboxes with no owner (UserID unset) get their
+// own isolated netd, so single-sandbox behavior is unchanged.
 const (
-	netGatewayIP  = "100.64.0.1"
-	netGuestCIDR  = "100.64.0.2/24"
 	netGatewayMAC = "52:54:00:00:00:01"
-	netGuestMAC   = "52:54:00:00:00:02"
 	netPrefixLen  = 24
 )
+
+func netGatewayIPFor(subnetIdx int) string { return fmt.Sprintf("100.64.%d.1", subnetIdx) }
+func netGuestCIDRFor(subnetIdx, guestIdx int) string {
+	return fmt.Sprintf("100.64.%d.%d/%d", subnetIdx, 2+guestIdx, netPrefixLen)
+}
+func netGuestMACFor(guestIdx int) string { return fmt.Sprintf("52:54:00:00:00:%02x", 2+guestIdx) }
+
+// netdInstance is one owner's shared bhatti-netd gateway process.
+type netdInstance struct {
+	sock      string
+	dir       string
+	subnetIdx int
+	mu        sync.Mutex // guards cmd (spawn-once)
+	cmd       *exec.Cmd
+	nextGuest int
+	refs      int
+}
 
 // waitForSocket blocks until path exists (a listening UDS) or the deadline.
 func waitForSocket(path string, d time.Duration) error {
@@ -83,6 +100,106 @@ func waitForSocket(path string, d time.Duration) error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return fmt.Errorf("socket %s not present after %s", path, d)
+}
+
+// netdKeyFor is the key that groups sandboxes onto a shared bhatti-netd. Same
+// owner (UserID) ⇒ same netd ⇒ siblings reach each other. No owner ⇒ keyed by
+// sandbox id, so each unowned sandbox gets its own isolated netd (prior
+// single-sandbox behavior is preserved).
+func netdKeyFor(spec engine.SandboxSpec, id string) string {
+	if spec.UserID != "" {
+		return "u:" + spec.UserID
+	}
+	return "s:" + id
+}
+
+// acquireNetd returns (creating if needed) the owner's shared netd instance and
+// reserves a guest slot on it, returning the instance and this guest's index.
+// Release with releaseNetd on Destroy.
+func (e *Engine) acquireNetd(ownerKey string, subnetIdx int) (*netdInstance, int) {
+	e.netdMu.Lock()
+	defer e.netdMu.Unlock()
+	inst := e.netds[ownerKey]
+	if inst == nil {
+		h := sha256.Sum256([]byte(ownerKey))
+		dir := filepath.Join(e.cfg.SocketDir, "netd-"+hex.EncodeToString(h[:6]))
+		inst = &netdInstance{sock: filepath.Join(dir, "n.sock"), dir: dir, subnetIdx: subnetIdx}
+		e.netds[ownerKey] = inst
+	}
+	idx := inst.nextGuest
+	inst.nextGuest++
+	inst.refs++
+	return inst, idx
+}
+
+// releaseNetd drops one reference to the owner's netd, tearing the process down
+// when the last sandbox of the owner is gone.
+func (e *Engine) releaseNetd(ownerKey string) {
+	e.netdMu.Lock()
+	inst := e.netds[ownerKey]
+	if inst == nil {
+		e.netdMu.Unlock()
+		return
+	}
+	inst.refs--
+	done := inst.refs <= 0
+	if done {
+		delete(e.netds, ownerKey)
+	}
+	e.netdMu.Unlock()
+	if !done {
+		return
+	}
+	inst.mu.Lock()
+	if inst.cmd != nil && inst.cmd.Process != nil {
+		_ = inst.cmd.Process.Kill()
+		_, _ = inst.cmd.Process.Wait()
+	}
+	inst.mu.Unlock()
+	os.RemoveAll(inst.dir)
+}
+
+// ensureNetd spawns the owner's bhatti-netd (LISTENING on inst.sock) if it is
+// not already running. Idempotent: siblings and cold Start reuse a live gateway.
+func (e *Engine) ensureNetd(ownerKey string) error {
+	e.netdMu.Lock()
+	inst := e.netds[ownerKey]
+	e.netdMu.Unlock()
+	if inst == nil {
+		return fmt.Errorf("netd instance %q not found", ownerKey)
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.cmd != nil && inst.cmd.Process != nil {
+		if _, err := os.Stat(inst.sock); err == nil {
+			return nil // already listening
+		}
+	}
+	if err := os.MkdirAll(inst.dir, 0700); err != nil {
+		return fmt.Errorf("netd dir: %w", err)
+	}
+	_ = os.Remove(inst.sock)
+	lf, err := os.OpenFile(filepath.Join(inst.dir, "netd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("netd log: %w", err)
+	}
+	defer lf.Close()
+	cmd := exec.Command(e.cfg.NetdBinary,
+		"--net-uds", inst.sock, "--gw-ip", netGatewayIPFor(inst.subnetIdx),
+		"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC)
+	cmd.Stdout = lf
+	cmd.Stderr = lf
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start bhatti-netd: %w", err)
+	}
+	if werr := waitForSocket(inst.sock, 5*time.Second); werr != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return fmt.Errorf("bhatti-netd not listening: %w", werr)
+	}
+	inst.cmd = cmd
+	return nil
 }
 
 // VM is per-sandbox state. The helper process IS the VM; we hold its cmd to
@@ -117,7 +234,7 @@ type VM struct {
 	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
-	netdCmd    *exec.Cmd // bhatti-netd gateway (net backend); nil on the TSI path
+	netdKey    string // owner key of the shared bhatti-netd (net backend); "" on TSI
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -125,7 +242,9 @@ type Engine struct {
 	mu        sync.RWMutex
 	vms       map[string]*VM
 	cfg       Config
-	baseImgMu sync.Mutex // guards the one-time base-image build
+	baseImgMu sync.Mutex               // guards the one-time base-image build
+	netdMu    sync.Mutex               // guards netds
+	netds     map[string]*netdInstance // owner key → shared bhatti-netd gateway
 }
 
 var _ engine.Engine = (*Engine)(nil)
@@ -171,7 +290,7 @@ func New(cfg Config) (*Engine, error) {
 	if err := os.MkdirAll(cfg.SocketDir, 0700); err != nil {
 		return nil, fmt.Errorf("krucible: create socket dir: %w", err)
 	}
-	eng := &Engine{vms: make(map[string]*VM), cfg: cfg}
+	eng := &Engine{vms: make(map[string]*VM), netds: make(map[string]*netdInstance), cfg: cfg}
 	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
 	return eng, nil
 }
@@ -237,10 +356,14 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	sockDir := filepath.Join(e.cfg.SocketDir, id)
 
 	var vm *VM
+	var netdKey string // owner's shared-netd key; released on error / Destroy
 	defer func() {
 		if err != nil {
 			if vm != nil {
 				vm.kill()
+			}
+			if netdKey != "" {
+				e.releaseNetd(netdKey)
 			}
 			os.RemoveAll(sandboxDir)
 			os.RemoveAll(sockDir)
@@ -265,8 +388,12 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	forwardUDS := filepath.Join(sockDir, "f.sock")
 	ctlSockUDS := filepath.Join(sockDir, "k.sock")
 	netUDS := ""
+	var netGuestIdx int
+	var netInst *netdInstance
 	if e.cfg.NetBackend {
-		netUDS = filepath.Join(sockDir, "n.sock")
+		netdKey = netdKeyFor(spec, id)
+		netInst, netGuestIdx = e.acquireNetd(netdKey, spec.SubnetIndex)
+		netUDS = netInst.sock
 	}
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
 		return info, fmt.Errorf("create socket dir: %w", err)
@@ -292,8 +419,11 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	var cdNet *configdrive.NetConfig
 	if netUDS != "" {
 		baseSpec.NetUDS = netUDS
-		baseSpec.NetMAC = netGuestMAC
-		cdNet = &configdrive.NetConfig{IP: netGuestCIDR, Gateway: netGatewayIP}
+		baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
+		cdNet = &configdrive.NetConfig{
+			IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
+			Gateway: netGatewayIPFor(netInst.subnetIdx),
+		}
 	}
 
 	name := spec.Name
@@ -413,6 +543,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		BundleDir: filepath.Join(sandboxDir, "bundle"),
 		baseSpec:  baseSpec,
 		logPath:   filepath.Join(sandboxDir, "vmm.log"),
+		netdKey:   netdKey,
 	}
 
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
@@ -451,24 +582,12 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	}
 	defer logFile.Close()
 
-	// virtio-net gateway: spawn bhatti-netd LISTENING on the net UDS before the
-	// VMM (which connects to it). Detached pgroup like the helper.
-	var netd *exec.Cmd
-	if spec.NetUDS != "" {
-		_ = os.Remove(spec.NetUDS)
-		netd = exec.Command(e.cfg.NetdBinary,
-			"--net-uds", spec.NetUDS, "--gw-ip", netGatewayIP,
-			"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC)
-		netd.Stdout = logFile
-		netd.Stderr = logFile
-		netd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := netd.Start(); err != nil {
-			return fmt.Errorf("start bhatti-netd: %w", err)
-		}
-		if werr := waitForSocket(spec.NetUDS, 5*time.Second); werr != nil {
-			_ = netd.Process.Kill()
-			_, _ = netd.Process.Wait()
-			return fmt.Errorf("bhatti-netd not listening: %w", werr)
+	// virtio-net gateway: ensure the owner's shared bhatti-netd is LISTENING on
+	// the net UDS before the VMM connects to it (spawned once per owner; siblings
+	// reuse it). The VMM will connect and netd will add it as a switch port.
+	if vm.netdKey != "" {
+		if nerr := e.ensureNetd(vm.netdKey); nerr != nil {
+			return nerr
 		}
 	}
 
@@ -494,17 +613,13 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	if werr := ag.WaitReady(ctx, 30*time.Second); werr != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		if netd != nil {
-			_ = netd.Process.Kill()
-			_, _ = netd.Process.Wait()
-		}
+		// Leave the shared netd running; sibling sandboxes may still be using it.
 		vmCancel()
 		return fmt.Errorf("agent not ready: %w\nvmm log:\n%s", werr, tailFile(vm.logPath, 4096))
 	}
 
 	vm.mu.Lock()
 	vm.cmd = cmd
-	vm.netdCmd = netd
 	vm.cancel = vmCancel
 	vm.HelperPID = cmd.Process.Pid
 	vm.Agent = ag
@@ -527,11 +642,8 @@ func (vm *VM) kill() {
 		// Adopted helper (not our child) — signal by pid; init reaps it.
 		_ = syscall.Kill(vm.HelperPID, syscall.SIGKILL)
 	}
-	if vm.netdCmd != nil && vm.netdCmd.Process != nil {
-		_ = vm.netdCmd.Process.Kill()
-		_, _ = vm.netdCmd.Process.Wait()
-		vm.netdCmd = nil
-	}
+	// The bhatti-netd gateway is shared per owner and outlives a single VM; it is
+	// torn down by releaseNetd on Destroy of the owner's last sandbox.
 	if vm.cancel != nil {
 		vm.cancel()
 	}
@@ -561,6 +673,10 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	e.mu.Lock()
 	delete(e.vms, id)
 	e.mu.Unlock()
+
+	if vm.netdKey != "" {
+		e.releaseNetd(vm.netdKey)
+	}
 
 	os.RemoveAll(dir)
 	os.RemoveAll(sockDir)

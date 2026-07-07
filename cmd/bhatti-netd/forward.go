@@ -10,23 +10,34 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const maxInFlightConn = 2048
 
-// installTCPForwarder makes the gateway route EVERY outbound guest TCP
-// connection through the egress guard's vetting dialer — host/private/metadata
-// denied, public allowed (the isolation TSI couldn't give) — and splices the
-// accepted guest endpoint to the real upstream. Dial-first so a denied or
-// unreachable destination RSTs the guest cleanly.
+// installTCPForwarder terminates EVERY guest TCP connection here and
+// re-originates it: a sibling destination (same owner subnet) is dialed via the
+// stack, which routes to that guest's link; everything else goes through the
+// egress guard's vetting dialer — host/private/metadata denied, public allowed
+// (the isolation TSI couldn't give). Dial-first so a denied or unreachable
+// destination RSTs the guest cleanly.
 func (g *Gateway) installTCPForwarder(dialer *gateway.Dialer) {
 	fwd := tcp.NewForwarder(g.stack, 0, maxInFlightConn, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
-		dest := net.JoinHostPort(addrString(id.LocalAddress), fmt.Sprint(id.LocalPort))
 
-		up, err := dialer.DialContext(context.Background(), "tcp", dest)
+		var up net.Conn
+		var err error
+		if g.isSibling(id.LocalAddress) {
+			// Same-owner sibling: dial via the stack so it routes to the sibling's
+			// link (native checksums, mediated + observable by netd).
+			up, err = gonet.DialContextTCP(context.Background(), g.stack,
+				tcpip.FullAddress{Addr: id.LocalAddress, Port: id.LocalPort}, ipv4.ProtocolNumber)
+		} else {
+			dest := net.JoinHostPort(addrString(id.LocalAddress), fmt.Sprint(id.LocalPort))
+			up, err = dialer.DialContext(context.Background(), "tcp", dest)
+		}
 		if err != nil {
 			r.Complete(true) // RST: denied by policy or unreachable
 			return

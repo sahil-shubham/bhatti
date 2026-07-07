@@ -16,10 +16,15 @@ import (
 // gateway path (DESIGN-bhatti-v2-networking §0c); lohar reads the addressing
 // from the config drive.
 
-// configureEth0 brings up the interface, assigns ipCIDR (e.g. "100.64.0.2/24"),
-// and adds a default route via gateway (e.g. "100.64.0.1").
+// configureEth0 brings up the interface and configures it point-to-point to the
+// bhatti-netd gateway: the guest link is a dedicated line to netd, not a shared
+// segment, so the guest sees ONLY the gateway. It assigns ipCIDR's address as a
+// /32 host address, adds an on-link host route to the gateway, and a default
+// route via it. Everything — internet AND siblings — is therefore sent to the
+// gateway, which routes it (siblings never resolve each other directly, so there
+// is no proxy-ARP fight with netd's promiscuous stack).
 func configureEth0(name, ipCIDR, gateway string) error {
-	ip, ipnet, err := net.ParseCIDR(ipCIDR)
+	ip, _, err := net.ParseCIDR(ipCIDR)
 	if err != nil {
 		return fmt.Errorf("parse %q: %w", ipCIDR, err)
 	}
@@ -27,7 +32,6 @@ func configureEth0(name, ipCIDR, gateway string) error {
 	if ip4 == nil {
 		return fmt.Errorf("only IPv4 supported for now: %q", ipCIDR)
 	}
-	prefix, _ := ipnet.Mask.Size()
 
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
@@ -47,13 +51,19 @@ func configureEth0(name, ipCIDR, gateway string) error {
 	if err := linkUp(fd, idx); err != nil {
 		return fmt.Errorf("link up: %w", err)
 	}
-	if err := addAddr(fd, idx, ip4, prefix); err != nil {
+	// /32 host address: the guest is point-to-point, not on a shared subnet.
+	if err := addAddr(fd, idx, ip4, 32); err != nil {
 		return fmt.Errorf("add addr: %w", err)
 	}
 	if gateway != "" {
 		gw := net.ParseIP(gateway).To4()
 		if gw == nil {
 			return fmt.Errorf("bad gateway %q", gateway)
+		}
+		// On-link host route to the gateway (it's off-link under a /32), then a
+		// default route via it.
+		if err := addOnlinkRoute(fd, idx, gw, 32); err != nil {
+			return fmt.Errorf("add gateway route: %w", err)
 		}
 		if err := addDefaultRoute(fd, idx, gw); err != nil {
 			return fmt.Errorf("add route: %w", err)
@@ -126,6 +136,25 @@ func addAddr(fd, idx int, ip4 net.IP, prefix int) error {
 	payload = append(payload, attr(unix.IFA_LOCAL, ip4)...)
 	payload = append(payload, attr(unix.IFA_ADDRESS, ip4)...)
 	return nlRequest(fd, unix.RTM_NEWADDR, unix.NLM_F_CREATE|unix.NLM_F_EXCL, payload)
+}
+
+// addOnlinkRoute adds "dst/dstLen dev eth0 scope link" (no gateway) so the
+// subnet is directly reachable on the link.
+func addOnlinkRoute(fd, idx int, dst net.IP, dstLen int) error {
+	msg := unix.RtMsg{
+		Family:   unix.AF_INET,
+		Dst_len:  uint8(dstLen),
+		Table:    unix.RT_TABLE_MAIN,
+		Protocol: unix.RTPROT_BOOT,
+		Scope:    unix.RT_SCOPE_LINK,
+		Type:     unix.RTN_UNICAST,
+	}
+	payload := append([]byte{}, (*(*[unix.SizeofRtMsg]byte)(unsafe.Pointer(&msg)))[:]...)
+	payload = append(payload, attr(unix.RTA_DST, dst)...)
+	oif := make([]byte, 4)
+	*(*uint32)(unsafe.Pointer(&oif[0])) = uint32(idx)
+	payload = append(payload, attr(unix.RTA_OIF, oif)...)
+	return nlRequest(fd, unix.RTM_NEWROUTE, unix.NLM_F_CREATE, payload)
 }
 
 func addDefaultRoute(fd, idx int, gw net.IP) error {

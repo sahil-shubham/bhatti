@@ -143,66 +143,27 @@ func TestGatewayOverUnixSocket(t *testing.T) {
 	}
 }
 
-var testSiblingMAC = tcpip.LinkAddress("\x52\x54\x00\x00\x00\x03")
-
-// ethFrame builds a minimal ethernet frame with an arbitrary payload.
-func ethFrame(dst, src tcpip.LinkAddress, ethertype uint16, payload []byte) []byte {
-	f := make([]byte, header.EthernetMinimumSize+len(payload))
-	header.Ethernet(f).Encode(&header.EthernetFields{
-		SrcAddr: src, DstAddr: dst, Type: tcpip.NetworkProtocolNumber(ethertype),
-	})
-	copy(f[header.EthernetMinimumSize:], payload)
-	return f
-}
-
-// TestGatewaySwitchesSiblings is the sibling-reachability mechanism (no VM): two
-// guest links on one netd. A broadcast (ARP) from one guest is flooded to the
-// other; a unicast to a learned sibling MAC is switched straight to that guest's
-// link — the traffic never enters the stack. This is what lets sibling sandboxes
-// of the same owner reach each other.
-func TestGatewaySwitchesSiblings(t *testing.T) {
+// TestIsSibling checks the sibling classifier: an address in the owner's guest
+// subnet (but not the gateway) is routed via the stack; the gateway itself and
+// out-of-subnet addresses are not.
+func TestIsSibling(t *testing.T) {
 	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC)
 	if err != nil {
 		t.Fatalf("NewGateway: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go gw.Run(ctx)
-
-	gaHost, gaNetd := net.Pipe() // guest A
-	gbHost, gbNetd := net.Pipe() // guest B
-	defer gaHost.Close()
-	defer gbHost.Close()
-	gw.AddGuest(gateway.NewFrameConn(gaNetd))
-	gw.AddGuest(gateway.NewFrameConn(gbNetd))
-	guestA := gateway.NewFrameConn(gaHost)
-	guestB := gateway.NewFrameConn(gbHost)
-
-	// 1. Broadcast ARP from A must be flooded to B.
-	if err := guestA.WriteFrame(arpRequestFrame()); err != nil {
-		t.Fatalf("A broadcast: %v", err)
+	cases := []struct {
+		addr [4]byte
+		want bool
+	}{
+		{[4]byte{100, 64, 0, 2}, true},   // a sibling
+		{[4]byte{100, 64, 0, 254}, true}, // another sibling
+		{[4]byte{100, 64, 0, 1}, false},  // the gateway itself
+		{[4]byte{1, 1, 1, 1}, false},     // public internet
+		{[4]byte{100, 64, 1, 2}, false},  // a different owner's subnet
 	}
-	got := readFrameCtx(t, guestB, 3*time.Second)
-	if header.Ethernet(got).Type() != header.ARPProtocolNumber {
-		t.Fatalf("B did not receive the flooded ARP (type=%#x)", header.Ethernet(got).Type())
-	}
-
-	// 2. Teach the switch where B is: B sends a unicast to the gateway (learned,
-	// not flooded), then a unicast from A to B's MAC must be switched to B.
-	if err := guestB.WriteFrame(ethFrame(testGwMAC, testSiblingMAC, uint16(header.IPv4ProtocolNumber), []byte("to-gw"))); err != nil {
-		t.Fatalf("B->gw: %v", err)
-	}
-	time.Sleep(100 * time.Millisecond) // let the switch learn B's MAC
-
-	payload := []byte("hello-sibling")
-	if err := guestA.WriteFrame(ethFrame(testSiblingMAC, testGuestMAC, uint16(header.IPv4ProtocolNumber), payload)); err != nil {
-		t.Fatalf("A->B: %v", err)
-	}
-	sib := readFrameCtx(t, guestB, 3*time.Second)
-	if string(sib[header.EthernetMinimumSize:]) != string(payload) {
-		t.Fatalf("B received %q, want sibling unicast %q", sib[header.EthernetMinimumSize:], payload)
-	}
-	if src := tcpip.LinkAddress(header.Ethernet(sib).SourceAddress()); src != testGuestMAC {
-		t.Fatalf("switched frame src MAC = %x, want A %x", src, testGuestMAC)
+	for _, c := range cases {
+		if got := gw.isSibling(tcpip.AddrFrom4(c.addr)); got != c.want {
+			t.Errorf("isSibling(%v) = %v, want %v", c.addr, got, c.want)
+		}
 	}
 }
