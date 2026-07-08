@@ -25,7 +25,19 @@ func newNetEngine(t *testing.T) engine.Engine {
 	if d := os.Getenv("KRUCIBLE_NET_DATADIR"); d != "" {
 		dataDir = d // fixed dir so vmm.log survives for debugging
 	}
-	return newNetEngineAt(t, dataDir, t.TempDir())
+	return newNetEngineAt(t, dataDir, shortSockDir(t))
+}
+
+// shortSockDir returns a SHORT temp dir for vsock/UDS paths. t.TempDir() on macOS
+// (/var/folders/...) exceeds the ~104-byte sockaddr_un limit, so sockets need a
+// short base like /tmp. (DataDir can stay t.TempDir() — regular files, no limit.)
+func shortSockDir(t *testing.T) string {
+	d, err := os.MkdirTemp("/tmp", "kr")
+	if err != nil {
+		t.Fatalf("short sock dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
 }
 
 // newNetEngineAt builds a net-backend engine on explicit dataDir + sockDir, so a
@@ -226,7 +238,7 @@ func readNetdPid(t *testing.T, sockDir string) int {
 // down.
 func TestKrucibleNetRecovery(t *testing.T) {
 	dataDir := t.TempDir()
-	sockDir := t.TempDir()
+	sockDir := shortSockDir(t)
 	eng1 := newNetEngineAt(t, dataDir, sockDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
