@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,8 +31,10 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		}
 	}
 
-	// bhatti-netd: the per-owner network gateway (pure Go). Autodetected next to
-	// the binary / on PATH when the net backend is enabled. Same discovery as vmm.
+	// bhatti-netd: the per-owner network gateway (pure Go), the DEFAULT in v2.
+	// Autodetected next to the binary / on PATH (same discovery as vmm). If the
+	// net backend is on but the helper is missing, fail fast with a clear message
+	// rather than silently falling back to the insecure shared-netstack (TSI).
 	netd := cfg.KrucibleNetd
 	if netd == "" && cfg.KrucibleNetBackend {
 		if exe, err := os.Executable(); err == nil {
@@ -45,6 +48,17 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 				netd = p
 			}
 		}
+	}
+	netBackend := cfg.KrucibleNetBackend
+	if netBackend && netd == "" {
+		// The secure gateway is the default, but the daemon is built at startup on
+		// hosts that may not have the runtime (dev builds, the unit-test gate). Don't
+		// refuse to start — fall back to TSI with a LOUD warning. A correct install
+		// ships bhatti-netd next to the binary, so this never fires in production.
+		slog.Warn("bhatti-netd not found — the secure network gateway is DISABLED and the " +
+			"guest is NOT isolated from the host (legacy TSI). Install the runtime bundle or run " +
+			"`make netd`; set krucible_net_backend: false to silence this warning.")
+		netBackend = false
 	}
 
 	libDir := cfg.KrucibleLibDir
@@ -95,7 +109,7 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		LibDir:      libDir,
 		SocketDir:   cfg.KrucibleSocketDir,
 		KernelImage: kernelImage,
-		NetBackend:  cfg.KrucibleNetBackend,
+		NetBackend:  netBackend,
 		NetdBinary:  netd,
 	})
 }
