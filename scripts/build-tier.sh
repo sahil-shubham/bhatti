@@ -88,4 +88,14 @@ export MOUNT ARCH DEB_ARCH AGENT SCRIPT_DIR
 echo "==> Running tier script: ${TIER}.sh"
 "$SCRIPT_DIR/tiers/${TIER}.sh"
 
+# The krucible engine boots /init.krun as PID 1 (engine ExecPath, cmd/vmm PID-1
+# mode). Tier scripts install lohar at /usr/local/bin/lohar (for the systemctl/
+# journalctl shims); also place it at /init.krun so the release image is
+# bootable on krucible — without this the guest panics with
+# "Requested init /init.krun failed (error -2)". (Integration CI builds its own
+# rootfs with /init.krun, so this only surfaced on a real release image.)
+cp "$AGENT" "$MOUNT/init.krun"
+chmod 755 "$MOUNT/init.krun"
+echo "==> installed /init.krun (lohar PID 1)"
+
 echo "==> Built: $IMG ($(du -h "$IMG" | cut -f1))"
