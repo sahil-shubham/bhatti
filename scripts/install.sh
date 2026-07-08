@@ -516,7 +516,8 @@ detect_tier() {
     fi
     if [ -f "$config_file" ]; then
         local rootfs_path
-        rootfs_path=$(grep '^firecracker_rootfs:' "$config_file" | awk '{print $2}' | tr -d '"' | tr -d "'") || true
+        # v2 uses krucible_base_image; keep firecracker_rootfs for migration.
+        rootfs_path=$(grep -E '^(krucible_base_image|firecracker_rootfs):' "$config_file" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'") || true
         if [ -n "$rootfs_path" ]; then
             local tier
             tier=$(basename "$rootfs_path" | sed "s/rootfs-//;s/-${ARCH}\.ext4//")
@@ -561,6 +562,81 @@ installed_fc_version() {
 }
 
 # ── Install functions ─────────────────────────────────
+
+# ensure_zstd installs zstd if missing (needed for the .tar.zst runtime bundle).
+ensure_zstd() {
+    command -v zstd >/dev/null 2>&1 && return 0
+    info "Installing zstd..."
+    if command -v apt-get >/dev/null 2>&1; then
+        { apt-get update -qq && apt-get install -y -qq zstd >/dev/null; } || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q zstd >/dev/null || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q zstd >/dev/null || true
+    elif command -v brew >/dev/null 2>&1; then
+        brew install zstd >/dev/null 2>&1 || true
+    fi
+    command -v zstd >/dev/null 2>&1 \
+        || die "failed to install zstd" "Install it manually and re-run."
+}
+
+# install_bundle downloads the per-platform v2 runtime bundle
+# (bhatti-<ver>-<os>-<arch>.tar.zst = CLI + bhatti-vmm + bhatti-netd + libkrun +
+# lean kernel), verifies it, installs the CLI to /usr/local/bin, and — when the
+# first arg is 1 — lays the krucible runtime under $DATA_DIR/runtime (consumed by
+# generate_config, and sets RUNTIME_DIR). One self-contained bundle IS the v2
+# install; there are no separate vmm/libkrun/kernel assets to chase.
+install_bundle() {
+    local want_runtime="${1:-0}"
+    local asset="bhatti-${VERSION}-${OS}-${ARCH}.tar.zst"
+    ensure_zstd
+
+    local tmp stage
+    tmp=$(mktemp "${TMPDIR:-/tmp}/bhatti-bundle.XXXXXX") || die "could not create temp file"
+    BHATTI_STAGE_FILE="$tmp"
+    stage=$(mktemp -d "${TMPDIR:-/tmp}/bhatti-stage.XXXXXX") || die "could not create temp dir"
+
+    download "${RELEASE_URL}/${asset}" "$tmp"
+    verify_checksum "$tmp" "$asset"
+    zstd -dc "$tmp" | tar -xf - -C "$stage" || die "failed to extract ${asset}"
+    rm -f "$tmp"
+
+    local root
+    root=$(find "$stage" -maxdepth 1 -type d -name 'bhatti-*' | head -1)
+    [ -n "$root" ] && [ -x "$root/bin/bhatti" ] \
+        || die "unexpected bundle layout (no bin/bhatti in ${asset})"
+
+    if [ "$OS" = "darwin" ]; then
+        xattr -dr com.apple.quarantine "$root" 2>/dev/null || true
+    fi
+    "$root/bin/bhatti" version >/dev/null 2>&1 \
+        || die "downloaded bhatti failed to execute (wrong platform or corrupt download)"
+
+    # Install the CLI.
+    local dest="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
+    local dest_dir; dest_dir=$(dirname "$dest")
+    if [ ! -d "$dest_dir" ] || [ ! -w "$dest_dir" ] || { [ -e "$dest" ] && [ ! -w "$dest" ]; }; then
+        need_sudo "install bhatti to ${dest}"
+    else
+        SUDO=""
+    fi
+    [ -d "$dest_dir" ] || $SUDO mkdir -p "$dest_dir"
+    { [ -f "$dest" ] && $SUDO cp "$dest" "${dest}.old" 2>/dev/null; } || true
+    $SUDO install -m 0755 "$root/bin/bhatti" "$dest" || die "failed to install bhatti to ${dest}"
+
+    # Runtime (server / local daemon): vmm + netd + libkrun + lean kernel.
+    if [ "$want_runtime" = "1" ]; then
+        RUNTIME_DIR="$DATA_DIR/runtime"
+        rm -rf "$RUNTIME_DIR"
+        mkdir -p "$RUNTIME_DIR"
+        cp -R "$root/bin" "$root/lib" "$root/kernel" "$RUNTIME_DIR/"
+        chmod +x "$RUNTIME_DIR/bin/"* 2>/dev/null || true
+        if [ "$OS" = "darwin" ]; then
+            xattr -dr com.apple.quarantine "$RUNTIME_DIR" 2>/dev/null || true
+        fi
+    fi
+    rm -rf "$stage"
+}
 
 install_bhatti_binary() {
     local binary="bhatti-${OS}-${ARCH}"
@@ -803,17 +879,25 @@ setup_jail_user() {
 
 generate_config() {
     local tier="$1"
+    local rt="${RUNTIME_DIR:-$DATA_DIR/runtime}"
+    # The lean kernel shipped in the bundle (Image-lean-* on arm64, vmlinux-lean-*
+    # on x86_64). block-root + external lean kernel is the v2 boot path.
+    local kernel
+    kernel=$(find "$rt/kernel" -maxdepth 1 -type f \( -name 'Image-lean-*' -o -name 'vmlinux-lean-*' \) 2>/dev/null | head -1)
     mkdir -p /etc/bhatti
     cat > /etc/bhatti/config.yaml << EOF
-engine: firecracker
+engine: krucible
 listen: :8080
 data_dir: ${DATA_DIR}
-firecracker_bin: /usr/local/bin/firecracker
-firecracker_jailer: /usr/local/bin/jailer
-jail_uid: 10000
-jail_gid: 10000
-firecracker_kernel: ${DATA_DIR}/images/vmlinux-${ARCH}
-firecracker_rootfs: ${DATA_DIR}/images/rootfs-${tier}-${ARCH}.ext4
+# Secure per-owner network gateway (bhatti-netd) is ON by default: the guest is
+# isolated from the host, egress is policed, and same-owner siblings are
+# reachable. Set 'krucible_net_backend: false' for the legacy shared-netstack
+# (TSI) path (a sandbox can then reach the host's loopback — not recommended).
+krucible_vmm: ${rt}/bin/bhatti-vmm
+krucible_netd: ${rt}/bin/bhatti-netd
+krucible_libdir: ${rt}/lib
+krucible_kernel_image: ${kernel}
+krucible_base_image: ${DATA_DIR}/images/rootfs-${tier}-${ARCH}.ext4
 EOF
 
     # Clean up pre-v1.6 config location
@@ -917,7 +1001,7 @@ do_cli_install() {
         heading "Installing bhatti ${VERSION} (${OS}/${ARCH})"
     fi
 
-    install_bhatti_binary
+    install_bundle    # v2 self-contained bundle; CLI only for a client install
 
     echo ""
     success "bhatti ${VERSION} → /usr/local/bin/bhatti"
@@ -964,14 +1048,12 @@ do_server_install() {
 
     mkdir -p "$DATA_DIR"/{images,sandboxes,volumes,snapshots}
 
-    install_firecracker
+    # v2 (krucible): one self-contained bundle brings the CLI + the whole runtime
+    # (bhatti-vmm, bhatti-netd, libkrun, lean kernel). No Firecracker.
+    heading "Installing bhatti ${VERSION} + runtime"
+    install_bundle 1
+    success "bhatti ${VERSION} + krucible runtime"
 
-    heading "Installing bhatti ${VERSION}"
-    install_bhatti_binary
-    success "bhatti ${VERSION}"
-
-    install_lohar
-    install_kernel
     install_rootfs "$tier"
     setup_jail_user
     generate_config "$tier"
@@ -1150,14 +1232,10 @@ do_server_update() {
         systemctl stop bhatti
     fi
 
-    install_firecracker
+    heading "Installing bhatti ${VERSION} + runtime"
+    install_bundle 1
+    success "bhatti ${VERSION} + krucible runtime"
 
-    heading "Installing bhatti ${VERSION}"
-    install_bhatti_binary
-    success "bhatti ${VERSION}"
-
-    install_lohar
-    install_kernel
     for t in $tiers_to_install; do
         install_rootfs "$t"
     done

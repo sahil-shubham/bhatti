@@ -261,6 +261,17 @@ EOF
     rm -f "$cfg"
 }
 
+@test "detect_tier: parses tier from v2 krucible_base_image path" {
+    local cfg=$(mktemp)
+    ARCH=arm64
+    cat > "$cfg" << EOF
+engine: krucible
+krucible_base_image: /var/lib/bhatti/images/rootfs-docker-arm64.ext4
+EOF
+    [ "$(detect_tier "$cfg")" = "docker" ]
+    rm -f "$cfg"
+}
+
 @test "detect_tier: handles double- and single-quoted paths" {
     local cfg=$(mktemp)
     ARCH=amd64
