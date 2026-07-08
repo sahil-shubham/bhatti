@@ -29,6 +29,15 @@ setup_file() {
     # we exercise the fresh-install path instead of the major-version
     # upgrade prompt against whatever real bhatti the dev has.
     export TEST_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+    # install_bundle needs zstd/tar/find; add their dirs (e.g. Homebrew's
+    # /opt/homebrew/bin on macOS) so the restricted PATH can reach them without
+    # pulling in wherever a real bhatti might live.
+    for _tool in zstd tar find; do
+        _tp=$(command -v "$_tool" 2>/dev/null) || continue
+        _td=$(dirname "$_tp")
+        case ":$TEST_PATH:" in *":$_td:"*) ;; *) TEST_PATH="$TEST_PATH:$_td" ;; esac
+    done
+    export TEST_PATH
 
     # Detect platform the same way install.sh does, so the asset name
     # matches what the script will request.
@@ -40,13 +49,14 @@ setup_file() {
         *) echo "unsupported test runner arch: $(uname -m)" >&2; exit 1 ;;
     esac
     export OS="$os" ARCH="$arch"
-    export BINARY="bhatti-${os}-${arch}"
+    export VERSION_SMOKE="v0.0.0-smoke"
+    export BUNDLE_ASSET="bhatti-${VERSION_SMOKE}-${os}-${arch}.tar.zst"
 
     # Sanity: every external command install.sh needs in CLI mode must
     # be reachable via TEST_PATH. If a runner ships them somewhere
     # else, we want to know now, not via a confusing test failure.
     local missing=""
-    for cmd in curl awk sed grep basename mktemp chmod cp install; do
+    for cmd in curl awk sed grep basename mktemp chmod cp install tar zstd; do
         PATH="$TEST_PATH" command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
     if [ -n "$missing" ]; then
@@ -54,26 +64,33 @@ setup_file() {
         exit 1
     fi
 
-    # Tiny fake binary that quacks like real bhatti for the version probe.
-    # install_bhatti_binary's post-download self-check runs `$tmp version`
-    # — this is what makes that check pass.
-    cat > "$RELEASE/$BINARY" <<'EOF'
+    # Build a fake v2 bundle matching the release layout: a top-level
+    # bhatti-<ver>-<os>-<arch>/ dir with bin/bhatti (+ lib/ + kernel/), tar.zst'd.
+    # install_bundle downloads + extracts this and runs `bin/bhatti version` as
+    # its self-check, so bin/bhatti must quack like real bhatti.
+    local dir="bhatti-${VERSION_SMOKE}-${os}-${arch}"
+    local btree="$RELEASE/.build/$dir"
+    mkdir -p "$btree/bin" "$btree/lib" "$btree/kernel"
+    cat > "$btree/bin/bhatti" <<'EOF'
 #!/bin/bash
 case "$1" in
     version) echo "bhatti v0.0.0-smoke" ;;
 esac
 EOF
-    chmod +x "$RELEASE/$BINARY"
+    chmod +x "$btree/bin/bhatti"
+    : > "$btree/lib/libkrun.so"
+    local karch=x86_64; [ "$arch" = "arm64" ] && karch=aarch64
+    : > "$btree/kernel/Image-lean-6.12.0-${karch}"
+    ( cd "$RELEASE/.build" && tar -cf - "$dir" | zstd -q -o "$RELEASE/${BUNDLE_ASSET}" )
 
-    # Generate checksums.txt in the same shape the release pipeline does.
-    # `cd` into $RELEASE so the path in the file is just the bare filename
-    # — that's what the script's grep against $CHECKSUMS will match.
+    # Generate checksums.txt in the same shape the release pipeline does (bare
+    # filename), which the script's grep against $CHECKSUMS matches.
     (
         cd "$RELEASE"
         if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$BINARY" > checksums-sha256.txt
+            sha256sum "$BUNDLE_ASSET" > checksums-sha256.txt
         else
-            shasum -a 256 "$BINARY" > checksums-sha256.txt
+            shasum -a 256 "$BUNDLE_ASSET" > checksums-sha256.txt
         fi
     )
 }
@@ -190,11 +207,10 @@ EOF
     tampered_release="$tampered_root/release"
     cp -R "$RELEASE" "$tampered_release"
 
-    # Replace the binary with different content. checksums.txt still has
+    # Replace the bundle with different content. checksums.txt still has
     # the OLD sha — verify_checksum should die when the new content
     # hashes to something different.
-    echo "tampered with" > "$tampered_release/$BINARY"
-    chmod +x "$tampered_release/$BINARY"
+    echo "tampered with" > "$tampered_release/$BUNDLE_ASSET"
 
     run env -i HOME="$HOME" PATH="$TEST_PATH" \
         BHATTI_MODE=cli BHATTI_TEST_VERSION="v0.0.0-smoke" \

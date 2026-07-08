@@ -602,9 +602,12 @@ install_bundle() {
     rm -f "$tmp"
 
     local root
-    root=$(find "$stage" -maxdepth 1 -type d -name 'bhatti-*' | head -1)
-    [ -n "$root" ] && [ -x "$root/bin/bhatti" ] \
-        || die "unexpected bundle layout (no bin/bhatti in ${asset})"
+    # -mindepth 1 so we don't match $stage itself (it's named bhatti-stage.XXXX,
+    # which also matches bhatti-*) — we want the extracted bhatti-<ver>-... subdir.
+    root=$(find "$stage" -mindepth 1 -maxdepth 1 -type d -name 'bhatti-*' | head -1)
+    if [ -z "$root" ] || [ ! -x "$root/bin/bhatti" ]; then
+        die "unexpected bundle layout (no bin/bhatti in ${asset})"
+    fi
 
     if [ "$OS" = "darwin" ]; then
         xattr -dr com.apple.quarantine "$root" 2>/dev/null || true
