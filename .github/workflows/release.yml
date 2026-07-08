@@ -130,10 +130,10 @@ jobs:
           set -euo pipefail
           mkdir -p stage/bin stage/lib
           cp bhatti-vmm stage/bin/bhatti-vmm
-          # bhatti-netd (opt-in net-backend gateway): Linux/KVM-focused; ship it
-          # only on Linux for now (macOS/HVF net is unvalidated and an unsigned
-          # helper would fail notarization). Pure Go, no libkrun linkage.
-          if [ "${{ matrix.os }}" = "linux" ]; then cp bhatti-netd stage/bin/bhatti-netd; fi
+          # bhatti-netd (opt-in net-backend gateway): validated on Linux/KVM AND
+          # macOS/HVF. Pure Go, no libkrun linkage (no rpath rewrite); it is
+          # Developer-ID signed below on macOS for notarization.
+          cp bhatti-netd stage/bin/bhatti-netd
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cp -R libkrucible/_install/lib/libkrun*.dylib stage/lib/
             DYLIB=$(find stage/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)
@@ -184,6 +184,10 @@ jobs:
           codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
             --entitlements cmd/vmm/hvf-entitlements.plist \
             --sign "$IDENTITY" stage/bin/bhatti-vmm
+          # bhatti-netd: plain userspace binary (gVisor netstack + sockets), no
+          # hypervisor access, so hardened-runtime sign with NO special entitlement.
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+            --sign "$IDENTITY" stage/bin/bhatti-netd
           codesign -dv --verbose=4 stage/bin/bhatti-vmm 2>&1 | grep -iE 'Authority|TeamIdentifier|flags|Timestamp='
           codesign --verify --strict stage/bin/bhatti-vmm
 
