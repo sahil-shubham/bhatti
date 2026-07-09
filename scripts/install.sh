@@ -2,10 +2,12 @@
 # scripts/install.sh — Unified bhatti installer.
 #
 # Detects platform and existing installation to do the right thing:
-#   macOS            → install/update CLI binary
-#   Linux (fresh)    → prompt: CLI or self-hosted server
-#   Linux (CLI)      → update CLI binary
-#   Linux (server)   → update all server components
+#   Linux / macOS (fresh)  → prompt: CLI or self-hosted server
+#   CLI install            → update the CLI binary
+#   server install         → update all server components
+# Both Linux (KVM) and macOS (Apple Silicon/HVF) can run the full self-hosted
+# stack; the only per-OS differences are the hypervisor preflight and the
+# service manager (systemd on Linux, launchd on macOS).
 #
 # Usage:
 #   curl -fsSL bhatti.sh/install | bash              # CLI or prompted
@@ -15,13 +17,22 @@
 #   BHATTI_MODE=cli|server     — skip install type prompt
 #   BHATTI_TIER=minimal|browser|docker|computer — skip tier prompt (server only)
 #   BHATTI_TIERS=all|tier1,tier2,...  — install additional tiers on update (server only)
-#   BHATTI_VERSION=v1.x.y      — install/update to this exact tag instead of
+#   BHATTI_VERSION=v2.x.y      — install/update to this exact tag instead of
 #                                latest. Useful for validating an `-rc` prerelease
 #                                before promoting it (the `releases/latest` API call
 #                                that the script normally uses skips prereleases).
 #                                The tag must exist as a public release/prerelease;
 #                                draft releases require auth and are not reachable
 #                                via the plain HTTPS asset URLs this script uses.
+#   BHATTI_ALLOW_MAJOR_CUTOVER=1 — allow installing v2 over a v1 (Firecracker)
+#                                server. v2 is a different VMM (krucible), so this
+#                                is a fresh install, NOT an in-place upgrade: v1
+#                                data/snapshots are not migrated. Refused by default.
+#
+# Platforms: Linux (KVM) and macOS (Apple Silicon, HVF) both install either the
+# CLI or a full self-hosted server from one self-contained bundle (bhatti-vmm +
+# bhatti-netd + libkrun + lean kernel). To use v1 (Firecracker), see the pinned
+# install line at https://bhatti.sh/v1/docs/quickstart/.
 
 # Skip script-mode hardening (set -e, traps) when sourced by the bats
 # test suite — those flags clobber bats' own ERR trap and result
@@ -34,8 +45,6 @@ if [ "${BHATTI_TEST:-}" != "1" ]; then
 fi
 
 GITHUB_REPO="sahil-shubham/bhatti"
-FC_VERSION="1.14.0"
-KERNEL_VERSION="6.1.155"
 DATA_DIR="/var/lib/bhatti"
 # Order matters: drives the order in user-facing hints ("outdated on disk:
 # computer, browser" follows ALL_KNOWN_TIERS order, not insertion order).
@@ -189,8 +198,8 @@ detect_platform() {
 # then map_arch", which doesn't need its own test.
 map_arch() {
     case "$1" in
-        x86_64)        ARCH="amd64"; FC_ARCH="x86_64" ;;
-        aarch64|arm64) ARCH="arm64"; FC_ARCH="aarch64" ;;
+        x86_64)        ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
         *) die "unsupported architecture: $1" ;;
     esac
 }
@@ -555,10 +564,16 @@ installed_bhatti_version() {
     echo "$ver"
 }
 
-# Get installed firecracker version (empty if not installed)
-installed_fc_version() {
-    command -v firecracker >/dev/null 2>&1 || { echo ""; return 0; }
-    firecracker --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+# is_firecracker_install returns 0 (true) if this host carries a v1 (Firecracker)
+# server — the firecracker binary, or a config that predates the krucible engine.
+# Used to hard-block an in-place v1→v2 crossing (a different VMM; not upgradeable).
+is_firecracker_install() {
+    command -v firecracker >/dev/null 2>&1 && return 0
+    local cfg="/etc/bhatti/config.yaml"
+    [ -f "$cfg" ] || cfg="$DATA_DIR/config.yaml"
+    [ -f "$cfg" ] || return 1
+    grep -q '^engine:[[:space:]]*krucible' "$cfg" && return 1
+    grep -q '^firecracker_rootfs:' "$cfg"
 }
 
 # ── Install functions ─────────────────────────────────
@@ -724,79 +739,6 @@ install_bhatti_binary() {
     BHATTI_STAGE_FILE=""
 }
 
-install_firecracker() {
-    local installed_fc
-    installed_fc=$(installed_fc_version)
-
-    if [ -n "$installed_fc" ] && ! version_gt "$FC_VERSION" "$installed_fc"; then
-        # FC is up to date, but jailer might be missing
-        if [ -x /usr/local/bin/jailer ]; then
-            success "Firecracker ${installed_fc} + jailer (up to date)"
-            return 0
-        fi
-        info "Firecracker ${installed_fc} up to date, installing missing jailer"
-    elif [ -n "$installed_fc" ]; then
-        heading "Updating Firecracker ${installed_fc} → ${FC_VERSION}"
-    else
-        heading "Installing Firecracker ${FC_VERSION}"
-    fi
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-
-    download_pipe \
-        "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${FC_ARCH}.tgz" \
-        tar xz -C "$tmpdir"
-
-    local release_dir="$tmpdir/release-v${FC_VERSION}-${FC_ARCH}"
-
-    [ -f "$release_dir/firecracker-v${FC_VERSION}-${FC_ARCH}" ] \
-        || die "firecracker binary not found in release archive" \
-               "Expected: $release_dir/firecracker-v${FC_VERSION}-${FC_ARCH}" \
-               "The release archive may be corrupt. Try again."
-
-    [ -f "$release_dir/jailer-v${FC_VERSION}-${FC_ARCH}" ] \
-        || die "jailer binary not found in release archive" \
-               "Expected: $release_dir/jailer-v${FC_VERSION}-${FC_ARCH}" \
-               "The release archive may be corrupt. Try again."
-
-    mv "$release_dir/firecracker-v${FC_VERSION}-${FC_ARCH}" /usr/local/bin/firecracker
-    mv "$release_dir/jailer-v${FC_VERSION}-${FC_ARCH}" /usr/local/bin/jailer
-    chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer
-    rm -rf "$tmpdir"
-    success "Firecracker ${FC_VERSION} + jailer"
-}
-
-install_lohar() {
-    local asset="lohar-linux-${ARCH}"
-    if is_up_to_date "$DATA_DIR/lohar" "$asset"; then
-        success "lohar (up to date)"
-        return 0
-    fi
-    step_start
-    heading "Installing lohar"
-    check_disk_space 10 "$DATA_DIR"
-    download "${RELEASE_URL}/${asset}" "$DATA_DIR/lohar"
-    verify_checksum "$DATA_DIR/lohar" "$asset"
-    chmod +x "$DATA_DIR/lohar"
-    success "lohar ($(du -h "$DATA_DIR/lohar" | cut -f1), $(step_elapsed))"
-}
-
-install_kernel() {
-    local asset="vmlinux-${KERNEL_VERSION}-${FC_ARCH}"
-    local kernel_path="$DATA_DIR/images/vmlinux-${ARCH}"
-    if is_up_to_date "$kernel_path" "$asset"; then
-        success "kernel (up to date)"
-        return 0
-    fi
-    step_start
-    heading "Installing kernel"
-    check_disk_space 15 "$DATA_DIR"
-    download_large "${RELEASE_URL}/${asset}" "$kernel_path"
-    verify_checksum "$kernel_path" "$asset"
-    success "kernel ($(du -h "$kernel_path" | cut -f1), $(step_elapsed))"
-}
-
 install_rootfs() {
     local tier="$1"
     local asset="rootfs-${tier}-${ARCH}.ext4.zst"
@@ -871,13 +813,6 @@ install_rootfs() {
     fi
 
     success "rootfs ${tier} ($(du -h "$rootfs_path" | cut -f1), $(step_elapsed))"
-}
-
-setup_jail_user() {
-    if ! id -u bhatti-vm >/dev/null 2>&1; then
-        useradd -r -s /usr/sbin/nologin -u 10000 bhatti-vm 2>/dev/null || true
-        success "Created bhatti-vm user (uid 10000)"
-    fi
 }
 
 generate_config() {
@@ -972,7 +907,90 @@ WantedBy=multi-user.target
 UNIT
 }
 
-# ── Top-level flows ───────────────────────────────────
+# write_launchd_daemon — the macOS equivalent of the systemd unit. A LaunchDaemon
+# that runs `bhatti serve`. HVF works for the daemon; the notarized bhatti-vmm
+# carries the com.apple.security.hypervisor entitlement. Logs to the data dir.
+write_launchd_daemon() {
+    local plist=/Library/LaunchDaemons/sh.bhatti.plist
+    cat > "$plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>sh.bhatti</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/bhatti</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>WorkingDirectory</key><string>${DATA_DIR}</string>
+    <key>StandardOutPath</key><string>${DATA_DIR}/bhatti.log</string>
+    <key>StandardErrorPath</key><string>${DATA_DIR}/bhatti.log</string>
+</dict>
+</plist>
+EOF
+    chmod 644 "$plist"
+}
+
+# start_service — (re)start the daemon after install/update and confirm health.
+# OS-aware: systemd on Linux, launchd on macOS. Best-effort; a failure prints
+# where to look rather than aborting a finished install.
+start_service() {
+    local plist=/Library/LaunchDaemons/sh.bhatti.plist
+    if [ "$OS" = "darwin" ]; then
+        launchctl bootout system "$plist" 2>/dev/null || true
+        launchctl bootstrap system "$plist" 2>/dev/null \
+            || launchctl load "$plist" 2>/dev/null || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now bhatti 2>/dev/null || return 1
+    else
+        return 1
+    fi
+    local healthy=false
+    for _ in 1 2 3 4 5; do
+        if curl -sf http://localhost:8080/health >/dev/null 2>&1; then healthy=true; break; fi
+        sleep 1
+    done
+    [ "$healthy" = true ]
+}
+
+# prompt_and_install_server — shared by the Linux and macOS fresh-install flows:
+# prompt for a tier (unless BHATTI_TIER is set), then do a self-host install
+# (handling the "all" tiers case). do_server_install is OS-aware.
+prompt_and_install_server() {
+    local tier="${BHATTI_TIER:-}"
+    if [ -z "$tier" ]; then
+        echo ""
+        echo "  Rootfs tier:"
+        echo "    1) minimal  — bare Ubuntu (~200MB)"
+        echo "    2) browser  — + Chromium/Playwright (~600MB)"
+        echo "    3) docker   — + Docker Engine (~550MB)"
+        echo "    4) computer — + Full desktop with KasmVNC (~1.5GB)"
+        echo "    5) all      — install all tiers (~2.8GB)"
+        echo ""
+        printf "  Choice [1]: "
+        read -r tier_choice < /dev/tty 2>/dev/null || tier_choice="1"
+        case "${tier_choice:-1}" in
+            2) tier="browser" ;;
+            3) tier="docker" ;;
+            4) tier="computer" ;;
+            5) tier="all" ;;
+            *) tier="minimal" ;;
+        esac
+    fi
+    if [ "$tier" = "all" ]; then
+        do_server_install "minimal"
+        for t in browser docker computer; do
+            install_rootfs "$t"
+        done
+    else
+        do_server_install "$tier"
+    fi
+}
+
+# ── Top-level flows ────────────────────────────────────
 
 do_cli_install() {
     local current
@@ -1037,15 +1055,21 @@ do_server_install() {
                                 "  sudo bhatti update" \
                                 "  curl -fsSL bhatti.sh/install | sudo bash"
 
-    # Preflight
-    if [ ! -e /dev/kvm ]; then
-        modprobe kvm 2>/dev/null || true
+    # Preflight — hypervisor per OS. Linux: KVM (/dev/kvm). macOS: HVF on Apple
+    # Silicon (no /dev/kvm; the notarized bhatti-vmm carries the hypervisor
+    # entitlement, so it runs without any extra device).
+    if [ "$OS" = "darwin" ]; then
+        [ "$ARCH" = "arm64" ] || die "self-hosting on macOS requires Apple Silicon (arm64)" \
+                                     "Intel Macs are not supported for the v2 runtime."
+    else
+        if [ ! -e /dev/kvm ]; then
+            modprobe kvm 2>/dev/null || true
+        fi
+        [ -e /dev/kvm ] || die "/dev/kvm not available — KVM is required" \
+                               "Enable virtualization in your BIOS/hypervisor settings," \
+                               "or use a VM with nested virtualization enabled."
     fi
-    [ -e /dev/kvm ] || die "/dev/kvm not available — KVM is required" \
-                           "Enable virtualization in your BIOS/hypervisor settings," \
-                           "or use a VM with nested virtualization enabled."
-    command -v curl >/dev/null 2>&1 || die "curl is required" \
-                                          "Install it with: apt-get install curl"
+    command -v curl >/dev/null 2>&1 || die "curl is required"
 
     heading "Installing bhatti ${VERSION} (server, ${tier} tier) on $(hostname) (${HOST_ARCH})"
 
@@ -1058,15 +1082,18 @@ do_server_install() {
     success "bhatti ${VERSION} + krucible runtime"
 
     install_rootfs "$tier"
-    setup_jail_user
     generate_config "$tier"
     create_admin_user
-    write_systemd_unit
 
-    # Install systemd unit directly (we already have root)
-    if command -v systemctl >/dev/null 2>&1; then
-        cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
-        systemctl daemon-reload
+    # Install the service (OS-aware): systemd on Linux, launchd on macOS.
+    if [ "$OS" = "darwin" ]; then
+        write_launchd_daemon
+    else
+        write_systemd_unit
+        if command -v systemctl >/dev/null 2>&1; then
+            cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
+            systemctl daemon-reload
+        fi
     fi
 
     local elapsed=$(( SECONDS - _total_start ))
@@ -1102,32 +1129,19 @@ do_server_install() {
     echo "    curl -fsSL bhatti.sh/uninstall | sudo bash"
     echo "============================================"
 
-    # Always start the service on fresh install. There's no reason to
-    # leave it stopped — the user just installed everything. If they
-    # want to run `bhatti serve` manually, they can disable the service.
-    if command -v systemctl >/dev/null 2>&1; then
-        echo ""
-        if systemctl enable --now bhatti 2>/dev/null; then
-            # Verify the service is actually healthy
-            local healthy=false
-            for _ in 1 2 3 4 5; do
-                if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
-                    healthy=true
-                    break
-                fi
-                sleep 1
-            done
-            if [ "$healthy" = true ]; then
-                success "bhatti service started and healthy"
-            else
-                printf '  %s⚠  Service started but not responding on :8080%s\n' "$RED" "$RESET"
-                echo "  Check logs:"
-                echo "    sudo journalctl -u bhatti --no-pager -n 20"
-                echo ""
-                journalctl -u bhatti --no-pager -n 5 2>/dev/null || true
-            fi
+    # Always start the service on fresh install — the user just installed
+    # everything. OS-aware (systemd on Linux, launchd on macOS).
+    echo ""
+    if start_service; then
+        success "bhatti service started and healthy"
+    else
+        printf '  %s⚠  Service not responding on :8080 yet%s\n' "$RED" "$RESET"
+        if [ "$OS" = "darwin" ]; then
+            echo "  Check logs:"
+            echo "    tail -n 40 ${DATA_DIR}/bhatti.log"
+            echo "  Or run it in the foreground:"
+            echo "    bhatti serve"
         else
-            printf '  %s⚠  Failed to start bhatti service%s\n' "$RED" "$RESET"
             echo "  Check logs:"
             echo "    sudo journalctl -u bhatti --no-pager -n 20"
             echo ""
@@ -1184,11 +1198,17 @@ do_server_update() {
     # because a stale .ext4 from a previous version can satisfy -f and
     # short-circuit `bhatti update --tiers <X>` for that tier — the gate
     # would skip install_rootfs() before its own skip-check ran.
+    # v2 runtime closure (from `install_bundle 1`): the CLI, the per-VM vmm helper,
+    # the per-owner net gateway, libkrun, and the lean kernel. lohar is baked into
+    # the rootfs (/init.krun), not a standalone file. (The old FC checks —
+    # firecracker/lohar/vmlinux — never matched on v2, so update never short-circuited.)
+    local rt="$DATA_DIR/runtime"
     local all_present=true
-    [ -f "/usr/local/bin/bhatti" ]                          || all_present=false
-    [ -f "/usr/local/bin/firecracker" ]                     || all_present=false
-    [ -f "$DATA_DIR/lohar" ]                                || all_present=false
-    [ -f "$DATA_DIR/images/vmlinux-${ARCH}" ]               || all_present=false
+    [ -f "/usr/local/bin/bhatti" ]              || all_present=false
+    [ -f "$rt/bin/bhatti-vmm" ]                 || all_present=false
+    [ -f "$rt/bin/bhatti-netd" ]                || all_present=false
+    ls "$rt"/lib/libkrun.* >/dev/null 2>&1      || all_present=false
+    ls "$rt"/kernel/*-lean-* >/dev/null 2>&1    || all_present=false
 
     local rootfs_fresh=true
     # shellcheck disable=SC2086
@@ -1201,7 +1221,31 @@ do_server_update() {
         return 0
     fi
 
-    # Guard against major version crossings (e.g. v0.5.x → v1.0.0).
+    # Hard stop: a v1 (Firecracker) server cannot upgrade in place to v2
+    # (krucible) — a different VMM, non-portable snapshots, a different on-disk
+    # layout. This is a deliberate cutover, not an update.
+    if is_firecracker_install && [ "$(major_version "$VERSION")" -ge 2 ]; then
+        echo ""
+        printf '  %s✗ Cannot upgrade a Firecracker (v1) server to %s in place.%s\n' "$RED" "$VERSION" "$RESET"
+        echo "  v2 replaces Firecracker with krucible — a different VMM. Snapshots and the"
+        echo "  on-disk layout do not carry over, so moving to v2 is a fresh install:"
+        echo ""
+        echo "    1. Drain + back up this server (sandboxes, volumes, secrets)."
+        echo "    2. Install v2 fresh (on a clean host, or after removing v1):"
+        echo "         curl -fsSL bhatti.sh/install | sudo bash"
+        echo ""
+        echo "  To keep running Firecracker instead, pin v1:"
+        echo "    curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPO}/firecracker/scripts/install.sh | sudo BHATTI_VERSION=v1.11.12 bash"
+        echo ""
+        if [ "${BHATTI_ALLOW_MAJOR_CUTOVER:-}" = "1" ]; then
+            info "BHATTI_ALLOW_MAJOR_CUTOVER=1 set — proceeding with a fresh v2 install over v1 (v1 data is NOT migrated)"
+        else
+            die "refusing in-place v1→v2 upgrade (different VMM)" \
+                "Set BHATTI_ALLOW_MAJOR_CUTOVER=1 to install v2 over this host anyway (v1 data is NOT migrated)."
+        fi
+    fi
+
+    # Guard against other major version crossings (e.g. a future v2 → v3).
     # Major version bumps may include breaking changes (snapshot format,
     # config schema, etc.) that require manual migration steps.
     if [ -n "$current" ] && crosses_major "$current" "$VERSION"; then
@@ -1227,9 +1271,15 @@ do_server_update() {
         info "${current} → ${VERSION}"
     fi
 
-    # Stop systemd service if running (restart after update)
+    # Stop the service if running (restart after update). OS-aware.
     local was_running=false
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active bhatti >/dev/null 2>&1; then
+    if [ "$OS" = "darwin" ]; then
+        if launchctl print system/sh.bhatti >/dev/null 2>&1; then
+            was_running=true
+            heading "Stopping bhatti service"
+            launchctl bootout system /Library/LaunchDaemons/sh.bhatti.plist 2>/dev/null || true
+        fi
+    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active bhatti >/dev/null 2>&1; then
         was_running=true
         heading "Stopping bhatti service"
         systemctl stop bhatti
@@ -1242,11 +1292,14 @@ do_server_update() {
     for t in $tiers_to_install; do
         install_rootfs "$t"
     done
-    setup_jail_user
-    write_systemd_unit
+    if [ "$OS" = "darwin" ]; then
+        write_launchd_daemon
+    else
+        write_systemd_unit
+    fi
 
-    # Migrate config from old location if needed (pre-v1.6)
-    if [ -f "$DATA_DIR/config.yaml" ] && [ ! -f "/etc/bhatti/config.yaml" ]; then
+    # Migrate config from old location if needed (pre-v1.6, Linux only)
+    if [ "$OS" != "darwin" ] && [ -f "$DATA_DIR/config.yaml" ] && [ ! -f "/etc/bhatti/config.yaml" ]; then
         mkdir -p /etc/bhatti
         mv "$DATA_DIR/config.yaml" /etc/bhatti/config.yaml
         info "Migrated config to /etc/bhatti/config.yaml"
@@ -1257,14 +1310,21 @@ do_server_update() {
     # changes, handle it via migration logic, not regeneration.
     # admin user is PRESERVED
 
-    # Always update the systemd unit and ensure service is enabled
-    cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
-    systemctl daemon-reload
-    systemctl enable bhatti 2>/dev/null || true
-
-    if [ "$was_running" = true ]; then
-        heading "Restarting bhatti service"
-        systemctl start bhatti
+    # Always refresh the service definition + ensure it's enabled (OS-aware).
+    if [ "$OS" = "darwin" ]; then
+        if [ "$was_running" = true ]; then
+            heading "Restarting bhatti service"
+            launchctl bootstrap system /Library/LaunchDaemons/sh.bhatti.plist 2>/dev/null \
+                || launchctl load /Library/LaunchDaemons/sh.bhatti.plist 2>/dev/null || true
+        fi
+    else
+        cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
+        systemctl daemon-reload
+        systemctl enable bhatti 2>/dev/null || true
+        if [ "$was_running" = true ]; then
+            heading "Restarting bhatti service"
+            systemctl start bhatti
+        fi
     fi
 
     echo ""
@@ -1323,11 +1383,11 @@ main() {
     local install_type
     install_type=$(detect_install_type)
 
+    # Both Linux (KVM) and macOS (Apple Silicon/HVF) can run the full stack —
+    # CLI-only or a self-host server. The only per-OS differences (hypervisor
+    # preflight, systemd vs launchd) live in do_server_install / do_server_update.
     case "$OS" in
-        darwin)
-            do_cli_install
-            ;;
-        linux)
+        linux|darwin)
             case "$install_type" in
                 server)
                     do_server_update
@@ -1339,11 +1399,9 @@ main() {
                     local mode="${BHATTI_MODE:-}"
 
                     if [ -z "$mode" ]; then
-                        # Auto-detect: root + KVM = server, otherwise CLI
-                        if [ "$(id -u)" -eq 0 ] && [ -e /dev/kvm ]; then
-                            # Root with KVM — default to server. The user ran
-                            # `curl | sudo bash` on a machine with KVM, they
-                            # almost certainly want a server install.
+                        if [ "$OS" = "linux" ] && [ "$(id -u)" -eq 0 ] && [ -e /dev/kvm ]; then
+                            # Root + KVM: they ran `curl | sudo bash` on a capable
+                            # box — default to self-host.
                             echo ""
                             echo "  Install bhatti as:"
                             echo "    1) Self-host — run bhatti on this machine"
@@ -1359,7 +1417,11 @@ main() {
                             echo ""
                             echo "  Install bhatti as:"
                             echo "    1) CLI — connect to a remote bhatti server"
-                            echo "    2) Self-host — run bhatti on this machine (requires root + KVM)"
+                            if [ "$OS" = "darwin" ]; then
+                                echo "    2) Self-host — run sandboxes locally on this Mac (Apple Silicon)"
+                            else
+                                echo "    2) Self-host — run bhatti on this machine (requires root + KVM)"
+                            fi
                             echo ""
                             printf "  Choice [1]: "
                             read -r mode_choice < /dev/tty 2>/dev/null || mode_choice="1"
@@ -1372,42 +1434,13 @@ main() {
 
                     case "$mode" in
                         server)
-                            # Check root BEFORE asking for tier
-                            [ "$(id -u)" -eq 0 ] || die "server installation requires root" \
+                            # Self-host writes /etc/bhatti, /usr/local/bin, and the
+                            # data dir — root on both OSes (macOS HVF itself needs no
+                            # root, but these paths do).
+                            [ "$(id -u)" -eq 0 ] || die "self-host installation requires root" \
                                                         "Re-run with:" \
-                                                        "  sudo bhatti update" \
                                                         "  curl -fsSL bhatti.sh/install | sudo bash"
-
-                            local tier="${BHATTI_TIER:-}"
-
-                            if [ -z "$tier" ]; then
-                                echo ""
-                                echo "  Rootfs tier:"
-                                echo "    1) minimal  — bare Ubuntu (~200MB)"
-                                echo "    2) browser  — + Chromium/Playwright (~600MB)"
-                                echo "    3) docker   — + Docker Engine (~550MB)"
-                                echo "    4) computer — + Full desktop with KasmVNC (~1.5GB)"
-                                echo "    5) all      — install all tiers (~2.8GB)"
-                                echo ""
-                                printf "  Choice [1]: "
-                                read -r tier_choice < /dev/tty 2>/dev/null || tier_choice="1"
-                                case "${tier_choice:-1}" in
-                                    2) tier="browser" ;;
-                                    3) tier="docker" ;;
-                                    4) tier="computer" ;;
-                                    5) tier="all" ;;
-                                    *) tier="minimal" ;;
-                                esac
-                            fi
-
-                            if [ "$tier" = "all" ]; then
-                                do_server_install "minimal"
-                                for t in browser docker computer; do
-                                    install_rootfs "$t"
-                                done
-                            else
-                                do_server_install "$tier"
-                            fi
+                            prompt_and_install_server
                             ;;
                         *)
                             do_cli_install

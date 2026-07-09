@@ -174,25 +174,22 @@ output_contains() {
 # The previous detect_platform tests just asserted "the test runner
 # has an arch", which proved nothing — these drive the cases directly.
 
-@test "map_arch: x86_64 (Linux) → amd64 / x86_64" {
-    ARCH=""; FC_ARCH=""
+@test "map_arch: x86_64 (Linux) → amd64" {
+    ARCH=""
     map_arch x86_64
     [ "$ARCH" = "amd64" ]
-    [ "$FC_ARCH" = "x86_64" ]
 }
 
-@test "map_arch: aarch64 (Linux) → arm64 / aarch64" {
-    ARCH=""; FC_ARCH=""
+@test "map_arch: aarch64 (Linux) → arm64" {
+    ARCH=""
     map_arch aarch64
     [ "$ARCH" = "arm64" ]
-    [ "$FC_ARCH" = "aarch64" ]
 }
 
-@test "map_arch: arm64 (macOS uname -m on Apple Silicon) → arm64 / aarch64" {
-    ARCH=""; FC_ARCH=""
+@test "map_arch: arm64 (macOS uname -m on Apple Silicon) → arm64" {
+    ARCH=""
     map_arch arm64
     [ "$ARCH" = "arm64" ]
-    [ "$FC_ARCH" = "aarch64" ]
 }
 
 @test "map_arch: unknown arch dies with a clear message" {

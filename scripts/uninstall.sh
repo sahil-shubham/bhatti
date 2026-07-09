@@ -54,51 +54,75 @@ if [[ -f /etc/systemd/system/bhatti.service ]]; then
     systemctl daemon-reload
 fi
 
-# --- 2. Kill any running Firecracker VMs ---
+# --- 2. Kill any running sandbox VMs / gateways (v2 = krucible) ---
+#
+# v2 runs one bhatti-vmm helper per sandbox and one bhatti-netd gateway per
+# owner. Both are plain host processes; the daemon normally reaps them, but
+# kill any strays before removing the runtime.
 
 KILLED=0
-for pid in $(pgrep -f "firecracker --api-sock" 2>/dev/null || true); do
-    echo "  killing firecracker pid $pid"
-    kill "$pid" 2>/dev/null || true
-    KILLED=$((KILLED + 1))
+for pat in "bhatti-vmm" "bhatti-netd"; do
+    for pid in $(pgrep -f "$pat" 2>/dev/null || true); do
+        echo "  killing $pat pid $pid"
+        kill "$pid" 2>/dev/null || true
+        KILLED=$((KILLED + 1))
+    done
 done
 if [[ $KILLED -gt 0 ]]; then
-    echo "  killed $KILLED firecracker process(es), waiting for cleanup..."
+    echo "  killed $KILLED helper process(es), waiting for cleanup..."
     sleep 2
 fi
 
-# --- 3. Clean up network devices ---
+# --- 2b. Legacy v1 (Firecracker) teardown — only if FC artifacts are present ---
+#
+# v2's network gateway (bhatti-netd) is a userspace gVisor netstack: there is NO
+# host tap/bridge/iptables state to reap. This block only runs on a leftover v1
+# host (per-sandbox TAP + per-user brbhatti bridge + FORWARD rules).
 
-# TAP devices (created per-sandbox)
-for tap in $(ip -o link show type tun 2>/dev/null | grep "tap" | awk -F': ' '{print $2}' | cut -d@ -f1); do
-    echo "  removing tap device: $tap"
-    ip link del "$tap" 2>/dev/null || true
-done
+if command -v firecracker >/dev/null 2>&1 \
+   || ip -o link show type bridge 2>/dev/null | grep -q "brbhatti"; then
+    echo "==> Firecracker (v1) artifacts detected — cleaning up host network state"
 
-# Bridge devices (created per-user)
-for br in $(ip -o link show type bridge 2>/dev/null | grep "brbhatti" | awk -F': ' '{print $2}' | cut -d@ -f1); do
-    echo "  removing bridge: $br"
-    ip link del "$br" 2>/dev/null || true
-done
-
-# iptables rules (bhatti adds FORWARD rules per-bridge)
-RULES=$(iptables -S FORWARD 2>/dev/null | grep -i "brbhatti" || true)
-if [[ -n "$RULES" ]]; then
-    echo "$RULES" | while read -r rule; do
-        echo "  removing iptables rule: $rule"
-        # shellcheck disable=SC2086
-        iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
+    for pid in $(pgrep -f "firecracker --api-sock" 2>/dev/null || true); do
+        echo "  killing firecracker pid $pid"
+        kill "$pid" 2>/dev/null || true
     done
+    sleep 1
+
+    for tap in $(ip -o link show type tun 2>/dev/null | grep "tap" | awk -F': ' '{print $2}' | cut -d@ -f1); do
+        echo "  removing tap device: $tap"
+        ip link del "$tap" 2>/dev/null || true
+    done
+    for br in $(ip -o link show type bridge 2>/dev/null | grep "brbhatti" | awk -F': ' '{print $2}' | cut -d@ -f1); do
+        echo "  removing bridge: $br"
+        ip link del "$br" 2>/dev/null || true
+    done
+    RULES=$(iptables -S FORWARD 2>/dev/null | grep -i "brbhatti" || true)
+    if [[ -n "$RULES" ]]; then
+        echo "$RULES" | while read -r rule; do
+            echo "  removing iptables rule: $rule"
+            # shellcheck disable=SC2086
+            iptables $(echo "$rule" | sed 's/^-A/-D/') 2>/dev/null || true
+        done
+    fi
 fi
 
-# --- 4. Remove binaries ---
+# --- 3. Remove binaries + the v2 runtime prefix ---
 
-for bin in /usr/local/bin/bhatti /usr/local/bin/firecracker; do
+for bin in /usr/local/bin/bhatti /usr/local/bin/firecracker /usr/local/bin/jailer; do
     if [[ -f "$bin" ]]; then
         echo "==> Removing $bin"
         rm -f "$bin"
     fi
 done
+
+# The v2 runtime closure (bhatti-vmm, bhatti-netd, libkrun, lean kernel) lives
+# under $DATA_DIR/runtime and is re-laid on every install, so remove it even in
+# soft mode (it is not user data).
+if [[ -d "$DATA_DIR/runtime" ]]; then
+    echo "==> Removing $DATA_DIR/runtime"
+    rm -rf "$DATA_DIR/runtime"
+fi
 
 # --- 5. Purge data (only with --purge) ---
 
@@ -150,10 +174,11 @@ echo ""
 if [[ "$PURGE" == "true" ]]; then
     echo "  All data removed."
 else
-    echo "  Binaries + service removed."
+    echo "  Binaries + runtime + service removed."
     echo "  Data preserved: $DATA_DIR"
-    echo "    (kernel, rootfs, volumes, secrets)"
+    echo "    (rootfs images, volumes, secrets, sandboxes)"
     echo "  Config preserved: /etc/bhatti/config.yaml"
+    echo "    (the krucible runtime under $DATA_DIR/runtime is re-installed on update)"
     echo ""
     echo "  To reinstall:"
     echo "    curl -fsSL bhatti.sh/install | sudo bash"
