@@ -3,7 +3,7 @@
   <img alt="bhatti" src="assets/logo-light.png" height="48">
 </picture>
 
-Open-source Firecracker microVM orchestrator. Each sandbox is a real Linux VM with its own kernel, filesystem, and process isolation — created in seconds, paused for free, resumed in microseconds.
+Open-source microVM orchestrator with its own VMM. Each sandbox is a real Linux VM with its own kernel, filesystem, and process isolation — created in seconds, paused for free, resumed in microseconds. Runs on **Linux (KVM)** and **macOS (Apple Silicon)** — a dev box or a server, your choice.
 
 Built for running AI coding agents in isolated environments. A paused sandbox wakes and serves an HTTP request in **under 4ms**.
 
@@ -14,53 +14,57 @@ bhatti shell dev                          # Ctrl+\ to detach
 bhatti destroy dev
 ```
 
-> ## 🔭 Where bhatti is heading (v1 → v2)
+> ## 🔭 bhatti v2 (krucible) — and v1 (Firecracker), frozen
 >
-> **`main` now tracks bhatti v2**, which replaces Firecracker with **krucible** —
-> our own fork of [libkrun](https://github.com/containers/libkrun),
+> **`main` is bhatti v2.** It replaces Firecracker with **krucible** — our own
+> fork of [libkrun](https://github.com/containers/libkrun),
 > [**libkrucible**](https://github.com/sahil-shubham/libkrucible) — as the VM
 > engine. Owning the VMM lets bhatti run **natively on macOS (Apple Silicon) as
-> well as Linux**, which drastically lowers the barrier to trying it on a laptop,
-> and gives us room to revisit early design decisions. **v2 is pre-release** — the
-> installer and signed macOS/Linux artifacts are still being built, so there's no
-> `curl | install` for it yet.
+> well as Linux**, adds a secure-by-default per-owner network gateway, and moves
+> storage onto host-independent qcow2 (no more btrfs requirement). The
+> `curl … | install` below installs v2.
 >
-> **For a stable, battle-tested bhatti today, use v1 (Firecracker).** It's Linux +
-> KVM, documented in this README and at [bhatti.sh](https://bhatti.sh), and the
-> `curl … | install` below installs it. The source lives on the
+> **v1 (Firecracker) is frozen but still installable.** It's Linux + KVM; the
+> source is on the
 > [`firecracker`](https://github.com/sahil-shubham/bhatti/tree/firecracker) branch
-> (latest release
-> [**v1.11.12**](https://github.com/sahil-shubham/bhatti/releases/tag/v1.11.12));
-> check out that branch to build it from source. v1 is **frozen** — preserved and
-> installable, but we're putting our energy into v2 rather than maintaining two
-> engines.
+> (latest [**v1.11.12**](https://github.com/sahil-shubham/bhatti/releases/tag/v1.11.12)),
+> documented at [bhatti.sh/v1/docs](https://bhatti.sh/v1/docs/). We're putting our
+> energy into v2 rather than maintaining two engines.
+>
+> **Moving from v1 to v2 is a cutover, not an in-place upgrade** — a different VMM
+> (snapshots and the on-disk layout don't carry over). Install v2 fresh; keep v1
+> by pinning `BHATTI_VERSION=v1.11.12`.
 >
 > The why (self-owned VMM, macOS, the rethink) and where to weigh in:
 > **[Discussions → bhatti v2](https://github.com/sahil-shubham/bhatti/discussions/22)**.
 
 ## Install
 
-Pick a line — both are on the **[releases page](https://github.com/sahil-shubham/bhatti/releases)**.
+**v2 (krucible).** One installer, two platforms. Self-host on any Linux box with
+KVM (Raspberry Pi 5, Hetzner AX, a cloud VM with nested virtualization) or on a
+Mac (Apple Silicon, HVF — no KVM, no root for the hypervisor itself):
 
-**v2 (krucible) — Linux + macOS · pre-release.** The self-owned-VMM line (see above).
-Download the signed, relocatable tarball for your platform from the
-[latest release](https://github.com/sahil-shubham/bhatti/releases) —
-`bhatti-<ver>-{darwin-arm64,linux-amd64,linux-arm64}.tar.zst`, a `bin/ lib/ kernel/`
-prefix — plus a rootfs tier image. A `curl bhatti.sh/install` one-liner ships with the
-first stable v2; until then it's an early-adopter setup.
+```bash
+curl -fsSL bhatti.sh/install | sudo bash        # self-host server (prompts for a tier)
+curl -fsSL bhatti.sh/install | bash             # CLI only (connect to a remote server)
+```
 
-**v1 (Firecracker) — Linux + KVM · stable (frozen).** On any Linux box with KVM
-(Raspberry Pi 5, Hetzner AX, a cloud VM with nested virtualization):
+The self-host install lays a single self-contained runtime bundle (daemon + agent +
+`bhatti-vmm` + the `bhatti-netd` gateway + libkrun + a lean kernel) plus a rootfs
+tier, creates an `admin` user, wires the local CLI, and starts the service
+(systemd on Linux, launchd on macOS) — `bhatti create` works immediately. Prefer a
+manual grab? Take the per-platform tarball
+(`bhatti-<ver>-{darwin-arm64,linux-amd64,linux-arm64}.tar.zst`) from the
+[latest release](https://github.com/sahil-shubham/bhatti/releases).
+
+**v1 (Firecracker) — Linux + KVM · frozen.** To install the old engine instead, pin
+it (a bare `bhatti.sh/install` now installs v2):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sahil-shubham/bhatti/firecracker/scripts/install.sh | sudo BHATTI_VERSION=v1.11.12 bash
 ```
 
-Installs the daemon + agent + Firecracker + jailer + kernel + a minimal Ubuntu 24.04
-rootfs, creates an `admin` user, and wires the local CLI — `bhatti create` works
-immediately. Prefer a manual grab? Take the binaries from the
-[v1.11.12 release](https://github.com/sahil-shubham/bhatti/releases/tag/v1.11.12).
-CLI-only on another machine: run the script without `sudo`, then `bhatti setup --url … --token …`.
+See [bhatti.sh/v1/docs](https://bhatti.sh/v1/docs/) for the v1 docs.
 
 > **Full documentation: [bhatti.sh](https://bhatti.sh).** This README is a snapshot. The website is the source of truth and is updated with each release. The pages most worth reading are the [Quickstart](https://bhatti.sh/docs/quickstart/), the [Architecture](https://bhatti.sh/docs/under-the-hood/architecture/) overview, and [Decisions & learnings](https://bhatti.sh/docs/under-the-hood/decisions/).
 
@@ -74,9 +78,10 @@ sudo bhatti update              # Server: updates all components
 sudo bhatti update --tiers all  # Server: also pull additional tiers
 ```
 
-> **v1 is frozen.** Pin it: `sudo BHATTI_VERSION=v1.11.12 bhatti update`. A bare
-> `bhatti update` tracks the latest release, so once v2.0.0 ships it would jump a v1
-> server to v2 (a different VMM — not an in-place upgrade). v2 gets its own update flow.
+> **Within v2, `bhatti update` is safe** — it refreshes the binary (CLI) or all
+> runtime components (server). **Crossing from v1 (Firecracker) is blocked**: it's a
+> different VMM, so the installer refuses an in-place jump and points you at a fresh
+> v2 install. To stay on v1, pin it: `sudo BHATTI_VERSION=v1.11.12 bhatti update`.
 
 ## Rootfs Tiers
 
@@ -185,10 +190,14 @@ All commands support `--json` for machine-readable output. See the [CLI Referenc
 
 ## Performance
 
-Measured on a Hetzner AX102 (Ryzen 9, x86_64, NVMe, btrfs) running
-bhatti v1.11.0. CLI on the daemon host so loopback latency only —
-add your network RTT for remote use. Reproduce with `bench/run.sh`
-in this repo; methodology and gotchas in `bench/README.md`.
+> The numbers below are the **v1 (Firecracker)** baseline on a Hetzner AX102
+> (Ryzen 9, x86_64, NVMe). v2 (krucible) is being re-measured on Linux/KVM and
+> macOS/HVF — the shape is the same (free warm-wake, sub-second cold-wake), and the
+> lean owned kernel roughly halves cold-start; this table will be updated with the
+> v2 figures.
+
+CLI on the daemon host so loopback latency only — add your network RTT for remote
+use. Reproduce with `bench/run.sh` in this repo; methodology in `bench/README.md`.
 
 ```
                                 p50       p99
@@ -210,19 +219,20 @@ transparent wake feels free.
 
 ```
 bhatti (host daemon)                        lohar (guest agent, PID 1 in each VM)
-  ├─ REST/WS API (:8080)                     ├─ TCP :1024 (exec, files, sessions)
-  ├─ Per-user auth (API keys, SHA-256)        ├─ TCP :1025 (port forwarding)
-  ├─ Firecracker engine                       ├─ PTY sessions + 64KB scrollback
-  │  (create, exec, snapshot, restore)        ├─ Atomic file writes
-  ├─ Thermal manager                          ├─ Process group kill
-  │  (hot → warm → cold, auto)               ├─ Exec as uid 1000 (not root)
-  ├─ Per-user bridge networks (isolated)      └─ Config drive (env, secrets)
+  ├─ Control API (unix socket + :8080)       ├─ vsock: exec, files, sessions
+  ├─ Per-user auth (API keys, SHA-256)        ├─ port forwarding
+  ├─ krucible engine (libkrun fork)           ├─ PTY sessions + 64KB scrollback
+  │  └─ per-VM bhatti-vmm helper + control      ├─ Atomic file writes
+  │     socket (create, exec, snapshot, fork)   ├─ Process group kill
+  ├─ Thermal manager (hot → warm → cold, auto)  ├─ Exec as uid 1000 (not root)
+  ├─ bhatti-netd gateway (gVisor, per owner)    └─ Config drive (env, secrets)
+  │  └─ policed egress, host isolation, siblings
   ├─ SQLite store + age encryption
   ├─ Rate limiting + exec timeouts
   └─ Reverse proxy (HTTP + WebSocket)
 ```
 
-Idle sandbox → **warm** after 30s (vCPUs paused, ~4ms wake) → **cold** after 30min (snapshotted to disk, memory freed, ~360ms wake including page-in on first request). Any API request transparently wakes it.
+Runs on Linux (KVM) and macOS (Apple Silicon, HVF). Idle sandbox → **warm** after 30s (vCPUs paused, ~4ms wake) → **cold** after 30min (snapshotted to disk, memory freed, sub-second wake including page-in on first request). Any API request transparently wakes it.
 
 ## Multi-Tenant Isolation
 
@@ -234,7 +244,7 @@ sudo bhatti user create --name alice --max-sandboxes 5
 ```
 
 - **API scoping** — users see only their own sandboxes and secrets
-- **Network isolation** — per-user bridge + /24 subnet, cross-user traffic blocked at L2
+- **Network isolation** — a per-owner `bhatti-netd` gateway (userspace gVisor netstack): egress is policed (the host, private ranges, and cloud metadata are denied by default), same-owner sandboxes can reach each other, and cross-owner traffic is isolated
 - **Resource caps** — per-user limits on sandbox count, CPUs, and memory
 - **Rate limiting** — per-user token buckets (30 creates/min, 600 execs/min, 1200 reads/min)
 - **Secrets** — encrypted at rest (age), scoped per user
@@ -259,10 +269,10 @@ Full docs live at **[bhatti.sh](https://bhatti.sh)** — that's the canonical re
 | **[Self-Hosting](https://bhatti.sh/docs/self-hosting/)** | Run bhatti on your own hardware, requirements, backups |
 | **[Concepts](https://bhatti.sh/docs/concepts/)** | Sandboxes, thermal states, the two binaries |
 | **[Architecture](https://bhatti.sh/docs/under-the-hood/architecture/)** | System design, data flow, concurrency model |
-| **[Firecracker engine](https://bhatti.sh/docs/under-the-hood/engine/)** | HTTP API, jailer, rate limits, why no FC SDK |
+| **[krucible engine](https://bhatti.sh/docs/under-the-hood/engine/)** | The libkrun fork, the bhatti-vmm helper, the control socket |
 | **[Lohar (the guest agent)](https://bhatti.sh/docs/under-the-hood/lohar-the-blacksmith/)** | PID 1 init, the systemctl shim, PTY, sessions, file ops |
 | **[Thermal states](https://bhatti.sh/docs/under-the-hood/thermal-states/)** | Hot/warm/cold, snapshots, the balloon trick |
-| **[Networking](https://bhatti.sh/docs/under-the-hood/networking/)** | Per-user bridges, iptables, the ARP trick |
+| **[Networking](https://bhatti.sh/docs/under-the-hood/networking/)** | The per-owner gVisor gateway, policed egress, siblings |
 | **[Wire protocol](https://bhatti.sh/docs/under-the-hood/wire-protocol/)** | Binary framing, connection lifecycle, auth |
 | **[Decisions & learnings](https://bhatti.sh/docs/under-the-hood/decisions/)** | Why TCP over vsock, why no diff snapshots, the bugs we paid for |
 | **[CLI Reference](https://bhatti.sh/docs/reference/cli/)** | All commands and flags |
@@ -271,7 +281,8 @@ Full docs live at **[bhatti.sh](https://bhatti.sh)** — that's the canonical re
 
 ## Requirements
 
-**Server:** Linux (aarch64 or x86_64) with KVM (`/dev/kvm`) and root access.
+**Self-host:** Linux (aarch64 or x86_64) with KVM (`/dev/kvm`) **or** macOS on
+Apple Silicon (HVF — no KVM needed). Either can be a dev box or a server.
 
 **CLI:** macOS or Linux. No special requirements.
 

@@ -4,9 +4,10 @@
 > **Documentation has moved to <https://bhatti.sh/docs>.**
 >
 > The website is the canonical reference and is updated with every release.
-> The Markdown files alongside this README are **deprecated stubs** kept only
-> for git history; they will not be updated and may be removed in a future
-> cleanup.
+> The old Firecracker-era Markdown pages that used to live alongside this
+> README are **retired** — they've been relocated to [`archive/v1/`](archive/v1/)
+> for git history. They describe **bhatti v1 (Firecracker)** and are not
+> maintained; the current engine is v2 (krucible).
 
 ## Quick links
 
@@ -25,33 +26,41 @@ machine-readable doc index is at **<https://bhatti.sh/llms.txt>**.
 
 ## Where each old doc went
 
-If you landed here from an old link or a stale checkout, the canonical
-version of each page now lives at:
+If you landed here from an old link or a stale checkout, each retired page now
+lives under [`archive/v1/`](archive/v1/) (frozen v1/Firecracker snapshot), and
+the canonical, maintained version is on the website:
 
-| Old path | New URL |
+| Retired file (now in `archive/v1/`) | Canonical URL |
 | --- | --- |
-| `docs/index.md`             | <https://bhatti.sh/docs/> |
-| `docs/quickstart.md`        | <https://bhatti.sh/docs/quickstart/> |
-| `docs/architecture.md`      | <https://bhatti.sh/docs/under-the-hood/architecture/> |
-| `docs/guest-agent.md`       | <https://bhatti.sh/docs/under-the-hood/lohar-the-blacksmith/> |
-| `docs/networking.md`        | <https://bhatti.sh/docs/under-the-hood/networking/> |
-| `docs/wire-protocol.md`     | <https://bhatti.sh/docs/under-the-hood/wire-protocol/> |
-| `docs/thermal-management.md`| <https://bhatti.sh/docs/under-the-hood/thermal-states/> |
-| `docs/decisions.md`         | <https://bhatti.sh/docs/under-the-hood/decisions/> |
-| `docs/api-reference.md`     | <https://bhatti.sh/docs/reference/api/> |
-| `docs/cli-reference.md`     | <https://bhatti.sh/docs/reference/cli/> |
-| `docs/kernel.md`            | <https://bhatti.sh/docs/contributing/kernel/> |
-| `docs/testing.md`           | <https://bhatti.sh/docs/contributing/testing/> |
-| `docs/tiers.md`             | <https://bhatti.sh/docs/contributing/adding-a-tier/> |
+| `archive/v1/index.md`             | <https://bhatti.sh/docs/> |
+| `archive/v1/quickstart.md`        | <https://bhatti.sh/docs/quickstart/> |
+| `archive/v1/architecture.md`      | <https://bhatti.sh/docs/under-the-hood/architecture/> |
+| `archive/v1/guest-agent.md`       | <https://bhatti.sh/docs/under-the-hood/lohar-the-blacksmith/> |
+| `archive/v1/networking.md`        | <https://bhatti.sh/docs/under-the-hood/networking/> |
+| `archive/v1/wire-protocol.md`     | <https://bhatti.sh/docs/under-the-hood/wire-protocol/> |
+| `archive/v1/thermal-management.md`| <https://bhatti.sh/docs/under-the-hood/thermal-states/> |
+| `archive/v1/decisions.md`         | <https://bhatti.sh/docs/under-the-hood/decisions/> |
+| `archive/v1/api-reference.md`     | <https://bhatti.sh/docs/reference/api/> |
+| `archive/v1/cli-reference.md`     | <https://bhatti.sh/docs/reference/cli/> |
+| `archive/v1/kernel.md`            | <https://bhatti.sh/docs/contributing/kernel/> |
+| `archive/v1/testing.md`           | <https://bhatti.sh/docs/contributing/testing/> |
+| `archive/v1/tiers.md`             | <https://bhatti.sh/docs/contributing/adding-a-tier/> |
+
+> **v1 users:** the website's frozen [v1 (Firecracker) docs](https://bhatti.sh/v1/docs/)
+> are the maintained place to read these; the `archive/v1/` copies here are a
+> git-history snapshot only.
 
 ## What's still in this folder
 
+- **`HANDOFF-krucible.md` + `PLAN-krucible-*.md`** — the current engine design
+  docs (v2/krucible): the engineer hand-off plus the cold-tier / init-model /
+  productionization plans. Contributor-facing; the website is the user-facing
+  reference.
 - **`archive/`** — historical PLAN docs and investigations preserved for git
-  archaeology. Out of date by design. Do not edit.
+  archaeology, plus **`archive/v1/`** (the retired Firecracker-era reference
+  pages). Out of date by design. Do not edit.
 - **`internal/`** — gitignored local planning notes (launch posts, drafts,
   internal-only plans). Will not appear in clones.
-- **Top-level `*.md` files** — deprecated stubs (see table above). Each one
-  carries a deprecation banner pointing at its canonical URL on bhatti.sh.
 
 ## Editing documentation
 
