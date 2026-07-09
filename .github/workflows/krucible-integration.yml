@@ -69,6 +69,16 @@ jobs:
           test -w /dev/kvm || sudo chmod 666 /dev/kvm
           mkdir -p "$HOME/krtmp"   # disk-backed: /tmp is a small tmpfs on the Pis
 
+      - name: Build a real tier rootfs (minimal) for the boot test
+        # Boots an ACTUAL release-tier image on krucible (not the test-built
+        # rootfs), catching rootfs-vs-engine gaps like the missing /init.krun that
+        # broke v2.1.0. TestKrucibleTierRootfsBoots picks up KRUCIBLE_TIER_ROOTFS.
+        run: |
+          sudo apt-get install -y -qq debootstrap
+          arch=$(dpkg --print-architecture)   # amd64 | arm64
+          sudo ./scripts/build-tier.sh minimal "$arch" ./lohar
+          echo "KRUCIBLE_TIER_ROOTFS=$PWD/dist/rootfs-minimal-${arch}.ext4" >> "$GITHUB_ENV"
+
       - name: Run krucible suite (-tags krucible)
         # PKG_CONFIG_PATH points pkg-config at our fork's libkrun; TMPDIR keeps
         # the RAM snapshots off the small /tmp tmpfs. VM suites run here (real
