@@ -34,6 +34,32 @@ func TestConfigYAMLParsing(t *testing.T) {
 	}
 }
 
+func TestNetBackendEnabledDefault(t *testing.T) {
+	// Security-critical default: the per-owner netd gateway is ON unless the
+	// config explicitly opts out. A plain bool reads an absent key as false (the
+	// v2.2.0 regression); *bool + NetBackendEnabled distinguishes the three states.
+	cases := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"absent defaults on", "engine: krucible\n", true},
+		{"explicit true", "krucible_net_backend: true\n", true},
+		{"explicit false opts out", "krucible_net_backend: false\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			if err := yaml.Unmarshal([]byte(tc.yaml), cfg); err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.NetBackendEnabled(); got != tc.want {
+				t.Fatalf("NetBackendEnabled()=%v, want %v (yaml=%q)", got, tc.want, tc.yaml)
+			}
+		})
+	}
+}
+
 func TestEnsureKeypair(t *testing.T) {
 	dir := t.TempDir()
 
@@ -237,5 +263,3 @@ func TestLoadConfigNoFile(t *testing.T) {
 		t.Errorf("engine=%q, want krucible", cfg.Engine)
 	}
 }
-
-

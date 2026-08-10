@@ -36,7 +36,7 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 	// net backend is on but the helper is missing, fail fast with a clear message
 	// rather than silently falling back to the insecure shared-netstack (TSI).
 	netd := cfg.KrucibleNetd
-	if netd == "" && cfg.KrucibleNetBackend {
+	if netd == "" && cfg.NetBackendEnabled() {
 		if exe, err := os.Executable(); err == nil {
 			cand := filepath.Join(filepath.Dir(exe), "bhatti-netd")
 			if _, err := os.Stat(cand); err == nil {
@@ -49,7 +49,7 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 			}
 		}
 	}
-	netBackend := cfg.KrucibleNetBackend
+	netBackend := cfg.NetBackendEnabled()
 	if netBackend && netd == "" {
 		// The secure gateway is the default, but the daemon is built at startup on
 		// hosts that may not have the runtime (dev builds, the unit-test gate). Don't

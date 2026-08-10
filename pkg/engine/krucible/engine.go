@@ -78,6 +78,9 @@ func netGuestCIDRFor(subnetIdx, guestIdx int) string {
 	return fmt.Sprintf("100.64.%d.%d/%d", subnetIdx, 2+guestIdx, netPrefixLen)
 }
 func netGuestMACFor(guestIdx int) string { return fmt.Sprintf("52:54:00:00:00:%02x", 2+guestIdx) }
+func netGuestIPFor(subnetIdx, guestIdx int) string {
+	return fmt.Sprintf("100.64.%d.%d", subnetIdx, 2+guestIdx)
+}
 
 // netdInstance is one owner's shared bhatti-netd gateway process. It is spawned
 // detached (survives a daemon restart) and identified by pid so recovery can
@@ -262,6 +265,7 @@ type VM struct {
 	configSrv  *configServer // host-side boot config server (§3.4); launchMu-guarded
 	netdKey    string        // owner key of the shared bhatti-netd (net backend); "" on TSI
 	subnetIdx  int           // owner's vnet subnet index (net backend); persisted for recovery
+	netIP      string        // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -443,9 +447,11 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// virtio-net gateway backend (opt-in): the guest gets eth0 wired to a
 	// per-sandbox bhatti-netd; lohar configures it from cdNet.
 	var cdNet *configdrive.NetConfig
+	var netIP string
 	if netUDS != "" {
 		baseSpec.NetUDS = netUDS
 		baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
+		netIP = netGuestIPFor(netInst.subnetIdx, netGuestIdx)
 		cdNet = &configdrive.NetConfig{
 			IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
 			Gateway: netGatewayIPFor(netInst.subnetIdx),
@@ -573,6 +579,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		logPath:   filepath.Join(sandboxDir, "vmm.log"),
 		netdKey:   netdKey,
 		subnetIdx: spec.SubnetIndex,
+		netIP:     netIP,
 	}
 
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
@@ -584,7 +591,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	e.mu.Unlock()
 
 	slog.Info("krucible sandbox created", "id", id, "name", name, "vcpus", vcpus, "mem_mib", memMiB, "block_root", e.cfg.BlockRoot)
-	return engine.SandboxInfo{ID: id, Name: name, Status: "running", EngineID: id}, nil
+	return engine.SandboxInfo{ID: id, Name: name, Status: "running", EngineID: id, IP: vm.netIP}, nil
 }
 
 // launch spawns the bhatti-vmm helper for vm and waits for the agent. When
@@ -986,7 +993,7 @@ func (e *Engine) Status(ctx context.Context, id string) (engine.SandboxInfo, err
 	}
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	return engine.SandboxInfo{ID: vm.ID, Name: vm.Name, Status: vm.Status, EngineID: vm.ID}, nil
+	return engine.SandboxInfo{ID: vm.ID, Name: vm.Name, Status: vm.Status, EngineID: vm.ID, IP: vm.netIP}, nil
 }
 
 func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
@@ -995,7 +1002,7 @@ func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
 	out := make([]engine.SandboxInfo, 0, len(e.vms))
 	for _, vm := range e.vms {
 		vm.mu.Lock()
-		out = append(out, engine.SandboxInfo{ID: vm.ID, Name: vm.Name, Status: vm.Status, EngineID: vm.ID})
+		out = append(out, engine.SandboxInfo{ID: vm.ID, Name: vm.Name, Status: vm.Status, EngineID: vm.ID, IP: vm.netIP})
 		vm.mu.Unlock()
 	}
 	return out, nil

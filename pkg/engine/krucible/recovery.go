@@ -42,6 +42,7 @@ type vmRecord struct {
 	HelperPID  int    `json:"helper_pid"`
 	NetdKey    string `json:"netd_key,omitempty"`   // owner key of the shared bhatti-netd (net backend)
 	SubnetIdx  int    `json:"subnet_idx,omitempty"` // owner's vnet subnet index
+	NetIP      string `json:"net_ip,omitempty"`     // guest IP on the netd gateway subnet
 }
 
 // netdRecord is the durable state of one owner's shared bhatti-netd, so recovery
@@ -87,7 +88,7 @@ func (vm *VM) toRecordLocked() vmRecord {
 		ControlUDS: vm.ControlUDS, ForwardUDS: vm.ForwardUDS, CtlSockUDS: vm.CtlSockUDS,
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
 		BundleDir: vm.BundleDir, LogPath: vm.logPath, BaseSpec: vm.baseSpec,
-		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx,
+		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx, NetIP: vm.netIP,
 	}
 }
 
@@ -131,7 +132,7 @@ func vmFromRecord(rec vmRecord) *VM {
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
 		BundleDir: rec.BundleDir, baseSpec: rec.BaseSpec, logPath: rec.LogPath,
-		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx,
+		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP,
 	}
 }
 

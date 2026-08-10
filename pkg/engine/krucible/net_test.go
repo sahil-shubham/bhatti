@@ -101,6 +101,52 @@ func TestKrucibleNetEgress(t *testing.T) {
 	}
 }
 
+// TestKrucibleNetIPReported is the IP-visibility gate for the net backend: the
+// engine must REPORT the guest's gateway IP (100.64.x.y) in SandboxInfo from
+// Create, Status, AND List — the value the server persists and `bhatti list`
+// shows. (That eth0 is actually up carrying it is covered by TestKrucibleNetEgress,
+// where traffic flows.) On TSI this is empty; on the net backend it must be set
+// and identical across all three surfaces.
+func TestKrucibleNetIPReported(t *testing.T) {
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netip", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatalf("Create(net): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	if info.IP == "" || !strings.HasPrefix(info.IP, "100.64.") {
+		t.Fatalf("Create SandboxInfo.IP = %q, want a 100.64.x.y gateway IP", info.IP)
+	}
+	st, err := eng.Status(ctx, id)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.IP != info.IP {
+		t.Fatalf("Status IP = %q, want %q (from Create)", st.IP, info.IP)
+	}
+	list, err := eng.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	found := false
+	for _, s := range list {
+		if s.ID == id {
+			found = true
+			if s.IP != info.IP {
+				t.Fatalf("List IP = %q, want %q (from Create)", s.IP, info.IP)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("sandbox %s missing from List", id)
+	}
+}
+
 // TestKrucibleNetHostIsolation asserts the gateway's egress guard: a guest on the
 // virtio-net backend cannot reach private/host space — a dial to an RFC-1918
 // address is refused by the guard in netd's forwarder.

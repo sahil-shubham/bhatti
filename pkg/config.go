@@ -41,7 +41,7 @@ type Config struct {
 	KrucibleLibDir      string `yaml:"krucible_libdir"`       // dir with libkrun/libkrunfw (default: autodetect)
 	KrucibleKernelImage string `yaml:"krucible_kernel_image"` // lean external kernel (block-root only; ~2x faster cold-start). Empty = autodetect dist/kernel/*-lean-*, else libkrunfw bundle
 	KrucibleSocketDir   string `yaml:"krucible_socket_dir"`   // short dir for vsock UDS (default: /tmp/bhatti-kr)
-	KrucibleNetBackend  bool   `yaml:"krucible_net_backend"`  // per-owner bhatti-netd gateway (policed egress, host isolation, siblings). DEFAULT true (LoadConfig); set false for legacy TSI. Needs libkrun net feature + bhatti-netd (shipped in the release bundle).
+	KrucibleNetBackend  *bool  `yaml:"krucible_net_backend"`  // per-owner bhatti-netd gateway (policed egress, host isolation, siblings). Default ON: nil (key absent) ⇒ enabled, see NetBackendEnabled. Opt out with false for legacy TSI. Needs libkrun net feature + bhatti-netd (shipped in the release bundle).
 	KrucibleNetd        string `yaml:"krucible_netd"`         // path to the bhatti-netd gateway helper (default: next to binary / PATH)
 
 	// Backup to S3-compatible storage
@@ -271,6 +271,16 @@ func LoadConfig() (*Config, error) {
 		cfg.ConfigPath = loadedFrom
 	}
 	return cfg, nil
+}
+
+// NetBackendEnabled reports whether the per-owner bhatti-netd gateway (secure
+// networking) is on. It is the DEFAULT in v2, so a nil pointer — the key absent
+// from the config — means ENABLED. A plain bool can't distinguish "absent" from
+// an explicit "false", so the field is a *bool and this method holds the
+// default; opt out with `krucible_net_backend: false`. nil-safe for the
+// BHATTI_CONFIG early-return path and for Configs built directly in tests.
+func (c *Config) NetBackendEnabled() bool {
+	return c.KrucibleNetBackend == nil || *c.KrucibleNetBackend
 }
 
 // EnsureKeypair generates an ed25519 SSH keypair in DataDir if missing.
