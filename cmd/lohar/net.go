@@ -16,9 +16,27 @@ import (
 
 // AF_VSOCK constants.
 const (
-	AF_VSOCK       = 40
-	VMADDR_CID_ANY = 0xFFFFFFFF
+	AF_VSOCK        = 40
+	VMADDR_CID_ANY  = 0xFFFFFFFF
+	VMADDR_CID_HOST = 2 // the host's well-known vsock CID
 )
+
+// dialVsock connects to the host (VMADDR_CID_HOST) on a vsock port — the
+// guest→host direction, used at boot to fetch config (§3.4). libkrun bridges it
+// to the daemon's UDS (krun_add_vsock_port2 listen=false).
+func dialVsock(port uint32) (net.Conn, error) {
+	fd, err := syscall.Socket(AF_VSOCK, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("vsock socket: %w", err)
+	}
+	addr := SockaddrVM{Family: AF_VSOCK, Port: port, CID: VMADDR_CID_HOST}
+	if _, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd),
+		uintptr(unsafe.Pointer(&addr)), unsafe.Sizeof(addr)); errno != 0 {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("vsock connect (cid=%d port=%d): %v", VMADDR_CID_HOST, port, errno)
+	}
+	return &vsockConn{file: os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port))}, nil
+}
 
 // SockaddrVM matches struct sockaddr_vm (16 bytes).
 type SockaddrVM struct {

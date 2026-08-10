@@ -26,6 +26,13 @@ const (
 	// Auth
 	AUTH byte = 0x11 // host → guest: token bytes (first frame after connect)
 
+	// Config fetch (guest → host, boot-time). lohar pulls its SandboxConfig over
+	// vsock instead of reading an on-disk config drive (DESIGN §3.4). The UDS the
+	// host serves this on is per-sandbox, so the channel is the capability: a
+	// guest can only fetch its own config.
+	CONFIG_REQ  byte = 0x12 // guest → host: empty payload
+	CONFIG_RESP byte = 0x13 // host → guest: JSON SandboxConfig
+
 	// Port forwarding
 	FWD_REQ  byte = 0x20 // host → guest: JSON-encoded ForwardRequest
 	FWD_RESP byte = 0x21 // guest → host: JSON-encoded ForwardResponse
@@ -65,6 +72,7 @@ const (
 const (
 	VsockPortControl = uint32(1024) // exec, shell
 	VsockPortForward = uint32(1025) // port forwarding
+	VsockPortConfig  = uint32(1026) // boot-time config fetch (guest → host)
 )
 
 // MaxFrameSize is the maximum allowed frame size (1 MB).

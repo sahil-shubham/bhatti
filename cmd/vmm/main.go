@@ -179,22 +179,6 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
-	// Config drive: a RAW ext4 attached as the data disk (/dev/vdb), which lohar
-	// mounts read-only at boot to read config.json (hostname, token, env, files,
-	// volumes). Pairs with the root disk (root=/dev/vda). lohar mounts it
-	// MS_RDONLY, so the RW device is harmless.
-	if spec.ConfigDrive != "" {
-		cconf := C.CString(spec.ConfigDrive)
-		defer C.free(unsafe.Pointer(cconf))
-		cconfID := C.CString("config")
-		defer C.free(unsafe.Pointer(cconfID))
-		// libkrun 2.0 dropped krun_set_data_disk; add the config drive as a raw data
-		// disk. Added after the root -> enumerates as /dev/vdb (lohar reads it there).
-		if r := C.krun_add_disk(cid, cconfID, cconf, C._Bool(false)); r != 0 {
-			fail("krun_add_disk(config): %d", int(r))
-		}
-	}
-
 	// virtio-fs --mount binds: expose host dirs to the guest, live + shared +
 	// bidirectional. lohar mounts each tag at its guest path (from the config
 	// drive). shm_size=0 → no DAX window (standard FUSE-over-virtio). Boot-time
@@ -210,9 +194,9 @@ func run(spec krucible.VMSpec) {
 		}
 	}
 
-	// Data volumes: block disks attached AFTER root (vda) + config (vdb), so they
-	// enumerate as /dev/vdc+ in order. krun_add_disk2 composes with the root/data
-	// setters (get_block_cfg). lohar mounts each at its guest path (config drive).
+	// Data volumes: block disks attached AFTER root (vda). With the config drive
+	// gone (§3.4) they enumerate as /dev/vdb+ in order. krun_add_disk2 composes
+	// with the root setter (get_block_cfg). lohar mounts each at its guest path.
 	for _, v := range spec.Volumes {
 		cbid := C.CString(v.BlockID)
 		cpath := C.CString(v.Path)
@@ -284,6 +268,17 @@ func run(spec krucible.VMSpec) {
 	}
 	addVsock(1024, spec.VsockControlUDS)
 	addVsock(1025, spec.VsockForwardUDS)
+
+	// Config fetch (guest → host): lohar dials port 1026 and libkrun connects to
+	// the host UDS where the daemon serves this sandbox's config (DESIGN §3.4).
+	// listen=false: the connection is initiated from the guest side.
+	if spec.VsockConfigUDS != "" {
+		c := C.CString(spec.VsockConfigUDS)
+		defer C.free(unsafe.Pointer(c))
+		if r := C.krun_add_vsock_port2(cid, C.uint32_t(1026), c, C._Bool(false)); r != 0 {
+			fail("krun_add_vsock_port2(config): %d", int(r))
+		}
+	}
 
 	// Warm-tier control socket (PAUSE/RESUME/STATUS). Optional; skipped when empty.
 	if spec.ControlSocketUDS != "" {

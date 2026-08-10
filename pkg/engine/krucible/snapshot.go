@@ -142,11 +142,6 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	if err := cloneFile(spec.RootDisk, filepath.Join(finalDir, "rootfs.qcow2")); err != nil {
 		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
 	}
-	if spec.ConfigDrive != "" {
-		if err := cloneFile(spec.ConfigDrive, filepath.Join(finalDir, "config.ext4")); err != nil {
-			return nil, fmt.Errorf("checkpoint: copy config drive: %w", err)
-		}
-	}
 
 	// Capture the device set (memory snapshots only — the restored RAM's view of
 	// its disks + mounts must stay valid; a filesystem snapshot is disk-only).
@@ -225,7 +220,6 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 	return e.create(ctx, spec, createOpts{
 		snapshotDir:    snapDir,
 		forcedToken:    m.Token,
-		configDrive:    filepath.Join(snapDir, configFile),
 		restoreVolumes: restoreVols,
 	})
 }

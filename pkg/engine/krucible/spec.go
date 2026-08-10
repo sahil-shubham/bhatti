@@ -54,11 +54,13 @@ type VMSpec struct {
 	// the config drive also moves to krun_add_disk (read-only).
 	RootDiskFormat string `json:"root_disk_format,omitempty"`
 
-	// ConfigDrive, if set, is a RAW ext4 image attached as a read-only block
-	// device (/dev/vdb) carrying config.json (hostname, token, env, files,
-	// volumes). lohar reads it at boot before listening. See pkg/configdrive
-	// and lohar's loadConfigDrive.
-	ConfigDrive string `json:"config_drive,omitempty"`
+	// VsockConfigUDS, if set, is a host UDS the daemon serves the sandbox's
+	// SandboxConfig JSON on. libkrun bridges the guest's connection on
+	// proto.VsockPortConfig (1026) to this UDS (krun_add_vsock_port2 listen=false);
+	// lohar dials it once at boot to fetch its config — replacing the on-disk
+	// config drive (DESIGN §3.4). Nothing config-related touches a guest disk or a
+	// snapshot bundle; the config.json lives host-side only.
+	VsockConfigUDS string `json:"vsock_config_uds,omitempty"`
 
 	Vcpus  uint8  `json:"vcpus"`
 	MemMiB uint32 `json:"mem_mib"`
@@ -99,10 +101,10 @@ type VMSpec struct {
 	// is fixed at boot).
 	Mounts []VMFsMount `json:"mounts,omitempty"`
 
-	// Volumes are block data disks attached AFTER the root (vda) + config drive
-	// (vdb), so they enumerate as /dev/vdc+ in order. Each is added via
-	// krun_add_disk2 (which composes with the root/data setters); the guest device
-	// name + mount path travel in the config drive (VolumeMountConfig).
+	// Volumes are block data disks attached AFTER the root (vda) — with the config
+	// drive gone (§3.4), they enumerate as /dev/vdb+ in order. Each is added via
+	// krun_add_disk2 (which composes with the root setter); the guest device name
+	// + mount path travel in the config (VolumeMountConfig).
 	Volumes []VMVolume `json:"volumes,omitempty"`
 	// KernelCmdline overrides the default block-root cmdline used with
 	// KernelImage. Empty = the built-in default (root=/dev/vda … init=ExecPath).

@@ -130,7 +130,7 @@ func runAgent() {
 
 	// --- Config drive ---
 
-	cfg := loadConfigDrive()
+	cfg := fetchConfig()
 	if cfg != nil {
 		hostname := "bhatti"
 		if cfg.Hostname != "" {
@@ -156,8 +156,6 @@ func runAgent() {
 		writeConfigFiles(cfg.Files)
 		mountVolumes(cfg.Volumes)
 		mountFsMounts(cfg.Mounts)
-		syscall.Unmount("/run/bhatti/config", 0)
-		os.RemoveAll("/run/bhatti/config")
 		bp("config_applied")
 	} else {
 		applyHostname("bhatti")
@@ -495,27 +493,33 @@ type NetConfig struct {
 	Gateway string `json:"gateway"`
 }
 
-func loadConfigDrive() *SandboxConfig {
-	if _, err := os.Stat("/dev/vdb"); err != nil {
-		return nil
-	}
-	os.MkdirAll("/run/bhatti/config", 0755)
-	if err := syscall.Mount("/dev/vdb", "/run/bhatti/config", "ext4",
-		syscall.MS_RDONLY, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: mount config drive: %v\n", err)
-		return nil
-	}
-	data, err := os.ReadFile("/run/bhatti/config/config.json")
+// fetchConfig pulls the sandbox's boot config over the guest→host config vsock
+// (§3.4), replacing the on-disk config drive. Returns nil if the config port is
+// not wired (the virtio-fs dev profile) or the fetch fails — the caller then
+// boots config-less, same as an absent config drive before.
+func fetchConfig() *SandboxConfig {
+	conn, err := dialVsock(proto.VsockPortConfig)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: read config.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lohar: config vsock dial: %v\n", err)
+		return nil
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := proto.WriteFrame(conn, proto.CONFIG_REQ, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: config req: %v\n", err)
+		return nil
+	}
+	typ, payload, err := proto.ReadFrame(conn)
+	if err != nil || typ != proto.CONFIG_RESP {
+		fmt.Fprintf(os.Stderr, "lohar: config resp: type=0x%02x err=%v\n", typ, err)
 		return nil
 	}
 	var cfg SandboxConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: parse config.json: %v\n", err)
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: parse config: %v\n", err)
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "lohar: loaded config drive for %s\n", cfg.SandboxID)
+	fmt.Fprintf(os.Stderr, "lohar: fetched config for %s\n", cfg.SandboxID)
 	return &cfg
 }
 

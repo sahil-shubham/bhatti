@@ -259,8 +259,9 @@ type VM struct {
 	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
-	netdKey    string // owner key of the shared bhatti-netd (net backend); "" on TSI
-	subnetIdx  int    // owner's vnet subnet index (net backend); persisted for recovery
+	configSrv  *configServer // host-side boot config server (§3.4); launchMu-guarded
+	netdKey    string        // owner key of the shared bhatti-netd (net backend); "" on TSI
+	subnetIdx  int           // owner's vnet subnet index (net backend); persisted for recovery
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -347,12 +348,10 @@ func (e *Engine) agentFor(id string) (*agent.AgentClient, error) {
 
 // createOpts carries restore hints for create(): cold-restore from a snapshot
 // bundle (snapshotDir), reuse a memory snapshot's in-guest token (forcedToken),
-// and use a prebuilt config drive (configDrive) so the restored VM's /dev/vdb
-// matches the captured device state. All empty = a fresh boot.
+// and frozen volumes to re-attach. All empty = a fresh boot.
 type createOpts struct {
 	snapshotDir    string
 	forcedToken    string
-	configDrive    string
 	restoreVolumes []restoreVol // frozen volume images to clone in + re-attach (restore/fork)
 }
 
@@ -413,6 +412,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	controlUDS := filepath.Join(sockDir, "c.sock")
 	forwardUDS := filepath.Join(sockDir, "f.sock")
 	ctlSockUDS := filepath.Join(sockDir, "k.sock")
+	configUDS := filepath.Join(sockDir, "cfg.sock")
 	netUDS := ""
 	var netGuestIdx int
 	var netInst *netdInstance
@@ -424,7 +424,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
 		return info, fmt.Errorf("create socket dir: %w", err)
 	}
-	for _, p := range []string{controlUDS, forwardUDS, ctlSockUDS, netUDS} {
+	for _, p := range []string{controlUDS, forwardUDS, ctlSockUDS, netUDS, configUDS} {
 		if p != "" && len(p) >= maxUnixPath {
 			return info, fmt.Errorf("vsock path too long (%d >= %d): %s — set a shorter SocketDir", len(p), maxUnixPath, p)
 		}
@@ -474,9 +474,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	}
 
 	// Data volumes (create --volume / persistent): attach each resolved volume as a
-	// block disk AFTER root (vda) + config (vdb) — so /dev/vdc+ in order — and tell
-	// lohar where to mount it. krucible previously ignored spec.ResolvedVolumes; the
-	// libkrun get_block_cfg fix lets add_disk2 compose with the root/data setters.
+	// block disk AFTER root (vda) — so /dev/vdb+ in order (the config drive is gone,
+	// §3.4) — and tell lohar where to mount it. The libkrun get_block_cfg fix lets
+	// add_disk2 compose with the root setter.
 	var cdVolumes []configdrive.VolumeMountConfig
 	for i, v := range spec.ResolvedVolumes {
 		format := "raw"
@@ -484,7 +484,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			format = "qcow2"
 		}
 		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", i), Path: v.FilePath, Format: format, ReadOnly: v.ReadOnly})
-		cdVolumes = append(cdVolumes, configdrive.VolumeMountConfig{Device: fmt.Sprintf("/dev/vd%c", 'c'+rune(i)), Mount: v.Mount, FS: "ext4", ReadOnly: v.ReadOnly})
+		cdVolumes = append(cdVolumes, configdrive.VolumeMountConfig{Device: fmt.Sprintf("/dev/vd%c", 'b'+rune(i)), Mount: v.Mount, FS: "ext4", ReadOnly: v.ReadOnly})
 	}
 
 	// Restore/fork: clone each frozen volume into this sandbox and re-attach it as
@@ -542,18 +542,20 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 				return info, err
 			}
 		}
-		confPath := filepath.Join(sandboxDir, "config.ext4")
-		if opts.configDrive != "" {
-			// Restore: reuse the snapshot's config drive so the restored VM's
-			// /dev/vdb matches the captured device state (the guest resumes from
-			// RAM and never re-reads it).
-			if err = cloneFile(opts.configDrive, confPath); err != nil {
-				return info, fmt.Errorf("copy snapshot config drive: %w", err)
-			}
-		} else if err = buildConfigDrive(confPath, id, name, token, spec, cdMounts, cdVolumes, cdNet); err != nil {
-			return info, fmt.Errorf("build config drive: %w", err)
+		// Config is fetched over vsock at boot (§3.4), not read from an on-disk
+		// config drive: write it host-side as config.json (no mke2fs; not in the
+		// guest, not in the snapshot bundle) and serve it on the per-sandbox config
+		// UDS. Restore reuses the snapshot's token (opts.forcedToken via `token`) so
+		// the resumed guest RAM's token still matches.
+		cfg := buildSandboxConfig(id, name, token, spec, cdMounts, cdVolumes, cdNet)
+		cfgJSON, merr := json.MarshalIndent(cfg, "", "  ")
+		if merr != nil {
+			return info, fmt.Errorf("marshal config: %w", merr)
 		}
-		baseSpec.ConfigDrive = confPath
+		if err = os.WriteFile(filepath.Join(sandboxDir, "config.json"), cfgJSON, 0600); err != nil {
+			return info, fmt.Errorf("write config.json: %w", err)
+		}
+		baseSpec.VsockConfigUDS = configUDS
 	} else {
 		if err = cloneTree(e.cfg.BaseRootfs, rootfsDir); err != nil {
 			return info, fmt.Errorf("clone rootfs: %w", err)
@@ -618,6 +620,23 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		}
 	}
 
+	// Serve the boot config over the guest→host config vsock (§3.4). Must be
+	// listening before the helper starts, since lohar dials it early in boot; a
+	// cold re-launch replaces any prior server.
+	vm.closeConfigSrv()
+	if spec.VsockConfigUDS != "" {
+		_ = os.Remove(spec.VsockConfigUDS)
+		cfgJSON, rerr := os.ReadFile(filepath.Join(vm.SandboxDir, "config.json"))
+		if rerr != nil {
+			return fmt.Errorf("read config.json: %w", rerr)
+		}
+		srv, serr := newConfigServer(spec.VsockConfigUDS, cfgJSON)
+		if serr != nil {
+			return fmt.Errorf("config server: %w", serr)
+		}
+		vm.configSrv = srv
+	}
+
 	vmCtx, vmCancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(vmCtx, e.cfg.VMMBinary, specPath)
 	cmd.Stdout = logFile
@@ -633,6 +652,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	}
 	if err := cmd.Start(); err != nil {
 		vmCancel()
+		vm.closeConfigSrv()
 		return fmt.Errorf("start vmm helper: %w", err)
 	}
 
@@ -642,6 +662,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		_, _ = cmd.Process.Wait()
 		// Leave the shared netd running; sibling sandboxes may still be using it.
 		vmCancel()
+		vm.closeConfigSrv()
 		return fmt.Errorf("agent not ready: %w\nvmm log:\n%s", werr, tailFile(vm.logPath, 4096))
 	}
 
@@ -677,6 +698,16 @@ func (vm *VM) kill() {
 	vm.cmd = nil
 	vm.cancel = nil
 	vm.HelperPID = 0
+	vm.closeConfigSrv()
+}
+
+// closeConfigSrv stops the boot config server (§3.4). Serialized with launch by
+// launchMu; safe when none is running.
+func (vm *VM) closeConfigSrv() {
+	if vm.configSrv != nil {
+		vm.configSrv.Close()
+		vm.configSrv = nil
+	}
 }
 
 // Destroy kills the helper and removes the sandbox dir.
@@ -850,10 +881,10 @@ func genToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// buildConfigDrive writes the per-sandbox config drive (hostname, token, env,
-// files) that lohar reads at /dev/vdb. Secrets are expected to be pre-resolved
-// into spec.Env by the server layer (same contract as the FC engine).
-func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig, volumes []configdrive.VolumeMountConfig, net *configdrive.NetConfig) error {
+// buildSandboxConfig assembles the per-sandbox config lohar fetches over vsock at
+// boot (§3.4). Secrets are pre-resolved into spec.Env by the server layer (same
+// contract as the FC engine).
+func buildSandboxConfig(id, name, token string, spec engine.SandboxSpec, mounts []configdrive.FsMountConfig, volumes []configdrive.VolumeMountConfig, net *configdrive.NetConfig) configdrive.SandboxConfig {
 	files := make(map[string]configdrive.ConfigFile, len(spec.Files))
 	for p, f := range spec.Files {
 		files[p] = configdrive.ConfigFile{
@@ -861,7 +892,7 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mou
 			Mode:    f.Mode,
 		}
 	}
-	return configdrive.Build(path, configdrive.SandboxConfig{
+	return configdrive.SandboxConfig{
 		SandboxID: id,
 		Hostname:  name,
 		Token:     token,
@@ -870,12 +901,11 @@ func buildConfigDrive(path, id, name, token string, spec engine.SandboxSpec, mou
 		Mounts:    mounts,
 		Volumes:   volumes,
 		Net:       net,
-		// Init is the once-after-boot command (create --init); lohar runs it as a
-		// TTY session named "init", as the sandbox user. Was silently dropped here
-		// (never copied onto SandboxConfig), so --init was a no-op on krucible.
+		// Init: the once-after-boot command (create --init); lohar runs it as a
+		// TTY session named "init", as the sandbox user.
 		Init: spec.Init,
 		User: "lohar",
-	})
+	}
 }
 
 // cloneBaseImage CoW-clones the shared base ext4 image to dst (per-sandbox root

@@ -71,7 +71,7 @@ func TestStateRoundTrip(t *testing.T) {
 		BundleDir: filepath.Join(dir, "bundle"), logPath: filepath.Join(dir, "vmm.log"),
 		HelperPID: 4242,
 		baseSpec: VMSpec{
-			RootDisk: filepath.Join(dir, "root.img"), ConfigDrive: filepath.Join(dir, "config.ext4"),
+			RootDisk: filepath.Join(dir, "root.img"), VsockConfigUDS: "/tmp/s/cfg.sock",
 			Vcpus: 1, MemMiB: 512, Pid1: true, ExecPath: "/init.krun",
 		},
 	}
@@ -88,20 +88,20 @@ func TestStateRoundTrip(t *testing.T) {
 	got := vmFromRecord(rec)
 
 	checks := map[string][2]any{
-		"ID":          {orig.ID, got.ID},
-		"Name":        {orig.Name, got.Name},
-		"UserID":      {orig.UserID, got.UserID},
-		"ControlUDS":  {orig.ControlUDS, got.ControlUDS},
-		"Token":       {orig.Token, got.Token},
-		"Thermal":     {orig.Thermal, got.Thermal},
-		"Status":      {orig.Status, got.Status},
-		"HelperPID":   {orig.HelperPID, got.HelperPID},
-		"MemMiB":      {orig.MemMiB, got.MemMiB},
-		"BundleDir":   {orig.BundleDir, got.BundleDir},
-		"logPath":     {orig.logPath, got.logPath},
-		"RootDisk":    {orig.baseSpec.RootDisk, got.baseSpec.RootDisk},
-		"ConfigDrive": {orig.baseSpec.ConfigDrive, got.baseSpec.ConfigDrive},
-		"ExecPath":    {orig.baseSpec.ExecPath, got.baseSpec.ExecPath},
+		"ID":             {orig.ID, got.ID},
+		"Name":           {orig.Name, got.Name},
+		"UserID":         {orig.UserID, got.UserID},
+		"ControlUDS":     {orig.ControlUDS, got.ControlUDS},
+		"Token":          {orig.Token, got.Token},
+		"Thermal":        {orig.Thermal, got.Thermal},
+		"Status":         {orig.Status, got.Status},
+		"HelperPID":      {orig.HelperPID, got.HelperPID},
+		"MemMiB":         {orig.MemMiB, got.MemMiB},
+		"BundleDir":      {orig.BundleDir, got.BundleDir},
+		"logPath":        {orig.logPath, got.logPath},
+		"RootDisk":       {orig.baseSpec.RootDisk, got.baseSpec.RootDisk},
+		"VsockConfigUDS": {orig.baseSpec.VsockConfigUDS, got.baseSpec.VsockConfigUDS},
+		"ExecPath":       {orig.baseSpec.ExecPath, got.baseSpec.ExecPath},
 	}
 	for field, pair := range checks {
 		if pair[0] != pair[1] {
