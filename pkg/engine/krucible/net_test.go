@@ -101,6 +101,31 @@ func TestKrucibleNetEgress(t *testing.T) {
 	}
 }
 
+// TestKrucibleNetDNS is the DNS-egress gate: name resolution in the guest must
+// work through the gateway's UDP forwarder (netcheck dns → net.LookupHost →
+// UDP:53 → netd → public resolver). Before the UDP forwarder existed this
+// failed — the exact "Temporary failure resolving" an apt update hit — so this
+// pins it. (Uses the baked netcheck helper; the minimal test rootfs has no
+// getent.)
+func TestKrucibleNetDNS(t *testing.T) {
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netdns", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatalf("Create(net): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	r, err := eng.Exec(ctx, id, []string{"netcheck", "dns"})
+	if err != nil || r.ExitCode != 0 {
+		t.Fatalf("guest DNS resolve failed (no UDP/DNS egress?): err=%v exit=%d out=%q",
+			err, r.ExitCode, strings.TrimSpace(r.Stdout))
+	}
+}
+
 // TestKrucibleNetIPReported is the IP-visibility gate for the net backend: the
 // engine must REPORT the guest's gateway IP (100.64.x.y) in SandboxInfo from
 // Create, Status, AND List — the value the server persists and `bhatti list`

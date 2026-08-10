@@ -134,6 +134,10 @@ func NewGateway(gwIP tcpip.Address, prefixLen int, mac tcpip.LinkAddress) (*Gate
 	g.installTCPForwarder(&gateway.Dialer{
 		Policy: &gateway.EgressPolicy{Default: gateway.PosturePublic},
 	})
+	// Guest UDP is re-originated the same way, under the same egress policy —
+	// this is DNS egress (UDP:53 to public resolvers). Without it a netd guest
+	// cannot resolve names.
+	g.installUDPForwarder(&gateway.EgressPolicy{Default: gateway.PosturePublic})
 	return g, nil
 }
 
