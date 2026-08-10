@@ -85,6 +85,41 @@ step_elapsed() {
     if [ "$dt" -eq 0 ]; then echo "<1s"; else echo "${dt}s"; fi
 }
 
+# ── Spinner ───────────────────────────────────────────
+# Animate a spinner + elapsed time while a command runs, so long silent steps
+# (decompress, download) show progress. Falls back to a plain run with no
+# animation when stderr isn't a TTY (CI, piped logs) or QUIET=1. Returns the
+# command's own exit status so callers' error handling is unchanged.
+spin()      { local l="$1"; shift; [ "${1:-}" = "--" ] && shift; _spin_run "$l" "" "$@"; }
+spin_file() { local l="$1" f="$2"; shift 2; [ "${1:-}" = "--" ] && shift; _spin_run "$l" "$f" "$@"; }
+_spin_run() {
+    local label="$1" file="$2"; shift 2
+    # Pick where to draw the spinner. /dev/tty *existing* isn't enough — it can
+    # exist but be unopenable (no controlling terminal: CI, cron, some pipes),
+    # where writing spews "Device not configured". Probe by actually opening it.
+    local tty=""
+    if [ "${QUIET:-}" != "1" ]; then
+        if { true > /dev/tty; } 2>/dev/null; then tty=/dev/tty
+        elif [ -t 2 ]; then tty=/dev/stderr; fi
+    fi
+    if [ -z "$tty" ]; then "$@"; return $?; fi
+    local start=$SECONDS frames='|/-\' n=0 rc=0 sz
+    "$@" &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ -n "$file" ] && [ -f "$file" ]; then
+            sz=" ($(du -h "$file" 2>/dev/null | cut -f1), $(( SECONDS - start ))s)"
+        else
+            sz=" ($(( SECONDS - start ))s)"
+        fi
+        printf '\r  %s%s%s %s%s ' "$BOLD" "${frames:$((n % 4)):1}" "$RESET" "$label" "$sz" > "$tty"
+        n=$((n + 1)); sleep 0.2
+    done
+    wait "$pid" || rc=$?
+    printf '\r\033[K' > "$tty"
+    return "$rc"
+}
+
 die() {
     printf '\n%serror: %s%s\n' "$RED" "$1" "$RESET" >&2
     shift
@@ -239,20 +274,28 @@ download() {
     fi
 }
 
-# download_large URL DEST — same as download() but with a progress bar.
-# Use for files >50MB where multi-minute silence is bad UX.
+# curl_to URL DEST HC_FILE — download URL to DEST, writing the HTTP status code
+# to HC_FILE. Split out so the spinner can background it as a named command.
+curl_to() { curl -sSL -w '%{http_code}' -o "$2" "$1" > "$3"; }
+
+# download_large URL DEST — download a large file behind a spinner that reports
+# elapsed time + the growing on-disk size. Reads cleaner than curl's '#' bar.
 download_large() {
     local url="$1" dest="$2"
-    local http_code
+    local http_code hc_file
+    hc_file=$(mktemp "${TMPDIR:-/tmp}/bhatti-hc.XXXXXX") || hc_file="${dest}.hc"
 
-    http_code=$(curl -SL --progress-bar -w '%{http_code}' -o "$dest" "$url") || {
-        rm -f "$dest" 2>/dev/null || true
+    spin_file "Downloading $(basename "$dest" .tmp)" "$dest" -- curl_to "$url" "$dest" "$hc_file" || {
+        rm -f "$dest" "$hc_file" 2>/dev/null || true
         die "download failed: $url" \
             "curl error (network issue or invalid URL)" \
             "Check your network connection and try again."
     }
 
-    if [ "$http_code" -ge 400 ] 2>/dev/null; then
+    http_code=$(cat "$hc_file" 2>/dev/null || echo "")
+    rm -f "$hc_file" 2>/dev/null || true
+
+    if [ -n "$http_code" ] && [ "$http_code" -ge 400 ] 2>/dev/null; then
         rm -f "$dest" 2>/dev/null || true
         die "download failed: $url" \
             "HTTP status: $http_code" \
@@ -798,8 +841,7 @@ install_rootfs() {
     download_large "${RELEASE_URL}/${asset}" "$zst_tmp"
     verify_checksum "$zst_tmp" "$asset"
 
-    info "Decompressing..."
-    zstd -d -q -f -o "$rootfs_path" "$zst_tmp"
+    spin "Decompressing ${tier} rootfs" -- zstd -d -q -f -o "$rootfs_path" "$zst_tmp"
     rm -f "$zst_tmp"
 
     [ -s "$rootfs_path" ] \
@@ -847,6 +889,7 @@ EOF
 
 create_admin_user() {
     heading "Creating admin user"
+    step_start
     ADMIN_KEY=$(bhatti user create --name admin --max-sandboxes 50 2>&1 \
         | grep "API key:" | awk '{print $NF}') || true
 
@@ -874,12 +917,18 @@ EOF
             fi
         fi
 
-        mkdir -p /root/.bhatti
-        cat > /root/.bhatti/config.yaml << EOF
+        # Root's own CLI config so `sudo bhatti` works. Root's home differs by OS
+        # (/var/root on macOS, /root on Linux) and macOS has a read-only /, so we
+        # never hardcode /root. Best-effort — must not abort an otherwise-good install.
+        local root_home
+        root_home=$(eval echo ~root 2>/dev/null) || root_home=""
+        if [ -n "$root_home" ] && [ -d "$root_home" ] && mkdir -p "$root_home/.bhatti" 2>/dev/null; then
+            cat > "$root_home/.bhatti/config.yaml" << EOF
 api_url: http://localhost:8080
 auth_token: ${ADMIN_KEY}
 EOF
-        success "Admin user created"
+        fi
+        success "Admin user created ($(step_elapsed))"
     else
         info "Admin user may already exist, skipping"
     fi
@@ -1078,8 +1127,9 @@ do_server_install() {
     # v2 (krucible): one self-contained bundle brings the CLI + the whole runtime
     # (bhatti-vmm, bhatti-netd, libkrun, lean kernel). No Firecracker.
     heading "Installing bhatti ${VERSION} + runtime"
+    step_start
     install_bundle 1
-    success "bhatti ${VERSION} + krucible runtime"
+    success "bhatti ${VERSION} + krucible runtime ($(step_elapsed))"
 
     install_rootfs "$tier"
     generate_config "$tier"
