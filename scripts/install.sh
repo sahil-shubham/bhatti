@@ -103,7 +103,7 @@ _spin_run() {
         elif [ -t 2 ]; then tty=/dev/stderr; fi
     fi
     if [ -z "$tty" ]; then "$@"; return $?; fi
-    local start=$SECONDS frames='|/-\' n=0 rc=0 sz
+    local start=$SECONDS frames=$'|/-\\' n=0 rc=0 sz
     "$@" &
     local pid=$!
     while kill -0 "$pid" 2>/dev/null; do
