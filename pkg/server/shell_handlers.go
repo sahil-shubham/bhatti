@@ -69,9 +69,9 @@ func (s *Server) serveShellHTML(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", strings.Join([]string{
 		"default-src 'none'",
 		"script-src https://cdn.jsdelivr.net 'nonce-" + nonce + "'", // CDN + inline
-		"style-src https://cdn.jsdelivr.net 'unsafe-inline'",       // xterm.css
-		"font-src https://cdn.jsdelivr.net",                        // FiraCode
-		"connect-src 'self'",                                       // WebSocket + fetch
+		"style-src https://cdn.jsdelivr.net 'unsafe-inline'",        // xterm.css
+		"font-src https://cdn.jsdelivr.net",                         // FiraCode
+		"connect-src 'self'",                                        // WebSocket + fetch
 		"frame-ancestors 'none'",
 	}, "; "))
 	w.Write(bytes.Replace(shellHTML, []byte("{{NONCE}}"), []byte(nonce), 1))
@@ -167,6 +167,8 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID
 		conn.WriteJSON(map[string]string{"type": "error", "error": "sandbox unavailable"})
 		return
 	}
+	s.attachInteractive(sb.EngineID)
+	defer s.detachInteractive(sb.EngineID)
 
 	// 9. Create shell session — same Engine.Shell() as CLI path.
 	conn.SetReadDeadline(time.Time{}) // clear the 10s auth deadline

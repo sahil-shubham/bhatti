@@ -69,6 +69,88 @@ func TestThermalHotToWarm(t *testing.T) {
 	}
 }
 
+func TestThermalAttachedInteractivePinsHot(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	cfg := ThermalConfig{WarmTimeout: 50 * time.Millisecond, ColdTimeout: time.Hour}
+
+	eid := createRunningBox(t, srv, eng, "shell-box")
+
+	// Idle long enough that it WOULD be paused, and the agent also reports idle.
+	eng.mu.Lock()
+	eng.ActivityResult = &proto.ActivityInfo{
+		LastActivityUnix: time.Now().Add(-time.Minute).Unix(),
+		AttachedSessions: 0,
+	}
+	eng.mu.Unlock()
+
+	// A client is attached — host-authoritative pin, independent of the agent.
+	srv.attachInteractive(eid)
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
+
+	te := srv.engine.(ThermalEngine)
+	srv.runThermalCycle(te, cfg)
+
+	eng.mu.Lock()
+	state := eng.thermal[eid]
+	eng.mu.Unlock()
+	if state != "hot" {
+		t.Fatalf("attached interactive session must pin hot, got thermal=%q", state)
+	}
+
+	// Non-vacuous: after detach the SAME idle sandbox pauses — proving the pin
+	// was the only thing holding it hot.
+	srv.detachInteractive(eid)
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
+	srv.runThermalCycle(te, cfg)
+
+	eng.mu.Lock()
+	state = eng.thermal[eid]
+	eng.mu.Unlock()
+	if state != "warm" {
+		t.Fatalf("after detach an idle sandbox must pause, got thermal=%q", state)
+	}
+}
+
+func TestThermalAttachedInteractiveNotColdStopped(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	cfg := ThermalConfig{WarmTimeout: time.Hour, ColdTimeout: 50 * time.Millisecond}
+
+	eid := createRunningBox(t, srv, eng, "warm-shell-box")
+	eng.mu.Lock()
+	eng.thermal[eid] = "warm"
+	eng.mu.Unlock()
+
+	// Attached + idle past the cold timeout: must NOT be snapshotted/stopped.
+	srv.attachInteractive(eid)
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
+
+	te := srv.engine.(ThermalEngine)
+	srv.runThermalCycle(te, cfg)
+
+	sb, err := srv.store.GetSandboxByID(eid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Status == "stopped" {
+		t.Fatalf("attached interactive session must not be cold-stopped")
+	}
+
+	// Non-vacuous: detach, age activity, and the same warm box is stopped.
+	srv.detachInteractive(eid)
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
+	srv.runThermalCycle(te, cfg)
+
+	sb, err = srv.store.GetSandboxByID(eid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Status != "stopped" {
+		t.Fatalf("after detach an idle warm sandbox must cold-stop, got %q", sb.Status)
+	}
+}
+
 func TestThermalHotStaysHotWithActivity(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)

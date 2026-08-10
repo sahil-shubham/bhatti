@@ -47,15 +47,15 @@ type ThermalConfig struct {
 
 // Server is the HTTP API server.
 type Server struct {
-	engine       engine.Engine
-	store        *store.Store
-	dataDir      string // path to data directory (for age.key)
-	mux          *http.ServeMux
-	limiter      *rateLimiter
-	stopThermal     context.CancelFunc
-	thermalDone     chan struct{}       // closed when thermal goroutine exits
-	stopTaskCleanup context.CancelFunc
-	startTime       time.Time
+	engine           engine.Engine
+	store            *store.Store
+	dataDir          string // path to data directory (for age.key)
+	mux              *http.ServeMux
+	limiter          *rateLimiter
+	stopThermal      context.CancelFunc
+	thermalDone      chan struct{} // closed when thermal goroutine exits
+	stopTaskCleanup  context.CancelFunc
+	startTime        time.Time
 	lastActivity     sync.Map // engineID → time.Time — host-side activity cache
 	snapshotFailures sync.Map // engineID → *atomic.Int64 — consecutive snapshot failure count
 	thermalFails     sync.Map // engineID → *atomic.Int64 — consecutive Activity query failures
@@ -88,12 +88,17 @@ type Server struct {
 	resumeSem       chan struct{}       // bounds concurrent cold resumes
 
 	// Backup
-	backupBackend   backup.Backend      // nil if backup not configured
-	stopBackup      context.CancelFunc
+	backupBackend backup.Backend // nil if backup not configured
+	stopBackup    context.CancelFunc
 
 	// Web shell
 	shellSessions *shellSessionTracker
 	shellLimiter  *shellRateLimiter
+
+	// interactiveAttach counts live interactive clients (CLI/web shell, piped
+	// exec WS) per engineID; a non-zero count pins the sandbox hot.
+	interactiveMu     sync.Mutex
+	interactiveAttach map[string]int
 }
 
 // maxThermalFailures is the number of consecutive Activity query failures
@@ -157,6 +162,39 @@ func (s *Server) touchActivity(engineID string) {
 	s.resetThermalFails(engineID)     // reset thermal failure counter on user activity
 }
 
+// attachInteractive marks a live interactive client (CLI/web shell, piped exec
+// WS) attached to engineID. While attached the sandbox is pinned hot: the
+// thermal manager never pauses or snapshots it, because on krucible a paused or
+// restored vsock does not survive resume — cooling under an attached client
+// strands the shell with no way back. Host-authoritative, so it does not depend
+// on the guest agent's AttachedSessions report.
+func (s *Server) attachInteractive(engineID string) {
+	s.interactiveMu.Lock()
+	s.interactiveAttach[engineID]++
+	s.interactiveMu.Unlock()
+	s.touchActivity(engineID)
+}
+
+// detachInteractive releases one interactive client and restarts the idle clock
+// from detach, so a just-closed shell isn't cold-stopped on stale activity.
+func (s *Server) detachInteractive(engineID string) {
+	s.interactiveMu.Lock()
+	if n := s.interactiveAttach[engineID] - 1; n <= 0 {
+		delete(s.interactiveAttach, engineID)
+	} else {
+		s.interactiveAttach[engineID] = n
+	}
+	s.interactiveMu.Unlock()
+	s.touchActivity(engineID)
+}
+
+// hasInteractiveAttach reports whether any interactive client is attached.
+func (s *Server) hasInteractiveAttach(engineID string) bool {
+	s.interactiveMu.Lock()
+	defer s.interactiveMu.Unlock()
+	return s.interactiveAttach[engineID] > 0
+}
+
 // TouchActivity is the exported version of touchActivity for use by
 // PublicProxyHandler's WebSocket activity callback (wired in main.go).
 func (s *Server) TouchActivity(engineID string) {
@@ -190,17 +228,18 @@ func WithBackupBackend(b backup.Backend) ServerOption {
 // containing age.key for secret encryption.
 func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOption) *Server {
 	s := &Server{
-		engine:        eng,
-		store:         st,
-		dataDir:       dataDir,
-		mux:           http.NewServeMux(),
-		limiter:       newRateLimiter(),
-		startTime:     time.Now(),
-		pullCancels:   make(map[string]context.CancelFunc),
-		forwards:      make(map[string][]net.Listener),
-		resumeSem:     make(chan struct{}, 10),
-		shellSessions: newShellSessionTracker(5),
-		shellLimiter:  newShellRateLimiter(10),
+		engine:            eng,
+		store:             st,
+		dataDir:           dataDir,
+		mux:               http.NewServeMux(),
+		limiter:           newRateLimiter(),
+		startTime:         time.Now(),
+		pullCancels:       make(map[string]context.CancelFunc),
+		forwards:          make(map[string][]net.Listener),
+		resumeSem:         make(chan struct{}, 10),
+		shellSessions:     newShellSessionTracker(5),
+		shellLimiter:      newShellRateLimiter(10),
+		interactiveAttach: map[string]int{},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -533,6 +572,15 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			continue
 		}
 
+		// An attached interactive client (CLI/web shell, piped exec) pins the
+		// sandbox hot. Never pause or snapshot it — on krucible a paused/restored
+		// vsock does not survive resume, so cooling under an attached client
+		// strands the session. Host-authoritative (not the agent's report).
+		if s.hasInteractiveAttach(sb.EngineID) {
+			s.touchActivity(sb.EngineID)
+			continue
+		}
+
 		thermal := te.ThermalState(sb.EngineID)
 
 		// --- Warm → Cold: host-side timing only, no agent query ---
@@ -719,7 +767,6 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 
 	return nil
 }
-
 
 // ServerVersion is set by the main package at startup from the build-time
 // version string. Advertised to CLI clients via the X-Bhatti-Version header

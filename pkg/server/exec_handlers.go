@@ -157,6 +157,8 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id stri
 		conn.WriteMessage(websocket.TextMessage, []byte("wake sandbox: "+err.Error()))
 		return
 	}
+	s.attachInteractive(sb.EngineID)
+	defer s.detachInteractive(sb.EngineID)
 
 	// Session reattach logic. Use context.Background — r.Context() is
 	// tied to the HTTP request and may cancel after WebSocket upgrade.
@@ -375,6 +377,8 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"wake sandbox: `+err.Error()+`"}`))
 		return
 	}
+	s.attachInteractive(sb.EngineID)
+	defer s.detachInteractive(sb.EngineID)
 
 	pe, ok := s.engine.(engine.PipedSessionEngine)
 	if !ok {
