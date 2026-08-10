@@ -1,3 +1,5 @@
+//go:build krucible
+
 package krucible
 
 import (
