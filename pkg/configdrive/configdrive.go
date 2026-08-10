@@ -1,24 +1,14 @@
-// Package configdrive builds the bhatti config drive: a small ext4 image
-// carrying config.json (hostname, auth token, env, files, volumes, DNS, init)
-// that lohar reads at /dev/vdb on boot, before the agent starts listening.
-//
-// This is the engine↔guest configuration contract. The SandboxConfig /
-// ConfigFile / VolumeMountConfig field names MUST stay in sync with lohar's
-// reader (cmd/lohar/main.go: SandboxConfig). It is cross-platform (mke2fs -d,
-// no mount/loop, no OS-specific syscalls) so both the krucible engine (macOS +
-// Linux) and the Firecracker engine can use it.
+// Package configdrive defines the bhatti sandbox config schema: the JSON
+// (hostname, auth token, env, files, volumes, DNS, init, net) lohar fetches over
+// the guest→host config vsock at boot (DESIGN-bhatti-v2-secrets-and-trust §3.4),
+// before the agent starts listening. It replaced the on-disk ext4 "config drive"
+// (retired along with mke2fs); the package name is kept for continuity. These
+// field names are the wire contract with lohar's reader (cmd/lohar/main.go:
+// SandboxConfig) — keep them in sync.
 package configdrive
 
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-)
-
-// SandboxConfig is the JSON written to the config drive and read by lohar at
-// boot. Field names are the wire contract with cmd/lohar/main.go.
+// SandboxConfig is the JSON lohar fetches over the config vsock at boot. Field
+// names are the wire contract with cmd/lohar/main.go.
 type SandboxConfig struct {
 	SandboxID   string                `json:"sandbox_id"`
 	Hostname    string                `json:"hostname"`
@@ -64,45 +54,4 @@ type FsMountConfig struct {
 	Tag      string `json:"tag"`
 	Mount    string `json:"mount"`
 	ReadOnly bool   `json:"read_only"`
-}
-
-// Build writes config.json into a fresh ext4 image at path via `mke2fs -d`
-// (no mount/loop — no leaked loop devices, works unprivileged on macOS and
-// Linux). The image is sized to the payload (1–4 MiB).
-func Build(path string, cfg SandboxConfig) error {
-	tmpDir, err := os.MkdirTemp("", "bhatti-config-*")
-	if err != nil {
-		return fmt.Errorf("create config temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
-		return fmt.Errorf("write config.json: %w", err)
-	}
-
-	// Payload + headroom, clamped to [1, 4] MiB (matches the FC builder).
-	sizeMB := len(data)*3/2/1024/1024 + 1
-	if sizeMB > 4 {
-		sizeMB = 4
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("create config drive: %w", err)
-	}
-	if err := f.Truncate(int64(sizeMB) << 20); err != nil {
-		f.Close()
-		return fmt.Errorf("truncate config drive: %w", err)
-	}
-	f.Close()
-
-	if out, err := exec.Command("mke2fs", "-t", "ext4", "-d", tmpDir, "-F", "-q", path).CombinedOutput(); err != nil {
-		os.Remove(path)
-		return fmt.Errorf("mke2fs config drive: %s: %w", out, err)
-	}
-	return nil
 }
