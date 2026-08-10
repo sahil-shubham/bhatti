@@ -50,6 +50,12 @@ DATA_DIR="/var/lib/bhatti"
 # computer, browser" follows ALL_KNOWN_TIERS order, not insertion order).
 ALL_KNOWN_TIERS="minimal browser docker computer"
 
+# Network resilience for release/API downloads. A blackholed address family
+# (observed: IPv4 to GitHub's asset CDN hangs ~75s on the OS SYN timeout while
+# IPv6 is fine) otherwise stalls every fetch. --connect-timeout bounds each
+# attempt so curl falls back to the working family fast; --retry rides out blips.
+CURL_NET_OPTS=(--connect-timeout 15 --retry 3 --retry-delay 2 --retry-connrefused)
+
 # ── Test overrides ──────────────────────────────────
 # Set by scripts/install_smoke.bats to point the installer at a local
 # fake-release tree instead of GitHub. Not user-facing; intentionally
@@ -252,7 +258,7 @@ download() {
     # Silence rm errors: if $dest was created by a different user
     # (legacy bug), we don't want a confusing "Permission denied"
     # piling on top of the actual download failure.
-    http_code=$(curl -sSL -w '%{http_code}' -o "$dest" "$url") || {
+    http_code=$(curl "${CURL_NET_OPTS[@]}" -sSL -w '%{http_code}' -o "$dest" "$url") || {
         rm -f "$dest" 2>/dev/null || true
         die "download failed: $url" \
             "curl error (network issue or invalid URL)" \
@@ -276,7 +282,7 @@ download() {
 
 # curl_to URL DEST HC_FILE — download URL to DEST, writing the HTTP status code
 # to HC_FILE. Split out so the spinner can background it as a named command.
-curl_to() { curl -sSL -w '%{http_code}' -o "$2" "$1" > "$3"; }
+curl_to() { curl "${CURL_NET_OPTS[@]}" -sSL -w '%{http_code}' -o "$2" "$1" > "$3"; }
 
 # download_large URL DEST — download a large file behind a spinner that reports
 # elapsed time + the growing on-disk size. Reads cleaner than curl's '#' bar.
@@ -319,7 +325,7 @@ download_pipe() {
     local err_file
     err_file=$(mktemp)
 
-    if ! curl -fsSL "$url" 2>"$err_file" | "$@"; then
+    if ! curl "${CURL_NET_OPTS[@]}" -fsSL "$url" 2>"$err_file" | "$@"; then
         local curl_err
         curl_err=$(cat "$err_file")
         rm -f "$err_file"
@@ -335,7 +341,7 @@ download_pipe() {
 CHECKSUMS=""
 
 fetch_checksums() {
-    CHECKSUMS=$(curl -fsSL "${RELEASE_URL}/checksums-sha256.txt" 2>/dev/null || true)
+    CHECKSUMS=$(curl "${CURL_NET_OPTS[@]}" -fsSL "${RELEASE_URL}/checksums-sha256.txt" 2>/dev/null || true)
 }
 
 # Compute sha256 of a local file (empty string if file missing or no tool)
@@ -484,7 +490,7 @@ resolve_latest_version() {
     fi
 
     local response
-    response=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest") \
+    response=$(curl "${CURL_NET_OPTS[@]}" -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest") \
         || die "could not reach GitHub API" \
                "Check your network connection." \
                "You can also download directly from:" \
