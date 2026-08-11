@@ -152,7 +152,7 @@ func (e *Engine) readoptNetd(vm *VM) {
 		return
 	}
 	dir := e.netdDir(vm.netdKey)
-	inst := &netdInstance{owner: vm.netdKey, sock: filepath.Join(dir, "n.sock"), dir: dir, subnetIdx: vm.subnetIdx, refs: 1}
+	inst := &netdInstance{owner: vm.netdKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: vm.subnetIdx, refs: 1}
 	if data, err := os.ReadFile(netdStatePath(dir)); err == nil {
 		var rec netdRecord
 		if json.Unmarshal(data, &rec) == nil {

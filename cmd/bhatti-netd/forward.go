@@ -8,8 +8,6 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/sahil-shubham/bhatti/pkg/gateway"
-
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -26,7 +24,7 @@ const maxInFlightConn = 2048
 // egress guard's vetting dialer — host/private/metadata denied, public allowed
 // (the isolation TSI couldn't give). Dial-first so a denied or unreachable
 // destination RSTs the guest cleanly.
-func (g *Gateway) installTCPForwarder(dialer *gateway.Dialer) {
+func (g *Gateway) installTCPForwarder() {
 	fwd := tcp.NewForwarder(g.stack, 0, maxInFlightConn, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 
@@ -39,7 +37,9 @@ func (g *Gateway) installTCPForwarder(dialer *gateway.Dialer) {
 				tcpip.FullAddress{Addr: id.LocalAddress, Port: id.LocalPort}, ipv4.ProtocolNumber)
 		} else {
 			dest := net.JoinHostPort(addrString(id.LocalAddress), fmt.Sprint(id.LocalPort))
-			up, err = dialer.DialContext(context.Background(), "tcp", dest)
+			// Per-sandbox egress: vet the destination against THIS guest's policy
+			// (keyed by source IP), or the default posture if it isn't registered.
+			up, err = g.stateFor(id.RemoteAddress).dialer.DialContext(context.Background(), "tcp", dest)
 		}
 		if err != nil {
 			r.Complete(true) // RST: denied by policy or unreachable
@@ -95,12 +95,12 @@ const udpIdleTimeout = 30 * time.Second
 // resolvers in the guest's resolv.conf); the address a guest subsequently
 // TCP-connects to is still vetted by the TCP forwarder, so DNS rebinding into
 // host/private space stays closed.
-func (g *Gateway) installUDPForwarder(policy *gateway.EgressPolicy) {
+func (g *Gateway) installUDPForwarder() {
 	fwd := udp.NewForwarder(g.stack, func(r *udp.ForwarderRequest) (handled bool) {
 		id := r.ID()
 		ip, err := netip.ParseAddr(addrString(id.LocalAddress))
-		if err != nil || !policy.Check("", ip).Allow {
-			return false // drop: unparseable, or denied (host/private/metadata/sibling)
+		if err != nil || !g.stateFor(id.RemoteAddress).pol.Check("", ip).Allow {
+			return false // drop: unparseable, or denied by this guest's egress policy
 		}
 		var wq waiter.Queue
 		ep, terr := r.CreateEndpoint(&wq)

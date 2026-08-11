@@ -16,6 +16,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
 	"github.com/sahil-shubham/bhatti/pkg/forward"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // newNetEngine builds a block-root engine with the virtio-net gateway backend
@@ -356,4 +357,40 @@ func TestKrucibleNetRecovery(t *testing.T) {
 // vsock, decoupled from the data plane).
 func TestKrucibleNetAgentSuite(t *testing.T) {
 	enginetest.RunAgentSuite(t, newNetEngine)
+}
+
+// TestKrucibleNetEgressPolicy is the per-sandbox network-rules gate: a policy
+// pushed via spec.NetPolicy (deny-by-default, allow only 1.1.1.1/32) travels
+// create -> engine -> the netd control channel -> the guest's forwarder, so the
+// guest reaches the allow-listed address and is denied everything else.
+func TestKrucibleNetEgressPolicy(t *testing.T) {
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{
+		Name: "netpol", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "deny", AllowCIDRs: []string{"1.1.1.1/32"}},
+	})
+	if err != nil {
+		t.Fatalf("Create(net+policy): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	// The allow-listed address is reachable.
+	if r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", "1.1.1.1:443"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("allow-listed 1.1.1.1 should be reachable under deny+allow: err=%v exit=%d out=%q",
+			err, r.ExitCode, strings.TrimSpace(r.Stdout))
+	}
+	// Everything else is denied by the default posture — proving the pushed
+	// policy is actually enforced per-guest (not the global public default).
+	r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", "8.8.8.8:443"})
+	if err != nil {
+		t.Fatalf("exec dial 8.8.8.8: %v", err)
+	}
+	if r.ExitCode == 0 {
+		t.Fatalf("8.8.8.8 must be denied under deny + allow-only-1.1.1.1 (egress policy not enforced): %q",
+			strings.TrimSpace(r.Stdout))
+	}
 }

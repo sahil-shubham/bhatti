@@ -23,6 +23,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/configdrive"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // Config holds paths and defaults for the krucible engine. All pure Go — the
@@ -89,6 +90,7 @@ func netGuestIPFor(subnetIdx, guestIdx int) string {
 type netdInstance struct {
 	owner     string
 	sock      string
+	ctlSock   string
 	dir       string
 	subnetIdx int
 	mu        sync.Mutex // guards cmd/pid (spawn-once)
@@ -136,7 +138,7 @@ func (e *Engine) acquireNetd(ownerKey string, subnetIdx int) (*netdInstance, int
 	inst := e.netds[ownerKey]
 	if inst == nil {
 		dir := e.netdDir(ownerKey)
-		inst = &netdInstance{owner: ownerKey, sock: filepath.Join(dir, "n.sock"), dir: dir, subnetIdx: subnetIdx}
+		inst = &netdInstance{owner: ownerKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: subnetIdx}
 		e.netds[ownerKey] = inst
 	}
 	inst.refs++
@@ -212,7 +214,8 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	}
 	defer lf.Close()
 	cmd := exec.Command(e.cfg.NetdBinary,
-		"--net-uds", inst.sock, "--gw-ip", netGatewayIPFor(inst.subnetIdx),
+		"--net-uds", inst.sock, "--ctl-uds", inst.ctlSock,
+		"--gw-ip", netGatewayIPFor(inst.subnetIdx),
 		"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC)
 	cmd.Stdout = lf
 	cmd.Stderr = lf
@@ -229,6 +232,52 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	inst.pid = cmd.Process.Pid
 	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
 	return nil
+}
+
+// pushSandboxPolicy registers this VM's per-sandbox egress state with its
+// owner's netd over the control UDS. Best-effort with a bounded retry, since
+// netd may have only just started listening. No-op on TSI (no netd IP).
+//
+// TODO(follow-up): persist NetPolicy in the vmRecord and re-push on a netd
+// respawn, so a netd that died and respawned doesn't silently drop a sandbox
+// back to the default (public) posture until its next launch.
+func (e *Engine) pushSandboxPolicy(vm *VM) {
+	if vm.netIP == "" || vm.netdKey == "" {
+		return
+	}
+	e.netdMu.Lock()
+	inst := e.netds[vm.netdKey]
+	e.netdMu.Unlock()
+	if inst == nil || inst.ctlSock == "" {
+		return
+	}
+	msg := gateway.ControlMsg{Op: gateway.ControlSet, GuestIP: vm.netIP, Sandbox: vm.ID, Policy: vm.netPolicy}
+	c := gateway.NewControlClient(inst.ctlSock)
+	defer c.Close()
+	for range 20 {
+		if err := c.Send(msg); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	slog.Warn("krucible: netd policy push failed", "sandbox", vm.ID, "ip", vm.netIP)
+}
+
+// delSandboxPolicy removes this VM's state from netd (best-effort; the owner's
+// netd may already be gone when this was the last sandbox).
+func (e *Engine) delSandboxPolicy(vm *VM) {
+	if vm.netIP == "" || vm.netdKey == "" {
+		return
+	}
+	e.netdMu.Lock()
+	inst := e.netds[vm.netdKey]
+	e.netdMu.Unlock()
+	if inst == nil || inst.ctlSock == "" {
+		return
+	}
+	c := gateway.NewControlClient(inst.ctlSock)
+	defer c.Close()
+	_ = c.Send(gateway.ControlMsg{Op: gateway.ControlDel, GuestIP: vm.netIP})
 }
 
 // VM is per-sandbox state. The helper process IS the VM; we hold its cmd to
@@ -263,10 +312,11 @@ type VM struct {
 	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
-	configSrv  *configServer // host-side boot config server (§3.4); launchMu-guarded
-	netdKey    string        // owner key of the shared bhatti-netd (net backend); "" on TSI
-	subnetIdx  int           // owner's vnet subnet index (net backend); persisted for recovery
-	netIP      string        // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
+	configSrv  *configServer          // host-side boot config server (§3.4); launchMu-guarded
+	netdKey    string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
+	subnetIdx  int                    // owner's vnet subnet index (net backend); persisted for recovery
+	netIP      string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
+	netPolicy  *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = default (public)
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -581,6 +631,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		netdKey:   netdKey,
 		subnetIdx: spec.SubnetIndex,
 		netIP:     netIP,
+		netPolicy: spec.NetPolicy,
 	}
 
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
@@ -626,6 +677,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		if nerr := e.ensureNetd(vm.netdKey); nerr != nil {
 			return nerr
 		}
+		e.pushSandboxPolicy(vm)
 	}
 
 	// Serve the boot config over the guest→host config vsock (§3.4). Must be
@@ -741,6 +793,7 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	e.mu.Unlock()
 
 	if vm.netdKey != "" {
+		e.delSandboxPolicy(vm)
 		e.releaseNetd(vm.netdKey)
 	}
 

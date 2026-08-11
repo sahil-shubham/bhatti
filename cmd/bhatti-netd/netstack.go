@@ -58,6 +58,10 @@ type Gateway struct {
 	mu       sync.RWMutex
 	ports    []*guestPort                     // all guest links
 	macTable map[tcpip.LinkAddress]*guestPort // learned guest MAC → port (stack→guest demux)
+
+	polMu    sync.RWMutex
+	guests   map[string]*guestState // guest gateway IP -> per-sandbox egress state
+	defState *guestState            // fallback for an unregistered guest (public)
 }
 
 // guestPort is one guest's virtio-net link.
@@ -70,6 +74,14 @@ func (p *guestPort) write(frame []byte) error {
 	p.wmu.Lock()
 	defer p.wmu.Unlock()
 	return p.fc.WriteFrame(frame)
+}
+
+// guestState is one guest's per-sandbox egress config, delivered by the daemon
+// over the control channel and keyed by the guest's gateway IP.
+type guestState struct {
+	sandbox string
+	pol     *gateway.EgressPolicy
+	dialer  *gateway.Dialer
 }
 
 // NewGateway builds the stack, assigns the gateway address gwIP/prefix, sets a
@@ -120,6 +132,7 @@ func NewGateway(gwIP tcpip.Address, prefixLen int, mac tcpip.LinkAddress) (*Gate
 	// ARPs the target guest on its link.
 	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: nicID}})
 
+	defPol := &gateway.EgressPolicy{Default: gateway.PosturePublic}
 	g := &Gateway{
 		stack:    s,
 		ep:       ch,
@@ -127,18 +140,50 @@ func NewGateway(gwIP tcpip.Address, prefixLen int, mac tcpip.LinkAddress) (*Gate
 		gwIP:     gwIP,
 		subnet:   protoAddr.AddressWithPrefix.Subnet(),
 		macTable: make(map[tcpip.LinkAddress]*guestPort),
+		guests:   make(map[string]*guestState),
+		// Unregistered guests keep today's behavior (public egress); the daemon
+		// tightens each sandbox via the control channel (SetSandbox).
+		defState: &guestState{pol: defPol, dialer: &gateway.Dialer{Policy: defPol}},
 	}
-	// Every guest TCP flow is terminated here and re-originated: internet via the
-	// egress guard (public allowed; host/private/metadata denied), siblings via
-	// the stack. Per-sandbox egress policy and L7 substitution layer on next.
-	g.installTCPForwarder(&gateway.Dialer{
-		Policy: &gateway.EgressPolicy{Default: gateway.PosturePublic},
-	})
-	// Guest UDP is re-originated the same way, under the same egress policy —
-	// this is DNS egress (UDP:53 to public resolvers). Without it a netd guest
-	// cannot resolve names.
-	g.installUDPForwarder(&gateway.EgressPolicy{Default: gateway.PosturePublic})
+	// Every guest TCP/UDP flow is terminated here and re-originated per-sandbox:
+	// the egress guard vets the destination against THAT guest's policy (public
+	// allowed; host/private/metadata denied), siblings route via the stack, and
+	// UDP is DNS egress. Policy is looked up by source IP at request time.
+	g.installTCPForwarder()
+	g.installUDPForwarder()
 	return g, nil
+}
+
+// SetSandbox registers or replaces a guest's per-sandbox egress state, keyed by
+// its gateway IP. A nil policy means "use the default posture" (public).
+// Implements gateway.ControlHandler — the daemon pushes over the control UDS.
+func (g *Gateway) SetSandbox(guestIP, sandboxID string, pol *gateway.EgressPolicy) {
+	if pol == nil {
+		pol = &gateway.EgressPolicy{Default: gateway.PosturePublic}
+	}
+	g.polMu.Lock()
+	g.guests[guestIP] = &guestState{sandbox: sandboxID, pol: pol, dialer: &gateway.Dialer{Policy: pol}}
+	g.polMu.Unlock()
+}
+
+// DelSandbox drops a guest's state (on sandbox destroy).
+func (g *Gateway) DelSandbox(guestIP string) {
+	g.polMu.Lock()
+	delete(g.guests, guestIP)
+	g.polMu.Unlock()
+}
+
+// stateFor returns the per-guest egress state for a source address, or the
+// default (public) when the guest isn't registered — so an unregistered guest
+// keeps today's behavior instead of being hard-denied by a create/push race.
+func (g *Gateway) stateFor(src tcpip.Address) *guestState {
+	g.polMu.RLock()
+	st := g.guests[addrString(src)]
+	g.polMu.RUnlock()
+	if st == nil {
+		return g.defState
+	}
+	return st
 }
 
 // isSibling reports whether addr is another guest of this owner (in the guest

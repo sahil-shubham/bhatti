@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -25,6 +26,7 @@ func main() {
 	gwIP := flag.String("gw-ip", "100.64.0.1", "gateway IPv4 address")
 	prefix := flag.Int("prefix", 24, "gateway subnet prefix length")
 	macStr := flag.String("mac", "52:54:00:00:00:01", "gateway link (MAC) address")
+	ctlUDS := flag.String("ctl-uds", "", "control socket the daemon pushes per-sandbox egress policy to (optional)")
 	flag.Parse()
 
 	if *netUDS == "" {
@@ -46,7 +48,7 @@ func main() {
 	defer stop()
 
 	log.Printf("bhatti-netd: listening on %s (gw %s/%d, mac %s)", *netUDS, *gwIP, *prefix, *macStr)
-	if err := serve(ctx, ln, cfg); err != nil && ctx.Err() == nil {
+	if err := serve(ctx, ln, cfg, *ctlUDS); err != nil && ctx.Err() == nil {
 		log.Fatalf("bhatti-netd: %v", err)
 	}
 }
@@ -78,10 +80,19 @@ func parseConfig(gwIP string, prefix int, macStr string) (gwConfig, error) {
 // connect (each libkrun virtio-net backend dials this socket). Every accepted
 // connection becomes a switch port; siblings on the same netd reach each other.
 // Closing the listener on ctx.Done unblocks a pending Accept.
-func serve(ctx context.Context, ln net.Listener, cfg gwConfig) error {
+func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlUDS string) error {
 	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac)
 	if err != nil {
 		return err
+	}
+	if ctlUDS != "" {
+		_ = os.Remove(ctlUDS)
+		ctlLn, lerr := net.Listen("unix", ctlUDS)
+		if lerr != nil {
+			return fmt.Errorf("control listen %s: %w", ctlUDS, lerr)
+		}
+		go func() { <-ctx.Done(); ctlLn.Close() }()
+		go gateway.ServeControl(ctlLn, gw)
 	}
 	go func() {
 		<-ctx.Done()

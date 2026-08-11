@@ -119,7 +119,7 @@ func TestGatewayOverUnixSocket(t *testing.T) {
 
 	served := make(chan error, 1)
 	go func() {
-		served <- serve(ctx, ln, gwConfig{ip: tcpip.AddrFrom4(testGwIP), prefix: 24, mac: testGwMAC})
+		served <- serve(ctx, ln, gwConfig{ip: tcpip.AddrFrom4(testGwIP), prefix: 24, mac: testGwMAC}, "")
 	}()
 
 	// Peer connects (as libkrun would).
