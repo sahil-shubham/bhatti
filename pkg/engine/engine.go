@@ -105,19 +105,6 @@ type SandboxInfo struct {
 	EngineID string `json:"engine_id"`
 }
 
-// SandboxStats is live host-side resource usage of a running sandbox, sampled
-// from its per-VM helper process. Zero means unknown / not running.
-type SandboxStats struct {
-	CPUPct   float64 `json:"cpu_pct"`   // host CPU% of the helper (0 when paused/cold)
-	RSSBytes int64   `json:"rss_bytes"` // resident host memory of the helper
-}
-
-// StatsProvider is implemented by engines that can report live per-sandbox
-// resource usage. Optional: the dashboard degrades to allocated-only without it.
-type StatsProvider interface {
-	Stats(ctx context.Context, id string) (SandboxStats, error)
-}
-
 // ExecResult holds the output of a command execution.
 type ExecResult struct {
 	ExitCode int    `json:"exit_code"`

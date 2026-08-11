@@ -101,13 +101,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/snapshots/", s.handleSnapshot)
 	s.mux.HandleFunc("/tasks/", s.handleTask)
 	s.mux.HandleFunc("/ports", s.handleAllPorts)
-
-	// Observability: read-only dashboard SPA + JSON feed + Prometheus metrics.
-	// Registered on s.mux, so all three sit behind the same bearer-token auth
-	// as every other API route (Server.ServeHTTP, server.go:830-851).
-	s.mux.HandleFunc("/dashboard", s.handleDashboard)
-	s.mux.HandleFunc("/dashboard/data", s.handleDashboardData)
-	s.mux.HandleFunc("/metrics", s.handleMetrics)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
