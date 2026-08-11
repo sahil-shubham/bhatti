@@ -123,7 +123,7 @@ func TestObservabilityRequiresAuth(t *testing.T) {
 	_, ts := setup(t)
 	for _, path := range []string{"/metrics", "/dashboard", "/dashboard/data"} {
 		req, _ := http.NewRequest("GET", ts.URL+path, nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := testHTTPClient.Do(req)
 		if err != nil {
 			t.Fatalf("%s: request failed: %v", path, err)
 		}

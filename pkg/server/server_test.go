@@ -32,6 +32,11 @@ func uniqueName(t *testing.T, prefix string) string {
 // testAPIKey is the plaintext key used in tests.
 const testAPIKey = "test-token"
 
+// testHTTPClient disables keep-alives so no idle persistConn lingers in a
+// process-global pool — otherwise it trips goleak.VerifyNone in an
+// alphabetically-later test (e.g. event_subscribe) that runs after an HTTP test.
+var testHTTPClient = &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
 func setup(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
@@ -64,7 +69,7 @@ func doReq(t *testing.T, ts *httptest.Server, method, path string, body any) *ht
 	req, _ := http.NewRequest(method, ts.URL+path, bodyReader)
 	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testHTTPClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +94,7 @@ func createSandbox(t *testing.T, ts *httptest.Server, sbName string) store.Sandb
 	}
 	var sb store.Sandbox
 	decodeJSON(t, resp, &sb)
-	t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil) })
+	t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil).Body.Close() })
 	return sb
 }
 
@@ -1196,7 +1201,6 @@ func TestRequestHasID(t *testing.T) {
 	resp.Body.Close()
 }
 
-
 func TestClassifyRequest(t *testing.T) {
 	tests := []struct {
 		method string
@@ -1224,7 +1228,6 @@ func TestClassifyRequest(t *testing.T) {
 	}
 }
 
-
 func TestVersionHeadersPresent(t *testing.T) {
 	oldVer := ServerVersion
 	oldMin := MinCLIVersion
@@ -1248,7 +1251,6 @@ func TestVersionHeadersPresent(t *testing.T) {
 		t.Errorf("X-Bhatti-Min-CLI = %q, want %q", got, "0.4.0")
 	}
 }
-
 
 func TestVersionHeaderOnHealth(t *testing.T) {
 	oldVer := ServerVersion
