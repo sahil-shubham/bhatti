@@ -80,7 +80,10 @@ with its own kernel, filesystem, and network.`,
   bhatti create --name work --volume workspace:/workspace
 
   # Autonomous agent (stays hot, never paused)
-  bhatti create --name agent --init "hermes gateway" --keep-hot`,
+  bhatti create --name agent --init "hermes gateway" --keep-hot
+
+  # Locked-down egress: deny by default, allow only specific hosts/CIDRs
+  bhatti create --name locked --egress deny --allow-host api.openai.com --allow-cidr 1.1.1.1/32`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		setupTiming(cmd)
 		defer printTiming()
@@ -212,6 +215,25 @@ with its own kernel, filesystem, and network.`,
 			req["mounts"] = mounts
 		}
 
+		// Per-sandbox egress policy (network rules). Omitted => public default
+		// (public internet reachable; host/private/metadata denied).
+		egress, _ := cmd.Flags().GetString("egress")
+		allowHosts, _ := cmd.Flags().GetStringSlice("allow-host")
+		allowCIDRs, _ := cmd.Flags().GetStringSlice("allow-cidr")
+		if egress != "" || len(allowHosts) > 0 || len(allowCIDRs) > 0 {
+			np := map[string]any{}
+			if egress != "" {
+				np["default"] = egress
+			}
+			if len(allowHosts) > 0 {
+				np["allow_hosts"] = allowHosts
+			}
+			if len(allowCIDRs) > 0 {
+				np["allow_cidrs"] = allowCIDRs
+			}
+			req["net_policy"] = np
+		}
+
 		var sb map[string]any
 		resp, err := apiRequest("POST", "/sandboxes", req)
 		if err != nil {
@@ -284,6 +306,9 @@ func init() {
 	createCmd.Flags().StringSlice("secret", nil, "Secret name from store (repeatable)")
 	createCmd.Flags().StringSlice("file", nil, "Inject file (local_path:guest_path, repeatable)")
 	createCmd.Flags().StringSlice("label", nil, "Set label key=value (repeatable)")
+	createCmd.Flags().String("egress", "", "Egress posture: public (default) or deny")
+	createCmd.Flags().StringSlice("allow-host", nil, "Allow egress to host, exact or *.wildcard (repeatable)")
+	createCmd.Flags().StringSlice("allow-cidr", nil, "Allow egress to CIDR (repeatable)")
 
 	editCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions (for autonomous agents)")
 	editCmd.Flags().Bool("allow-cold", false, "Re-enable thermal transitions")

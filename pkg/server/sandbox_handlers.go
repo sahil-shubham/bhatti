@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
@@ -44,6 +45,9 @@ type createSandboxReq struct {
 
 	// G1.6: operator-controlled labels for fleet enumeration
 	Labels map[string]string `json:"labels,omitempty"`
+
+	// Per-sandbox egress policy (network rules); nil => public default.
+	NetPolicy *gateway.NetPolicyWire `json:"net_policy,omitempty"`
 }
 
 // createFileReq describes a file to inject at sandbox creation.
@@ -142,6 +146,16 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		if err := validateLabels(req.Labels); err != nil {
 			errResp(w, 400, err.Error())
 			return
+		}
+
+		// Validate the egress policy up front. The engine re-parses the wire
+		// form when pushing to netd, but failing here gives the caller a clear
+		// 400 (bad posture / unparseable host or CIDR) instead of a deep error.
+		if req.NetPolicy != nil {
+			if _, err := gateway.PolicyFromWire(*req.NetPolicy); err != nil {
+				errResp(w, 400, "invalid net_policy: "+err.Error())
+				return
+			}
 		}
 
 		var spec engine.SandboxSpec
@@ -357,6 +371,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// Set user context for engine-level network isolation
 		spec.UserID = user.ID
 		spec.SubnetIndex = user.SubnetIndex
+		spec.NetPolicy = req.NetPolicy // per-sandbox egress policy (nil => public default)
 
 		// v0.3: Resolve image name to file path
 		if req.Image != "" {

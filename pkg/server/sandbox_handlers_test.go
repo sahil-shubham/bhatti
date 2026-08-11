@@ -479,3 +479,58 @@ func TestB2_TemplateRejectsInvalidRequestFile(t *testing.T) {
 		t.Fatalf("expected 400 for empty guest_path, got %d: %s", resp.StatusCode, body)
 	}
 }
+
+// ==========================================================================
+// net_policy (per-sandbox egress rules)
+// ==========================================================================
+
+func TestCreateSandbox_NetPolicy(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"name": uniqueName(t, "netpol"),
+		"net_policy": map[string]any{
+			"default":     "deny",
+			"allow_hosts": []string{"api.openai.com", "*.github.com"},
+			"allow_cidrs": []string{"1.1.1.1/32"},
+		},
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, body)
+	}
+	var sb store.Sandbox
+	decodeJSON(t, resp, &sb)
+	t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil).Body.Close() })
+
+	np := eng.LastCreateSpec.NetPolicy
+	if np == nil {
+		t.Fatal("net_policy did not reach the engine spec")
+	}
+	if np.Default != "deny" {
+		t.Errorf("spec default = %q, want deny", np.Default)
+	}
+	if len(np.AllowHosts) != 2 || np.AllowHosts[0] != "api.openai.com" {
+		t.Errorf("spec allow_hosts = %v, want [api.openai.com *.github.com]", np.AllowHosts)
+	}
+	if len(np.AllowCIDRs) != 1 || np.AllowCIDRs[0] != "1.1.1.1/32" {
+		t.Errorf("spec allow_cidrs = %v, want [1.1.1.1/32]", np.AllowCIDRs)
+	}
+}
+
+// TestCreateSandbox_NetPolicyInvalid rejects an unparseable policy at the API
+// (fail-fast 400) instead of deferring to a deep engine error.
+func TestCreateSandbox_NetPolicyInvalid(t *testing.T) {
+	_, ts := setup(t)
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"name": uniqueName(t, "badnetpol"),
+		"net_policy": map[string]any{
+			"default": "sometimes", // not public|deny
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400 for bad egress posture, got %d", resp.StatusCode)
+	}
+}
