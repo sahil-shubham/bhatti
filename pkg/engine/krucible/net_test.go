@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -392,5 +394,68 @@ func TestKrucibleNetEgressPolicy(t *testing.T) {
 	if r.ExitCode == 0 {
 		t.Fatalf("8.8.8.8 must be denied under deny + allow-only-1.1.1.1 (egress policy not enforced): %q",
 			strings.TrimSpace(r.Stdout))
+	}
+}
+
+// TestKrucibleNetdRespawnsCtllessAdopt guards the daemon-upgrade case: a live
+// netd that serves traffic but predates the control channel (has n.sock, no
+// ctl.sock) must be replaced, not adopted — otherwise per-sandbox egress policy
+// is silently dropped and guests run on the open default.
+func TestKrucibleNetdRespawnsCtllessAdopt(t *testing.T) {
+	e := newNetEngine(t).(*Engine)
+
+	dir, err := os.MkdirTemp("/tmp", "kr-ctlless")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "n.sock")
+	ctlSock := filepath.Join(dir, "ctl.sock")
+
+	// Stand in for the old netd: a live process + an n.sock (serving traffic),
+	// but no ctl.sock (no control channel).
+	dummy := exec.Command("sleep", "30")
+	dummy.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := dummy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	oldPid := dummy.Process.Pid
+	t.Cleanup(func() { _ = syscall.Kill(-oldPid, syscall.SIGKILL) })
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	owner := "ctlless-owner"
+	e.netdMu.Lock()
+	e.netds[owner] = &netdInstance{owner: owner, sock: sock, ctlSock: ctlSock, dir: dir, subnetIdx: 7, pid: oldPid, refs: 1}
+	e.netdMu.Unlock()
+
+	if err := e.ensureNetd(owner); err != nil {
+		t.Fatalf("ensureNetd: %v", err)
+	}
+
+	// ensureNetd SIGKILLed the stale netd; reap our child so it isn't left a
+	// zombie (in production it's reparented to init, which reaps it).
+	_ = dummy.Wait()
+
+	e.netdMu.Lock()
+	inst := e.netds[owner]
+	e.netdMu.Unlock()
+	t.Cleanup(func() {
+		if inst.pid > 0 {
+			_ = syscall.Kill(-inst.pid, syscall.SIGKILL)
+		}
+	})
+
+	if pidAlive(oldPid) {
+		t.Error("stale ctl-less netd was not killed")
+	}
+	if inst.pid == oldPid || !pidAlive(inst.pid) {
+		t.Errorf("netd was not respawned: pid=%d (old=%d)", inst.pid, oldPid)
+	}
+	if _, serr := os.Stat(ctlSock); serr != nil {
+		t.Errorf("respawned netd has no control socket: %v", serr)
 	}
 }

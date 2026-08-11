@@ -198,16 +198,28 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	}
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
-	// Already running (we spawned it, or we adopted it across a daemon restart)?
+	// Already running — we spawned it, or adopted it across a daemon restart.
+	// A live netd that serves traffic (n.sock) but has no control socket
+	// (ctl.sock) is an older binary that survived a daemon upgrade: it can never
+	// receive per-sandbox egress policy, so replace it instead of silently
+	// running guests on the open default.
 	if inst.pid > 0 && pidAlive(inst.pid) {
-		if _, err := os.Stat(inst.sock); err == nil {
+		_, sockErr := os.Stat(inst.sock)
+		_, ctlErr := os.Stat(inst.ctlSock)
+		if sockErr == nil && ctlErr == nil {
 			return nil
+		}
+		if sockErr == nil {
+			slog.Warn("krucible: adopted netd lacks control socket; respawning", "owner", ownerKey, "pid", inst.pid)
+			_ = syscall.Kill(-inst.pid, syscall.SIGKILL)
+			inst.pid = 0
 		}
 	}
 	if err := os.MkdirAll(inst.dir, 0700); err != nil {
 		return fmt.Errorf("netd dir: %w", err)
 	}
 	_ = os.Remove(inst.sock)
+	_ = os.Remove(inst.ctlSock)
 	lf, err := os.OpenFile(filepath.Join(inst.dir, "netd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("netd log: %w", err)
@@ -228,6 +240,11 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		_, _ = cmd.Process.Wait()
 		return fmt.Errorf("bhatti-netd not listening: %w", werr)
 	}
+	if werr := waitForSocket(inst.ctlSock, 5*time.Second); werr != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return fmt.Errorf("bhatti-netd control socket not listening: %w", werr)
+	}
 	inst.cmd = cmd
 	inst.pid = cmd.Process.Pid
 	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
@@ -235,32 +252,36 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 }
 
 // pushSandboxPolicy registers this VM's per-sandbox egress state with its
-// owner's netd over the control UDS. Best-effort with a bounded retry, since
-// netd may have only just started listening. No-op on TSI (no netd IP).
+// owner's netd over the control UDS, retrying briefly since netd may have only
+// just started listening. Returns an error when the policy could not be
+// delivered, so the caller can fail closed rather than boot the guest on the
+// open default. No-op on TSI (no netd IP).
 //
-// TODO(follow-up): persist NetPolicy in the vmRecord and re-push on a netd
-// respawn, so a netd that died and respawned doesn't silently drop a sandbox
-// back to the default (public) posture until its next launch.
-func (e *Engine) pushSandboxPolicy(vm *VM) {
+// TODO(follow-up): re-push on recovery. A sandbox recovered across a daemon
+// restart that respawns its netd (see ensureNetd) loses its policy until its
+// next launch; the create path — the common case — always pushes.
+func (e *Engine) pushSandboxPolicy(vm *VM) error {
 	if vm.netIP == "" || vm.netdKey == "" {
-		return
+		return nil
 	}
 	e.netdMu.Lock()
 	inst := e.netds[vm.netdKey]
 	e.netdMu.Unlock()
 	if inst == nil || inst.ctlSock == "" {
-		return
+		return fmt.Errorf("netd control socket unavailable for %s", vm.ID)
 	}
 	msg := gateway.ControlMsg{Op: gateway.ControlSet, GuestIP: vm.netIP, Sandbox: vm.ID, Policy: vm.netPolicy}
 	c := gateway.NewControlClient(inst.ctlSock)
 	defer c.Close()
+	var lastErr error
 	for range 20 {
-		if err := c.Send(msg); err == nil {
-			return
+		if lastErr = c.Send(msg); lastErr == nil {
+			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	slog.Warn("krucible: netd policy push failed", "sandbox", vm.ID, "ip", vm.netIP)
+	slog.Warn("krucible: netd policy push failed", "sandbox", vm.ID, "ip", vm.netIP, "err", lastErr)
+	return fmt.Errorf("netd policy push failed for %s: %w", vm.ID, lastErr)
 }
 
 // delSandboxPolicy removes this VM's state from netd (best-effort; the owner's
@@ -677,7 +698,11 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		if nerr := e.ensureNetd(vm.netdKey); nerr != nil {
 			return nerr
 		}
-		e.pushSandboxPolicy(vm)
+		if perr := e.pushSandboxPolicy(vm); perr != nil && vm.netPolicy != nil {
+			// A policy was explicitly requested but couldn't be delivered to
+			// netd — fail closed rather than boot the guest on the open default.
+			return fmt.Errorf("enforce egress policy: %w", perr)
+		}
 	}
 
 	// Serve the boot config over the guest→host config vsock (§3.4). Must be
