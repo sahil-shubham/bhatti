@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1006,6 +1007,42 @@ func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
 		vm.mu.Unlock()
 	}
 	return out, nil
+}
+
+// Stats reports live host-side resource usage for a running sandbox by sampling
+// its bhatti-vmm helper process. Implements engine.StatsProvider. A stopped or
+// unknown sandbox reports zero (not an error) so the dashboard can still render
+// it. The helper's RSS is the sandbox's real footprint: libkrun maps guest RAM
+// MAP_PRIVATE, so only touched pages are resident.
+func (e *Engine) Stats(ctx context.Context, id string) (engine.SandboxStats, error) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return engine.SandboxStats{}, err
+	}
+	vm.mu.Lock()
+	pid, status := vm.HelperPID, vm.Status
+	vm.mu.Unlock()
+	if pid <= 0 || status != "running" {
+		return engine.SandboxStats{}, nil
+	}
+	return helperStats(ctx, pid), nil
+}
+
+// helperStats reads rss (KiB) + cpu% of a pid via ps (cross-platform: macOS +
+// Linux procps). One-shot; the dashboard polls. Any error (e.g. the process
+// exited between the status check and here) yields zero, not a failure.
+func helperStats(ctx context.Context, pid int) engine.SandboxStats {
+	out, err := exec.CommandContext(ctx, "ps", "-o", "rss=,pcpu=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return engine.SandboxStats{}
+	}
+	f := strings.Fields(string(out))
+	if len(f) < 2 {
+		return engine.SandboxStats{}
+	}
+	rssKB, _ := strconv.ParseInt(f[0], 10, 64)
+	cpu, _ := strconv.ParseFloat(f[1], 64)
+	return engine.SandboxStats{CPUPct: cpu, RSSBytes: rssKB * 1024}
 }
 
 // Shutdown kills every helper (called on daemon SIGTERM, after the server has

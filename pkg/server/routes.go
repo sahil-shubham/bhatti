@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -100,6 +101,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/snapshots/", s.handleSnapshot)
 	s.mux.HandleFunc("/tasks/", s.handleTask)
 	s.mux.HandleFunc("/ports", s.handleAllPorts)
+
+	// Observability: read-only dashboard SPA + JSON feed + Prometheus metrics.
+	// Registered on s.mux, so all three sit behind the same bearer-token auth
+	// as every other API route (Server.ServeHTTP, server.go:830-851).
+	s.mux.HandleFunc("/dashboard", s.handleDashboard)
+	s.mux.HandleFunc("/dashboard/data", s.handleDashboardData)
+	s.mux.HandleFunc("/metrics", s.handleMetrics)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +161,9 @@ func (s *Server) getUserSandbox(w http.ResponseWriter, r *http.Request, id strin
 	user := UserFromContext(r.Context())
 	sb, err := s.store.GetSandbox(user.ID, id)
 	if err != nil {
-		errResp(w, 404, "not found")
+		// The CLI passes names through without client-side resolution, so this
+		// message is what a user sees for a typo'd name — name it clearly.
+		errResp(w, 404, fmt.Sprintf("sandbox %q not found", id))
 		return nil
 	}
 	return sb
