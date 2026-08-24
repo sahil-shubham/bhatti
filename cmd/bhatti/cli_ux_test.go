@@ -303,6 +303,24 @@ func TestCLIInspectImageNonDefault(t *testing.T) {
 	}
 }
 
+
+// startTestListener opens a TCP listener inside the sandbox and waits for it
+// to be up. The minimal tier ships no python3/nc/socat and its /bin/sh is dash
+// (the previous `&>` was a bashism dash parses as a background token plus an
+// empty redirect); perl-base is part of Ubuntu's base system. --detach (setsid)
+// keeps the listener alive after the exec connection closes.
+func startTestListener(t *testing.T, c *cliTest, name string, port int) {
+	t.Helper()
+	if _, stderr, code := c.run("exec", name, "--detach", "--",
+		"perl", "-MIO::Socket::INET",
+		// NB: the socket must be assigned — an unreferenced IO::Socket::INET is
+		// garbage-collected (closed) as soon as the statement ends.
+		"-e", fmt.Sprintf("my $s=IO::Socket::INET->new(LocalPort=>%d,Listen=>5,ReuseAddr=>1) or die; sleep 60", port)); code != 0 {
+		t.Fatalf("start listener exit %d: %s", code, stderr)
+	}
+	time.Sleep(1 * time.Second)
+}
+
 func TestCLIPorts(t *testing.T) {
 	c := setupCLITest(t)
 
@@ -310,10 +328,7 @@ func TestCLIPorts(t *testing.T) {
 	c.run("create", "--name", name)
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
 
-	// Start a listener
-	c.run("exec", name, "--", "sh", "-c",
-		"python3 -m http.server 9090 &>/dev/null &")
-	time.Sleep(1 * time.Second)
+	startTestListener(t, c, name, 9090)
 
 	// Text output
 	stdout, _, code := c.run("ports", name)
@@ -444,12 +459,19 @@ func TestCLIHugepagesFlag(t *testing.T) {
 	}
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
 
-	// Verify via inspect JSON
+	// Verify via inspect JSON. Hugepages is a Firecracker-era capability:
+	// krucible accepts the flag but does not report the field, so absence
+	// means "engine doesn't support it" (skip), while present-but-false
+	// means the flag was dropped on the floor (fail).
 	stdout, _, _ := c.run("--json", "inspect", name)
 	var sb map[string]interface{}
 	json.Unmarshal([]byte(stdout), &sb)
-	if sb["hugepages"] != true {
-		t.Errorf("hugepages: %v, want true", sb["hugepages"])
+	v, ok := sb["hugepages"]
+	if !ok || v == nil {
+		t.Skip("engine does not report hugepages (krucible) — FC-only capability")
+	}
+	if v != true {
+		t.Errorf("hugepages: %v, want true", v)
 	}
 }
 
@@ -464,8 +486,8 @@ func TestCLIVolumeClone(t *testing.T) {
 	// Create volume, write data
 	c.run("volume", "create", "--name", src, "--size", "64")
 	t.Cleanup(func() {
-		c.run("volume", "delete", src)
-		c.run("volume", "delete", dst)
+		c.run("volume", "delete", "-y", src)
+		c.run("volume", "delete", "-y", dst)
 	})
 
 	c.run("create", "--name", sb1, "--volume", src+":/data")
@@ -499,7 +521,7 @@ func TestCLICreateWithSecret(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("secret set exit %d", code)
 	}
-	t.Cleanup(func() { c.run("secret", "delete", secretName) })
+	t.Cleanup(func() { c.run("secret", "delete", "-y", secretName) })
 
 	// Create with --secret
 	_, _, code = c.run("create", "--name", sbName, "--secret", secretName)
@@ -734,10 +756,7 @@ func TestCLIPublishUnpublish(t *testing.T) {
 	c.run("create", "--name", name)
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
 
-	// Start a listener
-	c.run("exec", name, "--", "sh", "-c",
-		"python3 -m http.server 9090 &>/dev/null &")
-	time.Sleep(1 * time.Second)
+	startTestListener(t, c, name, 9090)
 
 	// Publish
 	stdout, _, code := c.run("publish", name, "-p", "9090")
@@ -943,10 +962,10 @@ func TestCLICreateAllFlags(t *testing.T) {
 
 	// Setup: volume + secret + local file
 	c.run("volume", "create", "--name", volName, "--size", "64")
-	t.Cleanup(func() { c.run("volume", "delete", volName) })
+	t.Cleanup(func() { c.run("volume", "delete", "-y", volName) })
 
 	c.run("secret", "set", secretName, "all-flags-secret")
-	t.Cleanup(func() { c.run("secret", "delete", secretName) })
+	t.Cleanup(func() { c.run("secret", "delete", "-y", secretName) })
 
 	tmpFile := filepath.Join(t.TempDir(), "allflags.conf")
 	os.WriteFile(tmpFile, []byte("allflags-config"), 0644)

@@ -126,7 +126,7 @@ var snapshotDeleteCmd = &cobra.Command{
 		defer printTiming()
 
 		if !confirmAction(cmd, fmt.Sprintf("Delete snapshot %q?", args[0])) {
-			return nil
+			return errAborted
 		}
 		if err := apiJSON("DELETE", "/snapshots/"+args[0], nil, nil); err != nil {
 			return err

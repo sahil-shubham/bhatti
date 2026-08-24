@@ -709,7 +709,7 @@ Persistent volumes are detached but not deleted.`,
 		defer printTiming()
 
 		if !confirmAction(cmd, fmt.Sprintf("Destroy sandbox %q?", args[0])) {
-			return nil
+			return errAborted
 		}
 
 		id, err := resolveID(args[0])

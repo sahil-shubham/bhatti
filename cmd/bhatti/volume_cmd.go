@@ -91,7 +91,7 @@ var volumeDeleteCmd = &cobra.Command{
 		defer printTiming()
 
 		if !confirmAction(cmd, fmt.Sprintf("Delete volume %q?", args[0])) {
-			return nil
+			return errAborted
 		}
 		if err := apiJSON("DELETE", "/volumes/"+args[0], nil, nil); err != nil {
 			return err
@@ -265,7 +265,7 @@ var volumeBackupDeleteCmd = &cobra.Command{
 		defer printTiming()
 
 		if !confirmAction(cmd, fmt.Sprintf("Delete backup %s?", args[1])) {
-			return nil
+			return errAborted
 		}
 		if err := apiJSON("DELETE", "/volumes/"+args[0]+"/backups/"+args[1], nil, nil); err != nil {
 			return err

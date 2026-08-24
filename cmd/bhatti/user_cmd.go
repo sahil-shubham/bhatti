@@ -126,7 +126,7 @@ var userDeleteCmd = &cobra.Command{
 	Args:  exactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !confirmAction(cmd, fmt.Sprintf("Delete user %q?", args[0])) {
-			return nil
+			return errAborted
 		}
 
 		st := openLocalStore()

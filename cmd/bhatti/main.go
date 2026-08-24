@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -109,7 +110,12 @@ func runDaemon() {
 		os.Exit(1)
 	}
 	if err != nil {
-		slog.Error("create engine", "error", err)
+		// Include which config was actually loaded: the most common cause of
+		// "set BaseImage or BaseRootfs" is the daemon silently reading a
+		// CLI-only config (no krucible_* keys) instead of the server config.
+		slog.Error("create engine", "error", err,
+			"config", cfg.ConfigPath,
+			"hint", "a server config needs the krucible_* keys; select an explicit file with BHATTI_CONFIG=/path/to/config.yaml")
 		os.Exit(1)
 	}
 
@@ -632,14 +638,10 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 // directory — no hardcoded list. Adding a new tier only requires the file
 // to exist on disk (placed there by install.sh).
 func registerTierImages(cfg *pkg.Config, st *store.Store) {
-	// Auto-detect architecture
-	arch := "arm64"
-	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
-		s := string(data)
-		if strings.Contains(s, "GenuineIntel") || strings.Contains(s, "AuthenticAMD") {
-			arch = "amd64"
-		}
-	}
+	// Guest arch == host arch (HVF and KVM both run native-arch guests), so the
+	// binary's own GOARCH is the truth. (Previously sniffed /proc/cpuinfo,
+	// which doesn't exist on macOS — it only worked there by fallback accident.)
+	arch := runtime.GOARCH
 
 	pattern := filepath.Join(cfg.DataDir, "images", fmt.Sprintf("rootfs-*-%s.ext4", arch))
 	matches, err := filepath.Glob(pattern)

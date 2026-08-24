@@ -121,6 +121,18 @@ func setupCLITest(t *testing.T) *cliTest {
 	}
 }
 
+// createdID extracts the sandbox identifier from `create`'s human output.
+// Current format: "sandbox/<name> created (...)" — strip the resource prefix;
+// the name resolves server-side everywhere an ID does. (Tests that need the
+// real ID should use runJSON on create instead.)
+func createdID(stdout string) string {
+	f := strings.Fields(stdout)
+	if len(f) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(f[0], "sandbox/")
+}
+
 // projectRoot returns the repo root by walking up from the test file.
 func projectRoot(t *testing.T) string {
 	t.Helper()
@@ -162,7 +174,7 @@ func TestCLICreate(t *testing.T) {
 	t.Logf("created: %s", strings.TrimSpace(stdout))
 
 	// Cleanup
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 }
 
 func TestCLIList(t *testing.T) {
@@ -170,8 +182,8 @@ func TestCLIList(t *testing.T) {
 
 	// Create a sandbox
 	stdout, _, _ := c.run("create", "--name", "cli-test-list")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	// List
 	stdout, _, code := c.run("list")
@@ -188,8 +200,8 @@ func TestCLIExec(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-exec")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	stdout, stderr, code := c.run("exec", "cli-test-exec", "--", "echo", "hello from cli")
 	if code != 0 {
@@ -204,8 +216,8 @@ func TestCLIExecFailure(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-execfail")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	_, _, code := c.run("exec", "cli-test-execfail", "--", "false")
 	if code != 1 {
@@ -217,8 +229,8 @@ func TestCLIExecByName(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-byname")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	// Resolve by name
 	stdout, _, code := c.run("exec", "cli-test-byname", "--", "hostname")
@@ -234,9 +246,9 @@ func TestCLIDestroy(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-destroy")
-	sbID := strings.Fields(stdout)[0]
+	sbID := createdID(stdout)
 
-	stdout, _, code := c.run("destroy", sbID)
+	stdout, _, code := c.run("destroy", "-y", sbID)
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
@@ -255,9 +267,9 @@ func TestCLIDestroyByName(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-rmname")
-	_ = strings.Fields(stdout)[0]
+	_ = createdID(stdout)
 
-	stdout, _, code := c.run("rm", "cli-test-rmname")
+	stdout, _, code := c.run("rm", "-y", "cli-test-rmname")
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
@@ -270,8 +282,8 @@ func TestCLIFileWriteRead(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-file")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	// Write via stdin piped to the binary
 	content := "hello from cli file write"
@@ -301,8 +313,8 @@ func TestCLIFileLS(t *testing.T) {
 	c := setupCLITest(t)
 
 	stdout, _, _ := c.run("create", "--name", "cli-test-filels")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	// Create some files via exec
 	c.run("exec", "cli-test-filels", "--", "sh", "-c",
@@ -323,8 +335,8 @@ func TestCLIPS(t *testing.T) {
 
 	// Create sandbox with init script (creates a session)
 	stdout, _, _ := c.run("create", "--name", "cli-test-ps", "--init", "sleep 3600")
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	time.Sleep(2 * time.Second)
 
@@ -499,7 +511,7 @@ func TestCLISecretCRUD(t *testing.T) {
 	}
 
 	// Delete
-	stdout, _, code = c.run("secret", "delete", "cli-test-key")
+	stdout, _, code = c.run("secret", "delete", "-y", "cli-test-key")
 	if code != 0 {
 		t.Fatalf("secret delete exit %d", code)
 	}
@@ -523,8 +535,8 @@ func TestCLIInitScript(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("create with init exit %d: %s", code, stderr)
 	}
-	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	sbID := createdID(stdout)
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	// Wait for init to run
 	time.Sleep(3 * time.Second)
@@ -559,7 +571,7 @@ func TestCLIJSONOutput(t *testing.T) {
 	if !ok || sbID == "" {
 		t.Fatalf("missing id in json: %v", sb)
 	}
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 	t.Log("✓ create --json returns valid JSON with id")
 
 	// List with --json
@@ -604,7 +616,7 @@ func TestCLICreateNonexistentImage(t *testing.T) {
 
 	_, stderr, code := c.run("create", "--name", "cli-bad-img", "--image", "nonexistent-image-xyz")
 	if code == 0 {
-		t.Cleanup(func() { c.run("destroy", "cli-bad-img") })
+		t.Cleanup(func() { c.run("destroy", "-y", "cli-bad-img") })
 		t.Fatal("create with nonexistent image should fail")
 	}
 	if !strings.Contains(stderr, "not found") {
@@ -618,7 +630,7 @@ func TestCLICreateNonexistentVolume(t *testing.T) {
 
 	_, stderr, code := c.run("create", "--name", "cli-bad-vol", "--volume", "nonexistent-vol-xyz:/data")
 	if code == 0 {
-		t.Cleanup(func() { c.run("destroy", "cli-bad-vol") })
+		t.Cleanup(func() { c.run("destroy", "-y", "cli-bad-vol") })
 		t.Fatal("create with nonexistent volume should fail")
 	}
 	if !strings.Contains(stderr, "not found") {
@@ -637,7 +649,7 @@ func TestCLISandboxNameValidation(t *testing.T) {
 		}
 		_, _, code := c.run("create", "--name", name)
 		if code == 0 {
-			c.run("destroy", name)
+			c.run("destroy", "-y", name)
 			t.Fatalf("name %q should be rejected", name)
 		}
 	}
@@ -649,7 +661,7 @@ func TestCLIVolumeNameValidation(t *testing.T) {
 
 	_, _, code := c.run("volume", "create", "--name", "../escape", "--size", "64")
 	if code == 0 {
-		c.run("volume", "delete", "../escape")
+		c.run("volume", "delete", "-y", "../escape")
 		t.Fatal("volume name with path traversal should be rejected")
 	}
 	t.Log("✓ invalid volume name rejected")
@@ -668,7 +680,7 @@ func TestCLIExecNonexistentSandbox(t *testing.T) {
 func TestCLIDestroyNonexistentSandbox(t *testing.T) {
 	c := setupCLITest(t)
 
-	_, _, code := c.run("destroy", "nonexistent-sandbox-xyz")
+	_, _, code := c.run("destroy", "-y", "nonexistent-sandbox-xyz")
 	if code == 0 {
 		t.Fatal("destroy nonexistent sandbox should fail")
 	}

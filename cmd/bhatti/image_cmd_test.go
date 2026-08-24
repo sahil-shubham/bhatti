@@ -40,7 +40,7 @@ func TestCLIImagePullAndBoot(t *testing.T) {
 		t.Fatal("image did not appear in list after 120s")
 	}
 pullDone:
-	t.Cleanup(func() { c.run("image", "delete", imgName) })
+	t.Cleanup(func() { c.run("image", "delete", "-y", imgName) })
 
 	// List should show the image
 	stdout, _, code = c.run("image", "list")
@@ -58,7 +58,7 @@ pullDone:
 		t.Fatalf("create with image exit %d: %s", code, stderr)
 	}
 	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	// Verify it's Alpine
 	stdout, _, code = c.run("exec", sbName, "--", "cat", "/etc/os-release")
@@ -86,11 +86,11 @@ func TestCLIImageSaveAndBoot(t *testing.T) {
 	// Save image
 	stdout, stderr, code = c.run("image", "save", srcName, "--name", imgName)
 	if code != 0 {
-		c.run("destroy", srcID)
+		c.run("destroy", "-y", srcID)
 		t.Fatalf("image save exit %d: %s", code, stderr)
 	}
-	c.run("destroy", srcID)
-	t.Cleanup(func() { c.run("image", "delete", imgName) })
+	c.run("destroy", "-y", srcID)
+	t.Cleanup(func() { c.run("image", "delete", "-y", imgName) })
 	t.Log("✓ image saved from running sandbox")
 
 	// Boot from saved image
@@ -99,7 +99,7 @@ func TestCLIImageSaveAndBoot(t *testing.T) {
 		t.Fatalf("create from saved exit %d: %s", code, stderr)
 	}
 	dstID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", dstID) })
+	t.Cleanup(func() { c.run("destroy", "-y", dstID) })
 
 	// Verify marker
 	stdout, _, code = c.run("exec", dstName, "--", "cat", "/home/lohar/marker.txt")
@@ -112,7 +112,7 @@ func TestCLIImageSaveAndBoot(t *testing.T) {
 func TestCLIImageDeleteNonexistent(t *testing.T) {
 	c := setupCLITest(t)
 
-	_, _, code := c.run("image", "delete", "nonexistent-image-xyz")
+	_, _, code := c.run("image", "delete", "-y", "nonexistent-image-xyz")
 	if code == 0 {
 		t.Fatal("delete nonexistent image should fail")
 	}

@@ -190,14 +190,25 @@ All commands support `--json` for machine-readable output. See the [CLI Referenc
 
 ## Performance
 
-> The numbers below are the **v1 (Firecracker)** baseline on a Hetzner AX102
-> (Ryzen 9, x86_64, NVMe). v2 (krucible) is being re-measured on Linux/KVM and
-> macOS/HVF — the shape is the same (free warm-wake, sub-second cold-wake), and the
-> lean owned kernel roughly halves cold-start; this table will be updated with the
-> v2 figures.
+**v2 (krucible) on macOS/HVF** — Apple Silicon laptop, v2.1.1, minimal tier,
+measured against the local daemon over its unix control socket with a
+persistent HTTP client (the "SDK floor": what an agent or SDK sees; CLI
+invocations add ~10–30ms of process startup on top). Small-n quick samples;
+full `bench/run.sh` percentiles to follow.
 
-CLI on the daemon host so loopback latency only — add your network RTT for remote
-use. Reproduce with `bench/run.sh` in this repo; methodology in `bench/README.md`.
+```
+                                p50        range/notes
+Run a command (API)             1.2ms      min 0.8ms, p90 2.2ms (n=30)
+Create a machine                ~350ms     317–397ms (n=8, cold boot)
+Wake on request (cold)          ~120ms     77–142ms via exec on a stopped
+                                           sandbox — includes page-in (n=3)
+Snapshot to disk (512MB)        ~600ms     538–937ms (n=3)
+Destroy a machine               ~15ms      10–25ms (n=7)
+```
+
+**v1 (Firecracker) baseline on Linux/KVM** — Hetzner AX102 (Ryzen 9, x86_64,
+NVMe), CLI on the daemon host (loopback; CLI startup included). v2 on
+Linux/KVM is being re-measured.
 
 ```
                                 p50       p99
@@ -213,7 +224,8 @@ Run a command                   12ms      14ms
 Cold-wake reads the memory snapshot from disk on first use — page-in
 cost is included, not just the orchestration call returning. Warm-wake
 is the killer feature: vCPUs paused but memory still in RAM means a
-transparent wake feels free.
+transparent wake feels free. Reproduce with `bench/run.sh`; methodology
+in `bench/README.md`.
 
 ## Architecture
 

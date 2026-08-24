@@ -8,11 +8,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// TemplateMountSpec defines a default volume mount for a template.
-// Volume is a named Docker volume tracked by bhatti (legacy v0.1/v0.2).
-// ImageRecord is a v0.3 rootfs image (admin or user-scoped).
-// SnapshotRecord is a v0.3 named VM snapshot.
-// TaskRecord tracks an async operation (e.g., image pull).
 // Store wraps SQLite operations.
 type Store struct {
 	db *sql.DB

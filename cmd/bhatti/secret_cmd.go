@@ -69,7 +69,7 @@ var secretDeleteCmd = &cobra.Command{
 		defer printTiming()
 
 		if !confirmAction(cmd, fmt.Sprintf("Delete secret %q?", args[0])) {
-			return nil
+			return errAborted
 		}
 
 		if err := apiJSON("DELETE", "/secrets/"+args[0], nil, nil); err != nil {

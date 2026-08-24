@@ -76,7 +76,7 @@ var imageDeleteCmd = &cobra.Command{
 		defer printTiming()
 
 		if !confirmAction(cmd, fmt.Sprintf("Delete image %q?", args[0])) {
-			return nil
+			return errAborted
 		}
 		if err := apiJSON("DELETE", "/images/"+args[0], nil, nil); err != nil {
 			return err

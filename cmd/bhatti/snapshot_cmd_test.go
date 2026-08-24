@@ -28,10 +28,10 @@ func TestCLISnapshotCheckpointAndResume(t *testing.T) {
 	// Checkpoint
 	stdout, stderr, code = c.run("snapshot", "create", sbName, "--name", snapName)
 	if code != 0 {
-		c.run("destroy", sbID)
+		c.run("destroy", "-y", sbID)
 		t.Fatalf("snapshot create exit %d: %s\nstdout: %s", code, stderr, stdout)
 	}
-	t.Cleanup(func() { c.run("snapshot", "delete", snapName) })
+	t.Cleanup(func() { c.run("snapshot", "delete", "-y", snapName) })
 	t.Log("✓ snapshot created")
 
 	// Verify source VM still runs after checkpoint
@@ -42,7 +42,7 @@ func TestCLISnapshotCheckpointAndResume(t *testing.T) {
 	t.Log("✓ source VM still running after checkpoint")
 
 	// Destroy source
-	c.run("destroy", sbID)
+	c.run("destroy", "-y", sbID)
 
 	// List snapshots
 	stdout, _, code = c.run("snapshot", "list")
@@ -60,7 +60,7 @@ func TestCLISnapshotCheckpointAndResume(t *testing.T) {
 		t.Fatalf("snapshot resume exit %d: %s\nstdout: %s", code, stderr, stdout)
 	}
 	resumeID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", resumeID) })
+	t.Cleanup(func() { c.run("destroy", "-y", resumeID) })
 	t.Log("✓ snapshot resumed")
 
 	// Verify data restored
@@ -74,7 +74,7 @@ func TestCLISnapshotCheckpointAndResume(t *testing.T) {
 func TestCLISnapshotDeleteNonexistent(t *testing.T) {
 	c := setupCLITest(t)
 
-	_, _, code := c.run("snapshot", "delete", "nonexistent-snap-xyz")
+	_, _, code := c.run("snapshot", "delete", "-y", "nonexistent-snap-xyz")
 	if code == 0 {
 		t.Fatal("delete nonexistent snapshot should fail")
 	}
@@ -95,7 +95,7 @@ func TestCLIDiskResize(t *testing.T) {
 		t.Fatalf("create with disk-size exit %d: %s", code, stderr)
 	}
 	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 
 	stdout, _, code = c.run("exec", sbName, "--", "df", "-m", "/")
 	if code != 0 {

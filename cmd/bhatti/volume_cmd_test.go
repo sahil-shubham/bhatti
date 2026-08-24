@@ -36,7 +36,7 @@ func TestCLIVolumeCRUD(t *testing.T) {
 	t.Log("✓ volume list shows created volume")
 
 	// Delete
-	stdout, _, code = c.run("volume", "delete", name)
+	stdout, _, code = c.run("volume", "delete", "-y", name)
 	if code != 0 {
 		t.Fatalf("volume delete exit %d", code)
 	}
@@ -56,7 +56,7 @@ func TestCLIVolumeResize(t *testing.T) {
 	name := fmt.Sprintf("cli-resize-%d", time.Now().UnixNano()%100000)
 
 	c.run("volume", "create", "--name", name, "--size", "64")
-	t.Cleanup(func() { c.run("volume", "delete", name) })
+	t.Cleanup(func() { c.run("volume", "delete", "-y", name) })
 
 	// Resize up
 	stdout, stderr, code := c.run("volume", "resize", name, "--size", "128")
@@ -84,7 +84,7 @@ func TestCLIVolumeAttachToSandbox(t *testing.T) {
 
 	// Create volume
 	c.run("volume", "create", "--name", volName, "--size", "64")
-	t.Cleanup(func() { c.run("volume", "delete", volName) })
+	t.Cleanup(func() { c.run("volume", "delete", "-y", volName) })
 
 	// Create sandbox with volume attached
 	stdout, stderr, code := c.run("create", "--name", sbName,
@@ -93,7 +93,7 @@ func TestCLIVolumeAttachToSandbox(t *testing.T) {
 		t.Fatalf("create with volume exit %d: %s", code, stderr)
 	}
 	sbID := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID) })
 	t.Log("✓ sandbox created with volume attached")
 
 	// Write data to volume
@@ -108,7 +108,7 @@ func TestCLIVolumeAttachToSandbox(t *testing.T) {
 	t.Log("✓ wrote data to volume via exec")
 
 	// Destroy sandbox
-	c.run("destroy", sbID)
+	c.run("destroy", "-y", sbID)
 	t.Log("✓ sandbox destroyed, volume should survive")
 
 	// Create new sandbox with same volume
@@ -119,7 +119,7 @@ func TestCLIVolumeAttachToSandbox(t *testing.T) {
 		t.Fatalf("create sb2 exit %d: %s", code, stderr)
 	}
 	sbID2 := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID2) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID2) })
 
 	// Read data back
 	stdout, _, code = c.run("exec", sbName2, "--", "cat", "/workspace/test.txt")
@@ -137,7 +137,7 @@ func TestCLIVolumeReadOnly(t *testing.T) {
 
 	// Create and seed volume with data
 	c.run("volume", "create", "--name", volName, "--size", "64")
-	t.Cleanup(func() { c.run("volume", "delete", volName) })
+	t.Cleanup(func() { c.run("volume", "delete", "-y", volName) })
 
 	// Seed with data (RW mount)
 	stdout, stderr, code := c.run("create", "--name", sbName, "--volume", volName+":/data")
@@ -146,7 +146,7 @@ func TestCLIVolumeReadOnly(t *testing.T) {
 	}
 	sbID := strings.Fields(stdout)[0]
 	c.run("exec", sbName, "--", "sh", "-c", "echo ro-test-data > /data/file.txt")
-	c.run("destroy", sbID)
+	c.run("destroy", "-y", sbID)
 
 	// Now mount read-only
 	sbName2 := sbName + "-ro"
@@ -155,7 +155,7 @@ func TestCLIVolumeReadOnly(t *testing.T) {
 		t.Fatalf("create RO exit %d: %s", code, stderr)
 	}
 	sbID2 := strings.Fields(stdout)[0]
-	t.Cleanup(func() { c.run("destroy", sbID2) })
+	t.Cleanup(func() { c.run("destroy", "-y", sbID2) })
 
 	// Data should be readable
 	stdout, _, code = c.run("exec", sbName2, "--", "cat", "/data/file.txt")
@@ -182,12 +182,12 @@ func TestCLIVolumeDeleteWhileAttached(t *testing.T) {
 	stdout, _, _ := c.run("create", "--name", sbName, "--volume", volName+":/workspace")
 	sbID := strings.Fields(stdout)[0]
 	t.Cleanup(func() {
-		c.run("destroy", sbID)
-		c.run("volume", "delete", volName)
+		c.run("destroy", "-y", sbID)
+		c.run("volume", "delete", "-y", volName)
 	})
 
 	// Delete should fail while attached
-	_, stderr, code := c.run("volume", "delete", volName)
+	_, stderr, code := c.run("volume", "delete", "-y", volName)
 	if code == 0 {
 		t.Fatal("volume delete should fail while attached")
 	}

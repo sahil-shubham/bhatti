@@ -1,4 +1,7 @@
-.PHONY: build vmm krucible test clean release
+# lohar and netd MUST be .PHONY: same-named binaries sit in the working tree
+# (gitignored), and a file target with no prerequisites that already exists is
+# silently "up to date" — `make lohar` would do nothing.
+.PHONY: build vmm krucible lohar netd test clean release
 
 VERSION ?= $(shell git describe --tags --always --dirty)
 

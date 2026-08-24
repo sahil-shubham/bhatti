@@ -140,20 +140,23 @@ func runCLI() {
 
 // loadConfig sets apiURL and apiToken with precedence:
 //
-//	flag → config file → env var → default
+//	flag → env var → config file → local socket → default
 //
-// This means `bhatti setup` writes the config and it just works.
-// Env vars are the fallback for CI/scripts, not the override.
+// Env vars override the config file (12-factor convention, matching
+// docker/kubectl): an agent or CI job can point an already-configured CLI at
+// another daemon with BHATTI_URL/BHATTI_TOKEN without editing
+// ~/.bhatti/config.yaml. `bhatti setup` still just works when no env
+// overrides are set.
 func loadConfig(cmd *cobra.Command) {
 	cfg, _ := pkg.LoadConfig()
 
-	// URL: flag wins, then config, then env, then default
+	// URL: flag wins, then env, then config, then the local unix socket
 	if v, _ := cmd.Flags().GetString("url"); v != "" {
+		apiURL = v
+	} else if v := os.Getenv("BHATTI_URL"); v != "" {
 		apiURL = v
 	} else if cfg != nil && cfg.APIURL != "" {
 		apiURL = cfg.APIURL
-	} else if v := os.Getenv("BHATTI_URL"); v != "" {
-		apiURL = v
 	} else if cfg != nil {
 		// No explicit remote endpoint: prefer the daemon's local unix control
 		// socket (not reachable from a sandbox). Fall back to the default TCP URL if
@@ -169,10 +172,10 @@ func loadConfig(cmd *cobra.Command) {
 	// Token: same order
 	if v, _ := cmd.Flags().GetString("token"); v != "" {
 		apiToken = v
-	} else if cfg != nil && cfg.AuthToken != "" {
-		apiToken = cfg.AuthToken
 	} else if v := os.Getenv("BHATTI_TOKEN"); v != "" {
 		apiToken = v
+	} else if cfg != nil && cfg.AuthToken != "" {
+		apiToken = cfg.AuthToken
 	}
 }
 
@@ -310,6 +313,12 @@ func compareVersions(a, b string) int {
 
 // confirmAction prompts for confirmation on destructive operations.
 // Returns true if --yes is set or the user confirms interactively.
+// errAborted is returned when a confirmation prompt is declined — including
+// non-interactive runs without --yes. It must be an error (non-zero exit):
+// scripts and agents chain commands (`bhatti destroy x && ...`), and an
+// aborted destructive operation that exits 0 reads as success.
+var errAborted = fmt.Errorf("aborted (use --yes to skip confirmation)")
+
 func confirmAction(cmd *cobra.Command, msg string) bool {
 	yes, _ := cmd.Flags().GetBool("yes")
 	if yes {
@@ -503,31 +512,17 @@ func printTiming() {
 
 // --- Name-to-ID resolution ---
 
+// resolveID passes the sandbox name or ID through unchanged. The server
+// resolves either on every /sandboxes/{id} route (store.GetSandbox matches ID
+// first, then name), so a client-side resolution round trip here would double
+// the latency of every CLI command — a full RTT wasted on remote links — for
+// no benefit. Kept as a function so call sites read as intent, and as the
+// place to reintroduce client-side resolution if a route ever needs a real ID.
 func resolveID(nameOrID string) (string, error) {
-	// Try direct ID lookup first
-	resp, err := apiRequest("GET", "/sandboxes/"+nameOrID, nil)
-	if err == nil && resp.StatusCode == 200 {
-		resp.Body.Close()
-		return nameOrID, nil
+	if nameOrID == "" {
+		return "", fmt.Errorf("sandbox name or ID required")
 	}
-	if resp != nil {
-		resp.Body.Close()
-	}
-
-	// Fall back to name search
-	var sandboxes []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
-		return "", fmt.Errorf("cannot list sandboxes: %w", err)
-	}
-	for _, sb := range sandboxes {
-		if sb.Name == nameOrID {
-			return sb.ID, nil
-		}
-	}
-	return "", fmt.Errorf("sandbox %q not found", nameOrID)
+	return nameOrID, nil
 }
 
 func parseEnvFlag(s string) map[string]string {
