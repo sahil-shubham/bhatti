@@ -48,7 +48,8 @@ Everything user-facing is built on those two. The CLI today does step 1
 imperatively, one verb per noun. A YAML manifest gives us step 1 across
 all nouns at once, with diff-and-converge.
 
-The four tracks in this plan are:
+The tracks in this plan are (A–D original; **E added 2026-08** after the
+eBPF/observability experiment — see E.2):
 
 | Track | What it adds | Substrate? |
 |-------|--------------|-----------|
@@ -56,10 +57,13 @@ The four tracks in this plan are:
 | **B. Internal DNS responder** | `<name>.sb` resolves, survives restore | No, but unlocks C |
 | **C. Cron / scheduled jobs** | Wake + exec on a schedule | No, depends on B for sane multi-sandbox jobs |
 | **D. Volumes nx (multi-mount + sharing)** | One volume, two readers | No, deferred — see §8 |
+| **E. Syscall tracing (declarative observe)** | `trace:` field → filtered NDJSON → sinks/actions | No — plugs into A |
 
-Track A goes first. Without it, B/C/D each invent their own config
-shape and we ship four flavors of YAML. With it, every later feature
-is "add a field to the manifest, add a controller, done."
+Track A goes first. Without it, the later tracks each invent their own
+config shape and we ship four flavors of YAML. With it, every later
+feature — DNS, cron, tracing — is "add a field to the manifest, add a
+controller, done." Track E is the proof: it slots in as a `trace:` field
+and one controller, with no new command surface.
 
 ---
 
@@ -189,6 +193,14 @@ sandboxes:
         command: ["python", "/workspace/sync.py"]
         timeout: 300         # seconds
         on_failure: continue # continue|retry|alert
+    trace:                     # ← declarative observability (Track E)
+      enabled: true
+      syscalls: [openat, connect, sendto, execve]
+      resolve: true            # host-side /proc/<pid>/mem → filenames
+      sinks: [events]          # queryable via /events?since=
+      actions:
+        - on: {syscall: connect}
+          do: emit             # emit | log | pause | snapshot
 ```
 
 Design notes:
@@ -241,6 +253,7 @@ type SandboxSpec struct {
     Schedules  []ScheduleSpec    `yaml:"schedules,omitempty"`
     KeepHot    *bool             `yaml:"keep_hot,omitempty"`   // pointer = tri-state
     Hugepages  *bool             `yaml:"hugepages,omitempty"`
+    Trace      *TraceSpec        `yaml:"trace,omitempty"`      // nil = inherit/off
     Labels     map[string]string `yaml:"labels,omitempty"`
 }
 
@@ -272,6 +285,27 @@ type ScheduleSpec struct {
     Command   []string `yaml:"command"`
     Timeout   int      `yaml:"timeout,omitempty"`    // seconds
     OnFailure string   `yaml:"on_failure,omitempty"` // continue|retry|alert
+}
+
+type TraceSpec struct {
+    Enabled  *bool         `yaml:"enabled,omitempty"`
+    Syscalls []string      `yaml:"syscalls,omitempty"` // capture filter; empty = safe default set
+    MaxRate  string        `yaml:"max_rate,omitempty"` // e.g. "1000/s"; source-side cap
+    Resolve  bool          `yaml:"resolve,omitempty"`  // host /proc/<pid>/mem → filename/argv
+    Sinks    []string      `yaml:"sinks,omitempty"`    // events | webhook:<url>
+    Actions  []TraceAction `yaml:"actions,omitempty"`
+}
+
+type TraceAction struct {
+    On TraceMatch `yaml:"on"`
+    Do string     `yaml:"do"` // emit | log | pause | snapshot | deny (deny → seccomp, see E.6)
+}
+
+type TraceMatch struct {
+    Syscall string `yaml:"syscall,omitempty"`
+    Ret     string `yaml:"ret,omitempty"`  // ok | err | <int>
+    Comm    string `yaml:"comm,omitempty"` // process-name glob
+    Path    string `yaml:"path,omitempty"` // filename glob (requires resolve: true)
 }
 ```
 
@@ -323,6 +357,8 @@ type DetachVolume struct{ Sandbox, Volume string }
 type WriteFile struct{ Sandbox, Target string; Content []byte; Mode os.FileMode }
 type UpsertSchedule struct{ Sandbox string; Spec ScheduleSpec }
 type DeleteSchedule struct{ Sandbox, Name string }
+type SetTrace struct{ Sandbox string; Spec TraceSpec }
+type ClearTrace struct{ Sandbox string }
 ```
 
 The plan has hard ordering:
@@ -365,6 +401,7 @@ secrets[]         → requires recreate (inserted at boot via config drive)
 env[]             → requires recreate (same)
 init              → requires recreate (only runs at boot)
 files[]           → live-write via /sandboxes/:id/files (no recreate)
+trace             → live TRACE_START/STOP on lohar control socket (no recreate; kernel swap needs recreate)
 ```
 
 ### A.4 Lifecycle commands
@@ -906,6 +943,202 @@ signal.
 
 ---
 
+## Track E — Syscall Tracing (declarative observability)
+
+### E.1 The need, sharply
+
+Track A's `Observe` operation reports *controller* state — `apply.done`,
+`schedule.run.failed`, `dns.wake_triggered`. It says nothing about what a
+sandbox's workload actually *did*: which files it opened, where it dialed,
+what it exec'd. For a platform that runs code it did not write — agents,
+CI jobs, untrusted builds — that gap is the whole product. Application logs
+can lie (a process controls its own stderr); the kernel cannot. Track E
+adds kernel-truth observability as a declared, reconciled property of a
+sandbox.
+
+The constraint that shapes everything below, and the reason this is a Track
+and not a new command family: **observability is a `trace:` field on a
+sandbox, reconciled by `apply` — not a `bhatti trace` / `bhatti hook` /
+`bhatti seccomp` verb set.** A builder on top of bhatti adds a stanza to
+the `bhattifile.yaml` they already commit, and the reconciler converges it,
+exactly the way `keep_hot`, `publish[]`, and `schedules[]` do. The plan's
+own First Principles (§Reconcile + Observe) already names both operations;
+Track E is the richer half of Observe.
+
+### E.2 What the experiment settled (2026-08, aarch64/HVF, local)
+
+Before designing, we booted a trace-enabled kernel on the krucible engine
+and measured, rather than assumed:
+
+- The lean kernel (`scripts/lean-kernel/config-lean_aarch64`, 15 MB) ships
+  with `BPF_SYSCALL=y` and `CGROUP_BPF=y` but **no** tracepoints, kprobes,
+  or BTF — `/sys/kernel/tracing` will not mount. Syscall observability is
+  impossible on it.
+- A `config-trace_aarch64` variant adding `KPROBES`, `EVENT_TRACING`,
+  `UPROBES`, `FTRACE` (17 MB, +13%) exposes **584 syscall tracepoints**.
+  `ls -la /etc/passwd` produced 1688 correlated syscall events; one `curl`
+  produced 1280. Per-process attribution, microsecond timestamps,
+  arguments, and return values are all present and readable.
+- `DEBUG_INFO_BTF` did **not** survive `olddefconfig` on this arm64 build:
+  it is in a Kconfig choice group where `DEBUG_INFO_NONE` wins unless
+  explicitly disabled and `DEBUG_INFO_DWARF4` is selected. Without BTF,
+  bpftrace cannot resolve named tracepoint fields (`args->filename`), but
+  raw ftrace + entry/exit correlation works fully. **BTF is a resolve-side
+  upgrade, not a blocker** — see E.6.
+- The dominant constraint is data volume: 1280 events from one command.
+  Filtering must happen at capture, not after shipping.
+
+Upshot: Track E ships on a **second kernel variant**, selected per-sandbox,
+with capture-side filtering as the load-bearing feature.
+
+### E.3 The kernel variant
+
+`scripts/build-lean-kernel.sh` gains a second output. `config-trace_<arch>`
+is `config-lean_<arch>` plus:
+
+```
+CONFIG_KPROBES=y
+CONFIG_EVENT_TRACING=y
+CONFIG_UPROBES=y
+CONFIG_FTRACE=y
+CONFIG_DEBUG_INFO_DWARF4=y      # required — satisfies BTF's dependency
+# CONFIG_DEBUG_INFO_NONE is not set
+CONFIG_DEBUG_INFO_BTF=y         # resolve-side upgrade; see E.6
+```
+
+Two artifacts: `Image-lean-<ver>-<arch>` (fast, default) and
+`Image-trace-<ver>-<arch>` (+2 MB). The engine already selects a kernel
+per sandbox via `SandboxSpec.KernelImage` (krucible `spec.go`), so no
+engine change is needed — `trace.enabled: true` maps to "boot this sandbox
+on the trace image." An untraced sandbox keeps the lean kernel and its
+faster cold-start. Measured cost: +2 MB resident per traced sandbox,
+~40 ms extra decompress; zero runtime overhead with no tracepoints
+enabled, ~100 ns–1 µs per traced syscall when they are.
+
+### E.4 The capture path: lohar's TRACE_START/STOP verb
+
+Tracing is driven over lohar's existing control channel — the transport
+that already carries exec and file ops — with two verbs:
+
+```
+TRACE_START { syscalls: [...], max_rate: "1000/s", resolve: bool }
+TRACE_STOP
+```
+
+`TRACE_START` mounts tracefs if needed, enables only the requested
+tracepoints, and starts a reader on `trace_pipe`. The reader does three
+things, and the order is the design:
+
+1. **Filter at capture.** Only declared syscalls are enabled, so the ring
+   buffer never holds the firehose. `max_rate` drops with a counter rather
+   than blocking the traced process (E.7).
+2. **Correlate.** Pair `sys_enter_*`/`sys_exit_*` by `(comm, pid,
+   syscall)` into one event with a duration and a return value — proven in
+   the experiment with no BTF.
+3. **Emit** NDJSON: `{ts, sandbox, pid, comm, syscall, dur_us, ret, path?}`.
+
+**Do not hand-roll the reader/parser.** Adopt `iovisor/gobpf/pkg/tracepipe`
+or `evilsocket/ftrace` for the `trace_pipe` read + line parse — the only
+kernel-churny part, and the text format has changed ~once in a decade —
+and keep bhatti's ~50 LOC of filter/correlate/emit. That split is the
+answer to "hand-maintaining this is tough": the churny lines are a vendored
+dependency, the durable logic is ours.
+
+### E.5 Sinks: reuse the events substrate
+
+The NDJSON stream flows to declared sinks:
+
+- `events` — persisted to the `events` table, queryable via the existing
+  `/events?since=<cursor>` endpoint. Durable form, reuses
+  `event_recorder.go` verbatim; a trace event is a high-volume event type
+  with its own retention. `bhatti apply --trace <name>` tails it.
+- `webhook:<url>` — POST batches to a builder's endpoint. This is the
+  extensibility escape hatch: any action bhatti has no built-in for, a
+  builder expresses as "emit to my URL." A builder never forks lohar to
+  add a sink.
+
+Trace-event retention is separate and aggressive (100–1000× lifecycle
+volume): a per-sandbox ring in the table, capped by count or age, pruned
+by the existing retention loop.
+
+### E.6 Actions: observe now, act via seccomp
+
+The `actions:` list is where a builder acts, declaratively:
+
+```yaml
+actions:
+  - on: {syscall: connect, ret: ok}
+    do: emit          # post-hoc, safe
+  - on: {syscall: openat, path: /etc/shadow}
+    do: snapshot      # freeze the VM for forensics
+```
+
+`emit`, `log`, `pause`, and `snapshot` are **post-hoc** — the reader sees
+the event, the daemon reacts (pause/snapshot are existing engine ops). They
+ship first because they cannot corrupt the workload.
+
+`deny` is different and the plan is honest about it: **ftrace observes, it
+cannot block.** The syscall is already complete when trace_pipe reports it.
+Blocking requires interposition:
+
+- **seccomp** — the guest kernel already supports it, and seccomp is itself
+  a declarative syscall filter, so `deny` compiles to a `seccomp:` profile
+  pushed via lohar at boot — a separate reconciled field, same manifest,
+  not a live trace action.
+- **BPF with return override** (`fmod_ret`/kprobe) — needs BTF and is the
+  reason to finish the BTF config from E.2. It is the only path that can
+  block on a *runtime* condition seccomp cannot express.
+
+Position: ship `emit`/`log`/`pause`/`snapshot`; express `deny` as a seccomp
+profile; defer BPF-based runtime denial until a real consumer needs a
+condition seccomp cannot state. Do not build BPF program-loading
+speculatively.
+
+### E.7 Reconcile, backpressure, and manifest wiring
+
+`trace` is in the **mutable set** (A.3): toggling it is a live
+`TRACE_START`/`TRACE_STOP`, no recreate — *except* enabling it on a
+lean-kernel sandbox, which needs a recreate to swap the kernel image (the
+diff flags this as immutable-kernel drift, warn-and-skip by default per
+A.3). The reconciler adds `SetTrace`/`ClearTrace`, sequenced after
+schedules (last, like other live-config actions).
+
+Backpressure is declared, not accidental: `max_rate` caps events/sec; over
+the cap the reader drops and increments `bhatti_trace_dropped_total`. If a
+webhook sink stalls, its buffer fills and drops — a slow consumer never
+blocks the traced workload or the guest. The "firehose nobody drinks"
+failure is made loud instead of silent.
+
+### E.8 Server + guest changes for E
+
+| Gap | Add |
+|-----|-----|
+| Trace kernel variant | second output from `build-lean-kernel.sh`; registered like other images |
+| Per-sandbox kernel select | already exists (`SandboxSpec.KernelImage`) — map `trace.enabled` to it |
+| lohar TRACE_START/STOP | two control-socket verbs + a `trace_pipe` reader goroutine |
+| Trace event type | high-volume event kind in `event_recorder.go` with its own retention cap |
+| Webhook sink | daemon-side batching poster keyed off the events stream |
+| seccomp field (for `deny`) | `seccomp:` sandbox property, compiled from `deny` actions, pushed at boot |
+
+### E.9 Tests for E
+
+- `TestTraceConfigFlags` — `config-trace_<arch>` keeps `DEBUG_INFO_BTF`
+  after `olddefconfig` (the exact regression the experiment hit).
+- `TestTracepipeParse` — golden `trace_pipe` lines → events, including the
+  `.....` flags column and signal-death (`128+N`) return codes.
+- `TestTraceCorrelate` — entry+exit → one event with duration; an unmatched
+  exit is flagged, not dropped silently.
+- `TestTraceFilter` — only declared syscalls emitted; `max_rate` drop
+  increments the counter.
+- `TestTraceReconcile` — `trace:` on a lean-kernel sandbox → diff flags
+  kernel drift; on a trace-kernel sandbox → live `SetTrace`.
+- `TestTraceSinkEvents` — emitted events land in the table and return from
+  `/events?since=`.
+- `TestSeccompDeny` — a `deny` action compiles to a seccomp profile that
+  actually blocks the syscall (the one action that must be proven to bite).
+
+---
+
 ## Dependency Graph and Sequencing
 
 ```
@@ -944,6 +1177,10 @@ Track C (cron / scheduled jobs) — strongly benefits from B:
 Track D (volumes nx)            — own plan; uses A's reservation
                                   fields (access_mode) but no other
                                   coupling.
+
+Track E (syscall tracing)       — depends on A's manifest (the `trace:`
+                                  field) and a trace-enabled guest kernel;
+                                  orthogonal to B/C/D.
 ```
 
 ### Recommended ship order, with rough sizing
@@ -957,10 +1194,15 @@ Track D (volumes nx)            — own plan; uses A's reservation
 | 5 | C | Schema + scheduler loop + handlers (manual trigger only) | 4 d | `bhatti schedule run` |
 | 6 | C | Cron parser + due loop + retry + manifest integration | 1 wk | `schedules:` in YAML works end-to-end |
 | 7 | D | Separate plan document | TBD | TBD |
+| 8 | E | Trace kernel variant + lohar TRACE_START/STOP + events sink | 1 wk | `trace:` writes to events table |
+| 9 | E | Webhook sinks + declarative actions + seccomp `deny` | 4 d | full declarative observability |
 
 **Total to "fuller serverless platform" (1–6): ~5 weeks of focused work.**
 The slicing is deliberate: each row leaves the system in a shippable
-state with documented behavior, even if later rows never land.
+state with documented behavior, even if later rows never land. Rows 8–9
+(Track E) are additive on top of that — the platform is complete without
+them, and tracing is worth its own ~1.5 weeks once the manifest exists to
+carry the `trace:` field.
 
 ### Why A first, not B
 
@@ -1012,6 +1254,9 @@ bhatti_dns_queries_total{user,result}    # result: hit|miss|forward|nxdomain
 bhatti_dns_query_duration_seconds
 bhatti_schedule_runs_total{result}       # result: ok|fail|skipped|retry
 bhatti_schedule_pending                  # gauge, schedules with next_run_at < now
+bhatti_trace_events_total{sandbox,syscall,result}   # after filtering
+bhatti_trace_dropped_total{sandbox,reason}          # reason: rate|buffer_full
+bhatti_trace_action_fired_total{sandbox,do}         # do: emit|pause|snapshot|deny
 ```
 
 And events (via `pkg/server/event_recorder.go`):
@@ -1022,6 +1267,9 @@ schedule.run.completed      sandbox=etl schedule=sync exit=0 duration=42s
 schedule.run.failed         sandbox=etl schedule=sync exit=1 stderr_tail=...
 apply.plan.executed         project=hermes-stack actions=12
 dns.wake_triggered          sandbox=pg from=api
+trace.stream.started        sandbox=agent-7 sinks=events,webhook
+trace.rule_fired            sandbox=agent-7 syscall=connect ret=0 dur_us=12 do=emit
+trace.backpressure_dropped  sandbox=agent-7 rate=98000/s dropped=41213
 ```
 
 These show up in `bhatti admin events` for free.
