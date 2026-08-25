@@ -3091,3 +3091,4 @@ CONFIG_ARCH_USE_MEMTEST=y
 #
 # end of Rust hacking
 # end of Kernel hacking
+CONFIG_NETFILTER_XT_TARGET_REJECT=y
