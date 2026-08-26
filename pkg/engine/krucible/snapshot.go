@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
@@ -176,8 +177,11 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 // ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
 // (the server's `snapshotResumer` capability): copy the snapshot's disk + config
 // drive, cold-restore its RAM/device/vCPU state, reusing the in-guest token (the
-// restored guest enforces it from RAM).
-func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName string) (engine.SandboxInfo, error) {
+// restored guest enforces it from RAM). ownerUserID homes the new sandbox on the
+// owner's shared netd — a fork/restore is an INDEPENDENT sandbox of the same
+// owner, so it must join that owner's fabric (and get a fresh, distinct IP there),
+// not spin up an isolated netd it shares with nothing.
+func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName, ownerUserID string) (engine.SandboxInfo, error) {
 	var m krucibleSnapManifest
 	if err := json.Unmarshal(manifestJSON, &m); err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("parse snapshot manifest: %w", err)
@@ -197,6 +201,7 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 		CPUs:      float64(m.Vcpus),
 		MemoryMB:  int(m.MemMiB),
 		BaseImage: filepath.Join(snapDir, diskFile), // the frozen disk; create() copies it as the root
+		UserID:    ownerUserID,                      // join the owner's shared netd
 	}
 	if m.Type == "filesystem" {
 		// Disk-only snapshot: cold-boot a fresh sandbox from the frozen disk
@@ -242,6 +247,12 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 	vm.mu.Lock()
 	hasMount := len(vm.baseSpec.Mounts) > 0
 	vm.mu.Unlock()
+	// The fork belongs to the source's owner and must join the same shared netd
+	// (netdKey is "u:<userID>" on the net backend; "" or "s:<id>" otherwise).
+	ownerUserID := strings.TrimPrefix(vm.netdKey, "u:")
+	if !strings.HasPrefix(vm.netdKey, "u:") {
+		ownerUserID = ""
+	}
 	if hasMount {
 		return engine.SandboxInfo{}, fmt.Errorf("cannot fork a sandbox with a virtio-fs --mount (the device cannot be memory-restored); use a filesystem snapshot (snapshot create --type filesystem) then create --snapshot")
 	}
@@ -259,7 +270,7 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 		return engine.SandboxInfo{}, fmt.Errorf("fork: checkpoint: %w", err)
 	}
 	manifestJSON, _ := json.Marshal(manifest)
-	return e.ResumeFromManifestJSON(ctx, filepath.Join(tmp, "snap"), manifestJSON, newName)
+	return e.ResumeFromManifestJSON(ctx, filepath.Join(tmp, "snap"), manifestJSON, newName, ownerUserID)
 }
 
 // SaveImage captures the sandbox's current filesystem as a reusable bootable

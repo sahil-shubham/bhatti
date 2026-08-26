@@ -372,6 +372,15 @@ func main() {
 			io.WriteString(w, "hello-from-guest\n")
 		})
 		http.ListenAndServe("0.0.0.0:"+os.Args[2], nil)
+	case "localip": // print the first non-loopback IPv4 on the box (the guest's eth0 address).
+		addrs, _ := net.InterfaceAddrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
+				fmt.Println(ipnet.IP.To4().String())
+				os.Exit(0)
+			}
+		}
+		os.Exit(1)
 	}
 }
 `

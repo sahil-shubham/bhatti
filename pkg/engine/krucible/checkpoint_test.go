@@ -62,7 +62,7 @@ func TestKrucibleCheckpointResume(t *testing.T) {
 	srcDestroyed = true
 
 	manifestJSON, _ := json.Marshal(manifest)
-	info2, err := ke.ResumeFromManifestJSON(ctx, finalDir, manifestJSON, "resumed")
+	info2, err := ke.ResumeFromManifestJSON(ctx, finalDir, manifestJSON, "resumed", "")
 	if err != nil {
 		t.Fatalf("ResumeFromManifestJSON: %v", err)
 	}

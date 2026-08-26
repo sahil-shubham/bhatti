@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"unsafe"
@@ -70,6 +71,107 @@ func configureEth0(name, ipCIDR, gateway string) error {
 		}
 	}
 	return nil
+}
+
+// reconfigureEth0 re-points eth0 to a fresh point-to-point identity after a
+// memory-restore fork. The restored guest still holds the SOURCE's /32 address
+// in RAM (lohar configures eth0 only at first boot, which the snapshot froze),
+// so a plain add would leave two addresses fighting on one link. Flush every
+// IPv4 address first, then add the fresh one. For a same-owner fork the gateway
+// is unchanged (same shared netd), so the on-link + default routes already
+// exist and survive an address flush; re-establish them anyway, tolerating
+// EEXIST, so a future cross-subnet fork stays correct. IPv6 link-local is left
+// untouched — netd is IPv4-only.
+//
+// The MAC is deliberately not changed: the guest link is point-to-point to
+// netd, which keys routing on IP and learns the MAC per-link from the guest's
+// frames, so the IP is the only identity that must be reconciled.
+func reconfigureEth0(name, ipCIDR, gateway string) error {
+	ip, _, err := net.ParseCIDR(ipCIDR)
+	if err != nil {
+		return fmt.Errorf("parse %q: %w", ipCIDR, err)
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("only IPv4 supported for now: %q", ipCIDR)
+	}
+
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", name, err)
+	}
+	idx := iface.Index
+
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		return fmt.Errorf("netlink socket: %w", err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return fmt.Errorf("netlink bind: %w", err)
+	}
+
+	if err := linkUp(fd, idx); err != nil {
+		return fmt.Errorf("link up: %w", err)
+	}
+	if err := flushAddrs(fd, name); err != nil {
+		return fmt.Errorf("flush addrs: %w", err)
+	}
+	if err := addAddr(fd, idx, ip4, 32); err != nil {
+		return fmt.Errorf("add addr: %w", err)
+	}
+	if gateway != "" {
+		gw := net.ParseIP(gateway).To4()
+		if gw == nil {
+			return fmt.Errorf("bad gateway %q", gateway)
+		}
+		if err := addOnlinkRoute(fd, idx, gw, 32); err != nil && !errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("add gateway route: %w", err)
+		}
+		if err := addDefaultRoute(fd, idx, gw); err != nil && !errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("add route: %w", err)
+		}
+	}
+	return nil
+}
+
+// flushAddrs removes every IPv4 address on the named link. Enumeration reuses
+// the stdlib's netlink address dump (iface.Addrs); only the delete is
+// hand-rolled (RTM_DELADDR, mirroring addAddr). IPv6 addresses are skipped.
+func flushAddrs(fd int, name string) error {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return err
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil {
+			continue // leave IPv6 link-local alone
+		}
+		ones, _ := ipnet.Mask.Size()
+		if err := delAddr(fd, iface.Index, ip4, ones); err != nil && !errors.Is(err, unix.EADDRNOTAVAIL) {
+			return err
+		}
+	}
+	return nil
+}
+
+// delAddr removes one IPv4 address from a link (RTM_DELADDR), the inverse of
+// addAddr.
+func delAddr(fd, idx int, ip4 net.IP, prefix int) error {
+	msg := unix.IfAddrmsg{Family: unix.AF_INET, Prefixlen: uint8(prefix), Index: uint32(idx)}
+	payload := append([]byte{}, (*(*[unix.SizeofIfAddrmsg]byte)(unsafe.Pointer(&msg)))[:]...)
+	payload = append(payload, attr(unix.IFA_LOCAL, ip4)...)
+	payload = append(payload, attr(unix.IFA_ADDRESS, ip4)...)
+	return nlRequest(fd, unix.RTM_DELADDR, 0, payload)
 }
 
 var nlSeq uint32

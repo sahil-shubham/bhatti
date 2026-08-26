@@ -541,7 +541,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	}
 
 	type snapshotResumer interface {
-		ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName string) (engine.SandboxInfo, error)
+		ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName, ownerUserID string) (engine.SandboxInfo, error)
 	}
 
 	sr, ok := s.engine.(snapshotResumer)
@@ -557,7 +557,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		sandboxName = snapName + "-" + genID()[:6]
 	}
 
-	info, err := sr.ResumeFromManifestJSON(r.Context(), snapDir, []byte(snap.ManifestJSON), sandboxName)
+	info, err := sr.ResumeFromManifestJSON(r.Context(), snapDir, []byte(snap.ManifestJSON), sandboxName, user.ID)
 	if err != nil {
 		if strings.Contains(err.Error(), "in use") {
 			errResp(w, 409, err.Error())

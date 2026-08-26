@@ -483,6 +483,43 @@ func (c *AgentClient) Activity(ctx context.Context) (*proto.ActivityInfo, error)
 	return &info, nil
 }
 
+// NetConfig reconciles the guest's eth0 to a fresh point-to-point identity
+// (ip_cidr + gateway) after a memory-restore fork. The restored guest holds the
+// source's IP in RAM; this re-points it so the fork is network-distinct from its
+// source. Ack is a NET_CONFIG frame with nil payload; an ERROR frame surfaces
+// the guest-side failure.
+func (c *AgentClient) NetConfig(ctx context.Context, ipCIDR, gateway string) error {
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return fmt.Errorf("agent connect: %w", err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	req := struct {
+		IPCIDR  string `json:"ip_cidr"`
+		Gateway string `json:"gateway"`
+	}{IPCIDR: ipCIDR, Gateway: gateway}
+	if err := proto.SendJSON(conn, proto.NET_CONFIG, req); err != nil {
+		return fmt.Errorf("agent send net config: %w", err)
+	}
+
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("agent read net config ack: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return fmt.Errorf("guest net config failed: %s", string(payload))
+	}
+	if msgType != proto.NET_CONFIG {
+		return fmt.Errorf("expected NET_CONFIG ack, got 0x%02x", msgType)
+	}
+	return nil
+}
+
 // SessionKill sends SIGTERM to a session's process.
 func (c *AgentClient) SessionKill(ctx context.Context, sessionID string) error {
 	conn, err := c.DialControl(ctx)

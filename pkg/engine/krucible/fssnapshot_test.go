@@ -47,7 +47,7 @@ func TestKrucibleFilesystemSnapshot(t *testing.T) {
 	}
 
 	manifestJSON, _ := json.Marshal(manifest)
-	info2, err := ke.ResumeFromManifestJSON(ctx, filepath.Join(snapDir, "fs1"), manifestJSON, "fsresumed")
+	info2, err := ke.ResumeFromManifestJSON(ctx, filepath.Join(snapDir, "fs1"), manifestJSON, "fsresumed", "")
 	if err != nil {
 		t.Fatalf("ResumeFromManifestJSON (filesystem): %v", err)
 	}

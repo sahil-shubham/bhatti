@@ -147,6 +147,21 @@ func handleControlConnection(conn net.Conn) {
 	case proto.FILE_LS_REQ:
 		handleFileList(conn, payload)
 
+	case proto.NET_CONFIG:
+		var req struct {
+			IPCIDR  string `json:"ip_cidr"`
+			Gateway string `json:"gateway"`
+		}
+		if err := json.Unmarshal(payload, &req); err != nil {
+			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("bad net config: %v", err)))
+			return
+		}
+		if err := reconfigureEth0("eth0", req.IPCIDR, req.Gateway); err != nil {
+			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("reconfigure eth0: %v", err)))
+			return
+		}
+		proto.WriteFrame(conn, proto.NET_CONFIG, nil)
+
 	default:
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("unexpected frame type 0x%02x", msgType)))
 	}

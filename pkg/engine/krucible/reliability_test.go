@@ -132,7 +132,7 @@ func TestKrucibleMultiVolumeSnapshotOrdering(t *testing.T) {
 		t.Fatalf("Checkpoint (memory, 2 volumes): %v", err)
 	}
 	mjson, _ := json.Marshal(manifest)
-	restored, err := eng.ResumeFromManifestJSON(ctx, filepath.Join(tmp, "snap"), mjson, "mvrestore")
+	restored, err := eng.ResumeFromManifestJSON(ctx, filepath.Join(tmp, "snap"), mjson, "mvrestore", "")
 	if err != nil {
 		t.Fatalf("ResumeFromManifestJSON: %v", err)
 	}
