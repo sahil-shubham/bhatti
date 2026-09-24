@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -163,8 +165,8 @@ func TestAliasValidation(t *testing.T) {
 		{"UPPERCASE", 400},
 		{"-leading-dash", 400},
 		{"has spaces", 400},
-		{"api", 400},     // reserved
-		{"www", 400},     // reserved
+		{"api", 400}, // reserved
+		{"www", 400}, // reserved
 		{"valid-alias", 201},
 	}
 
@@ -317,6 +319,43 @@ func TestLocalhostBypassesDomainCheck(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("localhost health: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestUnixSocketBypassesDomainRouting: in domain mode the local CLI talks over
+// the unix control socket with Host "unix". That must reach the API (auth), not
+// the Host router's "unknown host" 404 — otherwise the on-box CLI is dead the
+// moment a domain is configured.
+func TestUnixSocketBypassesDomainRouting(t *testing.T) {
+	srv, _ := setupDomainMode(t)
+	dir, err := os.MkdirTemp("/tmp", "bs") // AF_UNIX path cap (104 B on macOS) rules out t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "api.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := &http.Server{Handler: srv}
+	go hs.Serve(ln)
+	t.Cleanup(func() { hs.Close() })
+
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
+	req, _ := http.NewRequest("GET", "http://unix/sandboxes", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /sandboxes over unix socket in domain mode: got %d, want 200", resp.StatusCode)
 	}
 }
 

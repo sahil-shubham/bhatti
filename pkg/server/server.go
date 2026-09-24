@@ -783,7 +783,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Domain mode: route by Host header BEFORE auth.
 	// Proxy zone subdomains are served unauthenticated.
 	// API host falls through to normal auth flow.
-	if s.proxyZone != "" {
+	// Requests on the local unix control socket are API calls by construction
+	// (the CLI sends Host "unix"), so they skip Host routing entirely.
+	if s.proxyZone != "" && !viaUnixSocket(r) {
 		host := stripPort(r.Host)
 
 		// API host and localhost always fall through to auth.
@@ -881,6 +883,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"user", user.Name,
 		"user_id", user.ID,
 	)
+}
+
+// viaUnixSocket reports whether r arrived on a unix-domain listener (the local
+// control socket) rather than TCP.
+func viaUnixSocket(r *http.Request) bool {
+	_, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr)
+	return ok
 }
 
 // statusWriter wraps http.ResponseWriter to capture the status code.
