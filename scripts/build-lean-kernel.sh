@@ -45,7 +45,14 @@ docker run --rm --platform "$PLATFORM" \
   -w /build ubuntu:24.04 bash -c "
 set -e
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq && apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc curl xz-utils >/dev/null 2>&1
+# Retry: a mirror mid-sync fails apt with exit 100. stderr stays visible so the
+# CI log says why (it used to be discarded, leaving a bare 'exit code 100').
+ok=0
+for i in 1 2 3; do
+  if apt-get -o Acquire::Retries=3 update -qq && apt-get -o Acquire::Retries=3 install -y -qq build-essential flex bison libelf-dev libssl-dev bc curl xz-utils >/dev/null; then ok=1; break; fi
+  echo \"apt attempt \$i failed; retrying\" >&2; sleep 15
+done
+[ \"\$ok\" = 1 ] || { echo 'apt failed after 3 attempts' >&2; exit 1; }
 curl -fsSL https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/linux-${KERNEL_VERSION}.tar.gz | tar xz
 cd linux-${KERNEL_VERSION}
 cp /lean.config .config
