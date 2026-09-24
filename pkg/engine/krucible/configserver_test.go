@@ -103,6 +103,32 @@ func TestConfigServerIsolation(t *testing.T) {
 	}
 }
 
+// TestConfigServerWaitsForGuestClose: after answering, the server must leave the
+// connection open until the guest hangs up. libkrun maps a host-side close to a
+// vsock RST, which makes the guest kernel drop the unread CONFIG_RESP — on a
+// fast host lohar then boots with no config (seen on an x86 Hetzner box).
+func TestConfigServerWaitsForGuestClose(t *testing.T) {
+	uds := serveConfig(t, configdrive.SandboxConfig{Token: "x"})
+	conn, err := net.DialTimeout("unix", uds, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := proto.WriteFrame(conn, proto.CONFIG_REQ, nil); err != nil {
+		t.Fatalf("write CONFIG_REQ: %v", err)
+	}
+	if typ, _, err := proto.ReadFrame(conn); err != nil || typ != proto.CONFIG_RESP {
+		t.Fatalf("read CONFIG_RESP: typ=%#x err=%v", typ, err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	var b [1]byte
+	_, err = conn.Read(b[:])
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("server closed first (err=%v); must wait for the guest to hang up", err)
+	}
+}
+
 // TestConfigServerNoLeakOnBadFrame: a connection that does NOT open with
 // CONFIG_REQ gets no response — the server never emits the config (which holds
 // the token) on an unexpected/garbage opening frame.

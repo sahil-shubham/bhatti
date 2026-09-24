@@ -1,9 +1,11 @@
 package krucible
 
 import (
+	"io"
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
@@ -54,14 +56,27 @@ func (s *configServer) serve() {
 // handle answers one CONFIG_REQ with a CONFIG_RESP carrying the config JSON.
 // A connection that doesn't open with CONFIG_REQ gets nothing (we never serve
 // on an unexpected frame).
+//
+// After writing, it waits for the guest to hang up before closing. libkrun's
+// unix proxy turns a host-side close into a vsock RST, and the guest kernel
+// discards unread data on RST — so closing right after the write races lohar's
+// read and, on a fast host, lohar sees EOF and boots without its config.
 func (s *configServer) handle(conn net.Conn) {
 	defer conn.Close()
 	msgType, _, err := proto.ReadFrame(conn)
 	if err != nil || msgType != proto.CONFIG_REQ {
 		return
 	}
-	_ = proto.WriteFrame(conn, proto.CONFIG_RESP, s.payload)
+	if proto.WriteFrame(conn, proto.CONFIG_RESP, s.payload) != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(configLinger))
+	_, _ = io.Copy(io.Discard, conn)
 }
+
+// configLinger bounds how long a served connection is held open waiting for the
+// guest to close it (lohar closes as soon as it has read the response).
+const configLinger = 5 * time.Second
 
 // Close stops the server. Idempotent.
 func (s *configServer) Close() error {
