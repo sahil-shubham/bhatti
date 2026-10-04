@@ -296,6 +296,16 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		s.handleSnapshotResume(w, r, user, name)
 		return
 	}
+	// Sub-route: GET /snapshots/:name/export
+	if len(parts) == 2 && parts[1] == "export" {
+		s.handleSnapshotExport(w, r, user, name)
+		return
+	}
+	// POST /snapshots/import (POST /snapshots/:name is otherwise unused)
+	if len(parts) == 1 && name == "import" && r.Method == http.MethodPost {
+		s.handleSnapshotImport(w, r, user)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -412,15 +422,8 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Check quota
-	existing, _ := s.store.ListSnapshots(user.ID)
-	userObj, _ := s.store.GetUser(user.ID)
-	maxSnaps := 5
-	if userObj != nil && userObj.MaxSnapshots > 0 {
-		maxSnaps = userObj.MaxSnapshots
-	}
-	if len(existing) >= maxSnaps {
-		errResp(w, 429, fmt.Sprintf("snapshot limit reached (%d/%d)", len(existing), maxSnaps))
+	if msg := s.snapshotLimitError(user.ID); msg != "" {
+		errResp(w, 429, msg)
 		return
 	}
 
@@ -459,29 +462,9 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Calculate total snapshot size
-	finalDir := filepath.Join(snapDir, req.Name)
-	var totalSize int64
-	filepath.Walk(finalDir, func(_ string, fi os.FileInfo, _ error) error {
-		if fi != nil && !fi.IsDir() {
-			totalSize += fi.Size()
-		}
-		return nil
-	})
-	sizeMB := int(totalSize / 1024 / 1024)
-
 	manifestJSON, _ := json.Marshal(manifestIface)
-	snap := store.SnapshotRecord{
-		ID: genID(), UserID: user.ID, Name: req.Name,
-		SourceSandbox: sb.ID,
-		MemPath:       filepath.Join(finalDir, "mem.snap"),
-		VMPath:        filepath.Join(finalDir, "vm.snap"),
-		RootfsPath:    filepath.Join(finalDir, "rootfs.ext4"),
-		ConfigPath:    filepath.Join(finalDir, "config.ext4"),
-		ManifestJSON:  string(manifestJSON),
-		SizeMB:        sizeMB,
-		CreatedAt:     time.Now(),
-	}
+	snap := newSnapshotRecord(user.ID, req.Name, sb.ID, filepath.Join(snapDir, req.Name), manifestJSON)
+	sizeMB := snap.SizeMB
 	if err := s.store.CreateSnapshot(snap); err != nil {
 		errRespInternal(w, r, "store snapshot record failed", err)
 		return
