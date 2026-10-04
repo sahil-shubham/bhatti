@@ -145,6 +145,9 @@ The server auto-discovers tiers from `/var/lib/bhatti/images/`. Install more wit
 | `volume delete` | Delete a volume |
 | `secret set` | Create or update an encrypted secret |
 | `secret list` | List secrets |
+| `secret grant` | Let a sandbox use a secret toward named HTTPS hosts (it gets a placeholder) |
+| `secret grants` | List grants and their status |
+| `secret revoke` | Revoke a grant |
 
 ### Images & Snapshots
 
@@ -238,7 +241,8 @@ bhatti (host daemon)                        lohar (guest agent, PID 1 in each VM
   │     socket (create, exec, snapshot, fork)   ├─ Process group kill
   ├─ Thermal manager (hot → warm → cold, auto)  ├─ Exec as uid 1000 (not root)
   ├─ bhatti-netd gateway (gVisor, per owner)    └─ Config drive (env, secrets)
-  │  └─ policed egress, host isolation, siblings
+  │  └─ policed egress, host isolation, siblings,
+  │     credential substitution (broker in the daemon)
   ├─ SQLite store + age encryption
   ├─ Rate limiting + exec timeouts
   └─ Reverse proxy (HTTP + WebSocket)
@@ -259,7 +263,7 @@ sudo bhatti user create --name alice --max-sandboxes 5
 - **Network isolation** — a per-owner `bhatti-netd` gateway (userspace gVisor netstack): egress is policed (the host, private ranges, and cloud metadata are denied by default), same-owner sandboxes can reach each other, and cross-owner traffic is isolated
 - **Resource caps** — per-user limits on sandbox count, CPUs, and memory
 - **Rate limiting** — per-user token buckets (30 creates/min, 600 execs/min, 1200 reads/min)
-- **Secrets** — encrypted at rest (age), scoped per user
+- **Secrets** — encrypted at rest (age), scoped per user. With a grant (`bhatti secret grant`, or `create --secret-grant NAME@host`) the sandbox never holds the value: it gets a placeholder, and its `bhatti-netd` swaps in the real value only in request headers of HTTPS connections to the granted hosts, verified against the system roots. A placeholder elsewhere in a request (URL, body) is refused; every use and refusal is an event. Revoking a grant stops new connections at once; connections already open keep the value until they close.
 
 ## Key Features
 
