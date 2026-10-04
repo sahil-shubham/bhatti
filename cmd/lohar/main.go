@@ -160,7 +160,7 @@ func runAgent() {
 		writeConfigFiles(cfg.Files)
 		mountVolumes(cfg.Volumes)
 		mountFsMounts(cfg.Mounts)
-		bundle, err := installSandboxCA("/", cfg.CACert, runCACertUpdate, exec.LookPath)
+		bundle, refresh, err := installSandboxCA("/", cfg.CACert, runCACertUpdate, exec.LookPath)
 		if err != nil {
 			logf("install sandbox CA: %v", err)
 		}
@@ -169,6 +169,13 @@ func runAgent() {
 		}
 		if bundle != "" {
 			setSandboxCAEnv(configEnv, bundle)
+		}
+		if refresh != nil {
+			go func() {
+				if err := refresh(); err != nil {
+					logf("refresh sandbox CA: %v", err)
+				}
+			}()
 		}
 		bp("config_applied")
 	} else {

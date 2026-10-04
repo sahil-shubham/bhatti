@@ -120,64 +120,55 @@ func appendCA(data, cert []byte) []byte {
 
 // installSandboxCA keeps the saved image's old CA out of both bundles before
 // trusting the new one; restored images can have belonged to another sandbox.
-func installSandboxCA(root, certPEM string, run func(string, ...string) error, lookPath func(string) (string, error)) (string, error) {
+// A marker means the asynchronous system-store refresh has not yet completed.
+func installSandboxCA(root, certPEM string, run func(string, ...string) error, lookPath func(string) (string, error)) (bundle string, refresh func() error, err error) {
 	if certPEM == "" {
-		return "", removeSandboxCA(root, run, lookPath)
+		return "", nil, removeSandboxCA(root, run, lookPath)
 	}
 	cert, err := validatedCA(certPEM)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	certPath, systemPath, bundlePath := caPaths(root)
 	oldCert, err := readCAFile(certPath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	system, err := readCAFile(systemPath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	fast := bytes.Equal(oldCert, cert) && bytes.Contains(system, cert)
-	if !fast {
+	sameCA := bytes.Equal(oldCert, cert) && bytes.Contains(system, cert)
+	markerPending := bytes.Contains(system, []byte(caMarkerBegin))
+	if !sameCA {
 		if !bytes.Equal(oldCert, cert) {
 			if err := writeCAFile(certPath, cert); err != nil {
-				return "", err
+				return "", nil, err
 			}
 		}
 		cleaned := stripCAMarker(system)
 		if len(oldCert) != 0 && !bytes.Equal(oldCert, cert) {
 			cleaned = bytes.ReplaceAll(cleaned, oldCert, nil)
 		}
-		if !bytes.Equal(system, cleaned) {
-			if err := writeCAFile(systemPath, cleaned); err != nil {
-				return "", err
-			}
-			system = cleaned
-		}
-		binary, lookupErr := lookPath("update-ca-certificates")
-		if lookupErr == nil {
-			if err := run(binary); err != nil {
-				logf("update-ca-certificates: %v; using bundle fallback", err)
-			} else {
-				system, err = readCAFile(systemPath)
-				if err != nil {
-					return "", err
-				}
-				if err := writeCAFile(bundlePath, appendCA(system, cert)); err != nil {
-					return "", err
-				}
-				return guestCABundlePath, nil
-			}
-		}
-		system = appendCAMarker(system, cert)
+		system = appendCAMarker(cleaned, cert)
 		if err := writeCAFile(systemPath, system); err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
 	if err := writeCAFile(bundlePath, appendCA(system, cert)); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return guestCABundlePath, nil
+	if !sameCA || markerPending {
+		if binary, err := lookPath("update-ca-certificates"); err == nil {
+			return guestCABundlePath, func() error {
+				if err := run(binary); err != nil {
+					return fmt.Errorf("update-ca-certificates: %w", err)
+				}
+				return nil
+			}, nil
+		}
+	}
+	return guestCABundlePath, nil, nil
 }
 
 func removeSandboxCA(root string, run func(string, ...string) error, lookPath func(string) (string, error)) error {

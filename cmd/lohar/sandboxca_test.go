@@ -67,12 +67,15 @@ func TestSandboxCAFallbackBundle(t *testing.T) {
 	root, ca := t.TempDir(), sandboxCATestCert(t, true)
 	cert, system, bundle := caPaths(root)
 	sandboxCASeed(t, system, "system roots\n")
-	guestPath, err := installSandboxCA(root, ca, func(string, ...string) error {
+	guestPath, refresh, err := installSandboxCA(root, ca, func(string, ...string) error {
 		t.Fatal("unexpected update")
 		return nil
 	}, sandboxCANoUpdate)
 	if err != nil || guestPath != guestCABundlePath {
 		t.Fatalf("install: bundle=%q err=%v", guestPath, err)
+	}
+	if refresh != nil {
+		t.Fatal("updater absent but refresh returned")
 	}
 	if got := sandboxCARead(t, cert); got != ca {
 		t.Fatal("CA source differs")
@@ -91,11 +94,13 @@ func TestSandboxCAReplacesDifferentCA(t *testing.T) {
 	_, system, bundle := caPaths(root)
 	sandboxCASeed(t, system, "system roots\n")
 	for _, ca := range []string{oldCA, newCA} {
-		if _, err := installSandboxCA(root, ca, func(string, ...string) error {
+		if _, refresh, err := installSandboxCA(root, ca, func(string, ...string) error {
 			t.Fatal("unexpected update")
 			return nil
 		}, sandboxCANoUpdate); err != nil {
 			t.Fatal(err)
+		} else if refresh != nil {
+			t.Fatal("updater absent but refresh returned")
 		}
 	}
 	for _, path := range []string{system, bundle} {
@@ -119,17 +124,78 @@ func TestSandboxCAUpdateCertificates(t *testing.T) {
 		calls++
 		return os.WriteFile(system, []byte("system roots\n"+ca), 0644)
 	}
-	if _, err := installSandboxCA(root, ca, run, look); err != nil {
-		t.Fatal(err)
+	guestPath, refresh, err := installSandboxCA(root, ca, run, look)
+	if err != nil || guestPath != guestCABundlePath {
+		t.Fatalf("install: bundle=%q err=%v", guestPath, err)
 	}
-	if calls != 1 {
-		t.Fatalf("update calls: %d", calls)
+	if calls != 0 || refresh == nil {
+		t.Fatalf("refresh ran during install or was not returned: calls=%d refresh=%v", calls, refresh != nil)
 	}
 	for _, path := range []string{system, bundle} {
 		got := sandboxCARead(t, path)
-		if strings.Contains(got, caMarkerBegin) || strings.Count(got, ca) != 1 || !strings.Contains(got, "system roots") {
-			t.Fatalf("unexpected certificate bundle at %s: %q", path, got)
+		if !strings.Contains(got, caMarkerBegin+ca+caMarkerEnd) || !strings.Contains(got, "system roots") {
+			t.Fatalf("CA not trusted before refresh at %s: %q", path, got)
 		}
+	}
+	if err := refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("update calls after refresh: %d", calls)
+	}
+	if got := sandboxCARead(t, system); strings.Contains(got, caMarkerBegin) || strings.Count(got, ca) != 1 {
+		t.Fatalf("refresh failed to regenerate system store: %q", got)
+	}
+}
+
+func TestSandboxCAPendingRefresh(t *testing.T) {
+	root, ca := t.TempDir(), sandboxCATestCert(t, true)
+	cert, system, bundle := caPaths(root)
+	sandboxCASeed(t, system, "system roots\n")
+	calls := 0
+	run := func(string, ...string) error {
+		calls++
+		return os.WriteFile(system, []byte("system roots\n"+ca), 0644)
+	}
+	look := func(string) (string, error) { return "update-ca-certificates", nil }
+	if _, refresh, err := installSandboxCA(root, ca, run, look); err != nil || refresh == nil {
+		t.Fatalf("first install: refresh=%v err=%v", refresh != nil, err)
+	}
+	originalSystem := sandboxCARead(t, system)
+	oldTime := time.Unix(1000, 0)
+	for _, path := range []string{cert, system} {
+		if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(bundle); err != nil {
+		t.Fatal(err)
+	}
+	_, refresh, err := installSandboxCA(root, ca, run, look)
+	if err != nil || refresh == nil || calls != 0 {
+		t.Fatalf("pending refresh ran inline or was lost: refresh=%v calls=%d err=%v", refresh != nil, calls, err)
+	}
+	for _, path := range []string{cert, system} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.ModTime().Equal(oldTime) {
+			t.Fatalf("sync install rewrote %s: time=%v", path, info.ModTime())
+		}
+	}
+	if got := sandboxCARead(t, system); got != originalSystem {
+		t.Fatal("pending marker was changed")
+	}
+	if got := sandboxCARead(t, bundle); !strings.Contains(got, ca) {
+		t.Fatal("env bundle was not rewritten")
+	}
+	if err := refresh(); err != nil || calls != 1 {
+		t.Fatalf("pending refresh: calls=%d err=%v", calls, err)
+	}
+	_, refresh, err = installSandboxCA(root, ca, run, look)
+	if err != nil || refresh != nil {
+		t.Fatalf("refreshed CA still pending: refresh=%v err=%v", refresh != nil, err)
 	}
 }
 
@@ -143,14 +209,19 @@ func TestSandboxCAIdempotent(t *testing.T) {
 		return os.WriteFile(system, []byte("system roots\n"+ca), 0644)
 	}
 	look := func(string) (string, error) { return "update-ca-certificates", nil }
-	if _, err := installSandboxCA(root, ca, run, look); err != nil {
+	_, refresh, err := installSandboxCA(root, ca, run, look)
+	if err != nil || refresh == nil {
+		t.Fatalf("first install: refresh=%v err=%v", refresh != nil, err)
+	}
+	if err := refresh(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(bundle); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := installSandboxCA(root, ca, run, look); err != nil {
-		t.Fatal(err)
+	_, refresh, err = installSandboxCA(root, ca, run, look)
+	if err != nil || refresh != nil {
+		t.Fatalf("fast path returned refresh=%v err=%v", refresh != nil, err)
 	}
 	if calls != 1 {
 		t.Fatalf("idempotent install called update %d times", calls)
@@ -164,7 +235,7 @@ func TestSandboxCARemovesStaleInstall(t *testing.T) {
 	root, ca := t.TempDir(), sandboxCATestCert(t, true)
 	cert, system, bundle := caPaths(root)
 	sandboxCASeed(t, system, "system roots\n")
-	if _, err := installSandboxCA(root, ca, func(string, ...string) error { return nil }, sandboxCANoUpdate); err != nil {
+	if _, _, err := installSandboxCA(root, ca, func(string, ...string) error { return nil }, sandboxCANoUpdate); err != nil {
 		t.Fatal(err)
 	}
 	calls := 0
@@ -236,7 +307,7 @@ func TestSandboxCARejectsInvalidCertificate(t *testing.T) {
 	for _, candidate := range []string{"garbage", sandboxCATestCert(t, false)} {
 		root := t.TempDir()
 		calls := 0
-		_, err := installSandboxCA(root, candidate, func(string, ...string) error {
+		_, _, err := installSandboxCA(root, candidate, func(string, ...string) error {
 			calls++
 			return nil
 		}, func(string) (string, error) {
@@ -261,8 +332,12 @@ func TestSandboxCAFailedUpdateFallsBack(t *testing.T) {
 	root, ca := t.TempDir(), sandboxCATestCert(t, true)
 	_, system, bundle := caPaths(root)
 	sandboxCASeed(t, system, "system roots\n")
-	if _, err := installSandboxCA(root, ca, func(string, ...string) error { return errors.New("failed") }, func(string) (string, error) { return "update-ca-certificates", nil }); err != nil {
-		t.Fatal(err)
+	_, refresh, err := installSandboxCA(root, ca, func(string, ...string) error { return errors.New("failed") }, func(string) (string, error) { return "update-ca-certificates", nil })
+	if err != nil || refresh == nil {
+		t.Fatalf("failed-update install: refresh=%v err=%v", refresh != nil, err)
+	}
+	if err := refresh(); err == nil {
+		t.Fatal("refresh failure was not reported")
 	}
 	if !bytes.Contains([]byte(sandboxCARead(t, system)), []byte(caMarkerBegin+ca+caMarkerEnd)) || !strings.Contains(sandboxCARead(t, bundle), ca) {
 		t.Fatal("failed update did not fall back")
