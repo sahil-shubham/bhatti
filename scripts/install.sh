@@ -913,7 +913,7 @@ install_rootfs() {
         echo "$expected" > "$checksum_file"
     fi
 
-    success "rootfs ${tier} ($(du -h "$rootfs_path" | cut -f1), $(step_elapsed))"
+    success "rootfs ${tier} ($(du -h "$bases_dir/$base_name" | cut -f1), $(step_elapsed))"
 }
 
 generate_config() {
