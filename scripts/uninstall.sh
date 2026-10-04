@@ -57,8 +57,8 @@ fi
 # --- 2. Kill any running sandbox VMs / gateways (v2 = krucible) ---
 #
 # v2 runs one bhatti-vmm helper per sandbox and one bhatti-netd gateway per
-# owner. Both are plain host processes; the daemon normally reaps them, but
-# kill any strays before removing the runtime.
+# owner. Both are plain host processes that outlive a daemon stop (the next
+# daemon adopts them), so stopping the service above left them running.
 
 KILLED=0
 for pat in "bhatti-vmm" "bhatti-netd"; do

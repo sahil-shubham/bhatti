@@ -1004,6 +1004,9 @@ WorkingDirectory=/var/lib/bhatti
 Environment=HOME=/root
 Restart=always
 RestartSec=5
+# Stopping or restarting the daemon signals bhatti alone: each sandbox's
+# bhatti-vmm and each owner's bhatti-netd outlive it, and the next daemon
+# adopts them, so a restart never reboots a guest. Don't change this.
 KillMode=process
 TimeoutStopSec=120
 LimitNOFILE=65536
