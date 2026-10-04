@@ -202,6 +202,8 @@ func runDaemon() {
 	// Start observability: event recorder, metrics snapshots, retention
 	srv.StartEventRecorder()
 	srv.StartRetention()
+	// After the recorder: the broker audits every credential use and refusal.
+	srv.StartCredentialBroker()
 
 	// Start thermal manager to transition idle VMs: hot → warm → cold
 	srv.StartThermalManager(server.ThermalConfig{

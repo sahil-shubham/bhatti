@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -42,6 +43,10 @@ type createSandboxReq struct {
 	// B15: secrets and files on create
 	Secrets []string        `json:"secrets,omitempty"` // secret names to resolve from store
 	Files   []createFileReq `json:"files,omitempty"`   // files to inject via config drive
+
+	// Secrets the guest gets as placeholders, substituted by netd only toward
+	// the named hosts (grant_handlers.go). Env var = secret name.
+	SecretGrants []createGrantReq `json:"secret_grants,omitempty"`
 
 	// G1.6: operator-controlled labels for fleet enumeration
 	Labels map[string]string `json:"labels,omitempty"`
@@ -171,6 +176,38 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.NetPolicy = &np
+
+		// Create-time secret grants: checked before anything is built; the
+		// placeholders are minted just before boot.
+		grantHostsBySecret := make(map[string][]string, len(req.SecretGrants))
+		if len(req.SecretGrants) > 0 && req.From != "" {
+			errResp(w, 400, "secret grants can't be injected into a fork (its environment is the source's); grant to it after it's created")
+			return
+		}
+		for _, g := range req.SecretGrants {
+			if g.Secret == "" {
+				errResp(w, 400, "secret grant: secret name required")
+				return
+			}
+			if _, dup := grantHostsBySecret[g.Secret]; dup {
+				errResp(w, 400, fmt.Sprintf("secret %q is granted twice", g.Secret))
+				return
+			}
+			if slices.Contains(req.Secrets, g.Secret) {
+				errResp(w, 400, fmt.Sprintf("secret %q is requested both as a plain secret and as a grant", g.Secret))
+				return
+			}
+			hosts, err := grantHosts(g.Hosts, req.NetPolicy)
+			if err != nil {
+				errResp(w, 400, fmt.Sprintf("secret grant %q: %v", g.Secret, err))
+				return
+			}
+			if _, err := s.store.GetSecret(user.ID, g.Secret); err != nil {
+				errResp(w, 400, fmt.Sprintf("secret %q not found", g.Secret))
+				return
+			}
+			grantHostsBySecret[g.Secret] = hosts
+		}
 
 		var spec engine.SandboxSpec
 		var templateID string
@@ -508,6 +545,8 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		handlerPhase("engine_create_start")
 		var info engine.SandboxInfo
 		var err error
+		var src *store.Sandbox // fork source
+		var grants []store.SecretGrant
 		if req.From != "" {
 			// Fork: clone a running sandbox (memory copy) instead of a fresh boot.
 			forker, ok := s.engine.(interface {
@@ -517,7 +556,8 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				errResp(w, 501, "engine does not support fork (--from)")
 				return
 			}
-			src, serr := s.store.GetSandbox(user.ID, req.From)
+			var serr error
+			src, serr = s.store.GetSandbox(user.ID, req.From)
 			if serr != nil {
 				errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
 				return
@@ -529,7 +569,26 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			spec.MemoryMB = src.MemoryMB
 			info, err = forker.Fork(r.Context(), src.EngineID, spec.Name)
 		} else {
-			info, err = s.engine.Create(r.Context(), spec)
+			// netd names the guest by our ID, so a grant minted now resolves
+			// from the guest's first request. A sandbox with a network gets its
+			// own CA in its trust store, so grants can be added while it runs.
+			spec.SandboxID = sbID
+			if !req.NetPolicy.NoNetwork() {
+				spec.CACert, err = s.mintSandboxCA(user.ID, sbID, spec.Name)
+			}
+			for _, g := range req.SecretGrants {
+				if err != nil {
+					break
+				}
+				var grant store.SecretGrant
+				if grant, err = s.newGrant(user.ID, g.Secret, sbID, grantHostsBySecret[g.Secret], 0); err == nil {
+					spec.Env[g.Secret] = grant.Placeholder
+					grants = append(grants, grant)
+				}
+			}
+			if err == nil {
+				info, err = s.engine.Create(r.Context(), spec)
+			}
 		}
 		handlerPhase("engine_create_done")
 		if err != nil {
@@ -537,6 +596,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			if len(resolvedVolumes) > 0 {
 				s.store.DetachAllPersistentVolumesForSandbox(sbID)
 			}
+			s.discardSubstitution(sbID)
 			errRespInternal(w, r, "sandbox create failed", err)
 			return
 		}
@@ -564,7 +624,15 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			Image:      imageName,
 			Labels:     req.Labels,
 		}
+		// The egress policy the sandbox runs under, for checking grants made
+		// later: a fork keeps its source's.
+		if src != nil {
+			sb.NetPolicy = src.NetPolicy
+		} else if b, merr := json.Marshal(req.NetPolicy); merr == nil {
+			sb.NetPolicy = b
+		}
 		if err := s.store.CreateSandbox(sb); err != nil {
+			s.discardSubstitution(sbID)
 			// UNIQUE constraint violation → name race. Another concurrent
 			// request won the insert. Destroy the VM we just booted and
 			// return the winner's sandbox.
@@ -587,6 +655,9 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			errRespInternal(w, r, "store sandbox failed", err)
 			return
 		}
+		if src != nil {
+			s.inheritSandboxCA(user.ID, src.ID, sbID)
+		}
 
 		// Record volume attachments
 		for _, v := range volumes {
@@ -608,7 +679,16 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				"keep_hot": req.KeepHot,
 			},
 		})
-		writeJSON(w, 201, sb)
+		created := struct {
+			store.Sandbox
+			SecretGrants []grantView `json:"secret_grants,omitempty"`
+		}{Sandbox: sb}
+		now := time.Now()
+		for _, g := range grants {
+			s.recordGrant(g, sb.Name)
+			created.SecretGrants = append(created.SecretGrants, viewGrant(g, sb.Name, now))
+		}
+		writeJSON(w, 201, created)
 	default:
 		errResp(w, 405, "method not allowed")
 	}
@@ -722,6 +802,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			errRespInternal(w, r, "delete sandbox failed", err)
 			return
 		}
+		s.discardSubstitution(sb.ID)
 		slog.Info("sandbox.destroyed", "sandbox_id", sb.ID, "name", sb.Name, "user", user.Name)
 		s.RecordEvent(store.Event{
 			Type: "sandbox.destroyed", UserID: user.ID, SandboxID: sb.ID,

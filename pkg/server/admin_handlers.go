@@ -152,11 +152,31 @@ func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
 		errResp(w, 400, "missing secret name")
 		return
 	}
+	// Grants live under /secrets: POST /secrets/{name}/grants mints one (a
+	// secret named "grants" included), GET /secrets/grants lists them,
+	// DELETE /secrets/grants/{id} revokes one.
+	if secret, ok := strings.CutSuffix(name, "/grants"); ok && r.Method == http.MethodPost && secret != "" && !strings.Contains(secret, "/") {
+		s.handleSecretGrantCreate(w, r, secret)
+		return
+	}
+	if name == "grants" && r.Method != http.MethodDelete {
+		s.handleSecretGrants(w, r)
+		return
+	}
+	if id, ok := strings.CutPrefix(name, "grants/"); ok && id != "" && !strings.Contains(id, "/") {
+		s.handleSecretGrantRevoke(w, r, id)
+		return
+	}
 	switch r.Method {
 	case http.MethodDelete:
 		if err := s.store.DeleteSecret(user.ID, name); err != nil {
 			errResp(w, 404, err.Error())
 			return
+		}
+		// A deleted secret takes its grants with it: re-creating the name later
+		// must not quietly revive access granted to the old one.
+		if err := s.store.DeleteSecretGrantsForSecret(user.ID, name); err != nil {
+			slog.Warn("secret.grants_cleanup", "secret", name, "error", err)
 		}
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 	default:
@@ -527,6 +547,10 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 			GuestIP  string `json:"guest_ip"`
 		} `json:"network"`
 		AgentToken string `json:"agent_token"`
+		// krucible: "memory" (default) restores the guest's RAM, trust store
+		// included; "filesystem" cold-boots a fresh guest from the disk.
+		Type      string          `json:"type"`
+		NetPolicy json.RawMessage `json:"net_policy"`
 	}
 	var m manifest
 	if err := json.Unmarshal([]byte(snap.ManifestJSON), &m); err != nil {
@@ -575,10 +599,19 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		EngineMeta: json.RawMessage("{}"),
 		CreatedBy:  user.ID, CreatedAt: time.Now(),
 	}
+	memory := m.Type != "filesystem"
+	if memory && len(m.NetPolicy) > 0 && string(m.NetPolicy) != "null" {
+		sb.NetPolicy = m.NetPolicy // the restore runs under the source's egress policy
+	}
 	if err := s.store.CreateSandbox(sb); err != nil {
 		s.engine.Destroy(r.Context(), info.EngineID)
 		errRespInternal(w, r, "store sandbox failed", err)
 		return
+	}
+	if memory {
+		// The restored guest trusts its source's CA (it's in the RAM and disk
+		// it came back with); a source destroyed since took its CA along.
+		s.inheritSandboxCA(user.ID, snap.SourceSandbox, sbID)
 	}
 
 	// Create volume_attachments for volumes in the snapshot manifest.
