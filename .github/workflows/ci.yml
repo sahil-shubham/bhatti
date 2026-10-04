@@ -56,8 +56,8 @@ jobs:
     # helper (bhatti-vmm) + the krucible-tagged Go, then run the pure-unit tests.
     # This is a build/link + unit gate only — the VM suites need a hypervisor and
     # self-skip here (no /dev/kvm on GitHub-hosted runners); they run on the
-    # self-hosted KVM cluster in krucible-integration.yml. No libkrunfw is needed: libkrun
-    # dlopen's it lazily and the external/lean-kernel path skips it entirely.
+    # self-hosted KVM cluster in krucible-integration.yml. bhatti-vmm boots only the
+    # lean kernel, so no libkrunfw is involved anywhere.
     name: Krucible Build & Unit
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -83,8 +83,8 @@ jobs:
           sudo apt-get install -y -qq build-essential pkg-config
           rustc --version && cargo --version   # Rust is preinstalled on ubuntu-latest
 
-      - name: Build libkrucible (libkrun --no-default-features --features blk)
-        # Catches Rust / cfg breakage in the fork on x86-linux.
+      - name: Build libkrucible (upstream libkrun, features blk,net,ffi)
+        # Catches Rust / cfg / C-API breakage on x86-linux.
         run: make krucible
 
       - name: Build bhatti-vmm (cgo link against libkrun)

@@ -73,9 +73,8 @@ func newNetEngineAt(t *testing.T, dataDir, sockDir string) engine.Engine {
 		VMMBinary:   vmm,
 		LibDir:      libDir(),
 		BlockRoot:   true,
-		NetBackend:  true,
 		NetdBinary:  netd,
-		KernelImage: os.Getenv("KRUCIBLE_LEAN_KERNEL"),
+		KernelImage: requireLeanKernel(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New(net): %v", err)

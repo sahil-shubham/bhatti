@@ -30,7 +30,7 @@ import (
 // it's extra coverage of the existing cold tier. Skips without libkrun / a
 // hypervisor / mke2fs (newBlockRootEngine).
 func TestKrucibleColdTierMultiVcpu(t *testing.T) {
-	eng := newBlockRootEngine(t)
+	eng := newCheckpointEngine(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 

@@ -21,7 +21,7 @@ import (
 // sandbox, then a hang). The per-VM launchMu must collapse the burst into a
 // single launch. Cross-arch (pure-Go engine) — guards macOS + both Linux arches.
 func TestKrucibleConcurrentWakeNoDoubleLaunch(t *testing.T) {
-	eng := newBlockRootEngine(t).(*Engine) // skips if libkrun/vmm/mke2fs unavailable
+	eng := newCheckpointEngine(t).(*Engine) // skips if libkrun/vmm/mke2fs unavailable
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 

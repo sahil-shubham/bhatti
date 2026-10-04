@@ -29,6 +29,9 @@ import (
 func TestKrucibleForkNetIdentity(t *testing.T) {
 	eng := newNetEngine(t)
 	ke := eng.(*Engine)
+	if !ke.caps.Checkpoint {
+		t.Skip("bhatti-vmm build has no checkpoint support; skipping")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
 	defer cancel()
 

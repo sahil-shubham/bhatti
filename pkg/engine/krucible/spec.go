@@ -35,16 +35,17 @@ type VMVolume struct {
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
-type VMSpec struct {
-	// RootfsDir is a host directory exposed to the guest as the virtiofs root
-	// (krun_set_root). For the POC there is no ext4/qcow2 image; qcow2 CoW
-	// overlays arrive with snapshot in P3.
-	RootfsDir string `json:"rootfs_dir,omitempty"`
+// VMMCapabilities is what a bhatti-vmm build supports, as printed by
+// `bhatti-vmm capabilities`. The engine reads it once at startup.
+type VMMCapabilities struct {
+	// Checkpoint covers everything built on saving VM state: pause/resume,
+	// cold snapshot/restore and fork.
+	Checkpoint bool `json:"checkpoint"`
+}
 
-	// RootDisk, if set, boots from a raw ext4 block image (krun_set_root_disk)
-	// instead of a virtio-fs host dir. This is the cold/fork-tier root: its
-	// snapshot state is just queue config (no FUSE inode map), and the image is
-	// the portable cold artifact. Mutually exclusive with RootfsDir.
+type VMSpec struct {
+	// RootDisk is the root block image (raw ext4, or a qcow2 overlay over one),
+	// attached first so it's /dev/vda. Required.
 	RootDisk string `json:"root_disk,omitempty"`
 
 	// RootDiskFormat selects how RootDisk is opened: "" / "raw" = a raw ext4

@@ -17,7 +17,7 @@ import (
 // unrestorable snapshot). The source is undisturbed; a filesystem snapshot is
 // the supported path for mounted sandboxes.
 func TestKrucibleForkMountedRefused(t *testing.T) {
-	eng := newBlockRootEngine(t)
+	eng := newCheckpointEngine(t)
 	ke := eng.(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

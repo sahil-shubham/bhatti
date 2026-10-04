@@ -38,7 +38,7 @@ func makeVolume(t *testing.T, name, mount string) engine.ResolvedVolume {
 // Injection: make the bundle dir unwritable so the helper's memory.img write
 // (into it) fails with EACCES after the PAUSE. Deterministic, no disk-fill.
 func TestKrucibleSnapshotFailureRecoverable(t *testing.T) {
-	eng := newBlockRootEngine(t).(*Engine)
+	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 
@@ -86,7 +86,7 @@ func TestKrucibleSnapshotFailureRecoverable(t *testing.T) {
 // stay matched, never swapped, and each carries its own data. A swap would show
 // /data1's marker under /data0 (or a missing mount).
 func TestKrucibleMultiVolumeSnapshotOrdering(t *testing.T) {
-	eng := newBlockRootEngine(t).(*Engine)
+	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
 
@@ -161,22 +161,22 @@ func TestKrucibleCreateCleansUpOnLaunchFailure(t *testing.T) {
 	dataDir := t.TempDir()
 	sockDir := t.TempDir()
 
-	// Fake helper: services the `create-overlay` subcommand (so create() gets past
-	// disk prep), but on the VM-run invocation just sleeps — the agent socket never
-	// appears, so WaitReady must give up at the caller's deadline and create() must
-	// clean up. Distinguishing the two invocations is essential: create() shells to
-	// the SAME binary for create-overlay, so a blanket sleep would wedge disk prep.
+	// Fake helper: answers the startup `capabilities` probe, but on the VM-run
+	// invocation just sleeps — the agent socket never appears, so WaitReady must
+	// give up at the caller's deadline and create() must clean up.
 	fake := filepath.Join(t.TempDir(), "fake-vmm")
-	script := "#!/bin/sh\ncase \"$1\" in\n  create-overlay) : > \"$2\"; exit 0 ;;\n  *) exec sleep 30 ;;\nesac\n"
+	script := "#!/bin/sh\ncase \"$1\" in\n  capabilities) echo '{\"checkpoint\":false}'; exit 0 ;;\n  *) exec sleep 30 ;;\nesac\n"
 	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	eng, err := New(Config{
-		DataDir:    dataDir,
-		SocketDir:  sockDir,
-		BaseRootfs: buildBaseRootfs(t, repo),
-		VMMBinary:  fake,
-		BlockRoot:  true,
+		DataDir:     dataDir,
+		SocketDir:   sockDir,
+		BaseRootfs:  buildBaseRootfs(t, repo),
+		VMMBinary:   fake,
+		BlockRoot:   true,
+		KernelImage: "/nonexistent/kernel", // never booted: the fake helper only sleeps
+		NetdBinary:  requireNetd(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -218,7 +218,7 @@ func TestKrucibleCreateCleansUpOnLaunchFailure(t *testing.T) {
 // overwrite an existing named snapshot (FC `CheckpointDuplicateName`) — a
 // clobber would silently corrupt a restore point.
 func TestKrucibleCheckpointDuplicateNameRefused(t *testing.T) {
-	eng := newBlockRootEngine(t).(*Engine)
+	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
@@ -243,7 +243,7 @@ func TestKrucibleCheckpointDuplicateNameRefused(t *testing.T) {
 // destroy must not panic, deadlock, or leak a helper — one serializes after the
 // other and the sandbox ends up gone with no orphaned bhatti-vmm.
 func TestKrucibleConcurrentCheckpointAndDestroy(t *testing.T) {
-	eng := newBlockRootEngine(t).(*Engine)
+	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 

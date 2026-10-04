@@ -19,7 +19,7 @@ import (
 // captured filesystem boots as a reusable image (`image save` + `create
 // --image`, the per-create image selection that krucible previously ignored).
 func TestKrucibleSaveImageRoundTrip(t *testing.T) {
-	eng := newBlockRootEngine(t)
+	eng := newCheckpointEngine(t)
 	ke := eng.(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

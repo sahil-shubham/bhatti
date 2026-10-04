@@ -21,7 +21,7 @@ import (
 // just RAM+root) — AND the fork's volume is an independent copy (writes in the
 // fork don't touch the source's volume).
 func TestKrucibleForkWithVolume(t *testing.T) {
-	eng := newBlockRootEngine(t)
+	eng := newCheckpointEngine(t)
 	ke := eng.(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
 	defer cancel()

@@ -36,7 +36,7 @@ func recoveryEngine(t *testing.T, dataDir, baseRootfs string) *Engine {
 	}
 	eng, err := New(Config{
 		DataDir: dataDir, BaseRootfs: baseRootfs, VMMBinary: vmm,
-		LibDir: libDir(), BlockRoot: true,
+		LibDir: libDir(), BlockRoot: true, KernelImage: requireLeanKernel(t, repo), NetdBinary: requireNetd(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

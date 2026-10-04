@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log/slog"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,12 +31,15 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		}
 	}
 
-	// bhatti-netd: the per-owner network gateway (pure Go), the DEFAULT in v2.
-	// Autodetected next to the binary / on PATH (same discovery as vmm). If the
-	// net backend is on but the helper is missing, fail fast with a clear message
-	// rather than silently falling back to the insecure shared-netstack (TSI).
+	// bhatti-netd: the per-owner network gateway, the guest's only network.
+	// Autodetected next to the binary / on PATH (same discovery as vmm); the
+	// engine refuses to start without it.
+	if cfg.KrucibleNetBackend != nil && !*cfg.KrucibleNetBackend {
+		return nil, fmt.Errorf("krucible_net_backend: false is no longer supported: " +
+			"guests are networked only through bhatti-netd; remove the key")
+	}
 	netd := cfg.KrucibleNetd
-	if netd == "" && cfg.NetBackendEnabled() {
+	if netd == "" {
 		if exe, err := os.Executable(); err == nil {
 			cand := filepath.Join(filepath.Dir(exe), "bhatti-netd")
 			if _, err := os.Stat(cand); err == nil {
@@ -49,36 +52,17 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 			}
 		}
 	}
-	netBackend := cfg.NetBackendEnabled()
-	if netBackend && netd == "" {
-		// The secure gateway is the default, but the daemon is built at startup on
-		// hosts that may not have the runtime (dev builds, the unit-test gate). Don't
-		// refuse to start — fall back to TSI with a LOUD warning. A correct install
-		// ships bhatti-netd next to the binary, so this never fires in production.
-		slog.Warn("bhatti-netd not found — the secure network gateway is DISABLED and the " +
-			"guest is NOT isolated from the host (legacy TSI). Install the runtime bundle or run " +
-			"`make netd`; set krucible_net_backend: false to silence this warning.")
-		netBackend = false
-	}
 
+	// Where libkrun lives when bhatti-vmm can't find it through its rpath (dev
+	// builds); put on the helper's library path.
 	libDir := cfg.KrucibleLibDir
-	if libDir == "" {
-		// libkrunfw lives in Homebrew on macOS, /usr/local/lib64 (or lib) on Linux.
-		for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib64", "/usr/local/lib", "/usr/lib64", "/usr/lib"} {
-			if m, _ := filepath.Glob(filepath.Join(d, "libkrunfw*")); len(m) > 0 {
-				libDir = d
-				break
-			}
-		}
-	}
 
 	// A prebuilt base image implies the block-root (cold-capable) path.
 	blockRoot := cfg.KrucibleBlockRoot || cfg.KrucibleBaseImage != ""
 
-	// Lean external kernel (krucible external-kernel boot, ~2x faster cold-start
-	// than libkrunfw's bundled kernel). Explicit config wins; else autodetect a
-	// dist/kernel/{Image,vmlinux}-lean-*-<arch> next to the binary or in the CWD.
-	// Empty -> fall back to the libkrunfw bundle. Block-root only (engine-gated).
+	// Lean external kernel (bhatti-vmm boots nothing else). Explicit config wins;
+	// else autodetect a dist/kernel/{Image,vmlinux}-lean-*-<arch> next to the
+	// binary or in the CWD. The engine refuses to start without one.
 	kernelImage := cfg.KrucibleKernelImage
 	if kernelImage == "" && blockRoot {
 		karch := map[string]string{"arm64": "aarch64", "amd64": "x86_64"}[runtime.GOARCH]
@@ -109,7 +93,6 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		LibDir:      libDir,
 		SocketDir:   cfg.KrucibleSocketDir,
 		KernelImage: kernelImage,
-		NetBackend:  netBackend,
 		NetdBinary:  netd,
 	})
 }

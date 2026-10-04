@@ -21,7 +21,7 @@ import (
 // restore guest RAM (a tmpfs marker survives, proving a memory restore, not a
 // fresh boot), reusing the in-guest token.
 func TestKrucibleCheckpointResume(t *testing.T) {
-	eng := newBlockRootEngine(t)
+	eng := newCheckpointEngine(t)
 	ke := eng.(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()

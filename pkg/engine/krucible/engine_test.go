@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
@@ -28,48 +27,45 @@ func ensureVMMSigned(t *testing.T, vmm string) {
 	}
 }
 
-// newSuiteEngine builds a krucible engine for the shared enginetest suite,
-// self-skipping if libkrun / bhatti-vmm aren't available (so `go test ./...`
-// stays green on hosts without libkrun). Build the helper with `make vmm`.
-func newSuiteEngine(t *testing.T) engine.Engine {
-	repo := repoRoot(t)
-	if !hasLibkrun() {
-		t.Skip("libkrun not installed (pkg-config libkrun); skipping")
+// leanKernel returns the lean guest kernel the VM tests boot:
+// KRUCIBLE_LEAN_KERNEL, else the build output under dist/kernel.
+func leanKernel(repo string) string {
+	if k := os.Getenv("KRUCIBLE_LEAN_KERNEL"); k != "" {
+		return k
 	}
-	if !hasHypervisor() {
-		t.Skip("no hypervisor (/dev/kvm or HVF); skipping VM suite")
+	karch := map[string]string{"arm64": "aarch64", "amd64": "x86_64"}[runtime.GOARCH]
+	for _, pat := range []string{"Image-lean-*-" + karch, "vmlinux-lean-*-" + karch} {
+		if m, _ := filepath.Glob(filepath.Join(repo, "dist", "kernel", pat)); len(m) > 0 {
+			return m[0]
+		}
 	}
-	vmm := filepath.Join(repo, "bhatti-vmm")
-	if _, err := os.Stat(vmm); err != nil {
-		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
-	}
-	ensureVMMSigned(t, vmm)
-	eng, err := New(Config{
-		DataDir:    t.TempDir(),
-		BaseRootfs: buildBaseRootfs(t, repo),
-		VMMBinary:  vmm,
-		LibDir:     libDir(),
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	return eng
+	return ""
 }
 
-// TestKrucibleAgentSuite runs the shared VMM-agnostic behavior suite against the
-// krucible engine — the parity gate (the same suite is meant to pass on FC).
-func TestKrucibleAgentSuite(t *testing.T) {
-	enginetest.RunAgentSuite(t, newSuiteEngine)
+// requireLeanKernel returns leanKernel(repo), skipping the test if there is none.
+func requireLeanKernel(t *testing.T, repo string) string {
+	t.Helper()
+	k := leanKernel(repo)
+	if k == "" {
+		t.Skip("no lean kernel: set KRUCIBLE_LEAN_KERNEL or build dist/kernel; skipping")
+	}
+	return k
 }
 
-// TestKrucibleThermalSuite asserts hot/warm transitions on the krucible engine.
-// Skips until the engine implements the thermal surface (P2).
-func TestKrucibleThermalSuite(t *testing.T) {
-	enginetest.RunThermalSuite(t, newSuiteEngine)
+// requireNetd returns the built bhatti-netd, skipping the test if there is none.
+func requireNetd(t *testing.T, repo string) string {
+	t.Helper()
+	netd := filepath.Join(repo, "bhatti-netd")
+	if _, err := os.Stat(netd); err != nil {
+		t.Skip("bhatti-netd not built (go build -o bhatti-netd ./cmd/bhatti-netd); skipping")
+	}
+	return netd
 }
 
-// newBlockRootEngine builds a krucible engine that boots sandboxes from a CoW
-// ext4 block image (cold-tier capable). Requires mke2fs on the host.
+// newBlockRootEngine builds a krucible engine for the VM suites: a qcow2 block
+// root over a base built from a test rootfs, booting the lean kernel. It
+// self-skips when libkrun, a hypervisor, mke2fs, bhatti-vmm or the kernel is
+// missing, so `go test ./...` stays green on hosts that can't run VMs.
 func newBlockRootEngine(t *testing.T) engine.Engine {
 	repo := repoRoot(t)
 	if !hasLibkrun() {
@@ -85,17 +81,16 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
+	kernel := requireLeanKernel(t, repo)
 	ensureVMMSigned(t, vmm)
 	eng, err := New(Config{
-		DataDir:    t.TempDir(),
-		BaseRootfs: buildBaseRootfs(t, repo),
-		VMMBinary:  vmm,
-		LibDir:     libDir(),
-		BlockRoot:  true,
-		// Opt-in: boot the external lean kernel instead of the libkrunfw bundle,
-		// so the block-root suites (snapshot, concurrent-wake) double as the
-		// lean-kernel parity gate when KRUCIBLE_LEAN_KERNEL is set.
-		KernelImage: os.Getenv("KRUCIBLE_LEAN_KERNEL"),
+		DataDir:     t.TempDir(),
+		BaseRootfs:  buildBaseRootfs(t, repo),
+		VMMBinary:   vmm,
+		LibDir:      libDir(),
+		BlockRoot:   true,
+		KernelImage: kernel,
+		NetdBinary:  requireNetd(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -103,27 +98,39 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 	return eng
 }
 
+// newCheckpointEngine is newBlockRootEngine for tests that pause, stop,
+// snapshot or fork; it skips when the bhatti-vmm build can't checkpoint.
+func newCheckpointEngine(t *testing.T) engine.Engine {
+	eng := newBlockRootEngine(t)
+	if !eng.(*Engine).caps.Checkpoint {
+		t.Skip("bhatti-vmm build has no checkpoint support; skipping")
+	}
+	return eng
+}
+
+// TestKrucibleAgentSuite runs the shared VMM-agnostic behavior suite against the
+// krucible engine — the parity gate (the same suite is meant to pass on FC).
+func TestKrucibleAgentSuite(t *testing.T) {
+	enginetest.RunAgentSuite(t, newBlockRootEngine)
+}
+
+// TestKrucibleThermalSuite asserts hot/warm transitions.
+func TestKrucibleThermalSuite(t *testing.T) {
+	enginetest.RunThermalSuite(t, newCheckpointEngine)
+}
+
 // TestKrucibleSnapshotSuite is the cold-tier gate: Stop (snapshot + free RAM) /
 // Start (restore) round-trip with RAM + rootfs intact and exec-after-restore.
 func TestKrucibleSnapshotSuite(t *testing.T) {
-	enginetest.RunSnapshotSuite(t, newBlockRootEngine)
+	enginetest.RunSnapshotSuite(t, newCheckpointEngine)
 }
 
-// TestKrucibleReliabilitySuite is the cold-tier HARDENING gate (migration plan
-// P1): N stop→start cycles stay stable (RAM + rootfs survive each), lifecycle
-// transitions are idempotent, and a concurrent Stop/Start/Exec storm converges
-// to a usable VM. The engine-internal failure injections (snapshot-write
-// failure, agent-timeout cleanup) live in reliability_test.go.
+// TestKrucibleReliabilitySuite is the cold-tier HARDENING gate: N stop→start
+// cycles stay stable (RAM + rootfs survive each), lifecycle transitions are
+// idempotent, and a concurrent Stop/Start/Exec storm converges to a usable VM.
+// The engine-internal failure injections live in reliability_test.go.
 func TestKrucibleReliabilitySuite(t *testing.T) {
-	enginetest.RunReliabilitySuite(t, newBlockRootEngine)
-}
-
-// TestKrucibleBlockRootAgentSuite runs the agent suite on a block-root engine.
-// With KRUCIBLE_LEAN_KERNEL set it doubles as the cross-arch lean-kernel
-// boot+agent gate, independent of the cold tier — so it runs on linux/arm64
-// (where the cold tier isn't wired yet) as well as macOS + linux/x86.
-func TestKrucibleBlockRootAgentSuite(t *testing.T) {
-	enginetest.RunAgentSuite(t, newBlockRootEngine)
+	enginetest.RunReliabilitySuite(t, newCheckpointEngine)
 }
 
 // --- test helpers ---
@@ -165,28 +172,18 @@ func hasHypervisor() bool {
 	}
 }
 
-// libDir returns a dyld search path covering libkrun + libkrunfw. Prefers the
-// libkrucible build prefix (our fork's libkrun) and appends the dir holding
-// libkrunfw (Homebrew). Colon-separated; passed straight to the helper's
-// DYLD_FALLBACK_LIBRARY_PATH / LD_LIBRARY_PATH.
+// libDir returns the libkrucible build prefix's library dir (lib64 on Linux,
+// lib on macOS), passed to the helper's DYLD_FALLBACK_LIBRARY_PATH /
+// LD_LIBRARY_PATH.
 func libDir() string {
-	var dirs []string
-	// libkrucible install prefix: libkrun.so lands in lib64 on Linux, lib on macOS.
 	for _, sub := range []string{"lib64", "lib"} {
 		if p, err := filepath.Abs("../../../libkrucible/_install/" + sub); err == nil {
 			if m, _ := filepath.Glob(filepath.Join(p, "libkrun.*")); len(m) > 0 {
-				dirs = append(dirs, p)
+				return p
 			}
 		}
 	}
-	// libkrunfw: Homebrew on macOS, /usr/local/lib64 (or lib) on Linux.
-	for _, d := range []string{"/opt/homebrew/lib", "/usr/local/lib64", "/usr/local/lib", "/usr/lib64", "/usr/lib"} {
-		if matches, _ := filepath.Glob(filepath.Join(d, "libkrunfw*")); len(matches) > 0 {
-			dirs = append(dirs, d)
-			break
-		}
-	}
-	return strings.Join(dirs, ":")
+	return ""
 }
 
 // buildBaseRootfs cross-compiles lohar to <root>/init.krun and a tiny multi-call

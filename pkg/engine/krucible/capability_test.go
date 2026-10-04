@@ -14,7 +14,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
-// TestEngineCapabilities boots one VM and probes the agent surface + TSI
+// TestEngineCapabilities boots one VM and probes the agent surface
 // networking, printing a WORKS / FAILS / N/A matrix. Informational — run with:
 //
 //	go test ./pkg/engine/krucible/ -run TestEngineCapabilities -v
@@ -35,10 +35,13 @@ func TestEngineCapabilities(t *testing.T) {
 	}
 
 	eng, err := New(Config{
-		DataDir:    t.TempDir(),
-		BaseRootfs: buildBaseRootfs(t, repo),
-		VMMBinary:  vmm,
-		LibDir:     libDir(),
+		DataDir:     t.TempDir(),
+		BaseRootfs:  buildBaseRootfs(t, repo),
+		VMMBinary:   vmm,
+		LibDir:      libDir(),
+		BlockRoot:   true,
+		KernelImage: requireLeanKernel(t, repo),
+		NetdBinary:  requireNetd(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -145,7 +148,7 @@ func TestEngineCapabilities(t *testing.T) {
 		return fmt.Sprintf("/bin has %d entries", len(fis)), nil
 	})
 
-	must("tsi egress: tcp", func() (string, error) {
+	must("egress: tcp", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"netcheck", "tcp"})
 		if err != nil {
 			return "", err
@@ -155,7 +158,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return strings.TrimSpace(r.Stdout), nil
 	})
-	must("tsi egress: dns", func() (string, error) {
+	must("egress: dns", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"netcheck", "dns"})
 		if err != nil {
 			return "", err
@@ -165,7 +168,7 @@ func TestEngineCapabilities(t *testing.T) {
 		}
 		return strings.TrimSpace(r.Stdout), nil
 	})
-	must("tsi egress: http", func() (string, error) {
+	must("egress: http", func() (string, error) {
 		r, err := eng.Exec(ctx, id, []string{"netcheck", "http"})
 		if err != nil {
 			return "", err

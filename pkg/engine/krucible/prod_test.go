@@ -45,11 +45,13 @@ func TestKrucibleProductionImage(t *testing.T) {
 	}
 
 	eng, err := New(Config{
-		DataDir:   t.TempDir(),
-		BaseImage: img,
-		BlockRoot: true,
-		VMMBinary: vmm,
-		LibDir:    libDir(),
+		DataDir:     t.TempDir(),
+		BaseImage:   img,
+		BlockRoot:   true,
+		VMMBinary:   vmm,
+		LibDir:      libDir(),
+		KernelImage: requireLeanKernel(t, repo),
+		NetdBinary:  requireNetd(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

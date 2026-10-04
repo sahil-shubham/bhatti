@@ -18,7 +18,7 @@ func TestKrucibleClockFreeze(t *testing.T) {
 	// rewind (KVM_SET_CLOCK + clocksource=kvm-clock); linux/arm64 rewinds the
 	// guest virtual counter via KVM_REG_ARM_TIMER_CNT (CNTVOFF_EL2 itself is an
 	// EL2 reg KVM won't surface to an EL1 guest vCPU).
-	eng := newSuiteEngine(t).(*Engine)
+	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "clk", CPUs: 1, MemoryMB: 512})

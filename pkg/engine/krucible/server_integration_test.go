@@ -26,7 +26,7 @@ import (
 // against a COLD (snapshotted, helper-killed) sandbox transparently cold-restores
 // it via the server's ensureHot -> EnsureHot -> Start.
 func TestKrucibleServerIntegration(t *testing.T) {
-	_, do := krucibleServer(t) // skips if libkrun/vmm/mke2fs unavailable
+	_, do := krucibleServer(t, newCheckpointEngine) // skips if libkrun/vmm/mke2fs unavailable
 
 	// --- create over HTTP ---
 	resp := do("POST", "/sandboxes", map[string]any{"name": "srv-it", "memory_mb": 512})
@@ -75,9 +75,9 @@ type doFunc func(method, path string, body any) *http.Response
 // krucibleServer stands up the full daemon (HTTP API + store + thermal) over a
 // real krucible block-root engine and returns an httptest server + an
 // authenticated request helper. Skips if libkrun/vmm/mke2fs are unavailable.
-func krucibleServer(t *testing.T) (*httptest.Server, doFunc) {
+func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*httptest.Server, doFunc) {
 	t.Helper()
-	eng := newBlockRootEngine(t)
+	eng := newEngine(t)
 	dir := t.TempDir()
 	st, err := store.New(filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -124,7 +124,7 @@ func krucibleServer(t *testing.T) (*httptest.Server, doFunc) {
 // it to the guest over the vsock tunnel -> a GET to that host port returns the
 // guest's response.
 func TestKrucibleServerForward(t *testing.T) {
-	_, do := krucibleServer(t)
+	_, do := krucibleServer(t, newBlockRootEngine)
 
 	resp := do("POST", "/sandboxes", map[string]any{"name": "fwd-srv"})
 	if resp.StatusCode != 201 {
@@ -172,7 +172,7 @@ func TestKrucibleServerForward(t *testing.T) {
 // POST /sandboxes with {from} forks a running sandbox via the engine's Fork
 // capability; the fork is a distinct, working, independent VM.
 func TestKrucibleServerFork(t *testing.T) {
-	_, do := krucibleServer(t) // skips if libkrun/vmm/mke2fs unavailable
+	_, do := krucibleServer(t, newCheckpointEngine) // skips if libkrun/vmm/mke2fs unavailable
 
 	resp := do("POST", "/sandboxes", map[string]any{"name": "fork-src", "memory_mb": 512})
 	if resp.StatusCode != 201 {

@@ -33,7 +33,7 @@ func leanColdEngine(t *testing.T) engine.Engine {
 	}
 	eng, err := New(Config{
 		DataDir: t.TempDir(), BaseImage: img, BlockRoot: true,
-		VMMBinary: vmm, LibDir: libDir(), KernelImage: lean,
+		VMMBinary: vmm, LibDir: libDir(), KernelImage: lean, NetdBinary: requireNetd(t, repoRoot(t)),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -75,7 +75,7 @@ func TestKrucibleLeanKernel(t *testing.T) {
 	bootOnce := func(t *testing.T, kernel string) (time.Duration, string) {
 		eng, err := New(Config{
 			DataDir: t.TempDir(), BaseImage: img, BlockRoot: true,
-			VMMBinary: vmm, LibDir: libDir(), KernelImage: kernel,
+			VMMBinary: vmm, LibDir: libDir(), KernelImage: kernel, NetdBinary: requireNetd(t, repoRoot(t)),
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)

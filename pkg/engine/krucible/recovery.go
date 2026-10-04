@@ -27,7 +27,6 @@ type vmRecord struct {
 	Name       string `json:"name"`
 	UserID     string `json:"user_id"`
 	SandboxDir string `json:"sandbox_dir"`
-	RootfsDir  string `json:"rootfs_dir"`
 	SockDir    string `json:"sock_dir"`
 	ControlUDS string `json:"control_uds"`
 	ForwardUDS string `json:"forward_uds"`
@@ -84,7 +83,7 @@ func stateFilePath(sandboxDir string) string { return filepath.Join(sandboxDir, 
 func (vm *VM) toRecordLocked() vmRecord {
 	return vmRecord{
 		ID: vm.ID, Name: vm.Name, UserID: vm.UserID,
-		SandboxDir: vm.SandboxDir, RootfsDir: vm.RootfsDir, SockDir: vm.SockDir,
+		SandboxDir: vm.SandboxDir, SockDir: vm.SockDir,
 		ControlUDS: vm.ControlUDS, ForwardUDS: vm.ForwardUDS, CtlSockUDS: vm.CtlSockUDS,
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
 		BundleDir: vm.BundleDir, LogPath: vm.logPath, BaseSpec: vm.baseSpec,
@@ -128,7 +127,7 @@ func writeRecord(rec vmRecord) {
 func vmFromRecord(rec vmRecord) *VM {
 	return &VM{
 		ID: rec.ID, Name: rec.Name, UserID: rec.UserID,
-		SandboxDir: rec.SandboxDir, RootfsDir: rec.RootfsDir, SockDir: rec.SockDir,
+		SandboxDir: rec.SandboxDir, SockDir: rec.SockDir,
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
 		BundleDir: rec.BundleDir, baseSpec: rec.BaseSpec, logPath: rec.LogPath,

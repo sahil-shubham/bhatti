@@ -74,6 +74,9 @@ func (e *Engine) CheckpointTyped(ctx context.Context, sandboxID, userID string, 
 }
 
 func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (any, error) {
+	if !e.caps.Checkpoint {
+		return nil, errNoCheckpoint
+	}
 	finalDir := filepath.Join(snapDir, snapName)
 	if _, err := os.Stat(finalDir); err == nil {
 		return nil, fmt.Errorf("snapshot %q already exists", snapName)
@@ -311,6 +314,9 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 //
 // dst is itself a bootable qcow2 root (backs the same base as the source).
 func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
+	if !e.caps.Checkpoint {
+		return errNoCheckpoint // the consistent copy needs the VM paused
+	}
 	// Reachable agent for the guest sync; releases its own lock before we take
 	// launchMu below.
 	if err := e.EnsureHot(ctx, sandboxID); err != nil {

@@ -17,7 +17,7 @@ import (
 // in-memory state (a tmpfs/RAM marker is present in the fork), then both run
 // independently and diverge, with the source undisturbed.
 func TestKrucibleFork(t *testing.T) {
-	eng := newBlockRootEngine(t)
+	eng := newCheckpointEngine(t)
 	ke := eng.(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()

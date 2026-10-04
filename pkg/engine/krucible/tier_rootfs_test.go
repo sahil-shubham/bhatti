@@ -50,9 +50,8 @@ func TestKrucibleTierRootfsBoots(t *testing.T) {
 		BlockRoot:   true,
 		VMMBinary:   vmm,
 		LibDir:      libDir(),
-		NetBackend:  true,
 		NetdBinary:  netd,
-		KernelImage: os.Getenv("KRUCIBLE_LEAN_KERNEL"),
+		KernelImage: requireLeanKernel(t, repo),
 	})
 	if err != nil {
 		t.Fatalf("New(tier): %v", err)

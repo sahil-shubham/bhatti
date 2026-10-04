@@ -18,6 +18,9 @@ import (
 
 // Pause: hot → warm. Idempotent on warm.
 func (e *Engine) Pause(ctx context.Context, id string) error {
+	if !e.caps.Checkpoint {
+		return errNoCheckpoint
+	}
 	vm, err := e.getVM(id)
 	if err != nil {
 		return err

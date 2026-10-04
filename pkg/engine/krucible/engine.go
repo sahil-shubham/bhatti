@@ -14,7 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -52,12 +52,10 @@ type Config struct {
 	// libkrunfw's bundled kernel. Block-root only (the cmdline roots on
 	// /dev/vda). arm64 = raw `Image`, x86 = ELF vmlinux.
 	KernelImage string
-	// NetBackend switches the guest off TSI onto a virtio-net device wired to a
-	// per-sandbox userspace gateway (bhatti-netd). Requires NetdBinary. Egress
-	// policy + host-isolation + (later) secret substitution live in the gateway.
-	NetBackend bool
-	// NetdBinary is the path to the bhatti-netd gateway helper (built from
-	// cmd/bhatti-netd). Required when NetBackend is set.
+	// NetdBinary is the bhatti-netd gateway helper (cmd/bhatti-netd). Required:
+	// the guest's only network is a virtio-net device wired to its owner's
+	// gateway, which polices egress and isolates the host. (libkrun's TSI needs
+	// a patched guest kernel; the lean kernel isn't one.)
 	NetdBinary string
 }
 
@@ -316,7 +314,6 @@ type VM struct {
 	Name       string
 	UserID     string
 	SandboxDir string
-	RootfsDir  string
 	SockDir    string
 	ControlUDS string // guest vsock 1024 (agent control)
 	ForwardUDS string // guest vsock 1025 (port forward)
@@ -347,6 +344,41 @@ type Engine struct {
 	baseImgMu sync.Mutex               // guards the one-time base-image build
 	netdMu    sync.Mutex               // guards netds
 	netds     map[string]*netdInstance // owner key → shared bhatti-netd gateway
+	caps      VMMCapabilities          // what the bhatti-vmm build supports (probed in New)
+}
+
+// errNoCheckpoint is returned by every operation that needs saved VM state
+// when the VMM build has no checkpoint support.
+var errNoCheckpoint = fmt.Errorf("%w: this bhatti-vmm build has no checkpoint support (stop, pause, snapshot, restore and fork are unavailable)", engine.ErrNotSupported)
+
+// ThermalSupported reports whether hot/warm/cold transitions are available.
+// The server consults it before using the engine's thermal methods.
+func (e *Engine) ThermalSupported() bool { return e.caps.Checkpoint }
+
+// probeCapabilities asks the VMM helper what it supports. A helper that can't
+// answer is rejected: daemon and helper ship in one bundle, so a mismatch is
+// a broken install, not something to guess around.
+func probeCapabilities(cfg Config) (VMMCapabilities, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, cfg.VMMBinary, "capabilities")
+	if cfg.LibDir != "" {
+		cmd.Env = append(os.Environ(),
+			"DYLD_FALLBACK_LIBRARY_PATH="+cfg.LibDir,
+			"LD_LIBRARY_PATH="+cfg.LibDir,
+		)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return VMMCapabilities{}, fmt.Errorf("krucible: %s capabilities: %w: %s", cfg.VMMBinary, err, strings.TrimSpace(stderr.String()))
+	}
+	var caps VMMCapabilities
+	if err := json.Unmarshal(out, &caps); err != nil {
+		return VMMCapabilities{}, fmt.Errorf("krucible: %s capabilities: bad output %q: %w", cfg.VMMBinary, out, err)
+	}
+	return caps, nil
 }
 
 var _ engine.Engine = (*Engine)(nil)
@@ -359,13 +391,19 @@ func New(cfg Config) (*Engine, error) {
 	if _, err := os.Stat(cfg.VMMBinary); err != nil {
 		return nil, fmt.Errorf("krucible: vmm helper not found at %s (run `make vmm`): %w", cfg.VMMBinary, err)
 	}
-	if cfg.NetBackend {
-		if cfg.NetdBinary == "" {
-			return nil, fmt.Errorf("krucible: NetBackend set but NetdBinary is empty")
-		}
-		if _, err := os.Stat(cfg.NetdBinary); err != nil {
-			return nil, fmt.Errorf("krucible: bhatti-netd not found at %s: %w", cfg.NetdBinary, err)
-		}
+	// bhatti-vmm boots an external kernel from a block root. libkrunfw's bundled
+	// kernel, and the virtio-fs root it could boot, aren't used any more.
+	if cfg.KernelImage == "" {
+		return nil, fmt.Errorf("krucible: no kernel image (set krucible_kernel_image)")
+	}
+	if !cfg.BlockRoot {
+		return nil, fmt.Errorf("krucible: block root required (set krucible_base_image or krucible_block_root)")
+	}
+	if cfg.NetdBinary == "" {
+		return nil, fmt.Errorf("krucible: no bhatti-netd (set krucible_netd)")
+	}
+	if _, err := os.Stat(cfg.NetdBinary); err != nil {
+		return nil, fmt.Errorf("krucible: bhatti-netd not found at %s: %w", cfg.NetdBinary, err)
 	}
 	// Need a rootfs source: a prebuilt block image (production) or a dir tree.
 	if cfg.BaseImage != "" {
@@ -392,7 +430,11 @@ func New(cfg Config) (*Engine, error) {
 	if err := os.MkdirAll(cfg.SocketDir, 0700); err != nil {
 		return nil, fmt.Errorf("krucible: create socket dir: %w", err)
 	}
-	eng := &Engine{vms: make(map[string]*VM), netds: make(map[string]*netdInstance), cfg: cfg}
+	caps, err := probeCapabilities(cfg)
+	if err != nil {
+		return nil, err
+	}
+	eng := &Engine{vms: make(map[string]*VM), netds: make(map[string]*netdInstance), cfg: cfg, caps: caps}
 	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
 	return eng, nil
 }
@@ -452,7 +494,6 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		return info, err
 	}
 	sandboxDir := filepath.Join(e.cfg.DataDir, "sandboxes", id)
-	rootfsDir := filepath.Join(sandboxDir, "rootfs")
 	sockDir := filepath.Join(e.cfg.SocketDir, id)
 
 	var vm *VM
@@ -488,14 +529,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	forwardUDS := filepath.Join(sockDir, "f.sock")
 	ctlSockUDS := filepath.Join(sockDir, "k.sock")
 	configUDS := filepath.Join(sockDir, "cfg.sock")
-	netUDS := ""
-	var netGuestIdx int
-	var netInst *netdInstance
-	if e.cfg.NetBackend {
-		netdKey = netdKeyFor(spec, id)
-		netInst, netGuestIdx = e.acquireNetd(netdKey, spec.SubnetIndex)
-		netUDS = netInst.sock
-	}
+	netdKey = netdKeyFor(spec, id)
+	netInst, netGuestIdx := e.acquireNetd(netdKey, spec.SubnetIndex)
+	netUDS := netInst.sock
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
 		return info, fmt.Errorf("create socket dir: %w", err)
 	}
@@ -506,27 +542,25 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	}
 
 	baseSpec := VMSpec{
-		Vcpus:            vcpus,
-		MemMiB:           memMiB,
-		Pid1:             true,
-		ExecPath:         "/init.krun",
-		VsockControlUDS:  controlUDS,
-		VsockForwardUDS:  forwardUDS,
-		ControlSocketUDS: ctlSockUDS,
-		LogLevel:         2,
+		Vcpus:           vcpus,
+		MemMiB:          memMiB,
+		Pid1:            true,
+		ExecPath:        "/init.krun",
+		VsockControlUDS: controlUDS,
+		VsockForwardUDS: forwardUDS,
+		LogLevel:        2,
 	}
-	// virtio-net gateway backend (opt-in): the guest gets eth0 wired to a
-	// per-sandbox bhatti-netd; lohar configures it from cdNet.
-	var cdNet *configdrive.NetConfig
-	var netIP string
-	if netUDS != "" {
-		baseSpec.NetUDS = netUDS
-		baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
-		netIP = netGuestIPFor(netInst.subnetIdx, netGuestIdx)
-		cdNet = &configdrive.NetConfig{
-			IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
-			Gateway: netGatewayIPFor(netInst.subnetIdx),
-		}
+	if e.caps.Checkpoint {
+		baseSpec.ControlSocketUDS = ctlSockUDS
+	}
+	// The guest's eth0 is wired to its owner's bhatti-netd; lohar configures it
+	// from cdNet.
+	baseSpec.NetUDS = netUDS
+	baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
+	netIP := netGuestIPFor(netInst.subnetIdx, netGuestIdx)
+	cdNet := &configdrive.NetConfig{
+		IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
+		Gateway: netGatewayIPFor(netInst.subnetIdx),
 	}
 
 	name := spec.Name
@@ -535,9 +569,8 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	}
 
 	// Per-sandbox auth token, carried into the guest via the config drive; the
-	// agent enforces it. Empty on the config-less virtio-fs dev path (no auth).
-	// On a memory-snapshot restore, reuse the snapshot's token (the restored guest
-	// enforces it from RAM).
+	// agent enforces it. On a memory-snapshot restore, reuse the snapshot's
+	// token (the restored guest enforces it from RAM).
 	token := opts.forcedToken
 
 	// virtio-fs --mount binds: assign a per-mount tag; the VMM exposes each host
@@ -633,16 +666,11 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			return info, fmt.Errorf("write config.json: %w", err)
 		}
 		baseSpec.VsockConfigUDS = configUDS
-	} else {
-		if err = cloneTree(e.cfg.BaseRootfs, rootfsDir); err != nil {
-			return info, fmt.Errorf("clone rootfs: %w", err)
-		}
-		baseSpec.RootfsDir = rootfsDir
 	}
 
 	vm = &VM{
 		ID: id, Name: name, UserID: spec.UserID,
-		SandboxDir: sandboxDir, RootfsDir: rootfsDir, SockDir: sockDir,
+		SandboxDir: sandboxDir, SockDir: sockDir,
 		ControlUDS: controlUDS, ForwardUDS: forwardUDS, CtlSockUDS: ctlSockUDS,
 		MemMiB: memMiB, Thermal: "hot", Status: "stopped", Token: token,
 		BundleDir: filepath.Join(sandboxDir, "bundle"),
@@ -654,6 +682,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		netPolicy: spec.NetPolicy,
 	}
 
+	if opts.snapshotDir != "" && !e.caps.Checkpoint {
+		return info, errNoCheckpoint
+	}
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
 		return info, err
 	}
@@ -848,6 +879,9 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 // root (BlockRoot) so the rootfs survives the round-trip; a virtio-fs VM can be
 // snapshotted but exec-after-restore breaks (the FUSE map isn't persisted).
 func (e *Engine) Stop(ctx context.Context, id string) error {
+	if !e.caps.Checkpoint {
+		return errNoCheckpoint
+	}
 	vm, err := e.getVM(id)
 	if err != nil {
 		return err
@@ -908,9 +942,10 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 	vm.mu.Unlock()
 	// Restore from the cold bundle if present; otherwise cold-boot fresh — a
 	// crashed or never-snapshotted sandbox whose RAM is gone but whose rootfs
-	// image persists. Recovery relies on this for restart-safety.
+	// image persists. Recovery relies on this for restart-safety. Without
+	// checkpoint support every start is a fresh boot.
 	snapshot, mode := "", "fresh boot"
-	if validateBundle(bundleDir) == nil {
+	if e.caps.Checkpoint && validateBundle(bundleDir) == nil {
 		snapshot, mode = bundleDir, "cold restore"
 	}
 	if err := e.launch(ctx, vm, snapshot); err != nil {
@@ -1058,26 +1093,15 @@ func isQcow2(path string) bool {
 func rootQcow2() bool { return os.Getenv("KRUCIBLE_ROOT_RAW") != "1" }
 
 // createRootOverlayQcow2 creates a qcow2 CoW overlay over the shared base ext4
-// at dst (the per-sandbox root) — instant + host-FS-independent. The daemon is
-// pure Go (never links libkrun), so it shells to the cgo helper, which creates
-// the overlay via libkrun/imago (krun_create_disk_overlay) — reusing the same
-// library that opens these images, with no external tool (no qemu-img).
+// at dst (the per-sandbox root): instant and host-FS-independent. The overlay
+// header is written directly (createQcow2Overlay); the VMM's qcow2 driver
+// (imago) opens it at boot.
 func (e *Engine) createRootOverlayQcow2(dst, base string) error {
 	fi, err := os.Stat(base)
 	if err != nil {
 		return fmt.Errorf("stat base image %s: %w", base, err)
 	}
-	cmd := exec.Command(e.cfg.VMMBinary, "create-overlay", dst, base, strconv.FormatInt(fi.Size(), 10))
-	if e.cfg.LibDir != "" {
-		cmd.Env = append(os.Environ(),
-			"DYLD_FALLBACK_LIBRARY_PATH="+e.cfg.LibDir,
-			"LD_LIBRARY_PATH="+e.cfg.LibDir,
-		)
-	}
-	if out, cerr := cmd.CombinedOutput(); cerr != nil {
-		return fmt.Errorf("create qcow2 overlay (%s -> %s): %w: %s", base, dst, cerr, out)
-	}
-	return nil
+	return createQcow2Overlay(dst, base, uint64(fi.Size()))
 }
 
 func (e *Engine) Status(ctx context.Context, id string) (engine.SandboxInfo, error) {
@@ -1132,29 +1156,6 @@ func generateID() (string, error) {
 		return "", fmt.Errorf("generate id: %w", err)
 	}
 	return fmt.Sprintf("%x", b), nil
-}
-
-// cloneTree copies src/* into dst, preferring a CoW clone (APFS clonefile on
-// darwin, reflink on linux) and falling back to a plain recursive copy.
-func cloneTree(src, dst string) error {
-	if err := os.MkdirAll(dst, 0755); err != nil {
-		return err
-	}
-	var primary *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		primary = exec.Command("cp", "-c", "-R", src+"/.", dst) // clonefile
-	default:
-		primary = exec.Command("cp", "-a", "--reflink=auto", src+"/.", dst)
-	}
-	if out, err := primary.CombinedOutput(); err != nil {
-		fallback := exec.Command("cp", "-R", src+"/.", dst)
-		if out2, err2 := fallback.CombinedOutput(); err2 != nil {
-			return fmt.Errorf("clone (%v: %s) and fallback (%v: %s) both failed",
-				err, out, err2, out2)
-		}
-	}
-	return nil
 }
 
 // buildBaseImage builds an ext4 image populated from srcDir (the rootfs tree)

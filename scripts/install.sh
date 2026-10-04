@@ -875,10 +875,8 @@ generate_config() {
 engine: krucible
 listen: :8080
 data_dir: ${DATA_DIR}
-# Secure per-owner network gateway (bhatti-netd) is ON by default: the guest is
-# isolated from the host, egress is policed, and same-owner siblings are
-# reachable. Set 'krucible_net_backend: false' for the legacy shared-netstack
-# (TSI) path (a sandbox can then reach the host's loopback — not recommended).
+# Guests are networked only through the per-owner bhatti-netd gateway: isolated
+# from the host, egress policed, same-owner siblings reachable.
 krucible_vmm: ${rt}/bin/bhatti-vmm
 krucible_netd: ${rt}/bin/bhatti-netd
 krucible_libdir: ${rt}/lib
