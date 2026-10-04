@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // krucibleSnapManifest is the krucible snapshot manifest the server stores
@@ -34,6 +35,10 @@ type krucibleSnapManifest struct {
 	// volumes are frozen into the snapshot dir and cloned into the restored sandbox.
 	Mounts  []snapMount  `json:"mounts,omitempty"`
 	Volumes []snapVolume `json:"volumes,omitempty"`
+	// The source's network posture: whether it has a NIC is part of the device
+	// set, and a restore or fork keeps the source's egress rules rather than
+	// opening up a sandbox that had none.
+	NetPolicy *gateway.NetPolicyWire `json:"net_policy,omitempty"`
 }
 
 // snapMount records a virtio-fs bind for restore. Only HostPath + ReadOnly are
@@ -97,6 +102,7 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	vm.mu.Lock()
 	spec := vm.baseSpec
 	token := vm.Token
+	netPolicy := vm.netPolicy
 	vm.mu.Unlock()
 	if spec.RootDiskFormat != "qcow2" || spec.RootDisk == "" {
 		return nil, fmt.Errorf("snapshot requires a qcow2 block-root sandbox")
@@ -175,6 +181,7 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	// the RAM snapshot; virtio-fs mounts are re-bound to the same host dirs.
 	var snapVols []snapVolume
 	var snapMounts []snapMount
+	var snapNet *gateway.NetPolicyWire
 	if snapType == "memory" {
 		for i, v := range spec.Volumes {
 			file := fmt.Sprintf("vol%d.img", i)
@@ -186,6 +193,7 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		for _, mnt := range spec.Mounts {
 			snapMounts = append(snapMounts, snapMount{HostPath: mnt.HostPath, ReadOnly: mnt.ReadOnly})
 		}
+		snapNet = netPolicy
 	}
 	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir, "volumes", len(snapVols), "mounts", len(snapMounts))
 	return krucibleSnapManifest{
@@ -193,7 +201,7 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
 		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
 		Token: token, KernelImage: spec.KernelImage,
-		Mounts: snapMounts, Volumes: snapVols,
+		Mounts: snapMounts, Volumes: snapVols, NetPolicy: snapNet,
 	}, nil
 }
 
@@ -232,10 +240,12 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 		// --image` on a captured node.
 		return e.create(ctx, spec, createOpts{})
 	}
-	// Reproduce the captured device set. Block volumes restore cleanly: clone each
-	// frozen volume into the new sandbox (independent copy — fork/restore diverges
-	// from the source). Memory snapshots of mounted sandboxes are refused at
+	// Reproduce the captured device set: libkrun refuses to restore the guest's
+	// RAM into any other. Block volumes restore cleanly: clone each frozen
+	// volume into the new sandbox (independent copy — fork/restore diverges from
+	// the source). Memory snapshots of mounted sandboxes are refused at
 	// checkpoint (virtio-fs can't be restored), so m.Mounts is empty here.
+	spec.NetPolicy = m.NetPolicy
 	var restoreVols []restoreVol
 	for _, v := range m.Volumes {
 		restoreVols = append(restoreVols, restoreVol{path: filepath.Join(snapDir, v.File), readOnly: v.ReadOnly})

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // TestKrucibleForkNetIdentity is the fork network-identity gate.
@@ -83,5 +84,48 @@ func TestKrucibleForkNetIdentity(t *testing.T) {
 	forkNet := fork.IP[:strings.LastIndex(fork.IP, ".")]
 	if srcNet != forkNet {
 		t.Fatalf("fork IP %q not on the source's subnet %q — fork did not join the owner's shared netd", fork.IP, src.IP)
+	}
+}
+
+// TestKrucibleForkKeepsEgressPolicy: a fork is its source's guest resumed in a
+// new sandbox, so its egress must stay as narrow as the source's instead of
+// coming up on the public default. It also proves the fork's NIC carries
+// traffic: the restored guest keeps the driver state and MAC it had, on a fresh
+// connection to the owner's netd.
+func TestKrucibleForkKeepsEgressPolicy(t *testing.T) {
+	eng := newNetEngine(t)
+	ke := eng.(*Engine)
+	if !ke.caps.Checkpoint {
+		t.Skip("bhatti-vmm build has no checkpoint support; skipping")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
+	defer cancel()
+
+	src, err := eng.Create(ctx, engine.SandboxSpec{
+		Name: "fork-policy-src", CPUs: 1, MemoryMB: 512, UserID: "policyowner",
+		NetPolicy: &gateway.NetPolicyWire{Default: "deny", AllowCIDRs: []string{"1.1.1.1/32"}},
+	})
+	if err != nil {
+		t.Fatalf("Create src: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), src.ID) })
+	fork, err := ke.Fork(ctx, src.ID, "fork-policy-fork")
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), fork.ID) })
+
+	dial := func(addr string) (bool, string) {
+		r, err := eng.Exec(ctx, fork.ID, []string{"netcheck", "dial", addr})
+		if err != nil {
+			t.Fatalf("exec dial %s in fork: %v", addr, err)
+		}
+		return r.ExitCode == 0, strings.TrimSpace(r.Stdout)
+	}
+	if ok, out := dial("1.1.1.1:443"); !ok {
+		t.Fatalf("fork can't reach the allow-listed 1.1.1.1 (no traffic through netd): %q", out)
+	}
+	if ok, out := dial("8.8.8.8:443"); ok {
+		t.Fatalf("fork reached 8.8.8.8: it came up without its source's deny policy: %q", out)
 	}
 }
