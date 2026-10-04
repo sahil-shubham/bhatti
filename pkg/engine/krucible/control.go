@@ -12,11 +12,10 @@ import (
 // controlCmd sends a single newline command to the libkrun control socket and
 // reads one newline-terminated reply. The protocol is one-shot per connection:
 //
-//	PAUSE  -> OK paused | ERR <reason>
-//	RESUME -> OK running | ERR <reason>
-//	STATUS -> OK <state>  (state ∈ running|pausing|paused|resuming)
-//
-// See `krun_set_control_socket` in libkrucible.
+//	PAUSE      -> OK | ERR <reason>
+//	RESUME     -> OK | ERR <reason>
+//	SAVE <dir> -> OK | ERR <reason> (leaves VM paused only on success)
+//	STATUS     -> OK running | OK paused
 func controlCmd(ctx context.Context, uds, cmd string) (string, error) {
 	if uds == "" {
 		return "", fmt.Errorf("no control socket configured")

@@ -14,8 +14,6 @@ package krucible
 // VMSpec is the sealed contract between the daemon (which writes it as JSON)
 // and the per-VM helper (cmd/vmm, which reads it and configures libkrun).
 //
-// Kept deliberately small for P1: virtiofs root + TSI networking + vsock
-// bridges, no snapshot/control-socket/egress yet (those land in P2+).
 // VMFsMount is one virtio-fs host-dir bind as the VMM sees it: a tag + the host
 // directory + read-only flag. The guest-side mount path travels in the config
 // drive (configdrive.FsMountConfig), keyed by the same tag.
@@ -40,8 +38,8 @@ type VMVolume struct {
 type VMMCapabilities struct {
 	// Pause: live pause/resume over the control socket (the warm tier).
 	Pause bool `json:"pause"`
-	// Checkpoint covers everything built on saving VM state to disk: cold
-	// snapshot/restore, fork, and consistent save-image.
+	// Checkpoint permits named memory snapshots, restore and fork; Stop/Start
+	// always power off and boot from disk, independent of this capability.
 	Checkpoint bool `json:"checkpoint"`
 }
 
@@ -61,8 +59,8 @@ type VMSpec struct {
 	// SandboxConfig JSON on. libkrun bridges the guest's connection on
 	// proto.VsockPortConfig (1026) to this UDS (krun_add_vsock_port2 listen=false);
 	// lohar dials it once at boot to fetch its config — replacing the on-disk
-	// config drive (DESIGN §3.4). Nothing config-related touches a guest disk or a
-	// snapshot bundle; the config.json lives host-side only.
+	// config drive (DESIGN §3.4). Nothing config-related touches a guest disk
+	// or checkpoint directory; config.json lives host-side only.
 	VsockConfigUDS string `json:"vsock_config_uds,omitempty"`
 
 	Vcpus  uint8  `json:"vcpus"`
@@ -81,15 +79,13 @@ type VMSpec struct {
 	VsockControlUDS string `json:"vsock_control_uds"`
 	VsockForwardUDS string `json:"vsock_forward_uds"`
 
-	// ControlSocketUDS, if set, is the host-side UDS the VMM serves for warm-tier
-	// commands (PAUSE/RESUME/STATUS). One newline command in, one line out, then
-	// close. See krun_set_control_socket.
+	// ControlSocketUDS, if set, is the host-side UDS the VMM serves for
+	// PAUSE/RESUME/SAVE/STATUS. One newline command in, one line out, then close.
 	ControlSocketUDS string `json:"control_socket_uds,omitempty"`
 
-	// SnapshotDir, if set, cold-restores the VM from a snapshot bundle
-	// (memory.img + checkpoint.bin + manifest.json) instead of cold booting:
-	// guest RAM, device, and vCPU state are loaded and the guest resumes from
-	// the snapshot point. See krun_set_snapshot. macOS/HVF only.
+	// SnapshotDir, if set, restores from a completed checkpoint directory
+	// (memory.bin + checkpoint.bin), instead of booting. The guest resumes with
+	// its saved RAM, devices and vCPUs. Currently supported on Linux KVM x86_64.
 	SnapshotDir string `json:"snapshot_dir,omitempty"`
 
 	// KernelImage, if set, boots an external kernel (e.g. a lean one) via

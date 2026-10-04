@@ -50,12 +50,13 @@ static bool bv_push_buf(void *self, KrunStr s) {
 }
 static KrunPushStrVtable bv_buf_vt = { .drop = NULL, .push = bv_push_buf };
 
-// bv_vm_ctl runs pause (op 0) or resume (op 1) on h. Returns 0 on success;
-// otherwise fills msg with libkrun's reason and returns -1.
-static int bv_vm_ctl(KrunVmmHandle h, int op, struct bv_errbuf *msg) {
+// bv_vm_ctl runs pause (op 0), resume (op 1), or save (op 2). A failed save
+// leaves the VM running; libkrun owns both error cleanup and resumption.
+static int bv_vm_ctl(KrunVmmHandle h, int op, const char *dir, struct bv_errbuf *msg) {
 	KrunError err = NULL;
 	if (op == 0) krun_vmm_handle_pause(h, &err);
-	else krun_vmm_handle_resume(h, &err);
+	else if (op == 1) krun_vmm_handle_resume(h, &err);
+	else krun_vmm_handle_save(h, bv_str(dir), &err);
 	if (!err) return 0;
 	msg->len = 0; msg->text[0] = 0;
 	KrunVtableHandle w = KRUN_VTABLE_HANDLE(KRUN_PUSH_STR_TYPE_TAG, bv_buf_vt, msg);
@@ -72,18 +73,18 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 )
 
 // capabilities is what this VMM build supports, reported by `vmm capabilities`
 // so the daemon can gate features at startup instead of failing per call.
-// Checkpoint (snapshot/restore/fork) arrives with the checkpoint stack on top
-// of upstream libkrun (docs/PLAN-libkrun-upstream-rebase.md, Phase 2).
-var capabilities = krucible.VMMCapabilities{Pause: true, Checkpoint: false}
+var capabilities = krucible.VMMCapabilities{Pause: true, Checkpoint: bool(C.krun_checkpoint_supported())}
 
 // defaultExtCmdline mirrors libkrun's bundled block-root cmdline for the
 // external-kernel path. x86 pins clocksource=kvm-clock; arm64 uses the arch timer.
@@ -140,11 +141,7 @@ func noErr(err C.KrunError, what string) {
 }
 
 func run(spec krucible.VMSpec) {
-	// Fail closed on features this build doesn't have: the daemon gates them via
-	// `vmm capabilities`, so a spec that asks for one is a daemon bug.
 	switch {
-	case spec.SnapshotDir != "":
-		fail("snapshot restore is not supported by this VMM build")
 	case spec.KernelImage == "":
 		fail("kernel_image is required (this VMM boots an external kernel only)")
 	case spec.RootDisk == "":
@@ -249,6 +246,9 @@ func run(spec krucible.VMSpec) {
 	}
 
 	C.krun_vmm_builder_devices(&b, devs)
+	if spec.SnapshotDir != "" {
+		C.krun_vmm_builder_restore_from(&b, cstr(spec.SnapshotDir))
+	}
 	vmm := C.krun_vmm_builder_build(&b, &kerr)
 	noErr(kerr, "build")
 
@@ -270,9 +270,10 @@ func run(spec krucible.VMSpec) {
 // serveControl answers the daemon's control commands, one per connection: a
 // command line in, one line out ("OK ..." or "ERR <reason>").
 //
-//	PAUSE   park every vCPU (returns once they're parked); idempotent
-//	RESUME  run them again; idempotent
-//	STATUS  "OK running" or "OK paused"
+//	PAUSE        park every vCPU (returns once they're parked); idempotent
+//	RESUME       run them again; idempotent
+//	SAVE <dir>   save a running VM to a new absolute directory; leave it paused
+//	STATUS       "OK running" or "OK paused"
 func serveControl(ln net.Listener, h C.KrunVmmHandle) {
 	var mu sync.Mutex // one command at a time; also guards paused
 	paused := false
@@ -290,20 +291,40 @@ func serveControl(ln net.Listener, h C.KrunVmmHandle) {
 			mu.Lock()
 			defer mu.Unlock()
 			reply := "ERR unknown command"
-			switch cmd := strings.TrimSpace(line); cmd {
-			case "PAUSE", "RESUME":
+			switch cmd := strings.TrimSpace(line); {
+			case cmd == "PAUSE" || cmd == "RESUME":
 				op, want := C.int(0), true
 				if cmd == "RESUME" {
 					op, want = 1, false
 				}
 				var msg C.struct_bv_errbuf
-				if C.bv_vm_ctl(h, op, &msg) == 0 {
+				if C.bv_vm_ctl(h, op, nil, &msg) == 0 {
 					paused = want
 					reply = "OK"
 				} else {
 					reply = "ERR " + C.GoString(&msg.text[0])
 				}
-			case "STATUS":
+			case strings.HasPrefix(cmd, "SAVE "):
+				dir := strings.TrimSpace(strings.TrimPrefix(cmd, "SAVE "))
+				if !filepath.IsAbs(dir) {
+					reply = "ERR SAVE requires an absolute directory"
+					break
+				}
+				if paused {
+					reply = "ERR VM is paused"
+					break
+				}
+				var msg C.struct_bv_errbuf
+				cdir := C.CString(dir)
+				if C.bv_vm_ctl(h, 2, cdir, &msg) == 0 {
+					paused = true
+					reply = "OK"
+				} else {
+					paused = false
+					reply = "ERR " + C.GoString(&msg.text[0])
+				}
+				C.free(unsafe.Pointer(cdir))
+			case cmd == "STATUS":
 				reply = "OK running"
 				if paused {
 					reply = "OK paused"
