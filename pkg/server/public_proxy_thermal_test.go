@@ -246,3 +246,30 @@ func TestPublicProxySnapshotFailureResetOnTraffic(t *testing.T) {
 		t.Fatal("snapshot failure counter should be cleared after public proxy traffic")
 	}
 }
+
+// TestPublicProxyColdWakeWithoutInitFailsFast: a sandbox with no --init comes
+// back from an idle power-off with nothing listening, and nothing ever will.
+// The proxy must answer 502 at once instead of waiting out the window it
+// gives an --init app to start.
+func TestPublicProxyColdWakeWithoutInitFailsFast(t *testing.T) {
+	srv, eng, ts := setupPublicProxy(t)
+	sb, eid := publishSandbox(t, srv, eng, "no-init", "no-init", 8080)
+	eng.mu.Lock()
+	eng.thermal[eid] = "cold"
+	eng.TunnelRefusals = 1 << 20
+	eng.mu.Unlock()
+	srv.store.StopSandbox(sb.ID)
+
+	start := time.Now()
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(ts.URL + "/no-init/")
+	if err != nil {
+		t.Fatalf("request: %v (after %s)", err, time.Since(start))
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502", resp.StatusCode)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("502 took %s: waited for an app no --init will start", d)
+	}
+}

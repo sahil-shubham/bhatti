@@ -586,6 +586,11 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	if memory && len(m.NetPolicy) > 0 && string(m.NetPolicy) != "null" {
 		sb.NetPolicy = m.NetPolicy // the restore runs under the source's egress policy
 	}
+	// The restored disk carries its source's boot config (--init included);
+	// best effort, a source destroyed since leaves it unknown (false).
+	if src, err := s.store.GetSandboxByID(snap.SourceSandbox); err == nil {
+		sb.HasInit = src.HasInit
+	}
 	if err := s.store.CreateSandbox(sb); err != nil {
 		s.engine.Destroy(r.Context(), info.EngineID)
 		errRespInternal(w, r, "store sandbox failed", err)

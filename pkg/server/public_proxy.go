@@ -74,6 +74,7 @@ type resolvedRoute struct {
 	engineID  string
 	sandboxID string
 	port      int
+	hasInit   bool // an --init app restarts at boot, so it's worth waiting for after a cold wake
 }
 
 // routeCache maps alias → resolvedRoute. Bounded to 10K entries with
@@ -311,6 +312,7 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 			engineID:  sb.EngineID,
 			sandboxID: sb.ID,
 			port:      rule.Port,
+			hasInit:   sb.HasInit,
 		}
 		h.routeCache.Set(alias, route)
 	}
@@ -332,9 +334,10 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 	// Wake sandbox with bounded concurrency + singleflight coalescing.
 	wasCold := false
 	if te, ok := thermalOf(h.engine); ok {
-		// A sandbox coming back from cold boots fresh (no checkpoint support):
-		// its app restarts from --init and may not be listening yet.
-		wasCold = te.ThermalState(route.engineID) == "cold"
+		// A sandbox coming back from cold boots fresh: an --init app restarts
+		// and may not be listening yet. Without --init nothing will listen, so
+		// there's nothing to wait for.
+		wasCold = route.hasInit && te.ThermalState(route.engineID) == "cold"
 		if err := h.ensureHotBounded(ctx, te, route.engineID); err != nil {
 			if err == errServerBusy {
 				h.busy.Add(1)

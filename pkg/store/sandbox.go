@@ -20,6 +20,9 @@ type Sandbox struct {
 	CreatedAt      time.Time       `json:"created_at"`
 	StoppedAt      *time.Time      `json:"stopped_at,omitempty"`
 	KeepHot        bool            `json:"keep_hot"`
+	// HasInit: the sandbox runs an --init command at every boot, so apps it
+	// starts come back after an idle stop (which powers the VM off).
+	HasInit        bool            `json:"has_init"`
 	ShellTokenHash string          `json:"-"` // never expose in API responses
 	CPUs           float64         `json:"cpus"`
 	MemoryMB       int             `json:"memory_mb"`
@@ -35,7 +38,7 @@ type Sandbox struct {
 
 // SecretRecord tracks an encrypted secret.
 
-const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal'), COALESCE(labels,'{}'), COALESCE(net_policy,'')`
+const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal'), COALESCE(labels,'{}'), COALESCE(net_policy,''), has_init`
 
 func (s *Store) CreateSandbox(sb Sandbox) error {
 	if sb.EngineMeta == nil {
@@ -45,13 +48,17 @@ func (s *Store) CreateSandbox(sb Sandbox) error {
 	if sb.KeepHot {
 		keepHot = 1
 	}
+	hasInit := 0
+	if sb.HasInit {
+		hasInit = 1
+	}
 	labelsJSON, err := marshalLabels(sb.Labels)
 	if err != nil {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels, net_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON, string(sb.NetPolicy),
+		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels, net_policy, has_init) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON, string(sb.NetPolicy), hasInit,
 	)
 	return err
 }
@@ -313,8 +320,8 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 	var sb Sandbox
 	var metaJSON, labelsJSON, netPolicy string
 	var stoppedAt sql.NullTime
-	var keepHot int
-	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image, &labelsJSON, &netPolicy)
+	var keepHot, hasInit int
+	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image, &labelsJSON, &netPolicy, &hasInit)
 	if err != nil {
 		return nil, err
 	}
@@ -326,6 +333,7 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 		sb.StoppedAt = &stoppedAt.Time
 	}
 	sb.KeepHot = keepHot != 0
+	sb.HasInit = hasInit != 0
 	if labelsJSON != "" && labelsJSON != "{}" {
 		if err := json.Unmarshal([]byte(labelsJSON), &sb.Labels); err != nil {
 			return nil, fmt.Errorf("parse sandbox labels: %w", err)

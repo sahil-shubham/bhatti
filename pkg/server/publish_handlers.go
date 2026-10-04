@@ -164,14 +164,29 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID
 		Meta: map[string]any{"sandbox": sb.Name, "port": req.Port, "alias": alias,
 			"url": publishedURL(alias, s.proxyZone, s.publicProxyAddr)},
 	})
-	writeJSON(w, 201, map[string]interface{}{
+	resp := map[string]interface{}{
 		"id":         rule.ID,
 		"sandbox_id": sb.ID,
 		"port":       rule.Port,
 		"alias":      alias,
 		"url":        publishedURL(alias, s.proxyZone, s.publicProxyAddr),
 		"created_at": rule.CreatedAt,
-	})
+	}
+	if warning := s.idleStopWarning(sb); warning != "" {
+		resp["warning"] = warning
+	}
+	writeJSON(w, 201, resp)
+}
+
+// idleStopWarning explains, for a sandbox that will be powered off when idle
+// with nothing to restart its app, that its published URL stops answering
+// then. "" when the app survives idle (--init, keep_hot) or there is no idle stop.
+func (s *Server) idleStopWarning(sb *store.Sandbox) string {
+	if sb.HasInit || sb.KeepHot || !thermalUsable(s.engine) {
+		return ""
+	}
+	return "this sandbox has no --init command: after it idles out it is powered off, and the app serving this " +
+		"port won't be running when the URL wakes it. Start the app from --init (create --init \"...\") or set --keep-hot."
 }
 
 func (s *Server) handleListPublishRules(w http.ResponseWriter, r *http.Request, sandboxID string) {

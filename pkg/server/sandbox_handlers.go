@@ -618,6 +618,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			CreatedBy:  user.ID,
 			CreatedAt:  time.Now(),
 			KeepHot:    req.KeepHot,
+			HasInit:    spec.Init != "",
 			CPUs:       spec.CPUs,
 			MemoryMB:   spec.MemoryMB,
 			DiskSizeMB: spec.DiskSizeMB,
@@ -628,6 +629,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// later: a fork keeps its source's.
 		if src != nil {
 			sb.NetPolicy = src.NetPolicy
+			sb.HasInit = src.HasInit // the fork carries its source's boot config
 		} else if b, merr := json.Marshal(req.NetPolicy); merr == nil {
 			sb.NetPolicy = b
 		}

@@ -476,9 +476,11 @@ and toggling keep_hot to control thermal management.`,
 
 var stopCmd = &cobra.Command{
 	Use:   "stop <sandbox>",
-	Short: "Snapshot and stop a sandbox",
-	Long: `Pause the sandbox and save a snapshot to disk. Resume later with
-'bhatti start'. Stopped sandboxes use zero CPU and memory.`,
+	Short: "Power a sandbox off",
+	Long: `Power the sandbox off, keeping its disk. 'bhatti start' (or any request
+that needs it) boots it again: files are kept, running processes are not, and
+its --init command runs again. Stopped sandboxes use zero CPU and memory. To
+keep a sandbox's memory, take a snapshot ('bhatti snapshot create').`,
 	Example: `  bhatti stop dev
   bhatti start dev     # resume later`,
 	Args:              exactArgs(1),
@@ -507,9 +509,9 @@ var stopCmd = &cobra.Command{
 
 var startCmd = &cobra.Command{
 	Use:   "start <sandbox>",
-	Short: "Resume a stopped sandbox",
-	Long: `Resume a sandbox from its snapshot. Continues exactly where it left off.
-Use --force to retry after a failed restore.`,
+	Short: "Boot a stopped sandbox",
+	Long: `Boot a stopped sandbox from its disk; its --init command runs again.
+Use --force to retry after a failed start.`,
 	Example: `  bhatti start dev
   bhatti start dev --force`,
 	Args:              exactArgs(1),

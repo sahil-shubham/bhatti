@@ -268,6 +268,9 @@ var publishCmd = &cobra.Command{
 				if shellURL, ok := result["shell_url"]; ok {
 					fmt.Printf("Shell:     %v\n", shellURL)
 				}
+				if warning, ok := result["warning"].(string); ok {
+					fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+				}
 			}
 		}
 	},

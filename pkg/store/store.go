@@ -105,6 +105,7 @@ ALTER TABLE sandboxes ADD COLUMN disk_size_mb INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sandboxes ADD COLUMN image TEXT NOT NULL DEFAULT 'minimal';
 ALTER TABLE sandboxes ADD COLUMN labels TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE sandboxes ADD COLUMN net_policy TEXT NOT NULL DEFAULT '';
+ALTER TABLE sandboxes ADD COLUMN has_init INTEGER NOT NULL DEFAULT 0;
 `
 
 // New opens (or creates) the SQLite database and runs migrations.
