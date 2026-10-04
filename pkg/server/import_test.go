@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"path/filepath"
+	"strings"
 	"net/http"
 	"testing"
 )
@@ -72,4 +74,18 @@ func TestImageImportNameValidation(t *testing.T) {
 		t.Fatalf("expected 400 for invalid name, got %d: %s", resp.StatusCode, bodyBytes)
 	}
 	resp.Body.Close()
+}
+
+// An install without the guest agent (lohar) can't convert images: pull and
+// import answer 501 with the reason up front, instead of a pull task that fails
+// in the background ("inject lohar: open …: no such file").
+func TestImagePullWithoutAgentIs501(t *testing.T) {
+	srv, ts := setup(t)
+	srv.loharPath = filepath.Join(t.TempDir(), "no-lohar-here")
+	resp := doReq(t, ts, "POST", "/images/pull", map[string]any{"ref": "alpine:3", "name": "alpine"})
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 501 || !strings.Contains(string(body), "lohar") {
+		t.Fatalf("pull without the agent: %d %s, want 501 naming lohar", resp.StatusCode, body)
+	}
 }

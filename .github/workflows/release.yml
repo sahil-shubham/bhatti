@@ -135,6 +135,11 @@ jobs:
           # macOS/HVF. Pure Go, built without cgo, no libkrun linkage; it is
           # Developer-ID signed below on macOS for notarization.
           cp bhatti-netd stage/bin/bhatti-netd
+          # lohar (the guest agent) for the guest arch: image pull/import write it
+          # into converted OCI images. Apple Silicon guests are arm64 too.
+          GUEST_ARCH=$([ "$(uname -m)" = x86_64 ] && echo amd64 || echo arm64)
+          GOOS=linux GOARCH=$GUEST_ARCH CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" \
+            -o stage/bin/lohar ./cmd/lohar/
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cp -R libkrucible/_install/lib/libkrun*.dylib stage/lib/
             DYLIB=$(find stage/lib -maxdepth 1 -type f -name 'libkrun.*.dylib' | head -1)

@@ -108,6 +108,7 @@ type Server struct {
 	proxyZone       string              // e.g. "bhatti.sh"
 	apiHost         string              // e.g. "api.bhatti.sh" (must be under proxyZone)
 	defaultEgress   string              // posture for creates that don't name one; "" = none
+	loharPath       string              // guest agent written into pulled/imported OCI images
 	publicProxyAddr string              // e.g. "host:8443" (for URL generation)
 	publicProxy     *PublicProxyHandler // nil until configured
 	resumeSem       chan struct{}       // bounds concurrent cold resumes
@@ -242,6 +243,12 @@ func WithAPIHost(host string) ServerOption {
 // WithPublicProxyAddr sets the address used for generating public URLs.
 func WithPublicProxyAddr(addr string) ServerOption {
 	return func(s *Server) { s.publicProxyAddr = addr }
+}
+
+// WithLoharPath sets the guest agent binary that image pull and import write
+// into converted OCI images (the runtime's bin/lohar).
+func WithLoharPath(path string) ServerOption {
+	return func(s *Server) { s.loharPath = path }
 }
 
 // WithDefaultEgress sets the egress posture ("none", "deny" or "public") for

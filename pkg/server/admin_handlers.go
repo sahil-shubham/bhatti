@@ -677,6 +677,10 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 		}
 	}
 
+	if !s.loharAvailable(w) {
+		return
+	}
+
 	taskID := genID()
 	task := store.TaskRecord{
 		ID: taskID, UserID: user.ID, Type: "image_pull",
@@ -690,7 +694,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 	s.pullCancels[taskID] = cancel
 	s.pullCancelMu.Unlock()
 
-	loharPath := filepath.Join(s.dataDir, "lohar")
+	loharPath := s.loharPath
 	outputDir := filepath.Join(s.dataDir, "images", user.ID)
 	os.MkdirAll(outputDir, 0700)
 	outputPath := filepath.Join(outputDir, req.Name+".ext4")
@@ -774,6 +778,9 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user 
 		errResp(w, 400, "valid name required")
 		return
 	}
+	if !s.loharAvailable(w) {
+		return
+	}
 
 	if _, err := s.store.GetImage(user.ID, name); err == nil {
 		errResp(w, 409, fmt.Sprintf("image %q already exists \u2014 delete first", name))
@@ -796,7 +803,7 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user 
 	}
 	tmpFile.Close()
 
-	loharPath := filepath.Join(s.dataDir, "lohar")
+	loharPath := s.loharPath
 	outputDir := filepath.Join(s.dataDir, "images", user.ID)
 	os.MkdirAll(outputDir, 0700)
 	outputPath := filepath.Join(outputDir, name+".ext4")
@@ -831,6 +838,19 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user 
 		Meta: map[string]any{"name": name, "size_mb": sizeMB},
 	})
 	writeJSON(w, 201, map[string]any{"name": name, "size_mb": sizeMB})
+}
+
+// loharAvailable answers 501 when the guest agent that image pull/import write
+// into converted images isn't installed, instead of failing deep in a
+// background task.
+func (s *Server) loharAvailable(w http.ResponseWriter) bool {
+	if s.loharPath != "" {
+		if fi, err := os.Stat(s.loharPath); err == nil && fi.Mode().IsRegular() {
+			return true
+		}
+	}
+	errResp(w, 501, fmt.Sprintf("image pull/import needs the guest agent (lohar) at %q, which this install doesn't have; reinstall the runtime bundle", s.loharPath))
+	return false
 }
 
 // --- Save Image (sandbox rootfs → image) ---

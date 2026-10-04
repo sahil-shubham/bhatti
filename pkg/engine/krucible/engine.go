@@ -1355,3 +1355,9 @@ func tailFile(path string, n int64) string {
 	}
 	return string(buf)
 }
+
+// LoharPath is the guest agent shipped beside bhatti-vmm in the runtime
+// bundle (bin/lohar); image pull/import write it into converted images.
+func (e *Engine) LoharPath() string {
+	return filepath.Join(filepath.Dir(e.cfg.VMMBinary), "lohar")
+}

@@ -261,7 +261,9 @@ func TestPublicProxyColdWakeWithoutInitFailsFast(t *testing.T) {
 	srv.store.StopSandbox(sb.ID)
 
 	start := time.Now()
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(ts.URL + "/no-init/")
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+	resp, err := client.Get(ts.URL + "/no-init/")
 	if err != nil {
 		t.Fatalf("request: %v (after %s)", err, time.Since(start))
 	}

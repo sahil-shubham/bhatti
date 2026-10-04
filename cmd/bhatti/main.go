@@ -192,6 +192,9 @@ func runDaemon() {
 	if cfg.PublicProxyListen != "" {
 		srvOpts = append(srvOpts, server.WithPublicProxyAddr(cfg.PublicProxyListen))
 	}
+	if lp, ok := eng.(interface{ LoharPath() string }); ok {
+		srvOpts = append(srvOpts, server.WithLoharPath(lp.LoharPath()))
+	}
 	switch cfg.DefaultEgress {
 	case "", "none", "deny", "public":
 		srvOpts = append(srvOpts, server.WithDefaultEgress(cfg.DefaultEgress))
