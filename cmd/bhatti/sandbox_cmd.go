@@ -59,6 +59,20 @@ func formatLabels(labels map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
+func parseSecretGrantFlag(s string) (secret string, hosts []string, err error) {
+	secret, rawHosts, ok := strings.Cut(s, "@")
+	if !ok || secret == "" || rawHosts == "" {
+		return "", nil, fmt.Errorf("invalid --secret-grant %q (expected NAME@host[,host...])", s)
+	}
+	hosts = strings.Split(rawHosts, ",")
+	for _, host := range hosts {
+		if host == "" {
+			return "", nil, fmt.Errorf("invalid --secret-grant %q: empty host", s)
+		}
+	}
+	return secret, hosts, nil
+}
+
 var createCmd = &cobra.Command{
 	Use:   "create [flags]",
 	Short: "Create a new sandbox",
@@ -72,6 +86,9 @@ with its own kernel, filesystem, and network.`,
 
   # With environment variables and init script
   bhatti create --name api --env API_KEY=sk-abc --init "npm install"
+
+  # Grant a secret for HTTPS requests to specific hosts
+  bhatti create --name bot --secret-grant GH_TOKEN@api.github.com,uploads.github.com
 
   # From a custom image
   bhatti create --name py --image python-3.12
@@ -104,6 +121,7 @@ with its own kernel, filesystem, and network.`,
 		volFlags, _ := cmd.Flags().GetStringSlice("volume")
 		mountFlags, _ := cmd.Flags().GetStringSlice("mount")
 		secretFlags, _ := cmd.Flags().GetStringSlice("secret")
+		secretGrantFlags, _ := cmd.Flags().GetStringArray("secret-grant")
 		fileFlags, _ := cmd.Flags().GetStringSlice("file")
 		labelFlags, _ := cmd.Flags().GetStringSlice("label")
 
@@ -153,6 +171,17 @@ with its own kernel, filesystem, and network.`,
 		// Parse --secret flags
 		if len(secretFlags) > 0 {
 			req["secrets"] = secretFlags
+		}
+		if len(secretGrantFlags) > 0 {
+			grants := make([]map[string]any, 0, len(secretGrantFlags))
+			for _, flag := range secretGrantFlags {
+				secret, hosts, err := parseSecretGrantFlag(flag)
+				if err != nil {
+					return err
+				}
+				grants = append(grants, map[string]any{"secret": secret, "hosts": hosts})
+			}
+			req["secret_grants"] = grants
 		}
 
 		// Parse --file flags: local_path:guest_path
@@ -294,6 +323,24 @@ with its own kernel, filesystem, and network.`,
 				fmt.Printf("  IP:    %s\n", ipVal)
 			}
 			fmt.Printf("  Shell: bhatti shell %s\n", sbName)
+			if grants, ok := sb["secret_grants"].([]any); ok {
+				for _, value := range grants {
+					grant, ok := value.(map[string]any)
+					if !ok {
+						continue
+					}
+					secret, _ := grant["secret"].(string)
+					rawHosts, _ := grant["hosts"].([]any)
+					hosts := make([]string, 0, len(rawHosts))
+					for _, host := range rawHosts {
+						if name, ok := host.(string); ok {
+							hosts = append(hosts, name)
+						}
+					}
+					fmt.Printf("  Secret: %s → %s (substituted; $%s holds a placeholder)\n",
+						secret, strings.Join(hosts, ", "), secret)
+				}
+			}
 		}
 		return nil
 	},
@@ -314,6 +361,7 @@ func init() {
 	createCmd.Flags().StringSlice("volume", nil, "Persistent volume (name:mount[:ro])")
 	createCmd.Flags().StringSlice("mount", nil, "Live host-dir bind, virtio-fs (host:guest[:ro]) — krucible only")
 	createCmd.Flags().StringSlice("secret", nil, "Secret name from store (repeatable)")
+	createCmd.Flags().StringArray("secret-grant", nil, "Grant a secret for HTTPS headers at hosts (NAME@host[,host...], repeatable)")
 	createCmd.Flags().StringSlice("file", nil, "Inject file (local_path:guest_path, repeatable)")
 	createCmd.Flags().StringSlice("label", nil, "Set label key=value (repeatable)")
 	createCmd.Flags().Bool("net", false, "Give the sandbox open internet access (same as --egress public)")
