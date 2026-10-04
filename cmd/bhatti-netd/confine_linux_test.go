@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 
@@ -14,16 +15,24 @@ import (
 )
 
 // In a child process (Landlock can't be undone): after landlockReadOnly("/etc")
-// it can still read under /etc but can't write anywhere — a file it could
-// create a moment earlier is now refused.
+// it can still read under /etc but can't write anywhere, so a file it could
+// create a moment earlier is now refused. The child enforces the ruleset on its
+// one locked thread: the test binary links cgo (go test -race needs it), where
+// AllThreadsSyscall is unavailable. netd's every-thread enforcement is covered
+// by TestKrucibleNetdConfined against the real cgo-free binary.
 func TestLandlockReadOnly(t *testing.T) {
 	if dir := os.Getenv("NETD_LANDLOCK_CHILD"); dir != "" {
+		runtime.LockOSThread() // the checks below must run on the confined thread
 		// confine sets no_new_privs before Landlock; restrict_self requires it
 		// for an unprivileged caller.
-		if _, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
-			t.Fatalf("no_new_privs: %v", errno)
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			t.Fatalf("no_new_privs: %v", err)
 		}
-		if err := landlockReadOnly("/etc"); err != nil {
+		thisThread := func(fd uintptr) syscall.Errno {
+			_, _, errno := syscall.RawSyscall(unix.SYS_LANDLOCK_RESTRICT_SELF, fd, 0, 0)
+			return errno
+		}
+		if err := landlockReadOnly("/etc", thisThread); err != nil {
 			if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
 				os.Exit(3)
 			}

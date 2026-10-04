@@ -42,7 +42,7 @@ func confine(uid, gid int) error {
 	if _, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
 		return fmt.Errorf("no_new_privs: %w", errno)
 	}
-	if err := landlockReadOnly("/etc"); err != nil {
+	if err := landlockReadOnly("/etc", restrictAllThreads); err != nil {
 		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
 			log.Printf("bhatti-netd: Landlock unavailable on this kernel (%v); running without filesystem confinement", err)
 			return nil
@@ -54,7 +54,7 @@ func confine(uid, gid int) error {
 
 // landlockReadOnly restricts every thread to reading beneath dir, and nothing
 // else, for every filesystem right this kernel's Landlock ABI knows.
-func landlockReadOnly(dir string) error {
+func landlockReadOnly(dir string, restrict func(rulesetFD uintptr) syscall.Errno) error {
 	abi, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0, unix.LANDLOCK_CREATE_RULESET_VERSION)
 	if errno != 0 {
 		return errno
@@ -97,8 +97,15 @@ func landlockReadOnly(dir string) error {
 		uintptr(unsafe.Pointer(&rule)), 0, 0, 0); errno != 0 {
 		return fmt.Errorf("add rule %s: %w", dir, errno)
 	}
-	if _, _, errno := syscall.AllThreadsSyscall(unix.SYS_LANDLOCK_RESTRICT_SELF, fd, 0, 0); errno != 0 {
+	if errno := restrict(fd); errno != 0 {
 		return errno
 	}
 	return nil
+}
+
+// restrictAllThreads enforces a Landlock ruleset on every thread of the
+// process. It needs a cgo-free binary (`make netd` builds one).
+func restrictAllThreads(fd uintptr) syscall.Errno {
+	_, _, errno := syscall.AllThreadsSyscall(unix.SYS_LANDLOCK_RESTRICT_SELF, fd, 0, 0)
+	return errno
 }
