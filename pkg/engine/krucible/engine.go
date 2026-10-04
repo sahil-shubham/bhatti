@@ -349,15 +349,11 @@ type Engine struct {
 
 // errNoCheckpoint is returned by every operation that needs saved VM state
 // when the VMM build has no checkpoint support.
-var errNoCheckpoint = fmt.Errorf("%w: this bhatti-vmm build has no checkpoint support (stop, snapshot, restore and fork are unavailable)", engine.ErrNotSupported)
+var errNoCheckpoint = fmt.Errorf("%w: this bhatti-vmm build has no checkpoint support (snapshot, restore and fork are unavailable)", engine.ErrNotSupported)
 
 // ThermalSupported reports whether the warm tier (live pause) is available.
 // The server consults it before using the engine's thermal methods.
 func (e *Engine) ThermalSupported() bool { return e.caps.Pause }
-
-// ColdSupported reports whether a sandbox can be snapshotted to disk (the cold
-// tier). Without it a warm sandbox stays warm.
-func (e *Engine) ColdSupported() bool { return e.caps.Checkpoint }
 
 // errNoPause is returned by Pause when the VMM build can't pause a VM.
 var errNoPause = fmt.Errorf("%w: this bhatti-vmm build can't pause a VM", engine.ErrNotSupported)
@@ -898,7 +894,7 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 // snapshotted but exec-after-restore breaks (the FUSE map isn't persisted).
 func (e *Engine) Stop(ctx context.Context, id string) error {
 	if !e.caps.Checkpoint {
-		return errNoCheckpoint
+		return e.powerOff(ctx, id)
 	}
 	vm, err := e.getVM(id)
 	if err != nil {
@@ -938,6 +934,44 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 	vm.mu.Unlock()
 	vm.persist()
 	slog.Info("krucible sandbox stopped (cold)", "id", id, "bundle", bundleDir)
+	return nil
+}
+
+// powerOff is Stop without checkpoint support: flush the guest's page cache
+// (lohar already syncs after each exec; this covers background writers), then
+// kill the VM. The root disk persists; Start boots it fresh, so the
+// sandbox comes back with its files but not its processes.
+func (e *Engine) powerOff(ctx context.Context, id string) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
+	vm.mu.Lock()
+	if vm.Status != "running" {
+		vm.mu.Unlock()
+		return nil
+	}
+	ag := vm.Agent
+	vm.mu.Unlock()
+	if ag != nil {
+		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// Best effort: a guest that can't sync still gets powered off; ext4's
+		// journal keeps the filesystem consistent, only unflushed writes are lost.
+		if _, err := ag.Exec(sctx, []string{"sync"}, nil, ""); err != nil {
+			slog.Warn("krucible stop: guest sync failed", "id", id, "error", err)
+		}
+		cancel()
+	}
+	vm.kill()
+	vm.mu.Lock()
+	vm.Status = "stopped"
+	vm.Thermal = "cold"
+	vm.Agent = nil
+	vm.mu.Unlock()
+	vm.persist()
+	slog.Info("krucible sandbox stopped (powered off)", "id", id)
 	return nil
 }
 

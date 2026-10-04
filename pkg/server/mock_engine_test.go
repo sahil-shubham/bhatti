@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
@@ -25,10 +26,6 @@ type mockEngine struct {
 	ExecResult     engine.ExecResult
 	CreateErr      error
 	ExecErr        error
-	// ExecStarted/ExecRelease, when set, make Exec signal that it started and
-	// block until released (a command still running).
-	ExecStarted chan struct{}
-	ExecRelease chan struct{}
 	StopErr        error
 	ActivityResult *proto.ActivityInfo
 	ActivityErr    error
@@ -36,6 +33,13 @@ type mockEngine struct {
 	// LastCreateSpec is the spec from the most recent successful Create call,
 	// for tests that want to verify what got passed downstream.
 	LastCreateSpec engine.SandboxSpec
+
+	// ExecStarted/ExecRelease, when set, make Exec signal that it started and
+	// block until released (a command still running).
+	ExecStarted chan struct{}
+	ExecRelease chan struct{}
+	// TunnelRefusals makes the next N Tunnel calls fail as "nothing listening".
+	TunnelRefusals int
 }
 
 func newMockEngine() *mockEngine {
@@ -175,9 +179,16 @@ func (m *mockEngine) ListeningPorts(_ context.Context, id string) ([]int, error)
 func (m *mockEngine) Tunnel(_ context.Context, id string, port int) (io.ReadWriteCloser, error) {
 	m.mu.Lock()
 	_, ok := m.sandboxes[id]
+	refuse := m.TunnelRefusals > 0
+	if refuse {
+		m.TunnelRefusals--
+	}
 	m.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("sandbox %q not found", id)
+	}
+	if refuse {
+		return nil, fmt.Errorf("forward to port %d: %w: connection refused", port, agent.ErrPortRefused)
 	}
 	_, client := net.Pipe()
 	return client, nil

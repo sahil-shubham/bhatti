@@ -1,14 +1,18 @@
 package krucible
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // ensureVMMSigned keeps the dev loop robust on darwin: HVF requires bhatti-vmm
@@ -156,6 +160,53 @@ func TestKrucibleReliabilitySuite(t *testing.T) {
 	enginetest.RunReliabilitySuite(t, newCheckpointEngine)
 }
 
+// TestKrucibleStopPowersOff: without checkpoint support, Stop powers the VM off
+// and Start boots it fresh. Files on the root disk survive; anything that lived
+// only in RAM (tmpfs, processes) is gone, and the guest has a new boot id.
+func TestKrucibleStopPowersOff(t *testing.T) {
+	eng := newBlockRootEngine(t)
+	if eng.(*Engine).caps.Checkpoint {
+		t.Skip("bhatti-vmm checkpoints; Stop snapshots instead of powering off")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "poweroff", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: gateway.PostureNone}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	run := func(argv ...string) string {
+		t.Helper()
+		r, err := eng.Exec(ctx, id, argv)
+		if err != nil || r.ExitCode != 0 {
+			t.Fatalf("exec %v: err=%v exit=%d", argv, err, r.ExitCode)
+		}
+		return strings.TrimSpace(r.Stdout)
+	}
+	bootBefore := run("cat", "/proc/sys/kernel/random/boot_id")
+	run("writeuid", "/workspace/on-disk")
+	run("writeuid", "/tmp/in-ram")
+
+	if err := eng.Stop(ctx, id); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := eng.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := run("cat", "/proc/sys/kernel/random/boot_id"); got == bootBefore {
+		t.Fatal("same boot id after Stop/Start: the VM wasn't powered off")
+	}
+	if got := run("cat", "/workspace/on-disk"); got != "1000" {
+		t.Fatalf("file on the root disk after power-off = %q, want 1000", got)
+	}
+	if got := run("cat", "/tmp/in-ram"); got != "" {
+		t.Fatalf("tmpfs file survived a power-off: %q", got)
+	}
+}
+
 // --- test helpers ---
 
 func repoRoot(t *testing.T) string {
@@ -220,6 +271,10 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 		if err := os.MkdirAll(filepath.Join(root, d), 0755); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// The guest user (uid 1000) writes to /workspace; the image's files are root's.
+	if err := os.Chmod(filepath.Join(root, "workspace"), 0o777); err != nil {
+		t.Fatal(err)
 	}
 	guestArch := runtime.GOARCH // HVF/KVM: guest arch == host arch
 

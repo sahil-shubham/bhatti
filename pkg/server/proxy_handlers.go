@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
@@ -131,10 +133,43 @@ type tunnelTransport struct {
 	engine   engine.Engine
 	engineID string
 	port     int
+	// waitUp is how long to keep retrying while nothing listens on port yet
+	// (a sandbox that just booted fresh). 0 = fail on the first refusal.
+	waitUp time.Duration
+}
+
+// coldStartGrace is how long the public proxy waits for a just-woken
+// sandbox's app to start listening. A sandbox that came back from cold
+// rebooted, and its --init app needs a moment; a warm one never stopped.
+func coldStartGrace(wasCold bool) time.Duration {
+	if wasCold {
+		return 15 * time.Second
+	}
+	return 0
+}
+
+// openTunnel dials port in the guest, retrying refusals (nothing listening
+// yet) until waitUp has passed. A refusal means no request bytes were sent, so
+// retrying is safe for any method.
+func (t *tunnelTransport) openTunnel(ctx context.Context) (io.ReadWriteCloser, error) {
+	deadline := time.Now().Add(t.waitUp)
+	delay := 50 * time.Millisecond
+	for {
+		tunnel, err := t.engine.Tunnel(ctx, t.engineID, t.port)
+		if err == nil || !errors.Is(err, agent.ErrPortRefused) || time.Now().Add(delay).After(deadline) {
+			return tunnel, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, 500*time.Millisecond)
+	}
 }
 
 func (t *tunnelTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	tunnel, err := t.engine.Tunnel(req.Context(), t.engineID, t.port)
+	tunnel, err := t.openTunnel(req.Context())
 	if err != nil {
 		return nil, err
 	}

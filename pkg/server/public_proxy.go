@@ -332,6 +332,9 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 	// Wake sandbox with bounded concurrency + singleflight coalescing.
 	wasCold := false
 	if te, ok := thermalOf(h.engine); ok {
+		// A sandbox coming back from cold boots fresh (no checkpoint support):
+		// its app restarts from --init and may not be listening yet.
+		wasCold = te.ThermalState(route.engineID) == "cold"
 		if err := h.ensureHotBounded(ctx, te, route.engineID); err != nil {
 			if err == errServerBusy {
 				h.busy.Add(1)
@@ -344,7 +347,6 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 			}
 			return
 		}
-		wasCold = true // conservative: we called ensureHotBounded
 	}
 
 	// Signal activity on every request (HTTP and WebSocket) so the
@@ -374,6 +376,7 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 			engine:   h.engine,
 			engineID: route.engineID,
 			port:     route.port,
+			waitUp:   coldStartGrace(wasCold),
 		},
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"

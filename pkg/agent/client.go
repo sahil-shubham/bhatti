@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -311,6 +312,10 @@ func (c *AgentClient) Shell(ctx context.Context, argv []string, env map[string]s
 	return &agentTermConn{conn: conn}, nil
 }
 
+// ErrPortRefused means the guest agent couldn't connect to the requested port:
+// nothing is listening there (yet). Nothing was sent to the guest app.
+var ErrPortRefused = errors.New("refused")
+
 // Forward opens a raw TCP tunnel to a port inside the guest.
 func (c *AgentClient) Forward(ctx context.Context, port uint16) (io.ReadWriteCloser, error) {
 	conn, err := c.dialForward(ctx)
@@ -344,7 +349,7 @@ func (c *AgentClient) Forward(ctx context.Context, port uint16) (io.ReadWriteClo
 		if resp.Message != nil {
 			msg = *resp.Message
 		}
-		return nil, fmt.Errorf("forward to port %d refused: %s", port, msg)
+		return nil, fmt.Errorf("forward to port %d: %w: %s", port, ErrPortRefused, msg)
 	}
 
 	// After handshake, conn is a raw bidirectional TCP tunnel.
