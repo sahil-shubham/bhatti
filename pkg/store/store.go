@@ -104,6 +104,7 @@ ALTER TABLE sandboxes ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 1024;
 ALTER TABLE sandboxes ADD COLUMN disk_size_mb INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sandboxes ADD COLUMN image TEXT NOT NULL DEFAULT 'minimal';
 ALTER TABLE sandboxes ADD COLUMN labels TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE sandboxes ADD COLUMN net_policy TEXT NOT NULL DEFAULT '';
 `
 
 // New opens (or creates) the SQLite database and runs migrations.
@@ -260,6 +261,27 @@ func New(dbPath string) (*Store, error) {
 		host_mem_avail_mb INTEGER NOT NULL DEFAULT 0
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_ms_ts ON metrics_snapshots(ts)`)
+
+	db.Exec(`CREATE TABLE IF NOT EXISTS secret_grants (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		secret_name TEXT NOT NULL,
+		sandbox_id TEXT NOT NULL,
+		hosts_json TEXT NOT NULL DEFAULT '[]',
+		placeholder TEXT NOT NULL UNIQUE,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		expires_at DATETIME,
+		revoked_at DATETIME
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_secret_grants_sandbox ON secret_grants(sandbox_id)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_secret_grants_user_created ON secret_grants(user_id, created_at)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS sandbox_cas (
+		sandbox_id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		cert_pem TEXT NOT NULL,
+		key_enc BLOB NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`)
 
 	return &Store{db: db}, nil
 }

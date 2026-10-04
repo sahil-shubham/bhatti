@@ -8,22 +8,23 @@ import (
 )
 
 type Sandbox struct {
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	TemplateID string          `json:"template_id"`
-	EngineID   string          `json:"engine_id"`
-	Status     string          `json:"status"`
-	IP         string          `json:"ip"`
-	EngineMeta json.RawMessage `json:"engine_meta"`
-	CreatedBy  string          `json:"created_by"`
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	TemplateID     string          `json:"template_id"`
+	EngineID       string          `json:"engine_id"`
+	Status         string          `json:"status"`
+	IP             string          `json:"ip"`
+	EngineMeta     json.RawMessage `json:"engine_meta"`
+	NetPolicy      json.RawMessage `json:"net_policy,omitempty"`
+	CreatedBy      string          `json:"created_by"`
 	CreatedAt      time.Time       `json:"created_at"`
 	StoppedAt      *time.Time      `json:"stopped_at,omitempty"`
 	KeepHot        bool            `json:"keep_hot"`
 	ShellTokenHash string          `json:"-"` // never expose in API responses
-	CPUs       float64         `json:"cpus"`
-	MemoryMB   int             `json:"memory_mb"`
-	DiskSizeMB int             `json:"disk_size_mb"`
-	Image      string          `json:"image"`
+	CPUs           float64         `json:"cpus"`
+	MemoryMB       int             `json:"memory_mb"`
+	DiskSizeMB     int             `json:"disk_size_mb"`
+	Image          string          `json:"image"`
 	// Labels is operator-controlled metadata for fleet enumeration
 	// (e.g. {"pool": "workers", "env": "prod"}). Persisted as JSON in
 	// the labels column. Empty/nil maps round-trip as the SQL default
@@ -34,7 +35,7 @@ type Sandbox struct {
 
 // SecretRecord tracks an encrypted secret.
 
-const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal'), COALESCE(labels,'{}')`
+const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal'), COALESCE(labels,'{}'), COALESCE(net_policy,'')`
 
 func (s *Store) CreateSandbox(sb Sandbox) error {
 	if sb.EngineMeta == nil {
@@ -49,8 +50,8 @@ func (s *Store) CreateSandbox(sb Sandbox) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON,
+		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels, net_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON, string(sb.NetPolicy),
 	)
 	return err
 }
@@ -310,14 +311,17 @@ func (s *Store) DeleteSandboxByID(id string) error {
 
 func scanSandbox(s scanner) (*Sandbox, error) {
 	var sb Sandbox
-	var metaJSON, labelsJSON string
+	var metaJSON, labelsJSON, netPolicy string
 	var stoppedAt sql.NullTime
 	var keepHot int
-	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image, &labelsJSON)
+	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image, &labelsJSON, &netPolicy)
 	if err != nil {
 		return nil, err
 	}
 	sb.EngineMeta = json.RawMessage(metaJSON)
+	if netPolicy != "" {
+		sb.NetPolicy = json.RawMessage(netPolicy)
+	}
 	if stoppedAt.Valid {
 		sb.StoppedAt = &stoppedAt.Time
 	}
