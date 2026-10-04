@@ -20,7 +20,7 @@ import (
 // but a tmpfs/RAM marker (/tmp) does NOT (the cold boot starts tmpfs fresh) —
 // the distinction from a memory snapshot.
 func TestKrucibleFilesystemSnapshot(t *testing.T) {
-	eng := newCheckpointEngine(t)
+	eng := newPauseEngine(t)
 	ke := eng.(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()

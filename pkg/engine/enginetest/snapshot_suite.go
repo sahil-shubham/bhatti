@@ -3,6 +3,8 @@ package enginetest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,18 +12,21 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
-// RunSnapshotSuite is the cold-tier gate: a sandbox survives a Stop (snapshot to
-// disk + free RAM) / Start (restore) round-trip with both its guest RAM and its
-// rootfs intact, and exec works on the restored guest. The SAME assertions are
-// meant to pass on FC and krucible.
-//
-// What it proves:
-//   - exec-after-restore works (guest vCPU/devices resumed; rootfs survived);
-//   - a marker written to tmpfs (guest RAM) before Stop is intact after Start
-//     (the memory image round-tripped, not just a fresh reboot).
+// checkpointEngine is the optional named memory-checkpoint/restore surface.
+type checkpointEngine interface {
+	Checkpoint(ctx context.Context, sandboxID, userID string, subnetIndex int, snapName, snapDir string) (any, error)
+	ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName, ownerUserID string) (engine.SandboxInfo, error)
+}
+
+// RunSnapshotSuite checks that a named checkpoint restores RAM and a usable
+// guest into a new sandbox without stopping the original.
 func RunSnapshotSuite(t *testing.T, newEngine NewEngine) {
 	eng := newEngine(t) // may t.Skip
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	cp, ok := eng.(checkpointEngine)
+	if !ok {
+		t.Skip("engine does not implement named checkpoint/restore")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
 	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "snap", CPUs: 1, MemoryMB: 512})
@@ -36,47 +41,43 @@ func RunSnapshotSuite(t *testing.T, newEngine NewEngine) {
 		t.Skip("engine does not implement the file surface")
 	}
 
-	// A marker in tmpfs lives in guest RAM — it must survive the memory snapshot.
-	const marker = "cold-marker-7f3a"
+	// A marker in tmpfs lives in guest RAM; a fresh boot cannot recover it.
+	const marker = "checkpoint-marker-7f3a"
 	if err := fe.FileWrite(ctx, id, "/tmp/snap-marker", "0644", int64(len(marker)), strings.NewReader(marker)); err != nil {
 		t.Fatalf("FileWrite marker: %v", err)
 	}
-	if r, err := eng.Exec(ctx, id, []string{"echo", "pre-stop"}); err != nil || !strings.Contains(r.Stdout, "pre-stop") {
-		t.Fatalf("pre-stop exec: err=%v out=%q", err, r.Stdout)
+	snapParent := t.TempDir()
+	manifest, err := cp.Checkpoint(ctx, id, "", 0, "memory", snapParent)
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if s, err := eng.Status(ctx, id); err != nil || s.Status != "running" {
+		t.Fatalf("source after checkpoint status = %q (err %v), want running", s.Status, err)
+	}
+	if r, err := eng.Exec(ctx, id, []string{"echo", "still-running"}); err != nil || !strings.Contains(r.Stdout, "still-running") {
+		t.Fatalf("source exec after checkpoint: err=%v out=%q", err, r.Stdout)
 	}
 
-	t.Run("Stop", func(t *testing.T) {
-		if err := eng.Stop(ctx, id); err != nil {
-			t.Fatalf("Stop: %v", err)
-		}
-		if s, err := eng.Status(ctx, id); err != nil || s.Status != "stopped" {
-			t.Fatalf("post-Stop status = %q (err %v), want stopped", s.Status, err)
-		}
-	})
-
-	t.Run("Start", func(t *testing.T) {
-		if err := eng.Start(ctx, id); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		if s, err := eng.Status(ctx, id); err != nil || s.Status != "running" {
-			t.Fatalf("post-Start status = %q (err %v), want running", s.Status, err)
-		}
-	})
-
-	t.Run("ExecAfterRestore", func(t *testing.T) {
-		r, err := eng.Exec(ctx, id, []string{"echo", "post-restore"})
-		if err != nil || !strings.Contains(r.Stdout, "post-restore") {
-			t.Fatalf("exec-after-restore: err=%v out=%q", err, r.Stdout)
-		}
-	})
-
-	t.Run("RAMSurvived", func(t *testing.T) {
-		var buf bytes.Buffer
-		if _, _, err := fe.FileRead(ctx, id, "/tmp/snap-marker", &buf); err != nil {
-			t.Fatalf("FileRead marker after restore: %v", err)
-		}
-		if buf.String() != marker {
-			t.Fatalf("tmpfs marker after restore = %q, want %q (guest RAM not restored)", buf.String(), marker)
-		}
-	})
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	restored, err := cp.ResumeFromManifestJSON(ctx, filepath.Join(snapParent, "memory"), manifestJSON, "restored", "")
+	if err != nil {
+		t.Fatalf("ResumeFromManifestJSON: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), restored.ID) })
+	if restored.ID == id {
+		t.Fatal("restore reused the source sandbox instead of creating a new one")
+	}
+	if r, err := eng.Exec(ctx, restored.ID, []string{"echo", "post-restore"}); err != nil || !strings.Contains(r.Stdout, "post-restore") {
+		t.Fatalf("exec-after-restore: err=%v out=%q", err, r.Stdout)
+	}
+	var buf bytes.Buffer
+	if _, _, err := fe.FileRead(ctx, restored.ID, "/tmp/snap-marker", &buf); err != nil {
+		t.Fatalf("FileRead marker after restore: %v", err)
+	}
+	if buf.String() != marker {
+		t.Fatalf("tmpfs marker after restore = %q, want %q (guest RAM not restored)", buf.String(), marker)
+	}
 }

@@ -127,8 +127,7 @@ func newPauseEngine(t *testing.T) engine.Engine {
 	return eng
 }
 
-// newCheckpointEngine is newBlockRootEngine for tests that pause, stop,
-// snapshot or fork; it skips when the bhatti-vmm build can't checkpoint.
+// newCheckpointEngine gates tests that save or restore guest memory.
 func newCheckpointEngine(t *testing.T) engine.Engine {
 	eng := newBlockRootEngine(t)
 	if !eng.(*Engine).caps.Checkpoint {
@@ -148,28 +147,22 @@ func TestKrucibleThermalSuite(t *testing.T) {
 	enginetest.RunThermalSuite(t, newPauseEngine)
 }
 
-// TestKrucibleSnapshotSuite is the cold-tier gate: Stop (snapshot + free RAM) /
-// Start (restore) round-trip with RAM + rootfs intact and exec-after-restore.
+// TestKrucibleSnapshotSuite exercises a named checkpoint/restore into a new
+// sandbox, keeping the original running.
 func TestKrucibleSnapshotSuite(t *testing.T) {
 	enginetest.RunSnapshotSuite(t, newCheckpointEngine)
 }
 
-// TestKrucibleReliabilitySuite is the cold-tier HARDENING gate: N stop→start
-// cycles stay stable (RAM + rootfs survive each), lifecycle transitions are
-// idempotent, and a concurrent Stop/Start/Exec storm converges to a usable VM.
-// The engine-internal failure injections live in reliability_test.go.
+// TestKrucibleReliabilitySuite exercises repeated power-off/reboot and
+// concurrent cold wakeups, independent of checkpoint availability.
 func TestKrucibleReliabilitySuite(t *testing.T) {
-	enginetest.RunReliabilitySuite(t, newCheckpointEngine)
+	enginetest.RunReliabilitySuite(t, newBlockRootEngine)
 }
 
-// TestKrucibleStopPowersOff: without checkpoint support, Stop powers the VM off
-// and Start boots it fresh. Files on the root disk survive; anything that lived
-// only in RAM (tmpfs, processes) is gone, and the guest has a new boot id.
+// TestKrucibleStopPowersOff pins that Stop always discards RAM and Start boots
+// fresh from the persisted root disk, even when checkpointing is available.
 func TestKrucibleStopPowersOff(t *testing.T) {
 	eng := newBlockRootEngine(t)
-	if eng.(*Engine).caps.Checkpoint {
-		t.Skip("bhatti-vmm checkpoints; Stop snapshots instead of powering off")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "poweroff", CPUs: 1, MemoryMB: 512,
@@ -206,6 +199,39 @@ func TestKrucibleStopPowersOff(t *testing.T) {
 	}
 	if got := run("cat", "/tmp/in-ram"); got != "" {
 		t.Fatalf("tmpfs file survived a power-off: %q", got)
+	}
+}
+
+// TestKrucibleStopIgnoresCheckpointCapability exercises the cold transition
+// without a hypervisor: a checkpoint-capable engine must still terminate its
+// helper rather than try to PAUSE/save to a control socket.
+func TestKrucibleStopIgnoresCheckpointCapability(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	id := "stop-capability"
+	vm := &VM{
+		ID: id, Status: "running", Thermal: "hot", SandboxDir: t.TempDir(),
+		cmd: cmd, waitDone: done, HelperPID: cmd.Process.Pid,
+	}
+	e := &Engine{
+		caps: VMMCapabilities{Checkpoint: true},
+		vms:  map[string]*VM{id: vm},
+	}
+	if err := e.Stop(context.Background(), id); err != nil {
+		t.Fatalf("Stop with checkpoint support: %v", err)
+	}
+	if vm.Status != "stopped" || vm.Thermal != "cold" || vm.HelperPID != 0 || vm.cmd != nil {
+		t.Fatalf("power-off did not clear helper: status=%q thermal=%q pid=%d cmd=%v",
+			vm.Status, vm.Thermal, vm.HelperPID, vm.cmd)
+	}
+	if pidAlive(cmd.Process.Pid) {
+		t.Fatalf("helper pid %d survived Stop", cmd.Process.Pid)
 	}
 }
 
@@ -307,7 +333,7 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	// splitting on whitespace and dispatching in-process (no real shell needed).
 	// writeuid: writes the caller's uid to a file — lets a test observe that
 	// --init (and exec) ran as uid 1000 without a full userland.
-	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes"} {
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes", "date", "oncpu"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -340,6 +366,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 func main() {
@@ -385,6 +412,23 @@ func dispatch(name string, args []string) {
 		if len(args) > 0 {
 			os.WriteFile(args[0], []byte(strconv.Itoa(os.Getuid())), 0644)
 		}
+	case "date": // high-resolution wall clock for restore-gap tests
+		fmt.Println(time.Now().UnixNano())
+	case "oncpu": // exercise a specific online vCPU after restoring its state
+		cpu, err := strconv.Atoi(args[0])
+		if err != nil || cpu < 0 || cpu >= 1024 {
+			os.Exit(2)
+		}
+		var mask [128]byte
+		mask[cpu/8] = 1 << uint(cpu%8)
+		_, _, errno := syscall.RawSyscall(syscall.SYS_SCHED_SETAFFINITY, 0, uintptr(len(mask)), uintptr(unsafe.Pointer(&mask[0])))
+		if errno != 0 {
+			fmt.Fprintln(os.Stderr, errno)
+			os.Exit(1)
+		}
+		until := time.Now().Add(100 * time.Millisecond)
+		for time.Now().Before(until) {}
+		fmt.Println(cpu)
 	case "fsbytes": // fsbytes PATH -> total bytes of the filesystem holding PATH
 		var st syscall.Statfs_t
 		if len(args) > 0 && syscall.Statfs(args[0], &st) == nil {

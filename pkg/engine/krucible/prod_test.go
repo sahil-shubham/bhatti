@@ -15,10 +15,9 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/oci"
 )
 
-// TestKrucibleProductionImage boots a REAL OCI-derived rootfs (a full userland
-// with a shell + coreutils, not the toy multi-call util) under the block-root
-// cold path and exercises a real shell plus the cold snapshot round-trip — the
-// production use case. Opt-in (slow / needs a real image), one of:
+// TestKrucibleProductionImage boots a real OCI-derived rootfs (full userland)
+// and exercises shell commands across a power-off/reboot on the persisted disk.
+// Opt-in (slow / needs a real image), one of:
 //
 //	KRUCIBLE_TEST_BASE_IMAGE=<prebuilt ext4>   # fast, CI-friendly
 //	KRUCIBLE_TEST_OCI_REF=<ref e.g. alpine>    # built here via oci.PullAndConvert (needs network)
@@ -78,7 +77,7 @@ func TestKrucibleProductionImage(t *testing.T) {
 		t.Logf("guest: %s", strings.TrimSpace(r.Stdout))
 	}
 
-	// Cold round-trip on the real userland.
+	// Power off and boot the real userland from its persisted root disk.
 	if err := eng.Stop(ctx, id); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -86,7 +85,7 @@ func TestKrucibleProductionImage(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	if r, err := eng.Exec(ctx, id, []string{"/bin/sh", "-c", "echo restored-$((1+1))"}); err != nil || strings.TrimSpace(r.Stdout) != "restored-2" {
-		t.Fatalf("exec-after-restore on real image: err=%v out=%q", err, r.Stdout)
+		t.Fatalf("exec-after-reboot on real image: err=%v out=%q", err, r.Stdout)
 	}
 }
 

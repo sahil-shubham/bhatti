@@ -3,7 +3,6 @@ package enginetest
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -12,26 +11,13 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
-// RunReliabilitySuite is the cold-tier hardening gate — the VMM-agnostic "spec"
-// the migration plan calls for (the FC snapshot-reliability suite, re-targeted
-// at the bundle/cold path). It asserts the failure-mode contract, not just the
-// happy path:
+// RunReliabilitySuite hardens the power-off cold tier:
+//   - StopStartCycles: rootfs data survives every power-off/reboot and exec
+//     works after each boot (RAM is intentionally discarded).
+//   - ConcurrentWakeStorm: overlapping cold wakes converge on one usable VM.
+//   - IdempotentTransitions: retrying Stop/Start does not corrupt state.
 //
-//   - StopStartCycles: N cold round-trips stay stable — guest RAM (tmpfs marker)
-//     AND rootfs (a file on the block root) survive EVERY cycle, and exec works
-//     after each. Catches drift the single-cycle RunSnapshotSuite can't (leaks,
-//     device-state corruption that only shows on the 2nd/3rd restore).
-//   - ConcurrentLifecycle: a burst of overlapping Stop/Start/EnsureHot/Exec must
-//     serialize (the per-VM launch lock) into a consistent, still-usable VM — no
-//     panic, no wedged state, no lost sandbox.
-//   - IdempotentTransitions: Stop-on-stopped and Start-on-running are no-ops, so
-//     a retrying caller (proxy wake, daemon recovery) can't corrupt state.
-//
-// Requires a cold-tier-capable engine (block root); the caller passes the right
-// factory (e.g. krucible's newBlockRootEngine), which self-skips without a
-// hypervisor. Engine-internal failure injections (snapshot-write failure,
-// agent-timeout cleanup, helper-process leak counts) live in the engine's own
-// package where the internals are reachable.
+// The caller supplies a block-root engine that self-skips without a hypervisor.
 func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 	eng := newEngine(t) // may t.Skip
 	fe, ok := eng.(fileEngine)
@@ -50,8 +36,7 @@ func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 		id := info.ID
 		t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
-		// A rootfs marker (survives via the block root) and a tmpfs marker
-		// (survives only if guest RAM round-trips through the snapshot).
+		// The rootfs survives Stop/Start because it is a persistent block root.
 		const rootMark = "reliability-root-9a1c"
 		if err := fe.FileWrite(ctx, id, "/root/relmark", "0644", int64(len(rootMark)), strings.NewReader(rootMark)); err != nil {
 			t.Fatalf("write rootfs marker: %v", err)
@@ -59,12 +44,6 @@ func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 
 		const cycles = 3
 		for i := 0; i < cycles; i++ {
-			// Refresh the RAM marker each cycle so a survived value proves THIS
-			// cycle's RAM round-tripped, not a stale disk copy.
-			ramMark := fmt.Sprintf("reliability-ram-cycle-%d", i)
-			if err := fe.FileWrite(ctx, id, "/tmp/relram", "0644", int64(len(ramMark)), strings.NewReader(ramMark)); err != nil {
-				t.Fatalf("cycle %d: write tmpfs marker: %v", i, err)
-			}
 
 			if err := eng.Stop(ctx, id); err != nil {
 				t.Fatalf("cycle %d: Stop: %v", i, err)
@@ -79,13 +58,9 @@ func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 				t.Fatalf("cycle %d: post-Start status = %q (err %v), want running", i, s.Status, err)
 			}
 
-			// exec works after every restore (vCPU/devices actually resumed).
+			// A fresh boot must still have a responsive agent and persisted root.
 			if r, err := eng.Exec(ctx, id, []string{"echo", "cycle-ok"}); err != nil || !strings.Contains(r.Stdout, "cycle-ok") {
-				t.Fatalf("cycle %d: exec-after-restore: err=%v out=%q", i, err, r.Stdout)
-			}
-			// tmpfs (guest RAM) survived.
-			if got := readFile(t, fe, ctx, id, "/tmp/relram"); got != ramMark {
-				t.Fatalf("cycle %d: tmpfs marker = %q, want %q (guest RAM not restored)", i, got, ramMark)
+				t.Fatalf("cycle %d: exec-after-boot: err=%v out=%q", i, err, r.Stdout)
 			}
 			// rootfs survived every cycle.
 			if got := readFile(t, fe, ctx, id, "/root/relmark"); got != rootMark {
@@ -150,8 +125,7 @@ func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 		id := info.ID
 		t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
-		// Drive it cold so each EnsureHot has real work (cold→restore) — the path
-		// that used to double-launch.
+		// Drive it cold (helper terminated) so each EnsureHot has real work.
 		if err := eng.Stop(ctx, id); err != nil {
 			t.Fatalf("Stop (drive cold): %v", err)
 		}

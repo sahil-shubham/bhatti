@@ -20,13 +20,11 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
-// TestKrucibleServerIntegration drives the FULL daemon stack (HTTP API + store +
-// thermal manager) over a real krucible block-root engine — the "whole suite on
-// the engine" milestone. It proves the production wake-on-request path: an exec
-// against a COLD (snapshotted, helper-killed) sandbox transparently cold-restores
-// it via the server's ensureHot -> EnsureHot -> Start.
+// TestKrucibleServerIntegration drives the full daemon stack (HTTP API + store
+// + thermal manager). Exec against a powered-off sandbox auto-boots from disk
+// through the server's ensureHot -> EnsureHot -> Start path.
 func TestKrucibleServerIntegration(t *testing.T) {
-	_, do := krucibleServer(t, newCheckpointEngine) // skips if libkrun/vmm/mke2fs unavailable
+	_, do := krucibleServer(t, newBlockRootEngine) // skips without VM prerequisites
 
 	// --- create over HTTP ---
 	resp := do("POST", "/sandboxes", map[string]any{"name": "srv-it", "memory_mb": 512})
@@ -64,8 +62,7 @@ func TestKrucibleServerIntegration(t *testing.T) {
 		}
 	})
 
-	// The key assertion: exec against a COLD sandbox auto-wakes it (cold restore)
-	// through the server's wake-on-request path — no explicit /start needed.
+	// Exec against a powered-off sandbox auto-boots without an explicit /start.
 	t.Run("ExecAutoWakesFromCold", func(t *testing.T) { exec("woke-cold", "echo", "woke-cold") })
 }
 

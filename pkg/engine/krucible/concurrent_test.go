@@ -21,7 +21,7 @@ import (
 // sandbox, then a hang). The per-VM launchMu must collapse the burst into a
 // single launch. Cross-arch (pure-Go engine) — guards macOS + both Linux arches.
 func TestKrucibleConcurrentWakeNoDoubleLaunch(t *testing.T) {
-	eng := newCheckpointEngine(t).(*Engine) // skips if libkrun/vmm/mke2fs unavailable
+	eng := newBlockRootEngine(t).(*Engine) // power-off cold wake needs no checkpoint
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -32,8 +32,8 @@ func TestKrucibleConcurrentWakeNoDoubleLaunch(t *testing.T) {
 	id := info.ID
 	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
-	// Drive it cold (snapshot + free RAM + kill the helper) so each EnsureHot has
-	// real work to do (cold → Start → launch), the exact path that double-spawned.
+	// Stop powers off the helper, forcing every EnsureHot to take the cold
+	// launch path where concurrent calls used to double-spawn.
 	if err := eng.Stop(ctx, id); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
