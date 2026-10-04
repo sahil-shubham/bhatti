@@ -3,21 +3,119 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg"
+	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 	"github.com/spf13/cobra"
 )
 
 var adminCmd = &cobra.Command{
-	Use:   "admin <status|events|metrics>",
-	Short: "Observability commands (requires DB access)",
-	Long: `Admin commands operate directly on the local SQLite database.
-Run on the server, not remotely.`,
+	Use:   "admin <status|events|metrics|migrate-images|gc-images>",
+	Short: "Observability and maintenance commands (requires local access)",
+	Long: `Admin commands operate directly on the local SQLite database and data
+directory. Run on the server, not remotely.`,
 	Example: `  bhatti admin status
   bhatti admin events --type thermal --since 24h
-  bhatti admin metrics --since 1h`,
+  bhatti admin metrics --since 1h
+  sudo bhatti admin gc-images --dry-run`,
+}
+
+// --- base images ---
+
+// adminDataDir is the data dir the image commands work on: --data-dir, else
+// the loaded config's data_dir.
+func adminDataDir() (string, error) {
+	if d, _ := rootCmd.PersistentFlags().GetString("data-dir"); d != "" {
+		return d, nil
+	}
+	cfg, err := pkg.LoadConfig()
+	if err != nil {
+		return "", fmt.Errorf("load config: %w", err)
+	}
+	return cfg.DataDir, nil
+}
+
+var adminMigrateImagesCmd = &cobra.Command{
+	Use:   "migrate-images",
+	Short: "Turn tier images into immutable bases and point disks at them",
+	Long: `A sandbox's root disk names its base image by path, so a base is never
+rewritten: bases live under <data_dir>/images/bases/, named by content; a tier
+image (images/rootfs-<tier>-<arch>.ext4) is a symlink to its current base; and
+every disk names the base itself. This brings a data dir to that layout:
+tier images that are still files become bases, and sandbox, snapshot and image
+disks that name a base through a symlink are re-pointed at it.
+
+Idempotent. The daemon runs it at startup and the installer before it switches
+a tier to a new image. Exits non-zero if anything was left unmigrated: a tier
+must not be switched while a disk still reaches its base through the symlink.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dataDir, err := adminDataDir()
+		if err != nil {
+			return err
+		}
+		m, err := krucible.MigrateImages(dataDir)
+		if isJSON(cmd) {
+			outputJSON(m)
+			return err
+		}
+		for _, s := range m.Moved {
+			fmt.Println("moved " + s)
+		}
+		for _, s := range m.Rewritten {
+			fmt.Println("re-pointed " + s)
+		}
+		for _, s := range m.Broken {
+			fmt.Fprintln(os.Stderr, "warning: "+s)
+		}
+		for _, s := range m.Problems {
+			fmt.Fprintln(os.Stderr, "not migrated: "+s)
+		}
+		if err == nil && len(m.Moved)+len(m.Rewritten) == 0 {
+			fmt.Println("images already migrated")
+		}
+		return err
+	},
+}
+
+var adminGCImagesCmd = &cobra.Command{
+	Use:   "gc-images",
+	Short: "Remove base images nothing uses any more",
+	Long: `Removes the bases under <data_dir>/images/bases/ that no tier image,
+sandbox, snapshot or saved image disk uses, nor the configured
+krucible_base_image. The daemon also runs it at startup.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// The configured base must be kept even with --data-dir: no config,
+		// no GC.
+		cfg, err := pkg.LoadConfig()
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		dataDir, err := adminDataDir()
+		if err != nil {
+			return err
+		}
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		removed, err := krucible.GCImages(dataDir, []string{cfg.KrucibleBaseImage}, dryRun)
+		if isJSON(cmd) {
+			outputJSON(map[string]any{"removed": removed, "dry_run": dryRun})
+			return err
+		}
+		verb := "removed"
+		if dryRun {
+			verb = "would remove"
+		}
+		for _, p := range removed {
+			fmt.Println(verb + " " + p)
+		}
+		if err == nil && len(removed) == 0 {
+			fmt.Println("no unused base images")
+		}
+		return err
+	},
 }
 
 // --- admin status ---
@@ -331,9 +429,13 @@ func init() {
 	adminEventsCmd.Flags().Bool("count", false, "Return count only")
 	adminMetricsCmd.Flags().String("since", "", "Time range (e.g. 1h, 24h, 7d)")
 
+	adminGCImagesCmd.Flags().Bool("dry-run", false, "List what would be removed without removing it")
+
 	adminCmd.AddCommand(adminStatusCmd)
 	adminCmd.AddCommand(adminEventsCmd)
 	adminCmd.AddCommand(adminMetricsCmd)
+	adminCmd.AddCommand(adminMigrateImagesCmd)
+	adminCmd.AddCommand(adminGCImagesCmd)
 }
 
 // --- helpers ---

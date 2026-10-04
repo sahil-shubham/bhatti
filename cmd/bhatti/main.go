@@ -21,6 +21,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/backup"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 	"github.com/sahil-shubham/bhatti/pkg/server"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
@@ -101,6 +102,9 @@ func runDaemon() {
 	var eng engine.Engine
 	switch cfg.Engine {
 	case "krucible", "":
+		// Before recovery reads any sandbox's disk: an older data dir names
+		// tier images by path, which the next image update would overwrite.
+		migrateImages(cfg.DataDir)
 		eng, err = newKrucibleEngine(cfg)
 	case "firecracker":
 		slog.Error("the firecracker engine was removed in v2 (krucible). For Firecracker, use the `firecracker` branch / a v1.x release; otherwise set engine: krucible")
@@ -155,6 +159,10 @@ func runDaemon() {
 			}
 		}
 	}
+
+	// After recovery and the temp-dir cleanup above, before serving: nothing
+	// can be naming a base it is about to remove.
+	gcImages(cfg)
 
 	// Register tier rootfs images as system images so --image browser/minimal/docker works.
 	// Uses user_id='' (admin images visible to all users). Idempotent — skips if already exists.
@@ -687,6 +695,40 @@ func registerTierImages(cfg *pkg.Config, st *store.Store) {
 			CreatedAt: info.ModTime(),
 		})
 		slog.Info("registered tier image", "name", tier, "path", path)
+	}
+}
+
+// migrateImages brings the data dir to the immutable-base layout
+// (pkg/engine/krucible/bases.go). Problems are logged, not fatal: what was
+// left alone still works; the installer refuses to switch a tier while
+// anything is left.
+func migrateImages(dataDir string) {
+	m, err := krucible.MigrateImages(dataDir)
+	for _, s := range m.Moved {
+		slog.Info("images.migrate.tier", "moved", s)
+	}
+	if len(m.Rewritten) > 0 {
+		slog.Info("images.migrate.disks", "repointed", len(m.Rewritten))
+	}
+	for _, s := range m.Broken {
+		slog.Warn("images.migrate.broken", "disk", s)
+	}
+	for _, s := range m.Problems {
+		slog.Error("images.migrate.problem", "detail", s)
+	}
+	if err != nil {
+		slog.Error("images.migrate", "error", err)
+	}
+}
+
+// gcImages removes base images nothing uses any more.
+func gcImages(cfg *pkg.Config) {
+	removed, err := krucible.GCImages(cfg.DataDir, []string{cfg.KrucibleBaseImage}, false)
+	for _, p := range removed {
+		slog.Info("images.gc.removed", "base", p)
+	}
+	if err != nil {
+		slog.Error("images.gc", "error", err)
 	}
 }
 
