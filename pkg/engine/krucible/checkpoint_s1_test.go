@@ -289,8 +289,12 @@ func TestKrucibleRestoreRefusals(t *testing.T) {
 			rctx, rcancel := context.WithTimeout(ctx, 15*time.Second)
 			defer rcancel()
 			start := time.Now()
-			_, err := e.ResumeFromManifestJSON(rctx, copyDir, checkpointJSON(t, badManifest), "bad-"+tc.name, "")
-			if err == nil || !strings.Contains(err.Error(), tc.want) && (tc.name != "truncated-checkpoint" || !strings.Contains(err.Error(), "corrupt")) {
+			badRestore, err := e.ResumeFromManifestJSON(rctx, copyDir, checkpointJSON(t, badManifest), "bad-"+tc.name, "")
+			if err == nil {
+				_ = e.Destroy(context.Background(), badRestore.ID)
+				t.Fatalf("tampered checkpoint %q restored successfully", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) && (tc.name != "truncated-checkpoint" || !strings.Contains(err.Error(), "corrupt")) {
 				t.Fatalf("refusal: want %q (or corrupt for truncation), got %v", tc.want, err)
 			}
 			if d := time.Since(start); d >= 15*time.Second {

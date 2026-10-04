@@ -100,11 +100,16 @@ func TestKrucibleConcurrentFork(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("Fork %d: %v", i, err)
+	for i, child := range children {
+		if child.ID != "" {
+			t.Cleanup(func() { _ = e.Destroy(context.Background(), child.ID) })
 		}
-		t.Cleanup(func() { _ = e.Destroy(context.Background(), children[i].ID) })
+		if errs[i] != nil {
+			t.Errorf("Fork %d: %v", i, errs[i])
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
 	}
 	ids := map[string]bool{src.ID: true}
 	for i, child := range children {
