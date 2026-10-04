@@ -654,40 +654,13 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
-		// Per-create image (image pull / image save / snapshot), falling back to
-		// the engine's default base. The image is the root's CoW backing.
-		base, berr := e.resolveBase(spec)
-		if berr != nil {
-			return info, berr
+		rootImg, rootFormat, rootBase, perr := e.prepareRootDisk(sandboxDir, spec)
+		if perr != nil {
+			return info, perr
 		}
-		var rootImg string
-		if rootQcow2() {
-			// Default: a qcow2 CoW root — instant + host-FS-independent (no
-			// reflink/btrfs). Raw is the opt-out (KRUCIBLE_ROOT_RAW=1).
-			rootImg = filepath.Join(sandboxDir, "root.qcow2")
-			if isQcow2(base) {
-				// A saved qcow2 image is already a CoW node over the raw base;
-				// copy it as this sandbox's root (it keeps backing that base).
-				if spec.DiskSizeMB > 0 {
-					return info, fmt.Errorf("disk size: not supported for sandboxes created from a saved image")
-				}
-				if err = cloneFile(base, rootImg); err != nil {
-					return info, fmt.Errorf("clone qcow2 image: %w", err)
-				}
-			} else if err = e.createRootOverlayQcow2(rootImg, base, spec.DiskSizeMB); err != nil {
-				return info, fmt.Errorf("create qcow2 root overlay: %w", err)
-			}
-			baseSpec.RootDiskFormat = "qcow2"
-		} else {
-			rootImg = filepath.Join(sandboxDir, "root.img")
-			if err = cloneFile(base, rootImg); err != nil {
-				return info, fmt.Errorf("clone base image: %w", err)
-			}
-			if err = growFile(rootImg, spec.DiskSizeMB); err != nil {
-				return info, fmt.Errorf("disk size: %w", err)
-			}
-		}
+		slog.Debug("krucible root disk", "id", id, "root", rootImg, "base", rootBase)
 		baseSpec.RootDisk = rootImg
+		baseSpec.RootDiskFormat = rootFormat
 		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
 
 		if token == "" {
@@ -1049,22 +1022,26 @@ func buildSandboxConfig(id, name, token string, spec engine.SandboxSpec, mounts 
 	}
 }
 
-// cloneBaseImage CoW-clones the shared base ext4 image to dst (per-sandbox root
-// disk). The base is either a prebuilt image (BaseImage, the production path) or
-// one built once from BaseRootfs via mke2fs (the dev path).
 // resolveBase returns the CoW backing image for a new sandbox's root: the
 // per-create image (spec.BaseImage — set by the server for `image pull`,
 // `image save`, snapshot), else the engine's default BaseImage, else a dev base
 // built once from BaseRootfs. May be raw (a fresh base) or qcow2 (a saved image
-// / snapshot, itself a CoW node over a raw base).
+// / snapshot, itself a CoW node over a raw base). A root names its backing by
+// path for good, so this is the file a symlink (a tier name) leads to now,
+// never the symlink an update re-points (bases.go).
 func (e *Engine) resolveBase(spec engine.SandboxSpec) (string, error) {
-	if spec.BaseImage != "" {
-		return spec.BaseImage, nil
+	base := spec.BaseImage
+	if base == "" {
+		base = e.cfg.BaseImage
 	}
-	if e.cfg.BaseImage != "" {
-		return e.cfg.BaseImage, nil
+	if base != "" {
+		p, err := resolveBasePath(base)
+		if err != nil {
+			return "", fmt.Errorf("base image: %w", err)
+		}
+		return p, nil
 	}
-	base := filepath.Join(e.cfg.DataDir, "base.img")
+	base = filepath.Join(e.cfg.DataDir, "base.img")
 	e.baseImgMu.Lock()
 	defer e.baseImgMu.Unlock()
 	if _, err := os.Stat(base); err != nil {
@@ -1073,6 +1050,47 @@ func (e *Engine) resolveBase(spec engine.SandboxSpec) (string, error) {
 		}
 	}
 	return base, nil
+}
+
+// prepareRootDisk makes a new sandbox's root disk in sandboxDir from its
+// base, returning the disk, its format ("qcow2", or "" for raw) and the base.
+// It holds the bases lock shared from picking the base until the disk names
+// it, so GC can't remove the base in between.
+func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (root, format, base string, err error) {
+	unlock, err := lockBases(e.cfg.DataDir, false)
+	if err != nil {
+		return "", "", "", fmt.Errorf("lock base images: %w", err)
+	}
+	defer unlock()
+	if base, err = e.resolveBase(spec); err != nil {
+		return "", "", "", err
+	}
+	if !rootQcow2() {
+		root = filepath.Join(sandboxDir, "root.img")
+		if err := cloneFile(base, root); err != nil {
+			return "", "", "", fmt.Errorf("clone base image: %w", err)
+		}
+		if err := growFile(root, spec.DiskSizeMB); err != nil {
+			return "", "", "", fmt.Errorf("disk size: %w", err)
+		}
+		return root, "", base, nil
+	}
+	// Default: a qcow2 CoW root — instant + host-FS-independent (no
+	// reflink/btrfs). Raw is the opt-out (KRUCIBLE_ROOT_RAW=1).
+	root = filepath.Join(sandboxDir, "root.qcow2")
+	if isQcow2(base) {
+		// A saved qcow2 image is already a CoW node over the raw base;
+		// copy it as this sandbox's root (it keeps backing that base).
+		if spec.DiskSizeMB > 0 {
+			return "", "", "", fmt.Errorf("disk size: not supported for sandboxes created from a saved image")
+		}
+		if err := cloneFile(base, root); err != nil {
+			return "", "", "", fmt.Errorf("clone qcow2 image: %w", err)
+		}
+	} else if err := e.createRootOverlayQcow2(root, base, spec.DiskSizeMB); err != nil {
+		return "", "", "", fmt.Errorf("create qcow2 root overlay: %w", err)
+	}
+	return root, "qcow2", base, nil
 }
 
 // isQcow2 reports whether path is a qcow2 image (magic "QFI\xfb"), so a saved

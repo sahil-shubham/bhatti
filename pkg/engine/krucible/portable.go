@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -324,6 +325,12 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 	if err != nil {
 		return imp, err
 	}
+	// From finding the base until the root disk names it, GC must leave it be.
+	unlock, err := lockBases(e.cfg.DataDir, false)
+	if err != nil {
+		return imp, fmt.Errorf("import: %w", err)
+	}
+	defer unlock()
 	base, err := e.findBase(am.Base)
 	if err != nil {
 		return imp, err
@@ -375,7 +382,7 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 
 	if am.Base != nil {
 		if base == "" {
-			if base, err = e.keepBase(filepath.Join(destDir, archiveBaseFile), am.Base.SHA256); err != nil {
+			if base, err = e.keepBase(filepath.Join(destDir, archiveBaseFile), am.Base.SHA256, am.Base.Name); err != nil {
 				return imp, err
 			}
 		}
@@ -581,24 +588,32 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// basesDir holds base images that arrived in snapshot archives, named by
-// content.
-func (e *Engine) basesDir() string { return filepath.Join(e.cfg.DataDir, "images", "bases") }
-
 // findBase looks for a base image with b's contents among this host's
-// system-wide images: the engine's base, the tier images in <DataDir>/images
-// and bases kept from earlier imports. Users' own images aren't candidates: a
-// snapshot must not reach another user's image by naming its hash. "" when
-// there is none.
+// system-wide images: the bases under images/bases, the engine's base, and
+// the tier images in <DataDir>/images. Users' own images aren't candidates: a
+// snapshot must not reach another user's image by naming its hash. It returns
+// the base itself, never a tier symlink to it (bases.go); "" when there is
+// none.
 func (e *Engine) findBase(b *archiveBase) (string, error) {
 	if b == nil {
 		return "", nil
 	}
-	cands := []string{
-		filepath.Join(e.basesDir(), "sha256-"+b.SHA256+".img"),
-		e.cfg.BaseImage,
-		filepath.Join(e.cfg.DataDir, "base.img"),
+	var cands, rest []string
+	if entries, err := os.ReadDir(basesDir(e.cfg.DataDir)); err == nil {
+		for _, de := range entries {
+			name := de.Name()
+			path := filepath.Join(basesDir(e.cfg.DataDir), name)
+			switch {
+			case strings.HasPrefix(name, "."):
+			case strings.HasSuffix(name, "-"+b.SHA256[:16]+".ext4") || name == "sha256-"+b.SHA256+".img":
+				cands = append(cands, path) // named for these contents: likely the one
+			default:
+				rest = append(rest, path)
+			}
+		}
 	}
+	cands = append(cands, rest...)
+	cands = append(cands, e.cfg.BaseImage, filepath.Join(e.cfg.DataDir, "base.img"))
 	if entries, err := os.ReadDir(filepath.Join(e.cfg.DataDir, "images")); err == nil {
 		for _, de := range entries {
 			cands = append(cands, filepath.Join(e.cfg.DataDir, "images", de.Name()))
@@ -606,7 +621,11 @@ func (e *Engine) findBase(b *archiveBase) (string, error) {
 	}
 	seen := map[string]bool{}
 	for _, c := range cands {
-		if c == "" || seen[c] {
+		if c == "" {
+			continue
+		}
+		c, err := resolveBasePath(c)
+		if err != nil || seen[c] {
 			continue
 		}
 		seen[c] = true
@@ -625,26 +644,55 @@ func (e *Engine) findBase(b *archiveBase) (string, error) {
 	return "", nil
 }
 
+// keptBaseStem matches the plain names a base kept from an archive takes its
+// name from: the base's name on the exporting host, less the content hash and
+// extension a bases/ name carries (rootfs-minimal-amd64 for
+// rootfs-minimal-amd64-0123456789abcdef.ext4).
+var keptBaseStem = regexp.MustCompile(`^([a-z0-9][a-z0-9._-]{0,62}?)(-[0-9a-f]{16})?(\.ext4|\.img)?$`)
+
 // keepBase moves a base image that arrived in an archive (already checked
-// against its hash) into basesDir, where later imports find it.
-func (e *Engine) keepBase(src, sum string) (string, error) {
-	dir := e.basesDir()
+// against sum, its sha256) into the bases directory, where later imports find
+// it. A base there is never replaced: one already under the name is used if it
+// holds the same bytes.
+func (e *Engine) keepBase(src, sum, name string) (string, error) {
+	dir := basesDir(e.cfg.DataDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("import: %w", err)
 	}
-	dst := filepath.Join(dir, "sha256-"+sum+".img")
-	if err := os.Rename(src, dst); err != nil {
-		// Another filesystem: copy, then publish under the final name.
-		tmp := dst + ".partial"
+	stem := "base"
+	if m := keptBaseStem.FindStringSubmatch(name); m != nil {
+		stem = m[1]
+	}
+	dst := filepath.Join(dir, baseName(stem, sum))
+	// Readable like an installed base: sandboxes' VMMs open it read-only.
+	if err := os.Chmod(src, 0o644); err != nil {
+		return "", fmt.Errorf("import: %w", err)
+	}
+	// Link, not rename: it never replaces a file already there.
+	err := os.Link(src, dst)
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		// Another filesystem: copy beside the bases first, then publish.
+		tmp := filepath.Join(dir, "."+filepath.Base(dst)+".partial")
 		if cerr := cloneFile(src, tmp); cerr != nil {
+			os.Remove(tmp)
 			return "", fmt.Errorf("import: keep base image: %w", errors.Join(err, cerr))
 		}
-		if err := os.Rename(tmp, dst); err != nil {
-			os.Remove(tmp)
+		err = os.Link(tmp, dst)
+		os.Remove(tmp)
+		if err != nil && !errors.Is(err, fs.ErrExist) {
 			return "", fmt.Errorf("import: keep base image: %w", err)
 		}
-		os.Remove(src)
 	}
+	if err != nil { // dst was there already
+		have, _, herr := hashFileCached(dst)
+		if herr != nil {
+			return "", fmt.Errorf("import: %w", herr)
+		}
+		if have != sum {
+			return "", fmt.Errorf("import: %s already holds another image", dst)
+		}
+	}
+	os.Remove(src)
 	return dst, nil
 }
 

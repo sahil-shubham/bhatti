@@ -260,9 +260,15 @@ func TestSnapshotImportNeedsTheBaseImage(t *testing.T) {
 	if _, _, err := importArchive(b, exportArchive(t, a, dir, m, true)); err != nil {
 		t.Fatalf("import with the base: %v", err)
 	}
-	kept := filepath.Join(b.cfg.DataDir, "images", "bases", "sha256-"+sum+".img")
+	// Named after the base on the exporting host, and by content.
+	kept := filepath.Join(b.cfg.DataDir, "images", "bases", baseName("rootfs", sum))
 	if got := fileSum(t, kept); got != sum {
 		t.Fatalf("kept base has sha256 %s, want %s", got, sum)
+	}
+	if fi, err := os.Stat(kept); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("kept base mode %v; sandboxes' VMMs read it, want 0644", fi.Mode())
 	}
 	if got, err := qcow2Backing(filepath.Join(dest, "rootfs.qcow2")); err != nil || got != kept {
 		t.Fatalf("root disk backs onto %q (%v), want %s", got, err, kept)
@@ -273,6 +279,50 @@ func TestSnapshotImportNeedsTheBaseImage(t *testing.T) {
 	}
 	if got, _ := qcow2Backing(filepath.Join(dest, "rootfs.qcow2")); got != kept {
 		t.Fatalf("root disk backs onto %q, want the kept %s", got, kept)
+	}
+}
+
+// TestSnapshotImportNamesTheBaseNotTheTier: on a host whose tier name is a
+// symlink to its base, an imported root disk names the base itself, so the
+// next image update (which re-points the tier) doesn't move it; and a kept
+// base never replaces another image already under its name.
+func TestSnapshotImportNamesTheBaseNotTheTier(t *testing.T) {
+	baseA := filepath.Join(t.TempDir(), "rootfs-minimal-amd64.ext4")
+	data := writeBase(t, baseA, 1)
+	a := portableEngine(t, baseA, "exit 0")
+	dir, m := fakeSnapshot(t, baseA, "filesystem")
+
+	b := portableEngine(t, "", "exit 0")
+	tier := filepath.Join(b.cfg.DataDir, "images", "rootfs-minimal-amd64.ext4")
+	b.cfg.BaseImage = tier
+	writeFile(t, tier, data)
+	if _, err := MigrateImages(b.cfg.DataDir); err != nil {
+		t.Fatal(err)
+	}
+	base, err := resolveBasePath(tier)
+	if err != nil || base == tier {
+		t.Fatalf("tier resolves to %q (%v)", base, err)
+	}
+	dest, _, err := importArchive(b, exportArchive(t, a, dir, m, false))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if got := backingOf(t, filepath.Join(dest, "rootfs.qcow2")); got != base {
+		t.Fatalf("root disk backs onto %q, want the base %s (not the tier name)", got, base)
+	}
+
+	// The archive's base is kept under its content name; a different image
+	// already there under that name (a 64-bit hash prefix collision) is left
+	// alone and the import refused.
+	c := portableEngine(t, "", "exit 0")
+	sum := fileSum(t, baseA)
+	squatter := filepath.Join(c.cfg.DataDir, "images", "bases", baseName("rootfs-minimal-amd64", sum))
+	other := writeBase(t, squatter, 9)
+	if _, _, err := importArchive(c, exportArchive(t, a, dir, m, true)); err == nil || !strings.Contains(err.Error(), "already holds another image") {
+		t.Fatalf("import over a different image under the base's name: %v", err)
+	}
+	if got, _ := os.ReadFile(squatter); !bytes.Equal(got, other) {
+		t.Fatal("an image under bases/ was overwritten")
 	}
 }
 
