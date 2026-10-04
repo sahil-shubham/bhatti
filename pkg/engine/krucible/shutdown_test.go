@@ -1,14 +1,17 @@
 // These tests intentionally carry NO `//go:build krucible` tag: they exercise
-// pure lifecycle/kill logic with a stand-in `sleep` process (no libkrun, no
-// hypervisor), so they run in the default `make test` on every OS/arch — the
-// portable safety net that catches Shutdown/Fork regressions in the plain CI
-// build job, not just the KVM/HVF integration lanes.
+// pure lifecycle logic with stand-in processes (no libkrun, no hypervisor), so
+// they run in the default `make test` on every OS/arch — the portable safety
+// net that catches Shutdown/Fork regressions in the plain CI build job, not
+// just the KVM/HVF integration lanes.
 
 package krucible
 
 import (
 	"context"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,54 +33,73 @@ func spawnStandin(t *testing.T) (*exec.Cmd, int) {
 			_, _ = cmd.Process.Wait() // only fixtures without their own Cmd.Wait
 		}
 	})
+	execd(t, pid, "sleep", "60")
 	return cmd, pid
 }
 
-// TestShutdownKillsAdoptedHelper is the regression test for the leak found in
-// review: Shutdown must kill a helper ADOPTED across a prior daemon restart
-// (only HelperPID set, cmd == nil), not just ones this engine owns. The old
-// cmd-only inline kill left adopted helpers running — orphaned live VMs whose
-// backing files the daemon would later delete.
-func TestShutdownKillsAdoptedHelper(t *testing.T) {
-	cmd, pid := spawnStandin(t)
-	e := &Engine{vms: map[string]*VM{}}
-	// Adopted shape: running, but no owned Cmd handle — only the persisted pid.
-	e.vms["adopted"] = &VM{ID: "adopted", Status: "running", HelperPID: pid}
+// TestShutdownLeavesHelpersRunning pins what a daemon restart relies on: the
+// engine's Shutdown stops no sandbox. A helper the engine spawned and one it
+// adopted from the previous daemon both keep running, still recorded, for the
+// next daemon to adopt; what the daemon served them — boot config, credential
+// broker — is closed. Shutdown used to kill both: every restart rebooted every
+// guest.
+func TestShutdownLeavesHelpersRunning(t *testing.T) {
+	owned, ownedPID := spawnStandin(t)
+	done := make(chan error, 1)
+	go func() { done <- owned.Wait() }()
+	t.Cleanup(func() {
+		_ = owned.Process.Kill()
+		select { // Shutdown must not have reaped it; if it did, don't wait forever
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	})
+	_, adoptedPID := spawnStandin(t)
+
+	socks := shortSockDir(t)
+	cfgSock := filepath.Join(socks, "cfg.sock")
+	cfgSrv, err := newConfigServer(cfgSock, []byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokerLn, err := net.Listen("unix", filepath.Join(socks, "b.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &netdInstance{owner: "u:owner", brokerLn: brokerLn}
+	e := &Engine{
+		vms: map[string]*VM{
+			"owned":   {ID: "owned", Status: "running", Thermal: "hot", cmd: owned, waitDone: done, HelperPID: ownedPID, configSrv: cfgSrv},
+			"adopted": {ID: "adopted", Status: "running", Thermal: "warm", HelperPID: adoptedPID},
+		},
+		netds: map[string]*netdInstance{"u:owner": inst},
+	}
 
 	e.Shutdown()
 
-	if e.vms["adopted"].HelperPID != 0 {
-		t.Errorf("HelperPID not cleared after Shutdown: %d", e.vms["adopted"].HelperPID)
-	}
-	// Reap with a bounded wait so the OLD (leaking) behavior fails fast rather
-	// than blocking for the full sleep.
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-done:
-		if code := cmd.ProcessState.ExitCode(); code != -1 {
-			t.Errorf("adopted helper exited normally (code %d) — Shutdown leaked it", code)
+	for id, pid := range map[string]int{"owned": ownedPID, "adopted": adoptedPID} {
+		vm := e.vms[id]
+		if !running(pid, "sleep", "60") {
+			t.Errorf("%s helper pid %d killed by Shutdown", id, pid)
 		}
-	case <-time.After(3 * time.Second):
-		t.Errorf("adopted helper still alive 3s after Shutdown — leaked (regression)")
+		if vm.HelperPID != pid || vm.Status != "running" {
+			t.Errorf("%s: Shutdown changed the record: pid %d status %q, want %d running", id, vm.HelperPID, vm.Status, pid)
+		}
 	}
-}
-
-// TestShutdownKillsOwnedHelper guards the owned path (vm.cmd set): it must keep
-// working after the adopted-path fix.
-func TestShutdownKillsOwnedHelper(t *testing.T) {
-	cmd, pid := spawnStandin(t)
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }() // launch owns Wait for its whole lifetime
-	e := &Engine{vms: map[string]*VM{}}
-	e.vms["owned"] = &VM{ID: "owned", Status: "running", cmd: cmd, waitDone: done}
-	e.Shutdown() // vm.kill() reaps the owned process synchronously
-
-	if pidAlive(pid) {
-		t.Errorf("owned helper pid %d still alive after Shutdown", pid)
+	select {
+	case err := <-done:
+		t.Errorf("owned helper exited after Shutdown: %v", err)
+		done <- err
+	default:
 	}
-	if e.vms["owned"].cmd != nil {
-		t.Errorf("vm.cmd not cleared after Shutdown")
+	if e.vms["owned"].configSrv != nil {
+		t.Error("boot config server still served after Shutdown")
+	}
+	if _, err := os.Stat(cfgSock); !os.IsNotExist(err) {
+		t.Errorf("boot config socket still there after Shutdown: %v", err)
+	}
+	if inst.brokerLn != nil {
+		t.Error("credential broker socket still served after Shutdown")
 	}
 }
 
@@ -88,11 +110,9 @@ func TestShutdownStoppedVMIsNoop(t *testing.T) {
 	e.Shutdown() // must not panic
 }
 
-// TestShutdownWaitsForLaunchMu proves the race fix: Shutdown must serialize
-// against an in-flight Start/Stop/Pause/Resume (which hold launchMu, not mu), so
-// it can't SIGKILL a helper mid-transition. We hold launchMu and assert Shutdown
-// blocks until it's released. The OLD Shutdown never touched launchMu, so it
-// would kill immediately — this test fails on that behavior.
+// TestShutdownWaitsForLaunchMu: Shutdown waits out an in-flight lifecycle
+// transition (Start/Stop/Pause/Resume hold launchMu), which persists what it
+// did, before the daemon exits — and leaves the helper running either way.
 func TestShutdownWaitsForLaunchMu(t *testing.T) {
 	_, pid := spawnStandin(t)
 	e := &Engine{vms: map[string]*VM{}}
@@ -106,13 +126,9 @@ func TestShutdownWaitsForLaunchMu(t *testing.T) {
 	select {
 	case <-done:
 		vm.launchMu.Unlock()
-		t.Fatal("Shutdown killed the VM without acquiring launchMu (raced an in-flight transition)")
+		t.Fatal("Shutdown returned while a transition held launchMu")
 	case <-time.After(200 * time.Millisecond):
 		// good: Shutdown is blocked on launchMu
-	}
-	if !pidAlive(pid) {
-		vm.launchMu.Unlock()
-		t.Fatal("helper killed while launchMu was held")
 	}
 
 	vm.launchMu.Unlock()
@@ -120,6 +136,9 @@ func TestShutdownWaitsForLaunchMu(t *testing.T) {
 	case <-done: // Shutdown proceeded once launchMu was free
 	case <-time.After(5 * time.Second):
 		t.Fatal("Shutdown did not complete after launchMu released")
+	}
+	if !running(pid, "sleep", "60") {
+		t.Fatal("Shutdown killed the helper")
 	}
 }
 

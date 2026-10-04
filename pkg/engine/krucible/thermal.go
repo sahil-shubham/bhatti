@@ -2,7 +2,9 @@ package krucible
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
@@ -54,15 +56,27 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
 	if vm.Thermal == "hot" {
+		vm.mu.Unlock()
 		return nil
 	}
 	if _, err := controlCmd(ctx, vm.CtlSockUDS, "RESUME"); err != nil {
+		vm.mu.Unlock()
 		return fmt.Errorf("resume: %w", err)
 	}
 	vm.Thermal = "hot"
 	vm.persistLocked()
+	ag, unasked := vm.Agent, errors.Is(vm.AgentInfoErr, errAgentInfoPaused)
+	vm.mu.Unlock()
+	if unasked { // adopted paused: its guest couldn't answer until now
+		info, err := queryAgentInfo(ctx, ag)
+		if err != nil {
+			slog.Warn("krucible.agent.info", "id", id, "error", err)
+		}
+		vm.mu.Lock()
+		vm.AgentInfo, vm.AgentInfoErr = info, err
+		vm.mu.Unlock()
+	}
 	return nil
 }
 

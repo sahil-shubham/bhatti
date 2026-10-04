@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // These tests exercise the recovery LOGIC with no VM/libkrun, so they run on
@@ -39,6 +42,7 @@ func TestStateRoundTrip(t *testing.T) {
 			RootDisk: filepath.Join(dir, "root.img"), VsockConfigUDS: "/tmp/s/cfg.sock",
 			Vcpus: 1, MemMiB: 512, Pid1: true, ExecPath: "/init.krun",
 		},
+		netPolicy: &gateway.NetPolicyWire{Default: "deny", AllowHosts: []string{"api.example.com"}, AllowCIDRs: []string{"1.1.1.1/32"}},
 	}
 	orig.persist()
 
@@ -71,5 +75,10 @@ func TestStateRoundTrip(t *testing.T) {
 		if pair[0] != pair[1] {
 			t.Errorf("%s: round-trip got %v, want %v", field, pair[1], pair[0])
 		}
+	}
+	// The engine reboots a sandbox under its egress policy after a restart only
+	// if state.json kept it: nil would push netd's public default.
+	if !reflect.DeepEqual(got.netPolicy, orig.netPolicy) {
+		t.Errorf("netPolicy: round-trip got %+v, want %+v", got.netPolicy, orig.netPolicy)
 	}
 }

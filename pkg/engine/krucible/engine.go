@@ -171,16 +171,17 @@ func (e *Engine) releaseNetd(ownerKey string) {
 		return
 	}
 	inst.mu.Lock()
-	if inst.pid > 0 {
+	switch {
+	case inst.cmd != nil && inst.cmd.Process != nil:
+		_ = inst.cmd.Process.Kill()
+		_, _ = inst.cmd.Process.Wait() // reap our child
+	case inst.pid > 0 && isNetd(inst.pid, inst.sock):
+		// Adopted across a restart, and still that netd (by now its pid could be
+		// anyone's). Reap it if it's our child (same-process recovery / tests); a
+		// no-op (ECHILD) in production where init re-parented it.
 		_ = syscall.Kill(inst.pid, syscall.SIGKILL)
-		if inst.cmd != nil && inst.cmd.Process != nil {
-			_, _ = inst.cmd.Process.Wait() // reap our child
-		} else {
-			// Adopted across a restart: reap if it's still our child (same-process
-			// recovery / tests); a no-op (ECHILD) in production where init re-parented it.
-			var ws syscall.WaitStatus
-			_, _ = syscall.Wait4(inst.pid, &ws, 0, nil)
-		}
+		var ws syscall.WaitStatus
+		_, _ = syscall.Wait4(inst.pid, &ws, 0, nil)
 	}
 	inst.pid = 0
 	if inst.brokerLn != nil {
@@ -208,7 +209,7 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	// (ctl.sock) is an older binary that survived a daemon upgrade: it can never
 	// receive per-sandbox egress policy, so replace it instead of silently
 	// running guests on the open default.
-	if inst.pid > 0 && pidAlive(inst.pid) {
+	if inst.pid > 0 && isNetd(inst.pid, inst.sock) {
 		_, sockErr := os.Stat(inst.sock)
 		_, ctlErr := os.Stat(inst.ctlSock)
 		if sockErr == nil && ctlErr == nil {
@@ -272,10 +273,6 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 // just started listening. Returns an error when the policy could not be
 // delivered, so the caller can fail closed rather than boot the guest on the
 // open default. No-op on TSI (no netd IP).
-//
-// TODO(follow-up): re-push on recovery. A sandbox recovered across a daemon
-// restart that respawns its netd (see ensureNetd) loses its policy until its
-// next launch; the create path — the common case — always pushes.
 func (e *Engine) pushSandboxPolicy(vm *VM) error {
 	if vm.netIP == "" || vm.netdKey == "" {
 		return nil
@@ -354,7 +351,7 @@ type VM struct {
 	netdKey      string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
 	subnetIdx    int                    // owner's vnet subnet index (net backend); persisted for recovery
 	netIP        string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
-	netPolicy    *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public
+	netPolicy    *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public; persisted, so a relaunch after a restart pushes it again
 	sandboxRef   string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
 	vmmUID       uint32                 // the helper's own uid and primary gid (vmmuser.go); 0 = runs as the daemon; persisted
 }
@@ -368,6 +365,10 @@ func (vm *VM) brokerRef() string {
 	}
 	return vm.ID
 }
+
+// specPath is the spec a sandbox's helper is started on — its only argument,
+// and so what tells that process apart from any other (isHelper).
+func (vm *VM) specPath() string { return filepath.Join(vm.SandboxDir, "vmspec.json") }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
 type Engine struct {
@@ -770,10 +771,10 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 // launch spawns the bhatti-vmm helper for vm and waits for the agent. When
 // snapshotDir is non-empty the helper restores from that checkpoint directory
 // instead of booting. Sets vm.cmd/cancel/Agent/Status on success.
-func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
+func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err error) {
 	spec := vm.baseSpec
 	spec.SnapshotDir = snapshotDir
-	specPath := filepath.Join(vm.SandboxDir, "vmspec.json")
+	specPath := vm.specPath()
 	// On Linux the helper runs confined (vmmuser.go): it is handed the spec it
 	// finds its files by, and the policy that holds it to them.
 	policy := ""
@@ -845,8 +846,8 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	cmd := exec.CommandContext(vmCtx, e.cfg.VMMBinary, specPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	// Detach the helper into its own process group so it survives a daemon
-	// restart/crash — recovery can then re-adopt the live VM. (darwin + linux.)
+	// Its own process group, out of the daemon's: the helper outlives every
+	// daemon restart, and the next daemon adopts it (recover). (darwin + linux.)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if e.cfg.LibDir != "" {
 		cmd.Env = append(os.Environ(),
@@ -865,6 +866,20 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		vm.closeConfigSrv()
 		return fmt.Errorf("start vmm helper: %w", err)
 	}
+	// Named in state.json before the guest is up: a daemon that goes away
+	// mid-launch leaves a helper the next one has to find, to kill (recover).
+	vm.mu.Lock()
+	vm.HelperPID = cmd.Process.Pid
+	vm.persistLocked()
+	vm.mu.Unlock()
+	defer func() {
+		if err != nil {
+			vm.mu.Lock()
+			vm.HelperPID = 0
+			vm.persistLocked()
+			vm.mu.Unlock()
+		}
+	}()
 
 	// One goroutine owns Wait for the process's entire lifetime. Racing a
 	// separate Process.Wait in kill against cmd.Wait can corrupt reaping; the
@@ -921,8 +936,9 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	return nil
 }
 
-// kill terminates the helper (best effort). Uses the Cmd handle when we own the
-// process, else the persisted pid (a helper adopted across a daemon restart).
+// kill terminates the helper and waits until it's gone: through the Cmd handle
+// when we spawned it, else by the persisted pid of a helper adopted across a
+// daemon restart — signalled only while it still runs this sandbox's spec.
 func (vm *VM) kill() {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
@@ -930,8 +946,7 @@ func (vm *VM) kill() {
 		_ = vm.cmd.Process.Kill()
 		<-vm.waitDone
 	} else if vm.HelperPID > 0 {
-		// Adopted helper (not our child) — signal by pid; init reaps it.
-		_ = syscall.Kill(vm.HelperPID, syscall.SIGKILL)
+		killHelper(vm.HelperPID, vm.specPath())
 	}
 	// The bhatti-netd gateway is shared per owner and outlives a single VM; it is
 	// torn down by releaseNetd on Destroy of the owner's last sandbox.
@@ -1242,8 +1257,12 @@ func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
 	return out, nil
 }
 
-// Shutdown kills every helper, including those adopted after daemon restart.
-// Serialized against per-VM lifecycle transitions by launchMu.
+// Shutdown is the engine's part of a daemon shutdown, and it stops no sandbox:
+// helpers and netds are detached processes that outlive the daemon, and the
+// next one adopts them (recover), so a restart — an upgrade, `systemctl
+// restart`, a cert-renewal hook — never reboots a guest. It waits out in-flight
+// lifecycle transitions, which persist what they did, and closes what the
+// daemon serves the sandboxes: boot config and credential broker sockets.
 func (e *Engine) Shutdown() {
 	e.mu.RLock()
 	vms := make([]*VM, 0, len(e.vms))
@@ -1253,8 +1272,22 @@ func (e *Engine) Shutdown() {
 	e.mu.RUnlock()
 	for _, vm := range vms {
 		vm.launchMu.Lock()
-		vm.kill() // no-op if already stopped; handles owned + adopted helpers
+		vm.closeConfigSrv()
 		vm.launchMu.Unlock()
+	}
+	e.netdMu.Lock()
+	insts := make([]*netdInstance, 0, len(e.netds))
+	for _, inst := range e.netds {
+		insts = append(insts, inst)
+	}
+	e.netdMu.Unlock()
+	for _, inst := range insts {
+		inst.mu.Lock()
+		if inst.brokerLn != nil {
+			inst.brokerLn.Close()
+			inst.brokerLn = nil
+		}
+		inst.mu.Unlock()
 	}
 }
 
