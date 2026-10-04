@@ -1,7 +1,11 @@
 package krucible
 
 import (
+	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"sync"
@@ -21,24 +25,43 @@ import (
 // The UDS is per-sandbox, so the channel *is* the capability: a guest reaches
 // only its own server and thus only its own config — no guest-presented
 // credential, no cross-tenant reach (§3.1).
+//
+// Each answer also carries a fresh seed for the guest kernel's CRNG
+// (configdrive.SandboxConfig.Entropy), which lohar credits before it starts
+// anything: a guest with no hardware RNG has nothing else to seed it for
+// minutes. It's made per request, so no two boots share one and none is ever
+// written down.
 type configServer struct {
-	ln      net.Listener
-	payload []byte // marshaled configdrive.SandboxConfig JSON
+	ln     net.Listener
+	config map[string]json.RawMessage // configdrive.SandboxConfig, field by field
 
 	mu     sync.Mutex
 	closed bool
 }
 
-// newConfigServer starts serving payload on udsPath and returns once the socket
-// is listening (so the caller can spawn the VM knowing a guest dial won't race a
-// not-yet-bound socket).
+// configEntropyLen is 256 bits: what the guest kernel needs to consider its
+// CRNG seeded.
+const configEntropyLen = 32
+
+// newConfigServer starts serving payload (the config JSON) on udsPath and
+// returns once the socket is listening (so the caller can spawn the VM knowing
+// a guest dial won't race a not-yet-bound socket).
 func newConfigServer(udsPath string, payload []byte) (*configServer, error) {
+	// Kept as raw fields, not decoded into the struct, so a field this daemon
+	// doesn't know still reaches the guest.
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &config); err != nil {
+		return nil, err
+	}
+	if config == nil {
+		return nil, errors.New("config is not a JSON object")
+	}
 	_ = os.Remove(udsPath) // clear a stale socket from a prior incarnation
 	ln, err := net.Listen("unix", udsPath)
 	if err != nil {
 		return nil, err
 	}
-	s := &configServer{ln: ln, payload: payload}
+	s := &configServer{ln: ln, config: config}
 	go s.serve()
 	return s, nil
 }
@@ -67,11 +90,22 @@ func (s *configServer) handle(conn net.Conn) {
 	if err != nil || msgType != proto.CONFIG_REQ {
 		return
 	}
-	if proto.WriteFrame(conn, proto.CONFIG_RESP, s.payload) != nil {
+	if proto.WriteFrame(conn, proto.CONFIG_RESP, s.response()) != nil {
 		return
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(configLinger))
 	_, _ = io.Copy(io.Discard, conn)
+}
+
+// response is the config with a fresh entropy seed in it. Neither Marshal can
+// fail: the seed is bytes, every other field was parsed from JSON.
+func (s *configServer) response() []byte {
+	seed := make([]byte, configEntropyLen)
+	rand.Read(seed)
+	resp := maps.Clone(s.config)
+	resp["entropy"], _ = json.Marshal(seed)
+	b, _ := json.Marshal(resp)
+	return b
 }
 
 // configLinger bounds how long a served connection is held open waiting for the

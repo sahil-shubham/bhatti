@@ -347,7 +347,7 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	// splitting on whitespace and dispatching in-process (no real shell needed).
 	// writeuid: writes the caller's uid to a file — lets a test observe that
 	// --init (and exec) ran as uid 1000 without a full userland.
-	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes", "date", "oncpu"} {
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes", "date", "oncpu", "rngready"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -447,6 +447,15 @@ func dispatch(name string, args []string) {
 		var st syscall.Statfs_t
 		if len(args) > 0 && syscall.Statfs(args[0], &st) == nil {
 			fmt.Println(uint64(st.Blocks) * uint64(st.Bsize))
+		}
+	case "rngready": // succeeds once the kernel's CRNG is seeded: until then a nonblocking /dev/random read is EAGAIN
+		fd, err := syscall.Open("/dev/random", syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_, err = syscall.Read(fd, make([]byte, 1))
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 	default: // true
 	}

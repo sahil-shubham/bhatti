@@ -3,6 +3,7 @@
 package krucible
 
 import (
+	"bytes"
 	"encoding/json"
 	"net"
 	"path/filepath"
@@ -100,6 +101,37 @@ func TestConfigServerIsolation(t *testing.T) {
 		if got.Token != tc.wantTok || got.SandboxID != tc.wantID {
 			t.Errorf("%s served {id:%q tok:%q}, want {id:%q tok:%q}", tc.uds, got.SandboxID, got.Token, tc.wantID, tc.wantTok)
 		}
+	}
+}
+
+// TestConfigServerSeedsEntropy: every answer carries its own 256-bit seed for
+// the guest's CRNG, alongside the config as given — fields this daemon doesn't
+// know included. The seed is all a guest without a hardware RNG has to seed it
+// at boot (TestKrucibleGuestCRNGSeededAtBoot).
+func TestConfigServerSeedsEntropy(t *testing.T) {
+	uds := filepath.Join(shortSockDir(t), "cfg.sock")
+	srv, err := newConfigServer(uds, []byte(`{"token":"tok_A","from_a_newer_daemon":{"x":1}}`))
+	if err != nil {
+		t.Fatalf("newConfigServer: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	var seeds [][]byte
+	for range 2 {
+		_, payload := fetchOverUDS(t, uds)
+		var got configdrive.SandboxConfig
+		if err := json.Unmarshal(payload, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.Token != "tok_A" || !bytes.Contains(payload, []byte(`"from_a_newer_daemon":{"x":1}`)) {
+			t.Fatalf("config not served as given: %s", payload)
+		}
+		if len(got.Entropy) != configEntropyLen || bytes.Equal(got.Entropy, make([]byte, configEntropyLen)) {
+			t.Fatalf("entropy = %x, want %d random bytes", got.Entropy, configEntropyLen)
+		}
+		seeds = append(seeds, got.Entropy)
+	}
+	if bytes.Equal(seeds[0], seeds[1]) {
+		t.Fatal("two boots were sent the same seed")
 	}
 }
 

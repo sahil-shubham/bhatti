@@ -28,6 +28,10 @@ type SandboxConfig struct {
 	// adds it to the guest's trust store so netd can terminate TLS for the
 	// hosts a secret grant names (credential substitution).
 	CACert string `json:"ca_cert,omitempty"`
+	// Entropy is a fresh seed for the guest kernel's CRNG, which lohar
+	// credits before it starts anything. The config server adds it to each
+	// answer (pkg/engine/krucible/configserver.go); it's never stored.
+	Entropy []byte `json:"entropy,omitempty"`
 }
 
 // NetConfig is the guest's eth0 addressing on the per-owner gateway network.

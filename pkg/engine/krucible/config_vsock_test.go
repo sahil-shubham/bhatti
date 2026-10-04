@@ -100,3 +100,27 @@ func TestKrucibleConfigOverVsock(t *testing.T) {
 		t.Errorf("exec with the CORRECT token failed: %v", err)
 	}
 }
+
+// TestKrucibleGuestCRNGSeededAtBoot: the guest kernel's CRNG is seeded by the
+// time the agent answers, from the seed the config vsock delivers. Under HVF a
+// guest has no hardware RNG (and the VMM attaches no virtio-rng), so without
+// it getrandom(2) blocks for minutes after boot — a guest Go program's TLS
+// handshake hung there, its own timeouts with it, which is how
+// TestKrucibleCredentialSubstitution failed on macOS. (x86 KVM guests seed
+// from RDRAND either way.)
+func TestKrucibleGuestCRNGSeededAtBoot(t *testing.T) {
+	eng := newBlockRootEngine(t)
+	ctx := context.Background()
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "crng", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), info.ID) })
+	r, err := eng.Exec(ctx, info.ID, []string{"rngready"})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if r.ExitCode != 0 {
+		t.Fatalf("guest CRNG unseeded after boot (getrandom would block): %s", r.Stderr)
+	}
+}
