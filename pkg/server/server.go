@@ -40,9 +40,9 @@ type ThermalEngine interface {
 }
 
 // ThermalSupport is implemented by engines whose thermal support depends on
-// runtime configuration (krucible: whether its VMM build can checkpoint).
-// An engine that implements ThermalEngine but reports false here is treated
-// as having no thermal management at all.
+// runtime configuration (krucible: whether its VMM build can pause). An engine
+// that implements ThermalEngine but reports false here is treated as having no
+// thermal management at all.
 type ThermalSupport interface {
 	ThermalSupported() bool
 }
@@ -61,6 +61,22 @@ func thermalOf(e engine.Engine) (ThermalEngine, bool) {
 func thermalUsable(e engine.Engine) bool {
 	ts, ok := e.(ThermalSupport)
 	return !ok || ts.ThermalSupported()
+}
+
+// ColdSupport is implemented by engines that can pause but may not be able to
+// snapshot a sandbox to disk (krucible without checkpoint support). Without a
+// cold tier, warm sandboxes stay warm and shutdown snapshots nothing.
+type ColdSupport interface {
+	ColdSupported() bool
+}
+
+// coldUsable is false only for an engine that explicitly reports no cold tier.
+func coldUsable(e engine.Engine) bool {
+	if !thermalUsable(e) {
+		return false
+	}
+	cs, ok := e.(ColdSupport)
+	return !ok || cs.ColdSupported()
 }
 
 // ThermalConfig controls automatic thermal transitions.
@@ -482,7 +498,7 @@ func cronMatch(expr string, t time.Time) bool {
 // as-is and marked in the store so recovery can detect it.
 func (s *Server) SnapshotAll() {
 	slog.Info("snapshotting all running VMs before shutdown")
-	if !thermalUsable(s.engine) {
+	if !coldUsable(s.engine) {
 		slog.Info("snapshot-all skipped: engine has no checkpoint support")
 		return
 	}
@@ -623,6 +639,9 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 		// times out (skipping the cold check) or wakes the VM via TCP.
 		// Use lastActivity timestamp instead, set when hot→warm fired.
 		if thermal == "warm" {
+			if !coldUsable(s.engine) {
+				continue // no cold tier: a warm sandbox stays warm until woken
+			}
 			ts, ok := s.lastActivity.Load(sb.EngineID)
 			if !ok {
 				continue

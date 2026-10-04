@@ -314,8 +314,8 @@ func (e *Engine) SaveImage(ctx context.Context, sandboxID, destPath string) erro
 //
 // dst is itself a bootable qcow2 root (backs the same base as the source).
 func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
-	if !e.caps.Checkpoint {
-		return errNoCheckpoint // the consistent copy needs the VM paused
+	if !e.caps.Pause {
+		return errNoPause // the consistent copy needs the VM paused
 	}
 	// Reachable agent for the guest sync; releases its own lock before we take
 	// launchMu below.

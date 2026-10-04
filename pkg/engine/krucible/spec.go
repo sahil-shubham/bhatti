@@ -38,8 +38,10 @@ type VMVolume struct {
 // VMMCapabilities is what a bhatti-vmm build supports, as printed by
 // `bhatti-vmm capabilities`. The engine reads it once at startup.
 type VMMCapabilities struct {
-	// Checkpoint covers everything built on saving VM state: pause/resume,
-	// cold snapshot/restore and fork.
+	// Pause: live pause/resume over the control socket (the warm tier).
+	Pause bool `json:"pause"`
+	// Checkpoint covers everything built on saving VM state to disk: cold
+	// snapshot/restore, fork, and consistent save-image.
 	Checkpoint bool `json:"checkpoint"`
 }
 

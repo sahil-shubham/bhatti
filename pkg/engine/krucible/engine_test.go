@@ -42,6 +42,18 @@ func leanKernel(repo string) string {
 	return ""
 }
 
+// shortSockDir returns a SHORT temp dir for vsock/UDS paths. t.TempDir() on macOS
+// (/var/folders/...) exceeds the ~104-byte sockaddr_un limit, so sockets need a
+// short base like /tmp. (DataDir can stay t.TempDir() — regular files, no limit.)
+func shortSockDir(t *testing.T) string {
+	d, err := os.MkdirTemp("/tmp", "kr")
+	if err != nil {
+		t.Fatalf("short sock dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
+}
+
 // requireLeanKernel returns leanKernel(repo), skipping the test if there is none.
 func requireLeanKernel(t *testing.T, repo string) string {
 	t.Helper()
@@ -91,9 +103,20 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 		BlockRoot:   true,
 		KernelImage: kernel,
 		NetdBinary:  requireNetd(t, repo),
+		SocketDir:   shortSockDir(t),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
+	}
+	return eng
+}
+
+// newPauseEngine is newBlockRootEngine for warm-tier tests; it skips when the
+// bhatti-vmm build can't pause a VM.
+func newPauseEngine(t *testing.T) engine.Engine {
+	eng := newBlockRootEngine(t)
+	if !eng.(*Engine).caps.Pause {
+		t.Skip("bhatti-vmm build can't pause; skipping")
 	}
 	return eng
 }
@@ -116,7 +139,7 @@ func TestKrucibleAgentSuite(t *testing.T) {
 
 // TestKrucibleThermalSuite asserts hot/warm transitions.
 func TestKrucibleThermalSuite(t *testing.T) {
-	enginetest.RunThermalSuite(t, newCheckpointEngine)
+	enginetest.RunThermalSuite(t, newPauseEngine)
 }
 
 // TestKrucibleSnapshotSuite is the cold-tier gate: Stop (snapshot + free RAM) /

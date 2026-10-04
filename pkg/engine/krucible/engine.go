@@ -349,11 +349,18 @@ type Engine struct {
 
 // errNoCheckpoint is returned by every operation that needs saved VM state
 // when the VMM build has no checkpoint support.
-var errNoCheckpoint = fmt.Errorf("%w: this bhatti-vmm build has no checkpoint support (stop, pause, snapshot, restore and fork are unavailable)", engine.ErrNotSupported)
+var errNoCheckpoint = fmt.Errorf("%w: this bhatti-vmm build has no checkpoint support (stop, snapshot, restore and fork are unavailable)", engine.ErrNotSupported)
 
-// ThermalSupported reports whether hot/warm/cold transitions are available.
+// ThermalSupported reports whether the warm tier (live pause) is available.
 // The server consults it before using the engine's thermal methods.
-func (e *Engine) ThermalSupported() bool { return e.caps.Checkpoint }
+func (e *Engine) ThermalSupported() bool { return e.caps.Pause }
+
+// ColdSupported reports whether a sandbox can be snapshotted to disk (the cold
+// tier). Without it a warm sandbox stays warm.
+func (e *Engine) ColdSupported() bool { return e.caps.Checkpoint }
+
+// errNoPause is returned by Pause when the VMM build can't pause a VM.
+var errNoPause = fmt.Errorf("%w: this bhatti-vmm build can't pause a VM", engine.ErrNotSupported)
 
 // probeCapabilities asks the VMM helper what it supports. A helper that can't
 // answer is rejected: daemon and helper ship in one bundle, so a mismatch is
@@ -557,7 +564,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		VsockForwardUDS: forwardUDS,
 		LogLevel:        2,
 	}
-	if e.caps.Checkpoint {
+	if e.caps.Pause || e.caps.Checkpoint {
 		baseSpec.ControlSocketUDS = ctlSockUDS
 	}
 	// With a network, the guest's eth0 is wired to its owner's bhatti-netd;

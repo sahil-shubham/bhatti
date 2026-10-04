@@ -7,9 +7,9 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
 
-// This file implements pkg/server.ThermalEngine on top of the libkrun control
-// socket (PAUSE/RESUME/STATUS). P2 scope = warm tier (hot↔warm). Cold lands in
-// P3 (snapshot-to-disk via a separate control verb).
+// This file implements pkg/server.ThermalEngine on top of bhatti-vmm's control
+// socket (PAUSE/RESUME/STATUS), the warm tier. The cold tier (snapshot to disk)
+// needs checkpoint support in the VMM; see ColdSupported.
 //
 // Memory model: libkrun maps guest RAM MAP_PRIVATE|MAP_ANONYMOUS (lazy commit),
 // so a paused VM's host RSS already only counts touched pages — we don't need
@@ -18,8 +18,8 @@ import (
 
 // Pause: hot → warm. Idempotent on warm.
 func (e *Engine) Pause(ctx context.Context, id string) error {
-	if !e.caps.Checkpoint {
-		return errNoCheckpoint
+	if !e.caps.Pause {
+		return errNoPause
 	}
 	vm, err := e.getVM(id)
 	if err != nil {

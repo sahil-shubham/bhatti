@@ -36,24 +36,54 @@ static void bv_report(const char *what, KrunError err) {
 }
 
 static KrunStr bv_str(const char *s) { return KRUN_STR(s); }
+
+// bv_errbuf collects a libkrun error message for a control-socket reply.
+struct bv_errbuf { char text[512]; size_t len; };
+static bool bv_push_buf(void *self, KrunStr s) {
+	struct bv_errbuf *b = self;
+	size_t room = sizeof(b->text) - 1 - b->len;
+	size_t n = s.len < room ? s.len : room;
+	memcpy(b->text + b->len, s.data, n);
+	b->len += n;
+	b->text[b->len] = 0;
+	return true;
+}
+static KrunPushStrVtable bv_buf_vt = { .drop = NULL, .push = bv_push_buf };
+
+// bv_vm_ctl runs pause (op 0) or resume (op 1) on h. Returns 0 on success;
+// otherwise fills msg with libkrun's reason and returns -1.
+static int bv_vm_ctl(KrunVmmHandle h, int op, struct bv_errbuf *msg) {
+	KrunError err = NULL;
+	if (op == 0) krun_vmm_handle_pause(h, &err);
+	else krun_vmm_handle_resume(h, &err);
+	if (!err) return 0;
+	msg->len = 0; msg->text[0] = 0;
+	KrunVtableHandle w = KRUN_VTABLE_HANDLE(KRUN_PUSH_STR_TYPE_TAG, bv_buf_vt, msg);
+	krun_error_message(err, &w);
+	krun_error_destroy(err);
+	return -1;
+}
 */
 import "C"
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"runtime"
+	"strings"
+	"sync"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 )
 
 // capabilities is what this VMM build supports, reported by `vmm capabilities`
 // so the daemon can gate features at startup instead of failing per call.
-// Checkpoint (pause/snapshot/restore/fork) arrives with the checkpoint stack
-// on top of upstream libkrun (docs/PLAN-libkrun-upstream-rebase.md, Phase 2).
-var capabilities = krucible.VMMCapabilities{Checkpoint: false}
+// Checkpoint (snapshot/restore/fork) arrives with the checkpoint stack on top
+// of upstream libkrun (docs/PLAN-libkrun-upstream-rebase.md, Phase 2).
+var capabilities = krucible.VMMCapabilities{Pause: true, Checkpoint: false}
 
 // defaultExtCmdline mirrors libkrun's bundled block-root cmdline for the
 // external-kernel path. x86 pins clocksource=kvm-clock; arm64 uses the arch timer.
@@ -115,8 +145,6 @@ func run(spec krucible.VMSpec) {
 	switch {
 	case spec.SnapshotDir != "":
 		fail("snapshot restore is not supported by this VMM build")
-	case spec.ControlSocketUDS != "":
-		fail("the pause/resume control socket is not supported by this VMM build")
 	case spec.KernelImage == "":
 		fail("kernel_image is required (this VMM boots an external kernel only)")
 	case spec.RootDisk == "":
@@ -224,6 +252,64 @@ func run(spec krucible.VMSpec) {
 	vmm := C.krun_vmm_builder_build(&b, &kerr)
 	noErr(kerr, "build")
 
+	// The handle must be taken before krun_vmm_run, which consumes the VMM.
+	if spec.ControlSocketUDS != "" {
+		h := C.krun_vmm_handle(vmm, &kerr)
+		noErr(kerr, "handle")
+		ln, err := net.Listen("unix", spec.ControlSocketUDS)
+		if err != nil {
+			fail("control socket %s: %v", spec.ControlSocketUDS, err)
+		}
+		go serveControl(ln, h)
+	}
+
 	fmt.Fprintf(os.Stderr, "vmm: run vcpus=%d mem=%dMiB root=%s\n", spec.Vcpus, spec.MemMiB, spec.RootDisk)
 	C.krun_vmm_run(vmm) // becomes the VM; returns only on error
+}
+
+// serveControl answers the daemon's control commands, one per connection: a
+// command line in, one line out ("OK ..." or "ERR <reason>").
+//
+//	PAUSE   park every vCPU (returns once they're parked); idempotent
+//	RESUME  run them again; idempotent
+//	STATUS  "OK running" or "OK paused"
+func serveControl(ln net.Listener, h C.KrunVmmHandle) {
+	var mu sync.Mutex // one command at a time; also guards paused
+	paused := false
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer conn.Close()
+			line, err := bufio.NewReader(conn).ReadString('\n')
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			reply := "ERR unknown command"
+			switch cmd := strings.TrimSpace(line); cmd {
+			case "PAUSE", "RESUME":
+				op, want := C.int(0), true
+				if cmd == "RESUME" {
+					op, want = 1, false
+				}
+				var msg C.struct_bv_errbuf
+				if C.bv_vm_ctl(h, op, &msg) == 0 {
+					paused = want
+					reply = "OK"
+				} else {
+					reply = "ERR " + C.GoString(&msg.text[0])
+				}
+			case "STATUS":
+				reply = "OK running"
+				if paused {
+					reply = "OK paused"
+				}
+			}
+			fmt.Fprintln(conn, reply)
+		}()
+	}
 }

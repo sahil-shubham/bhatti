@@ -31,18 +31,6 @@ func newNetEngine(t *testing.T) engine.Engine {
 	return newNetEngineAt(t, dataDir, shortSockDir(t))
 }
 
-// shortSockDir returns a SHORT temp dir for vsock/UDS paths. t.TempDir() on macOS
-// (/var/folders/...) exceeds the ~104-byte sockaddr_un limit, so sockets need a
-// short base like /tmp. (DataDir can stay t.TempDir() — regular files, no limit.)
-func shortSockDir(t *testing.T) string {
-	d, err := os.MkdirTemp("/tmp", "kr")
-	if err != nil {
-		t.Fatalf("short sock dir: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(d) })
-	return d
-}
-
 // newNetEngineAt builds a net-backend engine on explicit dataDir + sockDir, so a
 // recovery test can spin up a SECOND engine over the same state (simulating a
 // daemon restart). Skips if the net backend prerequisites aren't present.

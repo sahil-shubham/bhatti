@@ -18,7 +18,7 @@ import (
 // recoveryEngine builds a block-root engine bound to a FIXED data dir, so a
 // second engine can be constructed over the same state to simulate a daemon
 // restart. Skips if libkrun/vmm/mke2fs are unavailable.
-func recoveryEngine(t *testing.T, dataDir, baseRootfs string) *Engine {
+func recoveryEngine(t *testing.T, dataDir, sockDir, baseRootfs string) *Engine {
 	t.Helper()
 	repo := repoRoot(t)
 	if !hasLibkrun() {
@@ -35,7 +35,7 @@ func recoveryEngine(t *testing.T, dataDir, baseRootfs string) *Engine {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
 	eng, err := New(Config{
-		DataDir: dataDir, BaseRootfs: baseRootfs, VMMBinary: vmm,
+		DataDir: dataDir, SocketDir: sockDir, BaseRootfs: baseRootfs, VMMBinary: vmm,
 		LibDir: libDir(), BlockRoot: true, KernelImage: requireLeanKernel(t, repo), NetdBinary: requireNetd(t, repo),
 	})
 	if err != nil {
@@ -61,11 +61,12 @@ func helperPID(t *testing.T, e *Engine, id string) int {
 // can exec on it — no reboot, no lost state.
 func TestKrucibleRecoveryAdoptLive(t *testing.T) {
 	dataDir := t.TempDir()
+	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	eng1 := recoveryEngine(t, dataDir, base)
+	eng1 := recoveryEngine(t, dataDir, sockDir, base)
 	info, err := eng1.Create(ctx, engine.SandboxSpec{Name: "rec", CPUs: 1, MemoryMB: 512})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -82,7 +83,7 @@ func TestKrucibleRecoveryAdoptLive(t *testing.T) {
 
 	// Simulate a daemon restart: abandon eng1 WITHOUT destroying (the detached
 	// helper keeps running), then build a new engine over the same data dir.
-	eng2 := recoveryEngine(t, dataDir, base)
+	eng2 := recoveryEngine(t, dataDir, sockDir, base)
 	t.Cleanup(func() { eng2.Destroy(context.Background(), id) })
 
 	s, err := eng2.Status(ctx, id)
@@ -102,11 +103,12 @@ func TestKrucibleRecoveryAdoptLive(t *testing.T) {
 // image persists) so it's usable again.
 func TestKrucibleRecoveryDeadHelper(t *testing.T) {
 	dataDir := t.TempDir()
+	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	eng1 := recoveryEngine(t, dataDir, base)
+	eng1 := recoveryEngine(t, dataDir, sockDir, base)
 	info, err := eng1.Create(ctx, engine.SandboxSpec{Name: "crash", CPUs: 1, MemoryMB: 512})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -121,7 +123,7 @@ func TestKrucibleRecoveryDeadHelper(t *testing.T) {
 	}
 
 	// Fresh engine: recovery should see the dead pid and mark it stopped.
-	eng2 := recoveryEngine(t, dataDir, base)
+	eng2 := recoveryEngine(t, dataDir, sockDir, base)
 	t.Cleanup(func() { eng2.Destroy(context.Background(), id) })
 	if s, err := eng2.Status(ctx, id); err != nil || s.Status != "stopped" {
 		t.Fatalf("recovered (dead) status = %q (err %v), want stopped", s.Status, err)

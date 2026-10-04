@@ -36,6 +36,7 @@ func TestEngineCapabilities(t *testing.T) {
 
 	eng, err := New(Config{
 		DataDir:     t.TempDir(),
+		SocketDir:   shortSockDir(t),
 		BaseRootfs:  buildBaseRootfs(t, repo),
 		VMMBinary:   vmm,
 		LibDir:      libDir(),

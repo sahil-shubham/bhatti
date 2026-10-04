@@ -45,11 +45,12 @@ func reapTerminatedWithin(pid int, d time.Duration) bool {
 // helper. Before the fix Shutdown skipped adopted helpers entirely.
 func TestKrucibleShutdownKillsAdoptedHelper(t *testing.T) {
 	dataDir := t.TempDir()
+	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	eng1 := recoveryEngine(t, dataDir, base)
+	eng1 := recoveryEngine(t, dataDir, sockDir, base)
 	info, err := eng1.Create(ctx, engine.SandboxSpec{Name: "shut", CPUs: 1, MemoryMB: 512})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -61,7 +62,7 @@ func TestKrucibleShutdownKillsAdoptedHelper(t *testing.T) {
 
 	// Simulate a daemon restart: a fresh engine over the same data dir adopts the
 	// still-running helper (it did not spawn it, so vm.cmd == nil).
-	eng2 := recoveryEngine(t, dataDir, base)
+	eng2 := recoveryEngine(t, dataDir, sockDir, base)
 	if got := helperPID(t, eng2, id); got != pid {
 		t.Fatalf("eng2 did not adopt the live helper: pid %d, want %d", got, pid)
 	}
@@ -79,11 +80,12 @@ func TestKrucibleShutdownKillsAdoptedHelper(t *testing.T) {
 // kill() reaps via cmd.Wait(), so termination is observable directly.
 func TestKrucibleShutdownKillsOwnedHelper(t *testing.T) {
 	dataDir := t.TempDir()
+	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	eng := recoveryEngine(t, dataDir, base)
+	eng := recoveryEngine(t, dataDir, sockDir, base)
 	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "shut2", CPUs: 1, MemoryMB: 512})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
