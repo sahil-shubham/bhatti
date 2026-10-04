@@ -85,7 +85,7 @@ type VMSpec struct {
 
 	// SnapshotDir, if set, restores from a completed checkpoint directory
 	// (memory.bin + checkpoint.bin), instead of booting. The guest resumes with
-	// its saved RAM, devices and vCPUs. Currently supported on Linux KVM x86_64.
+	// its saved RAM, devices and vCPUs. Supported on Linux KVM (x86_64, arm64).
 	SnapshotDir string `json:"snapshot_dir,omitempty"`
 
 	// KernelImage, if set, boots an external kernel (e.g. a lean one) via
