@@ -256,7 +256,7 @@ func TestKrucibleRestoreRefusals(t *testing.T) {
 			}
 		}},
 		{"future-version", "unsupported checkpoint version", func(t *testing.T, dir string, _ *krucibleSnapManifest) {
-			tamperCheckpointHeader(t, dir, 8, 2)
+			tamperCheckpointHeader(t, dir, 8, 99)
 		}},
 		{"wrong-arch", "checkpoint was taken on", func(t *testing.T, dir string, _ *krucibleSnapManifest) {
 			tamperCheckpointHeader(t, dir, 12, 2)

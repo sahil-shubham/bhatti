@@ -106,8 +106,16 @@ func fail(format string, args ...any) {
 }
 
 func main() {
+	// check-checkpoint <dir>: whether this host can restore the checkpoint in
+	// dir, judged by libkrun as a restore would be; exits 1 with the reason.
+	if len(os.Args) == 3 && os.Args[1] == "check-checkpoint" {
+		var kerr C.KrunError
+		C.krun_checkpoint_check_host(cstr(os.Args[2]), &kerr)
+		noErr(kerr, "check-checkpoint")
+		return
+	}
 	if len(os.Args) != 2 {
-		fail("usage: vmm <spec.json> | vmm capabilities")
+		fail("usage: vmm <spec.json> | vmm capabilities | vmm check-checkpoint <dir>")
 	}
 	if os.Args[1] == "capabilities" {
 		if err := json.NewEncoder(os.Stdout).Encode(capabilities); err != nil {
