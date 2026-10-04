@@ -202,6 +202,9 @@ func TestSnapshotImportRefusals(t *testing.T) {
 		MemPath: filepath.Join(userDir, "taken", "mem.snap"), ManifestJSON: "{}", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
+	takenFile := filepath.Join(userDir, "taken", "memory.bin")
+	os.MkdirAll(filepath.Dir(takenFile), 0o700)
+	os.WriteFile(takenFile, []byte("the existing snapshot"), 0o600)
 	called := false
 	eng.imp = func(io.Reader, string) (engine.SnapshotImport, error) {
 		called = true
@@ -223,8 +226,11 @@ func TestSnapshotImportRefusals(t *testing.T) {
 	if resp := postArchive(t, ts, "", strings.NewReader("x")); resp.StatusCode != 400 {
 		t.Fatalf("archive with an invalid name: %d", resp.StatusCode)
 	}
+	if got, _ := os.ReadFile(takenFile); string(got) != "the existing snapshot" {
+		t.Fatal("an import under a taken name touched the existing snapshot")
+	}
 	entries, _ := os.ReadDir(userDir)
-	if len(entries) != 0 {
+	if len(entries) != 1 {
 		t.Fatalf("refused imports left %v behind", entries)
 	}
 	if snaps, _ := st.ListSnapshots("usr_test"); len(snaps) != 1 {

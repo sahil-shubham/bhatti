@@ -74,6 +74,17 @@ func TestSnapshotExportLeavesNoPartialArchive(t *testing.T) {
 		t.Fatalf("export that broke off: %v", err)
 	}
 	noFile()
+	// An earlier archive under that name outlives a failed export.
+	if err := os.WriteFile(out, []byte("earlier archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exportSnapshot("dev-ready", out, false); err == nil {
+		t.Fatal("export that broke off succeeded")
+	}
+	if got, _ := os.ReadFile(out); string(got) != "earlier archive" {
+		t.Fatalf("a failed export left %d bytes where the earlier archive was", len(got))
+	}
+	os.Remove(out)
 	if _, err := exportSnapshot("dev-ready", out, true); err == nil || !strings.Contains(err.Error(), "422") || !strings.Contains(err.Error(), "engine says no") {
 		t.Fatalf("refused export: %v", err)
 	}
