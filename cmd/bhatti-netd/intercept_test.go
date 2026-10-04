@@ -277,6 +277,9 @@ func (r *rig) connect(sandbox string) net.Conn {
 		r.t.Fatal(err)
 	}
 	go r.proxy.serve(guest, up, sandbox)
+	// A regression that stalls the stream (say, peeked bytes not replayed)
+	// fails here rather than hanging the run.
+	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
 	r.t.Cleanup(func() { client.Close() })
 	return client
 }
