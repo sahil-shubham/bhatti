@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
@@ -281,6 +282,12 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 	}
 	if hasMount {
 		return engine.SandboxInfo{}, fmt.Errorf("cannot fork a sandbox with a virtio-fs --mount (the device cannot be memory-restored); use a filesystem snapshot (snapshot create --type filesystem) then create --snapshot")
+	}
+
+	// Refuse before CHECKPOINT freezes the source; its baked-in lohar may
+	// predate network reconciliation even though the daemon supports fork.
+	if err := e.RequireGuestAgentFeature(ctx, sandboxID, proto.FeatureNetConfig); err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("fork: %w", err)
 	}
 
 	tmp, err := os.MkdirTemp(e.cfg.DataDir, "fork-")

@@ -195,6 +195,10 @@ func (e *Engine) recover() {
 		}
 		if alive {
 			vm.Agent = agent.NewKrucibleClient(vm.ControlUDS, vm.ForwardUDS, vm.Token)
+			vm.AgentInfo, vm.AgentInfoErr = queryAgentInfo(context.Background(), vm.Agent)
+			if vm.AgentInfoErr != nil {
+				slog.Warn("krucible.agent.info", "id", vm.ID, "error", vm.AgentInfoErr)
+			}
 		} else {
 			vm.HelperPID = 0
 		}

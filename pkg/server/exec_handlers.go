@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -469,6 +470,14 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 		}
 		pipedConn = pc
 		sessionID = info.SessionID
+	}
+	// A legacy lohar sends both pipes on STDOUT. Preserve its output even
+	// when the client subscribed only to stderr; tag the merged stream stdout.
+	if streams != nil {
+		if caps, ok := s.engine.(engine.GuestAgentCapabilities); ok &&
+			errors.Is(caps.RequireGuestAgentFeature(r.Context(), sb.EngineID, proto.FeaturePipedStderr), engine.ErrGuestAgentOutdated) {
+			streams = &streamSet{stdout: true}
+		}
 	}
 	defer pipedConn.Close()
 

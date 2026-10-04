@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent"
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/configdrive"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
@@ -320,32 +321,34 @@ type VM struct {
 	// same vsock UDS paths and orphaning processes. Ordering rule: acquire
 	// launchMu BEFORE mu, never the reverse (mu guards field reads/writes and is
 	// also taken by read-only Status/List, which must not block on a transition).
-	launchMu   sync.Mutex
-	ID         string
-	Name       string
-	UserID     string
-	SandboxDir string
-	SockDir    string
-	ControlUDS string // guest vsock 1024 (agent control)
-	ForwardUDS string // guest vsock 1025 (port forward)
-	CtlSockUDS string // VMM control socket (PAUSE/RESUME/SAVE/STATUS)
-	MemMiB     uint32 // configured at boot (for ThermalEngine.MemSizeMib)
-	Thermal    string // "hot" | "warm" | "cold"
-	Token      string
-	Agent      *agent.AgentClient
-	Status     string // "running" | "stopped"
-	baseSpec   VMSpec // the spec to (re-)launch with
-	logPath    string
-	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
-	cmd        *exec.Cmd
-	waitDone   <-chan error // cmd.Wait is owned by one goroutine, including during kill
-	cancel     context.CancelFunc
-	configSrv  *configServer          // host-side boot config server (§3.4); launchMu-guarded
-	netdKey    string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
-	subnetIdx  int                    // owner's vnet subnet index (net backend); persisted for recovery
-	netIP      string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
-	netPolicy  *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public
-	sandboxRef string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
+	launchMu     sync.Mutex
+	ID           string
+	Name         string
+	UserID       string
+	SandboxDir   string
+	SockDir      string
+	ControlUDS   string // guest vsock 1024 (agent control)
+	ForwardUDS   string // guest vsock 1025 (port forward)
+	CtlSockUDS   string // VMM control socket (PAUSE/RESUME/SAVE/STATUS)
+	MemMiB       uint32 // configured at boot (for ThermalEngine.MemSizeMib)
+	Thermal      string // "hot" | "warm" | "cold"
+	Token        string
+	Agent        *agent.AgentClient
+	AgentInfo    proto.AgentInfo // refreshed at every boot; never persisted across launches
+	AgentInfoErr error           // a failed query is unknown, not a legacy guest
+	Status       string          // "running" | "stopped"
+	baseSpec     VMSpec          // the spec to (re-)launch with
+	logPath      string
+	HelperPID    int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
+	cmd          *exec.Cmd
+	waitDone     <-chan error // cmd.Wait is owned by one goroutine, including during kill
+	cancel       context.CancelFunc
+	configSrv    *configServer          // host-side boot config server (§3.4); launchMu-guarded
+	netdKey      string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
+	subnetIdx    int                    // owner's vnet subnet index (net backend); persisted for recovery
+	netIP        string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
+	netPolicy    *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public
+	sandboxRef   string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
 }
 
 // brokerRef is how netd names this sandbox to the credential broker: the
@@ -651,12 +654,22 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", idx), Path: dst, Format: format, ReadOnly: rv.readOnly})
 	}
 
+	var requiresGrowth bool
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
 		rootImg, rootFormat, rootBase, perr := e.prepareRootDisk(sandboxDir, spec)
 		if perr != nil {
 			return info, perr
+		}
+		// A larger block device does not enlarge ext4 without lohar's boot-time
+		// resize. Reject only actual growth; a size at/below the base is safe.
+		if spec.DiskSizeMB > 0 && !isQcow2(rootBase) {
+			baseStat, statErr := os.Stat(rootBase)
+			if statErr != nil {
+				return info, fmt.Errorf("stat root base: %w", statErr)
+			}
+			requiresGrowth = int64(spec.DiskSizeMB)*1024*1024 > baseStat.Size()
 		}
 		slog.Debug("krucible root disk", "id", id, "root", rootImg, "base", rootBase)
 		baseSpec.RootDisk = rootImg
@@ -701,6 +714,16 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	}
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
 		return info, err
+	}
+	if spec.RequireGuestCA {
+		if err = vm.requireFeature(proto.FeatureSandboxCA); err != nil {
+			return info, fmt.Errorf("create with secret grants: %w", err)
+		}
+	}
+	if requiresGrowth {
+		if err = vm.requireFeature(proto.FeatureRootGrowth); err != nil {
+			return info, fmt.Errorf("create with disk-size: %w", err)
+		}
 	}
 
 	// Fork/restore reconcile: a memory restore brings the guest back with the
@@ -835,12 +858,20 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, tailFile(vm.logPath, 4096))
 	default:
 	}
+	// lohar lives on the guest's disk, not in the daemon binary. A failed
+	// capability probe must not prevent an ordinary boot or mislabel it old.
+	agentInfo, infoErr := queryAgentInfo(ctx, ag)
+	if infoErr != nil {
+		slog.Warn("krucible.agent.info", "id", vm.ID, "error", infoErr)
+	}
 	vm.mu.Lock()
 	vm.cmd = cmd
 	vm.cancel = vmCancel
 	vm.waitDone = waitDone
 	vm.HelperPID = cmd.Process.Pid
 	vm.Agent = ag
+	vm.AgentInfo = agentInfo
+	vm.AgentInfoErr = infoErr
 	vm.Status = "running"
 	vm.Thermal = "hot"
 	vm.mu.Unlock()

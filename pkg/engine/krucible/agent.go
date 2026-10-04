@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
@@ -98,11 +99,60 @@ func (e *Engine) ExecStream(ctx context.Context, id string, cmd []string, onEven
 	}
 }
 
+func queryAgentInfo(ctx context.Context, ag *agent.AgentClient) (proto.AgentInfo, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return ag.Info(probeCtx)
+}
+
+// RequireGuestAgentFeature implements engine.GuestAgentCapabilities. Cold
+// sandboxes must boot before checking: their lohar may differ from the
+// daemon's current image, and every boot refreshes the in-memory report.
+func (e *Engine) RequireGuestAgentFeature(ctx context.Context, id string, feature proto.AgentFeature) error {
+	if err := e.EnsureHot(ctx, id); err != nil {
+		return err
+	}
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	return vm.requireFeature(feature)
+}
+
+func (vm *VM) requireFeature(feature proto.AgentFeature) error {
+	vm.mu.Lock()
+	info, infoErr := vm.AgentInfo, vm.AgentInfoErr
+	vm.mu.Unlock()
+	if infoErr != nil {
+		return fmt.Errorf("guest agent capabilities unavailable: %w", infoErr)
+	}
+	if !info.Legacy && info.Version == "" {
+		return fmt.Errorf("guest agent capabilities unavailable: no response cached")
+	}
+	if !info.Has(feature) {
+		return engine.GuestAgentOutdated(string(feature))
+	}
+	return nil
+}
+
 // PipedSession implements engine.PipedSessionEngine.
 func (e *Engine) PipedSession(ctx context.Context, id string, spec engine.PipedSpec) (*proto.SessionInfo, engine.PipedConn, error) {
 	ag, err := e.agentFor(id)
 	if err != nil {
 		return nil, nil, err
+	}
+	if spec.Stderr {
+		vm, err := e.getVM(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		vm.mu.Lock()
+		legacy := vm.AgentInfo.Legacy
+		vm.mu.Unlock()
+		if legacy {
+			// Old lohar ignores this flag and always merges stderr into stdout.
+			spec.Stderr = false
+		}
 	}
 	return ag.PipedSession(ctx, spec)
 }

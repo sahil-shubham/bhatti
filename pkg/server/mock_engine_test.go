@@ -23,12 +23,13 @@ type mockEngine struct {
 	nextID    atomic.Int64
 
 	// Configurable per-test
-	ExecResult     engine.ExecResult
-	CreateErr      error
-	ExecErr        error
-	StopErr        error
-	ActivityResult *proto.ActivityInfo
-	ActivityErr    error
+	ExecResult      engine.ExecResult
+	CreateErr       error
+	ExecErr         error
+	StopErr         error
+	ActivityResult  *proto.ActivityInfo
+	ActivityErr     error
+	GuestFeatureErr error
 
 	// LastCreateSpec is the spec from the most recent successful Create call,
 	// for tests that want to verify what got passed downstream.
@@ -246,6 +247,10 @@ func (m *mockEngine) MemSizeMib(_ string) int64 {
 	return 2048
 }
 
+func (m *mockEngine) RequireGuestAgentFeature(_ context.Context, _ string, _ proto.AgentFeature) error {
+	return m.GuestFeatureErr
+}
+
 // mockTermConn wraps net.Pipe as engine.TerminalConn.
 type mockTermConn struct {
 	conn   net.Conn
@@ -254,10 +259,8 @@ type mockTermConn struct {
 
 func (t *mockTermConn) Read(p []byte) (int, error)  { return t.conn.Read(p) }
 func (t *mockTermConn) Write(p []byte) (int, error) { return t.conn.Write(p) }
-func (t *mockTermConn) Resize(rows, cols int) error  { return nil }
+func (t *mockTermConn) Resize(rows, cols int) error { return nil }
 func (t *mockTermConn) Close() error {
 	t.server.Close()
 	return t.conn.Close()
 }
-
-

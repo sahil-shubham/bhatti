@@ -208,6 +208,12 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			}
 			grantHostsBySecret[g.Secret] = hosts
 		}
+		if len(req.SecretGrants) > 0 {
+			if _, ok := s.engine.(engine.GuestAgentCapabilities); !ok {
+				errResp(w, 501, "engine does not support guest-agent capability checks for secret grants")
+				return
+			}
+		}
 
 		var spec engine.SandboxSpec
 		var templateID string
@@ -573,6 +579,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			// from the guest's first request. A sandbox with a network gets its
 			// own CA in its trust store, so grants can be added while it runs.
 			spec.SandboxID = sbID
+			spec.RequireGuestCA = len(req.SecretGrants) > 0
 			if !req.NetPolicy.NoNetwork() {
 				spec.CACert, err = s.mintSandboxCA(user.ID, sbID, spec.Name)
 			}

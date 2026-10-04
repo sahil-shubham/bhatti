@@ -914,7 +914,13 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, 
 // Used for 500 errors to avoid leaking internal paths, IPs, or system details.
 // An engine.ErrNotSupported is the caller asking for something this engine
 // can't do, so it's a 501 carrying the engine's (deliberately user-facing) message.
+// An outdated guest agent is a client-actionable conflict (recreate the
+// sandbox), distinct from an unavailable capability probe or a broken engine.
 func errRespInternal(w http.ResponseWriter, r *http.Request, logMsg string, err error) {
+	if errors.Is(err, engine.ErrGuestAgentOutdated) {
+		errResp(w, 409, err.Error())
+		return
+	}
 	if errors.Is(err, engine.ErrNotSupported) {
 		errResp(w, 501, err.Error())
 		return

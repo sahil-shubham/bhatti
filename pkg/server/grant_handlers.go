@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/broker"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
@@ -250,6 +251,15 @@ func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request,
 	hosts, err := grantHosts(req.Hosts, sandboxEgress(sb))
 	if err != nil {
 		errResp(w, 400, "invalid grant: "+err.Error())
+		return
+	}
+	caps, ok := s.engine.(engine.GuestAgentCapabilities)
+	if !ok {
+		errResp(w, 501, "engine does not support guest-agent capability checks for secret grants")
+		return
+	}
+	if err := caps.RequireGuestAgentFeature(r.Context(), sb.EngineID, proto.FeatureSandboxCA); err != nil {
+		errRespInternal(w, r, "guest agent cannot install sandbox CA", err)
 		return
 	}
 	if _, err := s.store.GetSandboxCA(sb.ID); errors.Is(err, sql.ErrNoRows) {
