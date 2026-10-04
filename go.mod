@@ -6,6 +6,7 @@ require (
 	filippo.io/age v1.3.1
 	github.com/google/go-containerregistry v0.21.3
 	github.com/gorilla/websocket v1.5.3
+	github.com/klauspost/compress v1.18.4
 	github.com/spf13/cobra v1.10.2
 	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.49.0
@@ -28,7 +29,6 @@ require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect

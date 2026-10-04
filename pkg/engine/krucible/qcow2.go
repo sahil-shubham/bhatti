@@ -117,3 +117,95 @@ func createQcow2Overlay(dst, backing string, size uint64) error {
 	}
 	return nil
 }
+
+// qcow2BackingRef is where a qcow2 image records its backing file's name.
+type qcow2BackingRef struct {
+	offset  int64  // of the name; 0 = no backing file
+	size    uint32 // of the name
+	cluster int64  // the image's cluster size
+}
+
+// readQcow2BackingRef reads the header fields that place the backing name.
+func readQcow2BackingRef(f *os.File) (qcow2BackingRef, error) {
+	var h [24]byte
+	if _, err := f.ReadAt(h[:], 0); err != nil {
+		return qcow2BackingRef{}, fmt.Errorf("read qcow2 header: %w", err)
+	}
+	be := binary.BigEndian
+	if string(h[:4]) != "QFI\xfb" {
+		return qcow2BackingRef{}, fmt.Errorf("not a qcow2 image")
+	}
+	if v := be.Uint32(h[4:]); v != 2 && v != 3 {
+		return qcow2BackingRef{}, fmt.Errorf("qcow2 version %d", v)
+	}
+	// The spec allows 9 (512 B) to 21 (2 MiB).
+	bits := be.Uint32(h[20:])
+	if bits < 9 || bits > 21 {
+		return qcow2BackingRef{}, fmt.Errorf("qcow2 cluster bits %d", bits)
+	}
+	ref := qcow2BackingRef{size: be.Uint32(h[16:]), cluster: 1 << bits}
+	off := be.Uint64(h[8:])
+	if off == 0 {
+		return ref, nil
+	}
+	// The name lives in the header cluster, after the header extensions.
+	if off >= uint64(ref.cluster) || off+uint64(ref.size) > uint64(ref.cluster) || ref.size > qcow2MaxBackingName {
+		return qcow2BackingRef{}, fmt.Errorf("qcow2 backing name at %d+%d is outside the header cluster", off, ref.size)
+	}
+	ref.offset = int64(off)
+	return ref, nil
+}
+
+// qcow2Backing returns the backing file name the qcow2 image at path records,
+// "" when it has none.
+func qcow2Backing(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	ref, err := readQcow2BackingRef(f)
+	if err != nil || ref.offset == 0 {
+		return "", err
+	}
+	name := make([]byte, ref.size)
+	if _, err := f.ReadAt(name, ref.offset); err != nil {
+		return "", fmt.Errorf("read qcow2 backing name: %w", err)
+	}
+	return string(name), nil
+}
+
+// setQcow2Backing points the qcow2 image at path, which has a backing file,
+// at another one with the same contents (the image's clusters only make sense
+// over those). The name is rewritten in place: it starts where the old one
+// did, and the rest of the header cluster after the header extensions is the
+// name's to use.
+func setQcow2Backing(path, backing string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ref, err := readQcow2BackingRef(f)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if ref.offset == 0 {
+		return fmt.Errorf("%s has no backing file to replace", path)
+	}
+	if len(backing) == 0 || len(backing) > qcow2MaxBackingName || ref.offset+int64(len(backing)) > ref.cluster {
+		return fmt.Errorf("%s: backing name %q doesn't fit the qcow2 header", path, backing)
+	}
+	// Zero what's left of a longer old name, then set the new length.
+	name := make([]byte, max(len(backing), int(ref.size)))
+	copy(name, backing)
+	if _, err := f.WriteAt(name, ref.offset); err != nil {
+		return fmt.Errorf("%s: write backing name: %w", path, err)
+	}
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], uint32(len(backing)))
+	if _, err := f.WriteAt(size[:], 16); err != nil {
+		return fmt.Errorf("%s: write backing name size: %w", path, err)
+	}
+	return f.Sync()
+}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -70,4 +71,83 @@ func TestQcow2OverlayCopyOnWrite(t *testing.T) {
 	run("qemu-io", "-f", "qcow2", "-c", "read -P 0xc3 512M 4k", ovl)
 	run("qemu-io", "-f", "raw", "-c", "read -P 0x5a 512M 4k", base)
 	run("qemu-img", "check", "-f", "qcow2", ovl) // refcounts still consistent after allocation
+}
+
+// TestQcow2BackingRewrite moves an overlay onto a copy of its base elsewhere,
+// as an imported snapshot's root disk is, and checks it is the same disk: the
+// header names the new base (longer, then shorter, with nothing of the old
+// name left), a name the header can't hold is refused without touching the
+// image, and qemu (when installed) reads the overlay's writes and the base's
+// data through it.
+func TestQcow2BackingRewrite(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.raw")
+	data := bytes.Repeat([]byte{0x5a}, 1<<20)
+	if err := os.WriteFile(base, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ovl := filepath.Join(dir, "root.qcow2")
+	if err := createQcow2Overlay(ovl, base, uint64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	qemu := true
+	for _, tool := range []string{"qemu-img", "qemu-io"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			qemu = false
+		}
+	}
+	run := func(name string, args ...string) {
+		t.Helper()
+		if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		}
+	}
+	if qemu {
+		run("qemu-io", "-f", "qcow2", "-c", "write -P 0xc3 0 4k", ovl)
+	}
+
+	moved := filepath.Join(dir, "a much longer directory", "where the base image moved.ext4")
+	short := filepath.Join(dir, "b")
+	for _, to := range []string{moved, short} {
+		if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(to, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := setQcow2Backing(ovl, to); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := qcow2Backing(ovl); err != nil || got != to {
+			t.Fatalf("backing = %q, %v; want %q", got, err, to)
+		}
+		if qemu {
+			run("qemu-img", "check", "-f", "qcow2", ovl)
+			run("qemu-io", "-f", "qcow2", "-c", "read -P 0xc3 0 4k", "-c", "read -P 0x5a 4k 4k", ovl)
+		}
+	}
+	// The old, longer name's tail is cleared.
+	hdr := make([]byte, qcow2ClusterSize)
+	f, err := os.Open(ovl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(hdr, []byte("where the base image moved")) {
+		t.Fatal("the header still holds part of the previous backing name")
+	}
+
+	before, _ := os.ReadFile(ovl)
+	if err := setQcow2Backing(ovl, "/"+strings.Repeat("x", qcow2MaxBackingName)); err == nil {
+		t.Fatal("a backing name longer than qcow2 allows was written")
+	}
+	if after, _ := os.ReadFile(ovl); !bytes.Equal(before, after) {
+		t.Fatal("a refused rewrite changed the image")
+	}
+	if _, err := qcow2Backing(base); err == nil {
+		t.Fatal("a raw image read as qcow2")
+	}
 }
