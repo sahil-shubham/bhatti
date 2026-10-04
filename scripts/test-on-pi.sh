@@ -19,13 +19,14 @@ TEST_FILTER="${2:-}"
 
 echo "==> Building agent binary..."
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
-    -ldflags='-s -w' \
+    -ldflags="-s -w -X main.version=${VERSION:-$(git describe --tags --always --dirty)}" \
     -o bin/lohar-linux-arm64 \
     ./cmd/lohar
 
 run_agent_tests() {
     echo "==> Compiling agent test binary..."
     GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c \
+        -ldflags="-X main.version=${VERSION:-$(git describe --tags --always --dirty)}" \
         -o bin/lohar-test-linux-arm64 ./cmd/lohar
 
     echo "==> Uploading to $PI_HOST..."

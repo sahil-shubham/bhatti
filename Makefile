@@ -16,7 +16,7 @@ build:
 
 # Build lohar (guest agent) for Linux
 lohar:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(VERSION)" -o lohar ./cmd/lohar/
 
 # Build the per-VM libkrun helper (krucible engine). cgo + libkrun via
 # pkg-config; on macOS it must be codesigned with the hypervisor entitlement

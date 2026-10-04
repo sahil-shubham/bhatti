@@ -41,7 +41,7 @@ echo "==> build rootfs (lohar @ /init.krun)"
 ROOT="$WORK/rootfs"
 rm -rf "$ROOT"
 mkdir -p "$ROOT"/{usr/local/bin,bin,proc,sys,dev/pts,tmp,run,etc,root}
-GOOS=linux GOARCH="$GUEST_ARCH" CGO_ENABLED=0 go build -o "$ROOT/init.krun" ./cmd/lohar
+GOOS=linux GOARCH="$GUEST_ARCH" CGO_ENABLED=0 go build -ldflags="-X main.version=${VERSION:-$(git describe --tags --always --dirty)}" -o "$ROOT/init.krun" ./cmd/lohar
 TD="$WORK/true-src"; mkdir -p "$TD"
 printf 'package main\nfunc main(){}\n' > "$TD/main.go"
 ( cd "$TD" && [ -f go.mod ] || go mod init smoketrue >/dev/null 2>&1

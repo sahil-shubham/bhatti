@@ -16,7 +16,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"/{bin,usr/local/bin,proc,sys,dev/pts,tmp,run,etc,root,workspace}
 
 echo "    lohar -> /init.krun"
-GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build -o "$OUT/init.krun" ./cmd/lohar
+GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build -ldflags="-X main.version=${VERSION:-$(git describe --tags --always --dirty)}" -o "$OUT/init.krun" ./cmd/lohar
 
 echo "    box (true/false/echo/errcho/sleep/netcheck) -> /bin"
 TD="$(mktemp -d)"

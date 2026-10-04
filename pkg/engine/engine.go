@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 
@@ -14,6 +15,21 @@ import (
 // can't perform in its current build or configuration. The API reports it as
 // 501 with the engine's message, not as an internal error.
 var ErrNotSupported = errors.New("not supported")
+
+// ErrGuestAgentOutdated means the sandbox's baked-in lohar cannot implement
+// an operation requested of the newer daemon. The API returns 409 so the
+// caller can recreate it instead of receiving an internal error.
+var ErrGuestAgentOutdated = errors.New("guest agent outdated")
+
+func GuestAgentOutdated(feature string) error {
+	return fmt.Errorf("%w: this sandbox runs an older guest agent; recreate it to use %s", ErrGuestAgentOutdated, feature)
+}
+
+// GuestAgentCapabilities is optional. Engines without guest capability
+// discovery do not claim support for credential-substitution grants.
+type GuestAgentCapabilities interface {
+	RequireGuestAgentFeature(ctx context.Context, id string, feature proto.AgentFeature) error
+}
 
 // VolumeMount describes a named volume to mount into a sandbox.
 type VolumeMount struct {
@@ -97,6 +113,9 @@ type SandboxSpec struct {
 	// guest's trust store so netd can terminate TLS for hosts a secret grant
 	// names. Empty = none (no credential substitution).
 	CACert string `json:"-"`
+	// RequireGuestCA is set only for create-time secret grants. Ordinary
+	// networked creates still work on an older lohar without trust-store support.
+	RequireGuestCA bool `json:"-"`
 }
 
 // FsMount is a live virtio-fs host-directory bind (create --mount): the host

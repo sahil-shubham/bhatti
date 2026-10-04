@@ -53,7 +53,7 @@ jobs:
       - name: Build lohar (the guest agent / init.krun)
         run: |
           export PATH=/usr/local/go/bin:$PATH
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o lohar ./cmd/lohar/
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" -o lohar ./cmd/lohar/
 
       - name: Build bhatti-netd (the per-owner network gateway)
         # Required for the TestKrucibleNet* suite to run instead of skipping. The

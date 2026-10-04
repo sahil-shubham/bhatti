@@ -27,6 +27,11 @@ const (
 	// with nil payload; failure = ERROR. Host → guest.
 	NET_CONFIG byte = 0x14
 
+	// Agent capability discovery. Older lohar replies with ERROR
+	// "unexpected frame type 0x15"; it does not answer AUTH.
+	INFO_REQ  byte = 0x15 // host → guest: empty payload
+	INFO_RESP byte = 0x16 // guest → host: JSON AgentInfo
+
 	// Exec
 	EXEC_REQ byte = 0x10 // host → guest: JSON-encoded ExecRequest
 

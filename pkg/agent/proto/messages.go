@@ -1,26 +1,54 @@
 package proto
 
+// AgentFeature names behavior that may be missing from a sandbox's baked-in
+// lohar, even when the host daemon has already been upgraded.
+type AgentFeature string
+
+const (
+	FeatureNetConfig   AgentFeature = "net_config"
+	FeatureSandboxCA   AgentFeature = "sandbox_ca"
+	FeatureRootGrowth  AgentFeature = "root_growth"
+	FeaturePipedStderr AgentFeature = "piped_stderr"
+)
+
+// AgentInfo is returned by INFO_RESP. Legacy is host-only: an old lohar
+// explicitly rejected INFO_REQ, rather than a query failing for another reason.
+type AgentInfo struct {
+	Version  string         `json:"version"`
+	Features []AgentFeature `json:"features"`
+	Legacy   bool           `json:"-"`
+}
+
+func (i AgentInfo) Has(feature AgentFeature) bool {
+	for _, f := range i.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
 // ExecRequest is sent from the host to the guest agent to execute a command.
 type ExecRequest struct {
 	Argv       []string          `json:"argv"`
 	Env        map[string]string `json:"env,omitempty"`
-	TTY        *bool             `json:"tty,omitempty"`            // nil = false
-	Rows       *uint16           `json:"rows,omitempty"`           // only used when TTY=true, default 24
-	Cols       *uint16           `json:"cols,omitempty"`           // only used when TTY=true, default 80
-	Cwd        *string           `json:"cwd,omitempty"`            // nil = agent's cwd (/)
-	SessionID  *string           `json:"session_id,omitempty"`     // nil = create new, non-nil = attach
-	MaxIdleSec *int              `json:"max_idle_sec,omitempty"`   // nil = default (0 = forever)
-	IfDetached *bool             `json:"if_detached,omitempty"`    // attach only if session is detached
-	Detach     *bool             `json:"detach,omitempty"`         // fire-and-forget: start and return PID immediately
-	OutputFile *string           `json:"output_file,omitempty"`    // detach: redirect stdout/stderr to this file
-	Session    *bool             `json:"session,omitempty"`        // non-TTY session with scrollback+reattach (piped)
-	Stderr     *bool             `json:"stderr,omitempty"`         // piped session: send stderr as STDERR frames instead of merging it into stdout
+	TTY        *bool             `json:"tty,omitempty"`          // nil = false
+	Rows       *uint16           `json:"rows,omitempty"`         // only used when TTY=true, default 24
+	Cols       *uint16           `json:"cols,omitempty"`         // only used when TTY=true, default 80
+	Cwd        *string           `json:"cwd,omitempty"`          // nil = agent's cwd (/)
+	SessionID  *string           `json:"session_id,omitempty"`   // nil = create new, non-nil = attach
+	MaxIdleSec *int              `json:"max_idle_sec,omitempty"` // nil = default (0 = forever)
+	IfDetached *bool             `json:"if_detached,omitempty"`  // attach only if session is detached
+	Detach     *bool             `json:"detach,omitempty"`       // fire-and-forget: start and return PID immediately
+	OutputFile *string           `json:"output_file,omitempty"`  // detach: redirect stdout/stderr to this file
+	Session    *bool             `json:"session,omitempty"`      // non-TTY session with scrollback+reattach (piped)
+	Stderr     *bool             `json:"stderr,omitempty"`       // piped session: send stderr as STDERR frames instead of merging it into stdout
 }
 
 // ActivityInfo reports the agent's activity state.
 type ActivityInfo struct {
 	LastActivityUnix int64 `json:"last_activity_unix"`
-	ActiveSessions   int   `json:"active_sessions"`  // running processes
+	ActiveSessions   int   `json:"active_sessions"`   // running processes
 	AttachedSessions int   `json:"attached_sessions"` // connected clients
 }
 
@@ -50,9 +78,9 @@ type ForwardResponse struct {
 type FileInfo struct {
 	Name  string `json:"name"`
 	Size  int64  `json:"size"`
-	Mode  string `json:"mode"`   // octal string, e.g. "0644"
+	Mode  string `json:"mode"` // octal string, e.g. "0644"
 	IsDir bool   `json:"is_dir"`
-	Mtime int64  `json:"mtime"`  // unix timestamp
+	Mtime int64  `json:"mtime"` // unix timestamp
 }
 
 // SystemctlRequest is the body of a SYSTEMCTL_REQ frame: a single privileged

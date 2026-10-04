@@ -133,6 +133,48 @@ func (c *AgentClient) sendAuth(conn net.Conn) error {
 	return proto.WriteFrame(conn, proto.AUTH, []byte(c.token))
 }
 
+// Info asks the baked-in guest agent which behaviors it implements. Only the
+// exact unexpected-frame reply identifies a legacy lohar; connection/auth,
+// timeout, protocol and other guest errors leave capabilities unknown.
+func (c *AgentClient) Info(ctx context.Context) (proto.AgentInfo, error) {
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return proto.AgentInfo{}, fmt.Errorf("agent connect for info: %w", err)
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	if err := proto.WriteFrame(conn, proto.INFO_REQ, nil); err != nil {
+		return proto.AgentInfo{}, fmt.Errorf("agent send info: %w", err)
+	}
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return proto.AgentInfo{}, fmt.Errorf("agent read info: %w", err)
+	}
+	if msgType == proto.ERROR {
+		if unexpectedFrame(payload, proto.INFO_REQ) {
+			return proto.AgentInfo{Legacy: true}, nil
+		}
+		return proto.AgentInfo{}, fmt.Errorf("guest agent info failed: %s", payload)
+	}
+	if msgType != proto.INFO_RESP {
+		return proto.AgentInfo{}, fmt.Errorf("expected INFO_RESP, got 0x%02x", msgType)
+	}
+	var info proto.AgentInfo
+	if err := json.Unmarshal(payload, &info); err != nil {
+		return proto.AgentInfo{}, fmt.Errorf("unmarshal agent info: %w", err)
+	}
+	if info.Version == "" || info.Features == nil {
+		return proto.AgentInfo{}, fmt.Errorf("incomplete guest agent info")
+	}
+	return info, nil
+}
+
+func unexpectedFrame(payload []byte, msgType byte) bool {
+	return string(payload) == fmt.Sprintf("unexpected frame type 0x%02x", msgType)
+}
+
 // dialVsockPort performs the Firecracker vsock CONNECT handshake.
 // See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md
 func (c *AgentClient) dialVsockPort(ctx context.Context, udsPath string, port uint32) (net.Conn, error) {
@@ -517,6 +559,9 @@ func (c *AgentClient) NetConfig(ctx context.Context, ipCIDR, gateway string) err
 		return fmt.Errorf("agent read net config ack: %w", err)
 	}
 	if msgType == proto.ERROR {
+		if unexpectedFrame(payload, proto.NET_CONFIG) {
+			return engine.GuestAgentOutdated("network reconciliation (net_config)")
+		}
 		return fmt.Errorf("guest net config failed: %s", string(payload))
 	}
 	if msgType != proto.NET_CONFIG {

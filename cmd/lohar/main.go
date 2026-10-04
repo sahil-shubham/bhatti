@@ -24,6 +24,10 @@ import (
 // every exec request's environment.
 var configEnv map[string]string
 
+// version is stamped into every guest binary at build time; a fresh boot
+// always reports the version actually baked into that sandbox's root disk.
+var version = "dev"
+
 func main() {
 	// Busybox pattern: check how we were invoked.
 	switch filepath.Base(os.Args[0]) {

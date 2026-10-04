@@ -111,6 +111,15 @@ func handleControlConnection(conn net.Conn) {
 		sessions := listSessions()
 		proto.SendJSON(conn, proto.EXEC_LIST_RESP, sessions)
 
+	case proto.INFO_REQ:
+		proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{
+			Version: version,
+			Features: []proto.AgentFeature{
+				proto.FeatureNetConfig, proto.FeatureSandboxCA,
+				proto.FeatureRootGrowth, proto.FeaturePipedStderr,
+			},
+		})
+
 	case proto.ACTIVITY_REQ:
 		proto.SendJSON(conn, proto.ACTIVITY_RESP, getActivity())
 

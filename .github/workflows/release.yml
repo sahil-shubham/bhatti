@@ -44,8 +44,9 @@ jobs:
 
       - name: Build lohar (guest agent, linux amd64 + arm64)
         run: |
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-amd64 ./cmd/lohar/
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/lohar-linux-arm64 ./cmd/lohar/
+          VERSION="$(git describe --tags --always --dirty)"
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o dist/lohar-linux-amd64 ./cmd/lohar/
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o dist/lohar-linux-arm64 ./cmd/lohar/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
