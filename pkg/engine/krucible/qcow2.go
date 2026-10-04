@@ -177,9 +177,11 @@ func qcow2Backing(path string) (string, error) {
 
 // setQcow2Backing points the qcow2 image at path, which has a backing file,
 // at another one with the same contents (the image's clusters only make sense
-// over those). The name is rewritten in place: it starts where the old one
-// did, and the rest of the header cluster after the header extensions is the
-// name's to use.
+// over those). A crash at any point leaves the image naming one of the two:
+// the new name goes into unused space of the header cluster (the spec keeps
+// everything after the header extensions for the name alone), one write of
+// the adjacent offset and size fields switches to it, and only then is the
+// old name cleared.
 func setQcow2Backing(path, backing string) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -193,19 +195,72 @@ func setQcow2Backing(path, backing string) error {
 	if ref.offset == 0 {
 		return fmt.Errorf("%s has no backing file to replace", path)
 	}
-	if len(backing) == 0 || len(backing) > qcow2MaxBackingName || ref.offset+int64(len(backing)) > ref.cluster {
+	n := int64(len(backing))
+	if n == 0 || n > qcow2MaxBackingName {
 		return fmt.Errorf("%s: backing name %q doesn't fit the qcow2 header", path, backing)
 	}
-	// Zero what's left of a longer old name, then set the new length.
-	name := make([]byte, max(len(backing), int(ref.size)))
-	copy(name, backing)
-	if _, err := f.WriteAt(name, ref.offset); err != nil {
+	// Right after the current name, else between the extensions and it.
+	// Readers want the name to end before the header cluster does.
+	off := ref.offset + int64(ref.size)
+	if off+n >= ref.cluster {
+		if off, err = qcow2ExtensionsEnd(f, ref.cluster); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if off+n > ref.offset {
+			return fmt.Errorf("%s: backing name %q doesn't fit the qcow2 header", path, backing)
+		}
+	}
+	if _, err := f.WriteAt([]byte(backing), off); err != nil {
 		return fmt.Errorf("%s: write backing name: %w", path, err)
 	}
-	var size [4]byte
-	binary.BigEndian.PutUint32(size[:], uint32(len(backing)))
-	if _, err := f.WriteAt(size[:], 16); err != nil {
-		return fmt.Errorf("%s: write backing name size: %w", path, err)
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	// backing_file_offset (8 bytes at 8) and backing_file_size (4 at 16): a
+	// single write inside the first sector, so it lands whole or not at all.
+	var ptr [12]byte
+	binary.BigEndian.PutUint64(ptr[0:], uint64(off))
+	binary.BigEndian.PutUint32(ptr[8:], uint32(n))
+	if _, err := f.WriteAt(ptr[:], 8); err != nil {
+		return fmt.Errorf("%s: write backing name offset: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	// An exported root disk carries its header: leave no path it no longer uses.
+	if _, err := f.WriteAt(make([]byte, ref.size), ref.offset); err != nil {
+		return fmt.Errorf("%s: clear old backing name: %w", path, err)
 	}
 	return f.Sync()
+}
+
+// qcow2ExtensionsEnd returns the offset just past the header extensions' end
+// marker, where the header cluster's room for the backing name starts.
+func qcow2ExtensionsEnd(f *os.File, cluster int64) (int64, error) {
+	var h [qcow2HeaderLen]byte
+	if _, err := f.ReadAt(h[:], 0); err != nil {
+		return 0, fmt.Errorf("read qcow2 header: %w", err)
+	}
+	be := binary.BigEndian
+	off := int64(72) // a version 2 header's length
+	if be.Uint32(h[4:]) == 3 {
+		off = int64(be.Uint32(h[100:]))
+	}
+	if off < 72 {
+		return 0, fmt.Errorf("qcow2 header length %d", off)
+	}
+	for {
+		var ext [8]byte
+		if off+int64(len(ext)) > cluster {
+			return 0, fmt.Errorf("qcow2 header extensions run past the header cluster")
+		}
+		if _, err := f.ReadAt(ext[:], off); err != nil {
+			return 0, fmt.Errorf("read qcow2 header extension: %w", err)
+		}
+		off += int64(len(ext))
+		if be.Uint32(ext[0:]) == 0 { // end of extensions
+			return off, nil
+		}
+		off += (int64(be.Uint32(ext[4:])) + 7) &^ 7
+	}
 }
