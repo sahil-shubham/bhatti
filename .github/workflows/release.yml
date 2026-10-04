@@ -130,8 +130,8 @@ jobs:
           set -euo pipefail
           mkdir -p stage/bin stage/lib
           cp bhatti-vmm stage/bin/bhatti-vmm
-          # bhatti-netd (opt-in net-backend gateway): validated on Linux/KVM AND
-          # macOS/HVF. Pure Go, no libkrun linkage (no rpath rewrite); it is
+          # bhatti-netd (the guests' network gateway): validated on Linux/KVM AND
+          # macOS/HVF. Pure Go, built without cgo, no libkrun linkage; it is
           # Developer-ID signed below on macOS for notarization.
           cp bhatti-netd stage/bin/bhatti-netd
           if [ "${{ matrix.os }}" = "darwin" ]; then

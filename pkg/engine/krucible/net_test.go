@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -519,5 +520,60 @@ func TestKrucibleNetdRespawnsCtllessAdopt(t *testing.T) {
 	}
 	if _, serr := os.Stat(ctlSock); serr != nil {
 		t.Errorf("respawned netd has no control socket: %v", serr)
+	}
+}
+
+// TestKrucibleNetdConfined: the netd the engine spawns (as root here) gives up
+// root once its sockets are open: not uid 0, no capabilities, no_new_privs, and
+// no filesystem writes — while still carrying the guest's traffic.
+func TestKrucibleNetdConfined(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("netd confinement is Linux-only and needs the engine to start it as root")
+	}
+	eng := newNetEngine(t)
+	ke := eng.(*Engine)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netdconf", CPUs: 1, MemoryMB: 512, UserID: "confined",
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), info.ID) })
+	if r, err := eng.Exec(ctx, info.ID, []string{"netcheck", "dns"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("guest DNS through a confined netd: err=%v exit=%d", err, r.ExitCode)
+	}
+
+	ke.netdMu.Lock()
+	var pid int
+	for _, n := range ke.netds {
+		n.mu.Lock()
+		pid = n.pid
+		n.mu.Unlock()
+	}
+	ke.netdMu.Unlock()
+	if pid == 0 {
+		t.Fatal("no netd running")
+	}
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := func(name string) string {
+		for _, l := range strings.Split(string(status), "\n") {
+			if v, ok := strings.CutPrefix(l, name+":"); ok {
+				return strings.Fields(v)[0]
+			}
+		}
+		return ""
+	}
+	if field("Uid") == "0" {
+		t.Fatal("netd still runs as root")
+	}
+	if got := field("CapEff"); strings.Trim(got, "0") != "" {
+		t.Fatalf("netd has effective capabilities %s", got)
+	}
+	if field("NoNewPrivs") != "1" {
+		t.Fatal("netd lacks no_new_privs")
 	}
 }

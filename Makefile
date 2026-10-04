@@ -38,7 +38,7 @@ vmm:
 # the daemon spawns it per owner when krucible_net_backend is set. Runs on the
 # host, so build it for the host platform like `bhatti`.
 netd:
-	go build -ldflags="-s -w" -o bhatti-netd ./cmd/bhatti-netd/
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o bhatti-netd ./cmd/bhatti-netd/
 	@echo "Built bhatti-netd"
 
 test:

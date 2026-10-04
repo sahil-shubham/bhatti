@@ -27,6 +27,8 @@ func main() {
 	prefix := flag.Int("prefix", 24, "gateway subnet prefix length")
 	macStr := flag.String("mac", "52:54:00:00:00:01", "gateway link (MAC) address")
 	ctlUDS := flag.String("ctl-uds", "", "control socket the daemon pushes per-sandbox egress policy to (optional)")
+	uid := flag.Int("uid", 65534, "user to run as once the sockets are open, when started as root")
+	gid := flag.Int("gid", 65534, "group to run as once the sockets are open, when started as root")
 	flag.Parse()
 
 	if *netUDS == "" {
@@ -47,8 +49,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	ctlLn, err := listenControl(*ctlUDS)
+	if err != nil {
+		log.Fatalf("bhatti-netd: %v", err)
+	}
+	if err := confine(*uid, *gid); err != nil {
+		log.Fatalf("bhatti-netd: confine: %v", err)
+	}
+
 	log.Printf("bhatti-netd: listening on %s (gw %s/%d, mac %s)", *netUDS, *gwIP, *prefix, *macStr)
-	if err := serve(ctx, ln, cfg, *ctlUDS); err != nil && ctx.Err() == nil {
+	if err := serve(ctx, ln, cfg, ctlLn); err != nil && ctx.Err() == nil {
 		log.Fatalf("bhatti-netd: %v", err)
 	}
 }
@@ -76,21 +86,31 @@ func parseConfig(gwIP string, prefix int, macStr string) (gwConfig, error) {
 	}, nil
 }
 
+// listenControl opens the control socket the daemon pushes per-sandbox egress
+// policy to ("" = none). Opened before confine, which takes away the right to
+// create it.
+func listenControl(path string) (net.Listener, error) {
+	if path == "" {
+		return nil, nil
+	}
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("control listen %s: %w", path, err)
+	}
+	return ln, nil
+}
+
 // serve builds the owner's gateway and accepts guest links as the owner's VMs
 // connect (each libkrun virtio-net backend dials this socket). Every accepted
 // connection becomes a switch port; siblings on the same netd reach each other.
 // Closing the listener on ctx.Done unblocks a pending Accept.
-func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlUDS string) error {
+func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlLn net.Listener) error {
 	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac)
 	if err != nil {
 		return err
 	}
-	if ctlUDS != "" {
-		_ = os.Remove(ctlUDS)
-		ctlLn, lerr := net.Listen("unix", ctlUDS)
-		if lerr != nil {
-			return fmt.Errorf("control listen %s: %w", ctlUDS, lerr)
-		}
+	if ctlLn != nil {
 		go func() { <-ctx.Done(); ctlLn.Close() }()
 		go gateway.ServeControl(ctlLn, gw)
 	}
