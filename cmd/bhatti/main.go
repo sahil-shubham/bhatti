@@ -123,10 +123,10 @@ func runDaemon() {
 		os.Exit(1)
 	}
 
-	// krucible recovers its own VMs internally (New() rehydrates from each
-	// sandbox's state.json); it does not implement VMStateProvider, and there are
-	// no host TAP devices to reclaim (TSI networking). The FC store-based recovery
-	// + TAP cleanup were removed with the engine (Phase 3).
+	// krucible recovers its own VMs internally: New() adopts the helpers the
+	// previous daemon left running (its shutdown stops none) and marks the rest
+	// stopped; srv.RecoverSandboxes below brings the store in line. There are no
+	// host TAP devices to reclaim (netd is userspace).
 
 	// v0.3: Detach volumes orphaned by crashed sandboxes.
 	// MUST run after recoverVMs (which marks dead-process sandboxes as stopped/unknown).
@@ -209,6 +209,8 @@ func runDaemon() {
 
 	// Start observability: event recorder, metrics snapshots, retention
 	srv.StartEventRecorder()
+	// Before the thermal manager's first cycle, and after the recorder.
+	srv.RecoverSandboxes(context.Background())
 	srv.StartRetention()
 	// After the recorder: the broker audits every credential use and refusal.
 	srv.StartCredentialBroker()
@@ -257,8 +259,9 @@ func runDaemon() {
 	})
 
 	// Auto-wake keep_hot sandboxes after recovery. These sandboxes maintain
-	// persistent external connections that die on pause — leaving them cold
-	// after a daemon restart defeats the purpose of keep_hot.
+	// persistent external connections that die on pause. One that outlived the
+	// previous daemon is hot already (a no-op here); one whose VM died while no
+	// daemon was running, or that was stopped, boots now.
 	go func() {
 		hotSandboxes, err := st.ListAllSandboxes()
 		if err != nil {
@@ -295,27 +298,9 @@ func runDaemon() {
 		s.Shutdown(shutCtx)
 	}
 
-	// Snapshot all running VMs before killing the engine.
-	// Done before Close() so the event recorder is still alive.
-	// This ensures every hot/warm sandbox has a snapshot on disk
-	// so recoverVMs can restore them on the next startup.
-	srv.SnapshotAll()
-
-	// Record shutdown event before closing the event recorder
-	srv.RecordEvent(store.Event{
-		Type: "daemon.shutdown",
-		Meta: map[string]any{
-			"signal": sig.String(),
-		},
-	})
-
-	// Stop background goroutines (thermal, metrics, retention, event recorder)
-	srv.Close()
-
-	// Stop engine (kill VMs, clean TAPs)
-	if shutdowner, ok := eng.(interface{ Shutdown() }); ok {
-		shutdowner.Shutdown()
-	}
+	// Sandboxes outlive the daemon: Shutdown stops none of them, and the next
+	// daemon adopts them as they are.
+	srv.Shutdown(sig.String())
 
 	slog.Info("shutdown complete")
 }

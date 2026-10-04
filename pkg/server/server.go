@@ -343,15 +343,13 @@ func (s *Server) startTaskCleanup() {
 	}()
 }
 
-// Close stops background goroutines (thermal manager, task cleanup).
-// It waits for the thermal manager to finish its current cycle before
-// returning, preventing races between a mid-cycle Stop() and SnapshotAll().
+// Close stops background goroutines (thermal manager, task cleanup, ...). It
+// waits for the thermal manager to finish its current cycle, so a transition
+// it started (a pause, a cold stop) completes and is recorded before the
+// daemon exits.
 func (s *Server) Close() {
 	if s.stopThermal != nil {
 		s.stopThermal()
-		// Wait for the thermal goroutine to finish its current cycle.
-		// Without this, SnapshotAll() can race with a mid-cycle thermal
-		// Stop(), causing double-stop or missed saveVMState.
 		if s.thermalDone != nil {
 			<-s.thermalDone
 		}
@@ -370,6 +368,59 @@ func (s *Server) Close() {
 	}
 	if s.events != nil {
 		s.events.Close()
+	}
+}
+
+// Shutdown is the daemon's exit once its listeners have drained. It leaves
+// every sandbox as it is — running, paused or stopped: the engine lets go of
+// its VMs without stopping them and the next daemon adopts them, so a restart
+// (an upgrade, `systemctl restart`, a cert-renewal hook) never reboots a guest.
+//
+// A planned host reboot is the one shutdown that should checkpoint running
+// sandboxes first, since their VMs won't outlive it. That would go here,
+// before the engine lets go.
+func (s *Server) Shutdown(sig string) {
+	s.RecordEvent(store.Event{Type: "daemon.shutdown", Meta: map[string]any{"signal": sig}})
+	s.Close()
+	if e, ok := s.engine.(interface{ Shutdown() }); ok {
+		e.Shutdown()
+	}
+}
+
+// RecoverSandboxes brings the store in line with the sandboxes the engine
+// recovered at startup. One whose VM outlived the previous daemon is running,
+// and its idle clock starts now: the thermal manager skips a warm sandbox it
+// has no activity time for, which would leave it warm for good. One whose VM
+// died while no daemon was watching is stopped, to boot fresh on next use.
+func (s *Server) RecoverSandboxes(ctx context.Context) {
+	sandboxes, err := s.store.ListAllSandboxes()
+	if err != nil {
+		slog.Warn("recover sandboxes: list", "error", err)
+		return
+	}
+	for _, sb := range sandboxes {
+		if sb.Status == "destroyed" {
+			continue
+		}
+		info, err := s.engine.Status(ctx, sb.EngineID)
+		if err != nil {
+			continue // the engine has no record of it
+		}
+		switch {
+		case info.Status == "running":
+			s.lastActivity.Store(sb.EngineID, time.Now())
+			if sb.Status != "running" {
+				slog.Info("sandbox running after restart", "sandbox", sb.Name, "id", sb.ID, "from_status", sb.Status)
+				s.store.UpdateSandboxStatus(sb.ID, "running")
+			}
+		case sb.Status == "running":
+			slog.Info("sandbox stopped while the daemon was down", "sandbox", sb.Name, "id", sb.ID)
+			s.store.StopSandbox(sb.ID)
+			s.RecordEvent(store.Event{
+				Type: "sandbox.stopped", SandboxID: sb.ID,
+				Meta: map[string]any{"name": sb.Name, "reason": "lost"},
+			})
+		}
 	}
 }
 
@@ -471,90 +522,6 @@ func cronMatch(expr string, t time.Time) bool {
 		}
 	}
 	return true
-}
-
-// SnapshotAll stops every hot or warm sandbox so it has a snapshot on disk.
-// Called during graceful shutdown so that recoverVMs can restore them on
-// the next startup.
-//
-// Sandboxes are snapshotted in parallel (bounded to 10 concurrent) to avoid
-// a 25-minute sequential shutdown with 50 VMs. On failure, the VM is left
-// as-is and marked in the store so recovery can detect it.
-func (s *Server) SnapshotAll() {
-	slog.Info("snapshotting all running VMs before shutdown")
-	if !thermalUsable(s.engine) {
-		slog.Info("snapshot-all skipped: engine has no thermal support")
-		return
-	}
-	sandboxes, err := s.store.ListAllSandboxes()
-	if err != nil {
-		slog.Warn("snapshot-all: list sandboxes", "error", err)
-		return
-	}
-
-	// Collect running sandboxes
-	var running []store.Sandbox
-	for _, sb := range sandboxes {
-		if sb.Status == "running" {
-			running = append(running, sb)
-		}
-	}
-	if len(running) == 0 {
-		slog.Info("snapshot-all: no running VMs")
-		return
-	}
-
-	slog.Info("snapshot-all: starting", "count", len(running))
-
-	// Parallel with bounded concurrency. 10 concurrent snapshots means
-	// 50 VMs finish in ~5 batches × 30s = 2.5min instead of 25min.
-	const maxParallel = 10
-	sem := make(chan struct{}, maxParallel)
-	var snapped, failed atomic.Int32
-	var wg sync.WaitGroup
-
-	for _, sb := range running {
-		wg.Add(1)
-		go func(sb store.Sandbox) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-
-			err := s.engine.Stop(ctx, sb.EngineID)
-			if err != nil {
-				// Retry once with a fresh context — transient failures
-				// (FC API timeout, disk hiccup) often succeed on retry.
-				slog.Warn("snapshot-all: first attempt failed, retrying",
-					"sandbox", sb.Name, "id", sb.ID, "error", err)
-				retryCtx, retryCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				err = s.engine.Stop(retryCtx, sb.EngineID)
-				retryCancel()
-			}
-			if err != nil {
-				failed.Add(1)
-				slog.Error("snapshot-all: retry failed, leaving VM running",
-					"sandbox", sb.Name, "id", sb.ID, "error", err)
-				// Do NOT kill the FC process — an unsnapshotted live VM is
-				// better than an unrecoverable dead sandbox.
-				return
-			}
-
-			s.saveVMState(sb.ID, sb.EngineID)
-			s.store.StopSandbox(sb.ID)
-			snapped.Add(1)
-			slog.Info("snapshot-all: stopped",
-				"sandbox", sb.Name, "id", sb.ID)
-		}(sb)
-	}
-	wg.Wait()
-
-	slog.Info("snapshot-all complete",
-		"snapshotted", snapped.Load(),
-		"failed", failed.Load(),
-		"total", len(running))
 }
 
 // StartThermalManager starts the background goroutine that transitions idle

@@ -41,6 +41,9 @@ type mockEngine struct {
 	ExecRelease chan struct{}
 	// TunnelRefusals makes the next N Tunnel calls fail as "nothing listening".
 	TunnelRefusals int
+
+	// Stops and Shutdowns count Stop and Shutdown calls.
+	Stops, Shutdowns int
 }
 
 func newMockEngine() *mockEngine {
@@ -90,6 +93,7 @@ func (m *mockEngine) Destroy(_ context.Context, id string) error {
 func (m *mockEngine) Stop(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.Stops++
 	if m.StopErr != nil {
 		return m.StopErr
 	}
@@ -100,6 +104,13 @@ func (m *mockEngine) Stop(_ context.Context, id string) error {
 	sb.Status = "stopped"
 	m.thermal[id] = "cold"
 	return nil
+}
+
+// Shutdown is the engine's half of the daemon's shutdown.
+func (m *mockEngine) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Shutdowns++
 }
 
 func (m *mockEngine) Start(_ context.Context, id string) error {
