@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -259,7 +260,12 @@ func TestKrucibleRestoreRefusals(t *testing.T) {
 			tamperCheckpointHeader(t, dir, 8, 99)
 		}},
 		{"wrong-arch", "checkpoint was taken on", func(t *testing.T, dir string, _ *krucibleSnapManifest) {
-			tamperCheckpointHeader(t, dir, 12, 2)
+			// Header codes: 1 x86_64, 2 aarch64; claim the other one.
+			foreign := uint32(2)
+			if runtime.GOARCH == "arm64" {
+				foreign = 1
+			}
+			tamperCheckpointHeader(t, dir, 12, foreign)
 		}},
 		{"short-memory", "memory.bin", func(t *testing.T, dir string, _ *krucibleSnapManifest) {
 			path := filepath.Join(dir, "memory.bin")

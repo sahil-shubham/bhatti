@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -143,18 +144,49 @@ func TestKrucibleSnapshotImportRefusesAnotherCPU(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(parent, "cpu")
-	// The host record follows the 20-byte header as a length-prefixed section:
-	// the 12-byte vendor first, then family, model, stepping, page size, TSC
-	// kHz, KVM caps, and the CPUID words (count, then leaf/subleaf/reg/bits).
+	// The host record follows the 20-byte header as a length-prefixed section.
 	const record = 20 + 4
-	cases := []struct {
+	type tamper struct {
 		name, want string
 		at         int64
 		value      []byte
-	}{
-		{"vendor", "CPU vendor differs", record, []byte("AuthenticAMD")},
-		// Leaf 1 ECX is the first word: claim every feature.
-		{"feature", "lacks features the guest uses", record + 12 + 6*4 + 4 + 12, []byte{0xff, 0xff, 0xff, 0xff}},
+	}
+	var cases []tamper
+	if runtime.GOARCH == "arm64" {
+		// MIDR_EL1, REVIDR_EL1, page size, counter Hz, GIC version and vCPU
+		// features, then the SVE vector lengths and the ID registers (count,
+		// then id/value pairs).
+		ck, err := os.ReadFile(filepath.Join(dir, checkpointFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		vls := record + 32
+		ids := vls + 4 + 8*int(binary.LittleEndian.Uint32(ck[vls:]))
+		const idAA64ISAR0 = 0x6030_0000_0013_c030
+		isar0 := -1
+		for i := range int(binary.LittleEndian.Uint32(ck[ids:])) {
+			if at := ids + 4 + 16*i; binary.LittleEndian.Uint64(ck[at:]) == idAA64ISAR0 {
+				isar0 = at + 8
+			}
+		}
+		if isar0 < 0 {
+			t.Fatal("the host record lacks ID_AA64ISAR0_EL1")
+		}
+		cases = []tamper{
+			// A Neoverse-N1 r3p1.
+			{"cpu", "CPU differs", record, binary.LittleEndian.AppendUint64(nil, 0x413f_d0c1)},
+			// Every instruction-set feature ID_AA64ISAR0_EL1 can claim.
+			{"feature", "lacks features the guest uses", int64(isar0), bytes.Repeat([]byte{0xff}, 8)},
+		}
+	} else {
+		// The 12-byte vendor first, then family, model, stepping, page size,
+		// TSC kHz, KVM caps, and the CPUID words (count, then
+		// leaf/subleaf/reg/bits). Leaf 1 ECX is the first word: claim every
+		// feature.
+		cases = []tamper{
+			{"vendor", "CPU vendor differs", record, []byte("AuthenticAMD")},
+			{"feature", "lacks features the guest uses", record + 12 + 6*4 + 4 + 12, []byte{0xff, 0xff, 0xff, 0xff}},
+		}
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -171,7 +203,7 @@ func TestKrucibleSnapshotImportRefusesAnotherCPU(t *testing.T) {
 			}
 			var leaf [4]byte
 			ck.ReadAt(leaf[:], tc.at-12)
-			if tc.name == "feature" && binary.LittleEndian.Uint32(leaf[:]) != 1 {
+			if runtime.GOARCH != "arm64" && tc.name == "feature" && binary.LittleEndian.Uint32(leaf[:]) != 1 {
 				t.Fatalf("expected leaf 1 first, found %d", binary.LittleEndian.Uint32(leaf[:]))
 			}
 			ck.WriteAt(tc.value, tc.at)
