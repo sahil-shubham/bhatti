@@ -8,8 +8,7 @@ import (
 )
 
 // This file implements pkg/server.ThermalEngine on top of bhatti-vmm's control
-// socket (PAUSE/RESUME/STATUS), the warm tier. The cold tier is Stop: a
-// snapshot to disk with checkpoint support, otherwise a power-off.
+// socket (PAUSE/RESUME/STATUS), the warm tier. Stop powers off the cold tier.
 //
 // Memory model: libkrun maps guest RAM MAP_PRIVATE|MAP_ANONYMOUS (lazy commit),
 // so a paused VM's host RSS already only counts touched pages — we don't need
@@ -71,8 +70,8 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 // (the public proxy calls it on every incoming request). It is tier-aware:
 //   - hot:  no-op
 //   - warm: RESUME over the control socket (helper alive, vCPUs paused)
-//   - cold: Start (re-launch the helper + restore the snapshot bundle) — the
-//     helper was killed at Stop, so a socket RESUME would fail.
+//   - cold: Start (boot from the persisted root disk); the helper was killed
+//     at Stop, so a socket RESUME would fail.
 //
 // This lets a single wake-on-request transparently revive both warm and cold
 // sandboxes.

@@ -43,10 +43,8 @@ type Config struct {
 	SocketDir     string
 	DefaultVcpus  uint8
 	DefaultMemMiB uint32
-	// BlockRoot boots sandboxes from an ext4 block image (CoW-cloned per
-	// sandbox from a base built once from BaseRootfs) instead of a virtio-fs
-	// host dir. Required for the cold tier (Stop/Start): the block image is the
-	// self-contained, snapshot-surviving rootfs (see docs/PLAN-krucible-cold-tier.md).
+	// BlockRoot is required for power-off cold tier: the root image persists
+	// when Stop kills the VM, and Start boots it again without preserving RAM.
 	BlockRoot bool
 	// KernelImage, if set, boots an external kernel (e.g. a lean one) instead of
 	// libkrunfw's bundled kernel. Block-root only (the cmdline roots on
@@ -317,17 +315,17 @@ type VM struct {
 	SockDir    string
 	ControlUDS string // guest vsock 1024 (agent control)
 	ForwardUDS string // guest vsock 1025 (port forward)
-	CtlSockUDS string // VMM control socket (PAUSE/RESUME/STATUS)
+	CtlSockUDS string // VMM control socket (PAUSE/RESUME/SAVE/STATUS)
 	MemMiB     uint32 // configured at boot (for ThermalEngine.MemSizeMib)
 	Thermal    string // "hot" | "warm" | "cold"
 	Token      string
 	Agent      *agent.AgentClient
 	Status     string // "running" | "stopped"
-	BundleDir  string // cold-snapshot bundle dir (Stop writes, Start restores from)
-	baseSpec   VMSpec // the spec to (re-)launch with; Start adds SnapshotDir
+	baseSpec   VMSpec // the spec to (re-)launch with
 	logPath    string
 	HelperPID  int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd        *exec.Cmd
+	waitDone   <-chan error // cmd.Wait is owned by one goroutine, including during kill
 	cancel     context.CancelFunc
 	configSrv  *configServer          // host-side boot config server (§3.4); launchMu-guarded
 	netdKey    string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
@@ -466,9 +464,8 @@ func (e *Engine) agentFor(id string) (*agent.AgentClient, error) {
 	return vm.Agent, nil
 }
 
-// createOpts carries restore hints for create(): cold-restore from a snapshot
-// bundle (snapshotDir), reuse a memory snapshot's in-guest token (forcedToken),
-// and frozen volumes to re-attach. All empty = a fresh boot.
+// createOpts carries restore hints for create(): restore from a named checkpoint
+// (snapshotDir), reuse its in-guest token (forcedToken), and clone its volumes.
 type createOpts struct {
 	snapshotDir    string
 	forcedToken    string
@@ -673,10 +670,8 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			}
 		}
 		// Config is fetched over vsock at boot (§3.4), not read from an on-disk
-		// config drive: write it host-side as config.json (no mke2fs; not in the
-		// guest, not in the snapshot bundle) and serve it on the per-sandbox config
-		// UDS. Restore reuses the snapshot's token (opts.forcedToken via `token`) so
-		// the resumed guest RAM's token still matches.
+		// config drive: write it host-side as config.json (no mke2fs; never on a
+		// guest disk). Restore reuses the saved in-guest token.
 		cfg := buildSandboxConfig(id, name, token, spec, cdMounts, cdVolumes, cdNet)
 		cfgJSON, merr := json.MarshalIndent(cfg, "", "  ")
 		if merr != nil {
@@ -693,7 +688,6 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		SandboxDir: sandboxDir, SockDir: sockDir,
 		ControlUDS: controlUDS, ForwardUDS: forwardUDS, CtlSockUDS: ctlSockUDS,
 		MemMiB: memMiB, Thermal: "hot", Status: "stopped", Token: token,
-		BundleDir: filepath.Join(sandboxDir, "bundle"),
 		baseSpec:  baseSpec,
 		logPath:   filepath.Join(sandboxDir, "vmm.log"),
 		netdKey:   netdKey,
@@ -734,8 +728,8 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 }
 
 // launch spawns the bhatti-vmm helper for vm and waits for the agent. When
-// snapshotDir is non-empty the helper cold-restores from that bundle instead of
-// cold booting. Sets vm.cmd/cancel/Agent/Status on success.
+// snapshotDir is non-empty the helper restores from that checkpoint directory
+// instead of booting. Sets vm.cmd/cancel/Agent/Status on success.
 func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	spec := vm.baseSpec
 	spec.SnapshotDir = snapshotDir
@@ -807,19 +801,44 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 		return fmt.Errorf("start vmm helper: %w", err)
 	}
 
+	// One goroutine owns Wait for the process's entire lifetime. Racing a
+	// separate Process.Wait in kill against cmd.Wait can corrupt reaping; the
+	// result also lets a refused restore fail as soon as the helper exits.
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
 	ag := agent.NewKrucibleClient(vm.ControlUDS, vm.ForwardUDS, vm.Token)
-	if werr := ag.WaitReady(ctx, 30*time.Second); werr != nil {
+	readyCtx, readyCancel := context.WithCancel(ctx)
+	readyDone := make(chan error, 1)
+	go func() { readyDone <- ag.WaitReady(readyCtx, 30*time.Second) }()
+	var werr error
+	select {
+	case exitErr := <-waitDone:
+		readyCancel()
+		vmCancel()
+		vm.closeConfigSrv()
+		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, tailFile(vm.logPath, 4096))
+	case werr = <-readyDone:
+	}
+	readyCancel()
+	if werr != nil {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		<-waitDone
 		// Leave the shared netd running; sibling sandboxes may still be using it.
 		vmCancel()
 		vm.closeConfigSrv()
 		return fmt.Errorf("agent not ready: %w\nvmm log:\n%s", werr, tailFile(vm.logPath, 4096))
 	}
-
+	select {
+	case exitErr := <-waitDone:
+		vmCancel()
+		vm.closeConfigSrv()
+		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, tailFile(vm.logPath, 4096))
+	default:
+	}
 	vm.mu.Lock()
 	vm.cmd = cmd
 	vm.cancel = vmCancel
+	vm.waitDone = waitDone
 	vm.HelperPID = cmd.Process.Pid
 	vm.Agent = ag
 	vm.Status = "running"
@@ -836,7 +855,7 @@ func (vm *VM) kill() {
 	defer vm.mu.Unlock()
 	if vm.cmd != nil && vm.cmd.Process != nil {
 		_ = vm.cmd.Process.Kill()
-		_, _ = vm.cmd.Process.Wait()
+		<-vm.waitDone
 	} else if vm.HelperPID > 0 {
 		// Adopted helper (not our child) — signal by pid; init reaps it.
 		_ = syscall.Kill(vm.HelperPID, syscall.SIGKILL)
@@ -848,6 +867,7 @@ func (vm *VM) kill() {
 	}
 	vm.cmd = nil
 	vm.cancel = nil
+	vm.waitDone = nil
 	vm.HelperPID = 0
 	vm.closeConfigSrv()
 }
@@ -894,60 +914,9 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
-// Stop is the cold tier: pause at a quiesced boundary, snapshot to a
-// self-contained bundle, then kill the helper to free RAM. Requires a block
-// root (BlockRoot) so the rootfs survives the round-trip; a virtio-fs VM can be
-// snapshotted but exec-after-restore breaks (the FUSE map isn't persisted).
+// Stop powers off the VM after a best-effort guest sync. The root disk
+// persists; Start boots it fresh, without processes or files in tmpfs.
 func (e *Engine) Stop(ctx context.Context, id string) error {
-	if !e.caps.Checkpoint {
-		return e.powerOff(ctx, id)
-	}
-	vm, err := e.getVM(id)
-	if err != nil {
-		return err
-	}
-	vm.launchMu.Lock()
-	defer vm.launchMu.Unlock()
-	vm.mu.Lock()
-	if vm.Status != "running" {
-		vm.mu.Unlock()
-		return nil
-	}
-	ctlUDS, bundleDir := vm.CtlSockUDS, vm.BundleDir
-	vm.mu.Unlock()
-
-	// Generous deadline: SNAPSHOT streams the whole guest RAM to disk.
-	sctx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-	if _, err := controlCmd(sctx, ctlUDS, "PAUSE"); err != nil {
-		return fmt.Errorf("stop: pause: %w", err)
-	}
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		return fmt.Errorf("stop: bundle dir: %w", err)
-	}
-	if _, err := controlCmd(sctx, ctlUDS, "SNAPSHOT "+bundleDir); err != nil {
-		// Snapshot failed (e.g. out of disk for memory.img). The guest is still
-		// PAUSED from above — un-pause it so it isn't left frozen (a frozen guest
-		// hangs the next exec). Then surface the error; the sandbox stays usable.
-		_, _ = controlCmd(sctx, ctlUDS, "RESUME")
-		return fmt.Errorf("stop: snapshot: %w", err)
-	}
-	vm.kill()
-	vm.mu.Lock()
-	vm.Status = "stopped"
-	vm.Thermal = "cold"
-	vm.Agent = nil
-	vm.mu.Unlock()
-	vm.persist()
-	slog.Info("krucible sandbox stopped (cold)", "id", id, "bundle", bundleDir)
-	return nil
-}
-
-// powerOff is Stop without checkpoint support: flush the guest's page cache
-// (lohar already syncs after each exec; this covers background writers), then
-// kill the VM. The root disk persists; Start boots it fresh, so the
-// sandbox comes back with its files but not its processes.
-func (e *Engine) powerOff(ctx context.Context, id string) error {
 	vm, err := e.getVM(id)
 	if err != nil {
 		return err
@@ -981,9 +950,7 @@ func (e *Engine) powerOff(ctx context.Context, id string) error {
 	return nil
 }
 
-// Start cold-restores a stopped sandbox from its snapshot bundle: re-launch the
-// helper with the bundle, restoring RAM + device + vCPU state and resuming from
-// the snapshot point.
+// Start boots a stopped sandbox from its persisted root disk.
 func (e *Engine) Start(ctx context.Context, id string) error {
 	vm, err := e.getVM(id)
 	if err != nil {
@@ -996,35 +963,15 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 		vm.mu.Unlock()
 		return nil
 	}
-	bundleDir := vm.BundleDir
 	vm.mu.Unlock()
-	// Restore from the cold bundle if present; otherwise cold-boot fresh — a
-	// crashed or never-snapshotted sandbox whose RAM is gone but whose rootfs
-	// image persists. Recovery relies on this for restart-safety. Without
-	// checkpoint support every start is a fresh boot.
-	snapshot, mode := "", "fresh boot"
-	if e.caps.Checkpoint && validateBundle(bundleDir) == nil {
-		snapshot, mode = bundleDir, "cold restore"
+	if err := e.launch(ctx, vm, ""); err != nil {
+		return fmt.Errorf("start (fresh boot): %w", err)
 	}
-	if err := e.launch(ctx, vm, snapshot); err != nil {
-		return fmt.Errorf("start (%s): %w", mode, err)
-	}
-	slog.Info("krucible sandbox started", "id", id, "mode", mode)
+	slog.Info("krucible sandbox started", "id", id, "mode", "fresh boot")
 	return nil
 }
 
-// krucibleProtoVer is the snapshot bundle protocol version this build can
-// restore. Mirrors libkrun's CHECKPOINT_VERSION / the manifest proto_ver.
-const krucibleProtoVer = 1
-
-type bundleManifest struct {
-	ProtoVer  int    `json:"proto_ver"`
-	Arch      string `json:"arch"`
-	VcpuCount int    `json:"vcpu_count"`
-}
-
-// hostSnapshotArch maps Go's GOARCH to the arch string libkrun writes into a
-// bundle manifest.
+// hostSnapshotArch maps Go's GOARCH to the saved manifest's arch string.
 func hostSnapshotArch() string {
 	switch runtime.GOARCH {
 	case "arm64":
@@ -1034,34 +981,6 @@ func hostSnapshotArch() string {
 	default:
 		return runtime.GOARCH
 	}
-}
-
-// validateBundle is bhatti's portability gate (Tier-2 of the cold/move design):
-// refuse a snapshot bundle that can't be restored on this host — incomplete,
-// wrong proto version, or cross-arch (a bundle moved from a different machine)
-// — before spawning the helper, so the failure is a clear error, not a guest
-// crash mid-restore.
-func validateBundle(bundleDir string) error {
-	for _, f := range []string{"manifest.json", "checkpoint.bin", "memory.img"} {
-		if _, err := os.Stat(filepath.Join(bundleDir, f)); err != nil {
-			return fmt.Errorf("incomplete snapshot bundle (missing %s): %w", f, err)
-		}
-	}
-	raw, err := os.ReadFile(filepath.Join(bundleDir, "manifest.json"))
-	if err != nil {
-		return fmt.Errorf("read manifest: %w", err)
-	}
-	var m bundleManifest
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return fmt.Errorf("parse manifest: %w", err)
-	}
-	if m.ProtoVer != krucibleProtoVer {
-		return fmt.Errorf("bundle proto_ver %d != %d (incompatible snapshot, re-snapshot)", m.ProtoVer, krucibleProtoVer)
-	}
-	if want := hostSnapshotArch(); m.Arch != want {
-		return fmt.Errorf("bundle arch %q != host %q (cross-arch restore not supported)", m.Arch, want)
-	}
-	return nil
 }
 
 // genToken returns a random 128-bit hex token (matches the FC engine's scheme).
@@ -1203,14 +1122,8 @@ func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
 	return out, nil
 }
 
-// Shutdown kills every helper (called on daemon SIGTERM, after the server has
-// snapshotted running VMs so they cold-restore on the next start). It terminates
-// BOTH helpers this engine owns (vm.cmd) AND ones adopted across a prior daemon
-// restart (only HelperPID set) via vm.kill() — the same path Destroy uses. The
-// former inline cmd-only kill leaked adopted helpers, orphaning live VMs whose
-// daemon had restarted at least once. Serialized per-VM against an in-flight
-// Start/Stop/Pause/Resume via launchMu (lock order: launchMu before mu), so a
-// SIGTERM can't SIGKILL a helper mid-transition (e.g. mid-snapshot).
+// Shutdown kills every helper, including those adopted after daemon restart.
+// Serialized against per-VM lifecycle transitions by launchMu.
 func (e *Engine) Shutdown() {
 	e.mu.RLock()
 	vms := make([]*VM, 0, len(e.vms))

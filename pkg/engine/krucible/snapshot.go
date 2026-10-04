@@ -3,6 +3,7 @@ package krucible
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,7 +20,6 @@ import (
 // records the captured disk + config drive (within the snapshot dir) and the
 // in-guest token to reuse on a memory restore.
 type krucibleSnapManifest struct {
-	ProtoVer    int    `json:"proto_ver"`
 	Arch        string `json:"arch"`
 	Type        string `json:"type"` // "memory" (RAM+disk) | "filesystem" (disk-only)
 	Vcpus       uint8  `json:"vcpus"`
@@ -73,11 +73,17 @@ func (e *Engine) CheckpointTyped(ctx context.Context, sandboxID, userID string, 
 	return e.checkpoint(ctx, sandboxID, snapName, snapDir, snapType)
 }
 
-func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (any, error) {
-	if !e.caps.Checkpoint {
+func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (manifest any, err error) {
+	if snapType == "memory" && !e.caps.Checkpoint {
 		return nil, errNoCheckpoint
 	}
-	finalDir := filepath.Join(snapDir, snapName)
+	if snapType == "filesystem" && !e.caps.Pause {
+		return nil, errNoPause
+	}
+	finalDir, err := filepath.Abs(filepath.Join(snapDir, snapName))
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint: absolute snapshot dir: %w", err)
+	}
 	if _, err := os.Stat(finalDir); err == nil {
 		return nil, fmt.Errorf("snapshot %q already exists", snapName)
 	}
@@ -107,42 +113,58 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
 
-	if err := os.MkdirAll(finalDir, 0o700); err != nil {
-		return nil, fmt.Errorf("checkpoint: snapshot dir: %w", err)
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		return nil, fmt.Errorf("checkpoint: snapshot parent: %w", err)
 	}
-	done := false
+	ownDir := false
 	defer func() {
-		if !done {
-			os.RemoveAll(finalDir)
+		if err != nil && ownDir {
+			_ = os.RemoveAll(finalDir)
 		}
 	}()
+	if snapType == "filesystem" {
+		if err := os.Mkdir(finalDir, 0o700); err != nil {
+			return nil, fmt.Errorf("checkpoint: snapshot dir: %w", err)
+		}
+		ownDir = true
+	}
 
 	// Flush the guest page cache to the device.
 	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
 	_, _ = e.Exec(syncCtx, sandboxID, []string{"sync"})
 	syncCancel()
 
-	cctx, ccancel := context.WithTimeout(ctx, 60*time.Second)
+	limit := 60 * time.Second
+	if snapType == "memory" {
+		limit = 120 * time.Second // SAVE may stream a large guest's RAM.
+	}
+	cctx, ccancel := context.WithTimeout(ctx, limit)
 	defer ccancel()
-	if _, err := controlCmd(cctx, vm.CtlSockUDS, "PAUSE"); err != nil {
-		return nil, fmt.Errorf("checkpoint: pause: %w", err)
+	if snapType == "filesystem" {
+		if _, err := controlCmd(cctx, vm.CtlSockUDS, "PAUSE"); err != nil {
+			return nil, fmt.Errorf("checkpoint: pause: %w", err)
+		}
+	} else {
+		// SAVE creates finalDir, freezes RAM/devices, and leaves the VM paused.
+		// No separate PAUSE: SAVE itself owns the quiesce and failure cleanup.
+		if _, err := controlCmd(cctx, vm.CtlSockUDS, "SAVE "+finalDir); err != nil {
+			return nil, fmt.Errorf("checkpoint: save: %w", err)
+		}
+		ownDir = true
 	}
 	defer func() {
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer rcancel()
-		_, _ = controlCmd(rctx, vm.CtlSockUDS, "RESUME")
-	}()
-
-	// A memory snapshot captures RAM + device + vCPU state (libkrun writes
-	// manifest.json/checkpoint.bin/memory.img). A filesystem snapshot is disk-only.
-	if snapType == "memory" {
-		if _, err := controlCmd(cctx, vm.CtlSockUDS, "SNAPSHOT "+finalDir); err != nil {
-			return nil, fmt.Errorf("checkpoint: snapshot: %w", err)
+		if _, resumeErr := controlCmd(rctx, vm.CtlSockUDS, "RESUME"); resumeErr != nil {
+			err = errors.Join(err, fmt.Errorf("checkpoint: resume: %w", resumeErr))
+			manifest = nil
 		}
+	}()
+	// Clone disks at the saved VM's quiescent point. Guest writes cannot
+	// resume until after all clones finish.
+	if err := exec.CommandContext(cctx, "sync").Run(); err != nil {
+		return nil, fmt.Errorf("checkpoint: host sync: %w", err)
 	}
-	// Freeze the disk + config drive (the VM is paused; a host sync makes the
-	// overlay file on disk complete).
-	_ = exec.CommandContext(cctx, "sync").Run()
 	if err := cloneFile(spec.RootDisk, filepath.Join(finalDir, "rootfs.qcow2")); err != nil {
 		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
 	}
@@ -165,11 +187,9 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 			snapMounts = append(snapMounts, snapMount{HostPath: mnt.HostPath, ReadOnly: mnt.ReadOnly})
 		}
 	}
-
-	done = true
 	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir, "volumes", len(snapVols), "mounts", len(snapMounts))
 	return krucibleSnapManifest{
-		ProtoVer: krucibleProtoVer, Arch: hostSnapshotArch(), Type: snapType,
+		Arch: hostSnapshotArch(), Type: snapType,
 		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
 		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
 		Token: token, KernelImage: spec.KernelImage,
@@ -178,8 +198,8 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 }
 
 // ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
-// (the server's `snapshotResumer` capability): copy the snapshot's disk + config
-// drive, cold-restore its RAM/device/vCPU state, reusing the in-guest token (the
+// (the server's `snapshotResumer` capability): clone the saved disk and
+// volumes, restore RAM/device/vCPU state, and reuse the in-guest token (the
 // restored guest enforces it from RAM). ownerUserID homes the new sandbox on the
 // owner's shared netd — a fork/restore is an INDEPENDENT sandbox of the same
 // owner, so it must join that owner's fabric (and get a fresh, distinct IP there),
@@ -212,11 +232,6 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 		// --image` on a captured node.
 		return e.create(ctx, spec, createOpts{})
 	}
-	// Memory snapshot: cold-restore RAM/device/vCPU, reusing the in-guest token +
-	// the captured config drive so the restored devices match.
-	if err := validateBundle(snapDir); err != nil {
-		return engine.SandboxInfo{}, err
-	}
 	// Reproduce the captured device set. Block volumes restore cleanly: clone each
 	// frozen volume into the new sandbox (independent copy — fork/restore diverges
 	// from the source). Memory snapshots of mounted sandboxes are refused at
@@ -232,11 +247,9 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 	})
 }
 
-// Fork creates a new sandbox that is an instant copy of a running sandbox,
-// including its in-memory process state (the "clone" of `create --from`):
-// memory-checkpoint the source to a throwaway bundle and immediately restore it
-// into a new sandbox, then discard the bundle. The fork's disk + config are
-// copies, so it diverges from the source; the source is undisturbed.
+// Fork checkpoints a running sandbox to a temporary directory, restores a
+// second VM from it, then removes the directory. The new VM privately maps
+// memory.bin: unlinking it does not invalidate an already running restore.
 func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.SandboxInfo, error) {
 	// Fast, friendly refusal: a --mount sandbox can't be memory-forked (libkrun
 	// can't restore a virtio-fs device from a memory snapshot). Check up front so
@@ -264,8 +277,8 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 	if err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("fork: temp dir: %w", err)
 	}
-	// Safe to remove once Resume returns: the new sandbox has its own root +
-	// config copies and the helper has already loaded memory.img.
+	// Restore clones disks and maps RAM privately; Linux keeps the unlinked
+	// memory.bin backing mapped in the fork after this directory is removed.
 	defer os.RemoveAll(tmp)
 
 	manifest, err := e.Checkpoint(ctx, sandboxID, "", 0, "snap", tmp)

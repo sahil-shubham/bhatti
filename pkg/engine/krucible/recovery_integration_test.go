@@ -129,7 +129,7 @@ func TestKrucibleRecoveryDeadHelper(t *testing.T) {
 		t.Fatalf("recovered (dead) status = %q (err %v), want stopped", s.Status, err)
 	}
 
-	// Start cold-boots it fresh (no bundle), and it works again.
+	// Start cold-boots it fresh from disk, and it works again.
 	if err := eng2.Start(ctx, id); err != nil {
 		t.Fatalf("Start (fresh relaunch): %v", err)
 	}

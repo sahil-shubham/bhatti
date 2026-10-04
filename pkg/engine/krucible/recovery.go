@@ -12,12 +12,9 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/agent"
 )
 
-// Recovery makes krucible restart-safe: each sandbox's durable state is written
-// to <sandboxDir>/state.json, the helper is detached from the daemon's process
-// group (so it survives a daemon restart/crash), and on New() the engine
-// rehydrates — adopting helpers that are still alive and marking dead ones cold
-// so the next request cold-restores them from the bundle. Pure Go; works on
-// macOS and Linux (syscall.Kill / Setpgid are cross-platform).
+// Recovery makes krucible restart-safe: persist each sandbox's state, adopt
+// helpers that are still alive, and cold-boot dead ones from their root disk.
+// Pure Go on macOS and Linux (syscall.Kill / Setpgid are cross-platform).
 
 // vmRecord is the durable, JSON-serialized state of a VM — everything needed to
 // reconnect to a live helper or to relaunch a dead one. The runtime-only fields
@@ -35,7 +32,6 @@ type vmRecord struct {
 	Thermal    string `json:"thermal"`
 	Status     string `json:"status"`
 	Token      string `json:"token"`
-	BundleDir  string `json:"bundle_dir"`
 	LogPath    string `json:"log_path"`
 	BaseSpec   VMSpec `json:"base_spec"`
 	HelperPID  int    `json:"helper_pid"`
@@ -86,7 +82,7 @@ func (vm *VM) toRecordLocked() vmRecord {
 		SandboxDir: vm.SandboxDir, SockDir: vm.SockDir,
 		ControlUDS: vm.ControlUDS, ForwardUDS: vm.ForwardUDS, CtlSockUDS: vm.CtlSockUDS,
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
-		BundleDir: vm.BundleDir, LogPath: vm.logPath, BaseSpec: vm.baseSpec,
+		LogPath: vm.logPath, BaseSpec: vm.baseSpec,
 		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx, NetIP: vm.netIP,
 	}
 }
@@ -130,7 +126,7 @@ func vmFromRecord(rec vmRecord) *VM {
 		SandboxDir: rec.SandboxDir, SockDir: rec.SockDir,
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
-		BundleDir: rec.BundleDir, baseSpec: rec.BaseSpec, logPath: rec.LogPath,
+		baseSpec: rec.BaseSpec, logPath: rec.LogPath,
 		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP,
 	}
 }
@@ -174,31 +170,8 @@ func pidAlive(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
-// bundleHasCheckpoint reports whether a cold-restore bundle exists.
-func bundleHasCheckpoint(bundleDir string) bool {
-	if bundleDir == "" {
-		return false
-	}
-	_, err := os.Stat(filepath.Join(bundleDir, "checkpoint.bin"))
-	return err == nil
-}
-
-// classifyRehydrate decides a recovered VM's status/thermal from its liveness
-// and whether a cold bundle exists. Pure (no IO) so it is unit-testable on every
-// OS/arch without a VM.
-func classifyRehydrate(alive, hasBundle bool) (status, thermal string) {
-	if alive {
-		return "running", "" // thermal kept from the record by the caller
-	}
-	if hasBundle {
-		return "stopped", "cold" // next EnsureHot/Start cold-restores from the bundle
-	}
-	return "stopped", "" // dead with no bundle — needs an explicit Start (relaunch)
-}
-
-// recover scans the data dir for persisted sandboxes and rehydrates them:
-// reconnect to live helpers, mark dead ones cold/stopped. Best-effort; a bad
-// record is skipped, not fatal.
+// recover scans durable sandboxes, adopts live helpers, and marks dead ones
+// stopped so Start can boot them from their root disk. Bad records are skipped.
 func (e *Engine) recover() {
 	matches, _ := filepath.Glob(filepath.Join(e.cfg.DataDir, "sandboxes", "*", stateFile))
 	for _, p := range matches {
@@ -213,12 +186,15 @@ func (e *Engine) recover() {
 		}
 		vm := vmFromRecord(rec)
 		alive := pidAlive(rec.HelperPID) && e.agentResponds(vm)
-		status, thermal := classifyRehydrate(alive, bundleHasCheckpoint(rec.BundleDir))
-		vm.Status = status
+		if alive {
+			vm.Status = "running"
+		} else {
+			vm.Status = "stopped"
+			vm.Thermal = ""
+		}
 		if alive {
 			vm.Agent = agent.NewKrucibleClient(vm.ControlUDS, vm.ForwardUDS, vm.Token)
 		} else {
-			vm.Thermal = thermal
 			vm.HelperPID = 0
 		}
 		e.mu.Lock()
