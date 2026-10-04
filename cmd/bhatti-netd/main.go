@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -20,13 +21,15 @@ import (
 // netd LISTENS on the unixstream socket; libkrun's virtio-net backend CONNECTS
 // to it (net/unixstream.rs Unixstream::open → connect). The daemon spawns one
 // netd per owner, then starts the VM pointed at the same path via
-// krun_add_net_unixstream. Egress policy / substitution / inbound layer on later.
+// krun_add_net_unixstream. With --broker-uds, netd substitutes credentials on
+// TLS to granted hosts, asking the daemon's broker over that socket.
 func main() {
 	netUDS := flag.String("net-uds", "", "unixstream socket to LISTEN on (libkrun connects here)")
 	gwIP := flag.String("gw-ip", "100.64.0.1", "gateway IPv4 address")
 	prefix := flag.Int("prefix", 24, "gateway subnet prefix length")
 	macStr := flag.String("mac", "52:54:00:00:00:01", "gateway link (MAC) address")
 	ctlUDS := flag.String("ctl-uds", "", "control socket the daemon pushes per-sandbox egress policy to (optional)")
+	brokerUDS := flag.String("broker-uds", "", "credential broker socket the daemon serves (optional; enables credential substitution)")
 	uid := flag.Int("uid", 65534, "user to run as once the sockets are open, when started as root")
 	gid := flag.Int("gid", 65534, "group to run as once the sockets are open, when started as root")
 	flag.Parse()
@@ -45,6 +48,11 @@ func main() {
 		log.Fatalf("bhatti-netd: listen %s: %v", *netUDS, err)
 	}
 	defer ln.Close()
+	// The directory is traversable by netd's group (to reach the broker
+	// socket), so the sockets themselves must not rely on the umask.
+	if err := os.Chmod(*netUDS, 0o600); err != nil {
+		log.Fatalf("bhatti-netd: chmod %s: %v", *netUDS, err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -53,12 +61,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("bhatti-netd: %v", err)
 	}
+	var cred *credProxy
+	if *brokerUDS != "" {
+		// Loaded before confine so the upstream trust doesn't depend on what
+		// Landlock leaves readable.
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			log.Printf("bhatti-netd: system roots: %v (intercepted upstreams will fail verification)", err)
+		}
+		cred = newCredProxy(&gateway.BrokerClient{Path: *brokerUDS}, roots)
+	}
 	if err := confine(*uid, *gid); err != nil {
 		log.Fatalf("bhatti-netd: confine: %v", err)
 	}
 
 	log.Printf("bhatti-netd: listening on %s (gw %s/%d, mac %s)", *netUDS, *gwIP, *prefix, *macStr)
-	if err := serve(ctx, ln, cfg, ctlLn); err != nil && ctx.Err() == nil {
+	if err := serve(ctx, ln, cfg, ctlLn, cred); err != nil && ctx.Err() == nil {
 		log.Fatalf("bhatti-netd: %v", err)
 	}
 }
@@ -98,6 +116,10 @@ func listenControl(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("control listen %s: %w", path, err)
 	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("control chmod %s: %w", path, err)
+	}
 	return ln, nil
 }
 
@@ -105,11 +127,12 @@ func listenControl(path string) (net.Listener, error) {
 // connect (each libkrun virtio-net backend dials this socket). Every accepted
 // connection becomes a switch port; siblings on the same netd reach each other.
 // Closing the listener on ctx.Done unblocks a pending Accept.
-func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlLn net.Listener) error {
+func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlLn net.Listener, cred *credProxy) error {
 	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac)
 	if err != nil {
 		return err
 	}
+	gw.cred = cred
 	if ctlLn != nil {
 		go func() { <-ctx.Done(); ctlLn.Close() }()
 		go gateway.ServeControl(ctlLn, gw)

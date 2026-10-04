@@ -30,6 +30,7 @@ func (g *Gateway) installTCPForwarder() {
 
 		var up net.Conn
 		var err error
+		var st *guestState
 		if g.isSibling(id.LocalAddress) {
 			// Same-owner sibling: dial via the stack so it routes to the sibling's
 			// link (native checksums, mediated + observable by netd).
@@ -39,7 +40,7 @@ func (g *Gateway) installTCPForwarder() {
 			// Per-sandbox egress: vet the destination against THIS guest's policy
 			// (keyed by source IP), or the default posture if it isn't registered,
 			// as a connection to the name the guest resolved to get this IP.
-			st := g.stateFor(id.RemoteAddress)
+			st = g.stateFor(id.RemoteAddress)
 			ip, perr := netip.ParseAddr(addrString(id.LocalAddress))
 			if perr != nil {
 				r.Complete(true)
@@ -59,7 +60,15 @@ func (g *Gateway) installTCPForwarder() {
 			return
 		}
 		r.Complete(false)
-		go splice(gonet.NewTCPConn(&wq, ep), up)
+		guest := gonet.NewTCPConn(&wq, ep)
+		// TLS to the internet from a registered sandbox may carry a placeholder
+		// for a granted host (intercept.go); the policy check above already
+		// passed, and up is the address the guest asked for.
+		if g.cred != nil && st != nil && st.sandbox != "" && id.LocalPort == tlsPort {
+			go g.cred.serve(guest, up, st.sandbox)
+			return
+		}
+		go splice(guest, up)
 	})
 	g.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 }

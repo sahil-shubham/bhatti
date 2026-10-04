@@ -62,6 +62,8 @@ type Gateway struct {
 	polMu    sync.RWMutex
 	guests   map[string]*guestState // guest gateway IP -> per-sandbox egress state
 	defState *guestState            // fallback for an unregistered guest (public)
+
+	cred *credProxy // credential substitution on :443; nil without a broker
 }
 
 // guestPort is one guest's virtio-net link.
