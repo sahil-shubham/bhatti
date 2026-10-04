@@ -214,7 +214,8 @@ func (p *credProxy) relay(guest *tls.Conn, up net.Conn, sandbox, host string) {
 	ctx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
 	uerr := upTLS.HandshakeContext(ctx)
 	cancel()
-	gr := bufio.NewReader(guest)
+	budget := &headBudget{r: guest, left: maxRequestHead}
+	gr := bufio.NewReader(budget)
 	if uerr != nil {
 		log.Printf("bhatti-netd: %s: upstream TLS for %s: %v", sandbox, host, uerr)
 		// Tell the guest why on its first request, then hang up.
@@ -227,7 +228,14 @@ func (p *credProxy) relay(guest *tls.Conn, up net.Conn, sandbox, host string) {
 	c := &credConn{p: p, sandbox: sandbox, host: host, values: map[string]heldValue{}}
 	ur := bufio.NewReader(upTLS)
 	for {
+		budget.left = maxRequestHead
 		req, err := http.ReadRequest(gr)
+		budget.left = -1 // bodies stream; only the head is held in memory
+		if errors.Is(err, errHeadTooLarge) {
+			writeError(guest, http.StatusRequestHeaderFieldsTooLarge, "request head too large")
+			linger(guest)
+			return
+		}
 		if err != nil {
 			return
 		}
@@ -235,6 +243,34 @@ func (p *credProxy) relay(guest *tls.Conn, up net.Conn, sandbox, host string) {
 			return
 		}
 	}
+}
+
+// maxRequestHead bounds what a guest can make netd hold for one request's
+// line and headers (Go's reader doesn't bound them itself).
+const maxRequestHead = 256 << 10
+
+var errHeadTooLarge = errors.New("request head too large")
+
+// headBudget counts the bytes read while a request head is parsed; left < 0
+// means unbounded (a body is being streamed).
+type headBudget struct {
+	r    io.Reader
+	left int64
+}
+
+func (b *headBudget) Read(p []byte) (int, error) {
+	if b.left < 0 {
+		return b.r.Read(p)
+	}
+	if b.left == 0 {
+		return 0, errHeadTooLarge
+	}
+	if int64(len(p)) > b.left {
+		p = p[:b.left]
+	}
+	n, err := b.r.Read(p)
+	b.left -= int64(n)
+	return n, err
 }
 
 // credConn is one intercepted connection's state: the values it resolved,

@@ -442,6 +442,20 @@ func TestCredHostHeaderMustBeInterceptedHost(t *testing.T) {
 	}
 }
 
+// TestCredRequestHeadBounded: a guest can't make netd buffer an unbounded
+// request head (Go's request reader sets no limit of its own).
+func TestCredRequestHeadBounded(t *testing.T) {
+	r := newRig(t)
+	c := r.dialTLS("api.test")
+	resp, _ := roundTrip(t, c, "GET / HTTP/1.1\r\nHost: api.test\r\nX-Big: "+strings.Repeat("a", maxRequestHead)+"\r\n\r\n")
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("status %d, want 431", resp.StatusCode)
+	}
+	if len(r.up.seen()) != 0 {
+		t.Fatal("an oversize head was forwarded")
+	}
+}
+
 // TestCredBrokerRefusalIs403: a placeholder the broker won't resolve (revoked,
 // expired, another sandbox's) is answered 403; nothing is forwarded.
 func TestCredBrokerRefusalIs403(t *testing.T) {
