@@ -140,6 +140,11 @@ func runAgent() {
 
 	cfg := fetchConfig()
 	if cfg != nil {
+		// First, so nothing below (or anything it starts) blocks on an
+		// unseeded CRNG.
+		if err := seedEntropy(cfg.Entropy); err != nil {
+			logf("seed entropy: %v", err)
+		}
 		hostname := "bhatti"
 		if cfg.Hostname != "" {
 			hostname = cfg.Hostname
@@ -513,6 +518,9 @@ type SandboxConfig struct {
 	DNSInternal string     `json:"dns_internal,omitempty"`
 	User        string     `json:"user"`
 	Net         *NetConfig `json:"net,omitempty"`
+	// Entropy is a fresh seed for the kernel's CRNG, sent per boot by the
+	// host's config server (seedEntropy).
+	Entropy []byte `json:"entropy,omitempty"`
 }
 
 // NetConfig mirrors configdrive.NetConfig: eth0 addressing for the virtio-net
