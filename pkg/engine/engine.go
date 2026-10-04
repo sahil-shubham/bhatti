@@ -79,7 +79,7 @@ type SandboxSpec struct {
 	NewVolumes []VolumeSpec           `json:"new_volumes,omitempty"`
 	Init       string                 `json:"init,omitempty"`
 	Hugepages  bool                   `json:"hugepages,omitempty"`  // 2MB hugepages, faster boot, no Diff snapshots
-	NetPolicy  *gateway.NetPolicyWire `json:"net_policy,omitempty"` // per-sandbox egress rules (default posture + allow-hosts); nil = public
+	NetPolicy  *gateway.NetPolicyWire `json:"net_policy,omitempty"` // per-sandbox network posture + allow rules; nil = public (the server always sets it; "none" = no NIC)
 
 	// v0.3: Persistent volume references (replaces VolumeMount for persistent vols)
 	PersistentVolumes []PersistentVolume `json:"persistent_volumes,omitempty"`

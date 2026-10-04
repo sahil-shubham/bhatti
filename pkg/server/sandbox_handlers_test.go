@@ -553,3 +553,46 @@ func TestCreateSandbox_NetPolicyInvalid(t *testing.T) {
 		t.Fatalf("expected 400 for bad egress posture, got %d", resp.StatusCode)
 	}
 }
+
+// TestCreateSandbox_NetPostureResolution pins how the server picks a sandbox's
+// network posture: an explicit one wins, allow rules alone imply deny, and
+// otherwise the configured default applies, which is "none" (no network
+// device) when unset. "none" with allow rules is contradictory and rejected.
+func TestCreateSandbox_NetPostureResolution(t *testing.T) {
+	cases := []struct {
+		name          string
+		serverDefault string
+		policy        map[string]any // nil = no net_policy in the request
+		wantStatus    int
+		wantPosture   string
+	}{
+		{"unset default is none", "", nil, 201, "none"},
+		{"configured default applies", "public", nil, 201, "public"},
+		{"allow rules imply deny", "public", map[string]any{"allow_hosts": []string{"api.example.com"}}, 201, "deny"},
+		{"explicit beats default", "none", map[string]any{"default": "public"}, 201, "public"},
+		{"none with allow rules rejected", "", map[string]any{"default": "none", "allow_hosts": []string{"x.com"}}, 400, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ts := setup(t)
+			srv.defaultEgress = tc.serverDefault
+			eng := srv.engine.(*mockEngine)
+			req := map[string]any{"name": uniqueName(t, "posture")}
+			if tc.policy != nil {
+				req["net_policy"] = tc.policy
+			}
+			resp := doReq(t, ts, "POST", "/sandboxes", req)
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if tc.wantStatus != 201 {
+				return
+			}
+			if np := eng.LastCreateSpec.NetPolicy; np == nil || np.Default != tc.wantPosture {
+				t.Fatalf("engine posture = %+v, want %q", np, tc.wantPosture)
+			}
+		})
+	}
+}

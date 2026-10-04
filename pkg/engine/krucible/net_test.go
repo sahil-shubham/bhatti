@@ -103,6 +103,50 @@ func TestKrucibleNetEgress(t *testing.T) {
 	}
 }
 
+// TestKrucibleNetNone: a sandbox with egress "none" boots with no network
+// device and no netd, and the agent still serves it over vsock.
+func TestKrucibleNetNone(t *testing.T) {
+	eng := newNetEngine(t)
+	ke := eng.(*Engine)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netnone", CPUs: 1, MemoryMB: 512, UserID: "nonet",
+		NetPolicy: &gateway.NetPolicyWire{Default: gateway.PostureNone}})
+	if err != nil {
+		t.Fatalf("Create(none): %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	// The test rootfs has no ls; /proc/net/dev lists every interface ("name:").
+	r, err := eng.Exec(ctx, id, []string{"cat", "/proc/net/dev"})
+	if err != nil || r.ExitCode != 0 {
+		t.Fatalf("exec over vsock: err=%v exit=%d", err, r.ExitCode)
+	}
+	var ifs []string
+	for _, l := range strings.Split(r.Stdout, "\n") {
+		if name, _, ok := strings.Cut(strings.TrimSpace(l), ":"); ok {
+			ifs = append(ifs, name)
+		}
+	}
+	// lo and the kernel's own dummy0 are always there; eth0 is the virtio-net NIC.
+	for _, name := range ifs {
+		if name == "eth0" {
+			t.Fatalf("interfaces = %q: a no-network sandbox has eth0", ifs)
+		}
+	}
+	ke.netdMu.Lock()
+	n := len(ke.netds)
+	ke.netdMu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d netd instances running for a no-network sandbox", n)
+	}
+	if r, _ := eng.Exec(ctx, id, []string{"netcheck", "tcp"}); r.ExitCode == 0 {
+		t.Fatal("egress succeeded with no network device")
+	}
+}
+
 // TestKrucibleNetDNS is the DNS-egress gate: name resolution in the guest must
 // work through the gateway's UDP forwarder (netcheck dns → net.LookupHost →
 // UDP:53 → netd → public resolver). Before the UDP forwarder existed this

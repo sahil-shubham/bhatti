@@ -33,6 +33,10 @@ type Config struct {
 	// Domain mode (Phase 2: host-based routing + TLS)
 	Domain *DomainConfig `yaml:"domain,omitempty"`
 
+	// DefaultEgress is the network posture for sandboxes created without one:
+	// "none" (no network device; the default), "deny" (allow-lists only) or "public".
+	DefaultEgress string `yaml:"default_egress,omitempty"`
+
 	// Krucible-specific (libkrun engine; macOS + Linux)
 	KrucibleVMM         string `yaml:"krucible_vmm"`          // path to the bhatti-vmm helper (default: next to binary / PATH)
 	KrucibleRootfs      string `yaml:"krucible_rootfs"`       // base rootfs dir (with /init.krun=lohar) the block-root base image is built from when krucible_base_image is unset

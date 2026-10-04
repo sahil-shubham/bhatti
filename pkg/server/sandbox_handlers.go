@@ -148,15 +148,29 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Validate the egress policy up front. The engine re-parses the wire
-		// form when pushing to netd, but failing here gives the caller a clear
-		// 400 (bad posture / unparseable host or CIDR) instead of a deep error.
+		// Resolve the egress posture: an explicit one wins; allow rules alone
+		// imply "deny" (allow only these); otherwise the server default, which
+		// is "none" (no network device) unless configured. Validated up front so
+		// the caller gets a clear 400 instead of a deep engine error.
+		np := gateway.NetPolicyWire{}
 		if req.NetPolicy != nil {
-			if _, err := gateway.PolicyFromWire(*req.NetPolicy); err != nil {
-				errResp(w, 400, "invalid net_policy: "+err.Error())
-				return
+			np = *req.NetPolicy
+		}
+		if np.Default == "" {
+			switch {
+			case len(np.AllowHosts) > 0 || len(np.AllowCIDRs) > 0:
+				np.Default = "deny"
+			case s.defaultEgress != "":
+				np.Default = s.defaultEgress
+			default:
+				np.Default = gateway.PostureNone
 			}
 		}
+		if err := gateway.ValidateWire(np); err != nil {
+			errResp(w, 400, "invalid net_policy: "+err.Error())
+			return
+		}
+		req.NetPolicy = &np
 
 		var spec engine.SandboxSpec
 		var templateID string
@@ -371,7 +385,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// Set user context for engine-level network isolation
 		spec.UserID = user.ID
 		spec.SubnetIndex = user.SubnetIndex
-		spec.NetPolicy = req.NetPolicy // per-sandbox egress policy (nil => public default)
+		spec.NetPolicy = req.NetPolicy // resolved above: never nil
 
 		// v0.3: Resolve image name to file path
 		if req.Image != "" {

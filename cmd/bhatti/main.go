@@ -184,6 +184,13 @@ func runDaemon() {
 	if cfg.PublicProxyListen != "" {
 		srvOpts = append(srvOpts, server.WithPublicProxyAddr(cfg.PublicProxyListen))
 	}
+	switch cfg.DefaultEgress {
+	case "", "none", "deny", "public":
+		srvOpts = append(srvOpts, server.WithDefaultEgress(cfg.DefaultEgress))
+	default:
+		slog.Error("invalid default_egress (want none, deny or public)", "value", cfg.DefaultEgress)
+		os.Exit(1)
+	}
 	if cfg.Domain != nil {
 		srvOpts = append(srvOpts,
 			server.WithProxyZone(cfg.Domain.ProxyZone),

@@ -333,7 +333,7 @@ type VM struct {
 	netdKey    string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
 	subnetIdx  int                    // owner's vnet subnet index (net backend); persisted for recovery
 	netIP      string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
-	netPolicy  *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = default (public)
+	netPolicy  *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -529,9 +529,16 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	forwardUDS := filepath.Join(sockDir, "f.sock")
 	ctlSockUDS := filepath.Join(sockDir, "k.sock")
 	configUDS := filepath.Join(sockDir, "cfg.sock")
-	netdKey = netdKeyFor(spec, id)
-	netInst, netGuestIdx := e.acquireNetd(netdKey, spec.SubnetIndex)
-	netUDS := netInst.sock
+	// A sandbox with egress "none" gets no NIC and no netd: everything the
+	// platform does with it (exec, files, shell, published ports) goes over vsock.
+	var netInst *netdInstance
+	var netGuestIdx int
+	netUDS := ""
+	if !spec.NetPolicy.NoNetwork() {
+		netdKey = netdKeyFor(spec, id)
+		netInst, netGuestIdx = e.acquireNetd(netdKey, spec.SubnetIndex)
+		netUDS = netInst.sock
+	}
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
 		return info, fmt.Errorf("create socket dir: %w", err)
 	}
@@ -553,14 +560,18 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	if e.caps.Checkpoint {
 		baseSpec.ControlSocketUDS = ctlSockUDS
 	}
-	// The guest's eth0 is wired to its owner's bhatti-netd; lohar configures it
-	// from cdNet.
-	baseSpec.NetUDS = netUDS
-	baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
-	netIP := netGuestIPFor(netInst.subnetIdx, netGuestIdx)
-	cdNet := &configdrive.NetConfig{
-		IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
-		Gateway: netGatewayIPFor(netInst.subnetIdx),
+	// With a network, the guest's eth0 is wired to its owner's bhatti-netd;
+	// lohar configures it from cdNet.
+	var netIP string
+	var cdNet *configdrive.NetConfig
+	if netInst != nil {
+		baseSpec.NetUDS = netUDS
+		baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
+		netIP = netGuestIPFor(netInst.subnetIdx, netGuestIdx)
+		cdNet = &configdrive.NetConfig{
+			IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
+			Gateway: netGatewayIPFor(netInst.subnetIdx),
+		}
 	}
 
 	name := spec.Name

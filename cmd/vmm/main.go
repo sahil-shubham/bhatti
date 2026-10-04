@@ -121,8 +121,6 @@ func run(spec krucible.VMSpec) {
 		fail("kernel_image is required (this VMM boots an external kernel only)")
 	case spec.RootDisk == "":
 		fail("root_disk is required (the external kernel boots a block root)")
-	case spec.NetUDS == "":
-		fail("net_uds is required (the guest's only network is the bhatti-netd gateway)")
 	}
 
 	var kerr C.KrunError
@@ -186,7 +184,7 @@ func run(spec krucible.VMSpec) {
 	noErr(kerr, "console build")
 	C.krun_mmio_device_manager_add(devs, C.KrunAttachDevice(console))
 
-	// vsock carries only the agent ports; the guest's inet goes over eth0.
+	// vsock carries only the agent ports; the guest's inet (if any) goes over eth0.
 	vsock := C.krun_vsock_device_new(3, 0, &kerr)
 	noErr(kerr, "vsock")
 	// listen=true: the host dials the UDS and libkrun forwards to the guest port
@@ -207,17 +205,20 @@ func run(spec krucible.VMSpec) {
 	C.krun_mmio_device_manager_add(devs, C.KrunAttachDevice(vsock))
 
 	// virtio-net to the owner's bhatti-netd gateway over a unixstream socket.
-	mac, err := net.ParseMAC(spec.NetMAC)
-	if err != nil || len(mac) != 6 {
-		fail("bad net_mac %q: %v", spec.NetMAC, err)
+	// Absent for an egress-"none" sandbox: no network device at all.
+	if spec.NetUDS != "" {
+		mac, err := net.ParseMAC(spec.NetMAC)
+		if err != nil || len(mac) != 6 {
+			fail("bad net_mac %q: %v", spec.NetMAC, err)
+		}
+		cmac := C.CBytes(mac)
+		// CSUM, GUEST_CSUM, GUEST_TSO4, GUEST_UFO, HOST_TSO4, HOST_UFO.
+		const features = 1<<0 | 1<<1 | 1<<7 | 1<<10 | 1<<11 | 1<<14
+		nic := C.krun_net_device_new_unixstream_path(cstr("eth0"), cstr(spec.NetUDS),
+			C.KrunBytes{data: (*C.uint8_t)(cmac), len: 6}, features, 0, &kerr)
+		noErr(kerr, "net "+spec.NetUDS)
+		C.krun_mmio_device_manager_add(devs, C.KrunAttachDevice(nic))
 	}
-	cmac := C.CBytes(mac)
-	// CSUM, GUEST_CSUM, GUEST_TSO4, GUEST_UFO, HOST_TSO4, HOST_UFO.
-	const features = 1<<0 | 1<<1 | 1<<7 | 1<<10 | 1<<11 | 1<<14
-	nic := C.krun_net_device_new_unixstream_path(cstr("eth0"), cstr(spec.NetUDS),
-		C.KrunBytes{data: (*C.uint8_t)(cmac), len: 6}, features, 0, &kerr)
-	noErr(kerr, "net "+spec.NetUDS)
-	C.krun_mmio_device_manager_add(devs, C.KrunAttachDevice(nic))
 
 	C.krun_vmm_builder_devices(&b, devs)
 	vmm := C.krun_vmm_builder_build(&b, &kerr)

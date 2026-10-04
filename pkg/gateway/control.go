@@ -19,11 +19,31 @@ import (
 	"sync"
 )
 
-// NetPolicyWire is the JSON form of an EgressPolicy.
+// NetPolicyWire is the JSON form of an EgressPolicy, plus the "none" posture:
+// a sandbox with no network device at all (never reaches netd).
 type NetPolicyWire struct {
-	Default    string   `json:"default,omitempty"`     // "public" (default) | "deny"
+	Default    string   `json:"default,omitempty"`     // "none" | "deny" | "public"; "" = public
 	AllowHosts []string `json:"allow_hosts,omitempty"` // exact ("api.x.com") or wildcard ("*.x.com")
 	AllowCIDRs []string `json:"allow_cidrs,omitempty"`
+}
+
+// PostureNone is the wire posture for a sandbox with no network device.
+const PostureNone = "none"
+
+// NoNetwork reports whether w asks for no network device. nil-safe.
+func (w *NetPolicyWire) NoNetwork() bool { return w != nil && w.Default == PostureNone }
+
+// ValidateWire checks w without building a netd policy: a known posture, and
+// parseable allow rules that only make sense with a network.
+func ValidateWire(w NetPolicyWire) error {
+	if w.Default == PostureNone {
+		if len(w.AllowHosts) > 0 || len(w.AllowCIDRs) > 0 {
+			return fmt.Errorf("gateway: allow rules need a network (egress deny or public, not none)")
+		}
+		return nil
+	}
+	_, err := PolicyFromWire(w)
+	return err
 }
 
 // PolicyFromWire builds an EgressPolicy from its wire form. The private-range /
@@ -37,7 +57,7 @@ func PolicyFromWire(w NetPolicyWire) (*EgressPolicy, error) {
 	case "deny":
 		p.Default = PostureDeny
 	default:
-		return nil, fmt.Errorf("gateway: unknown egress posture %q (want public|deny)", w.Default)
+		return nil, fmt.Errorf("gateway: unknown egress posture %q (want none|deny|public)", w.Default)
 	}
 	for _, h := range w.AllowHosts {
 		hp, err := ParseHostPattern(h)

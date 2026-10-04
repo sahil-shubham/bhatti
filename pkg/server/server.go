@@ -107,6 +107,7 @@ type Server struct {
 	// Public proxy (set via options)
 	proxyZone       string              // e.g. "bhatti.sh"
 	apiHost         string              // e.g. "api.bhatti.sh" (must be under proxyZone)
+	defaultEgress   string              // posture for creates that don't name one; "" = none
 	publicProxyAddr string              // e.g. "host:8443" (for URL generation)
 	publicProxy     *PublicProxyHandler // nil until configured
 	resumeSem       chan struct{}       // bounds concurrent cold resumes
@@ -241,6 +242,12 @@ func WithAPIHost(host string) ServerOption {
 // WithPublicProxyAddr sets the address used for generating public URLs.
 func WithPublicProxyAddr(addr string) ServerOption {
 	return func(s *Server) { s.publicProxyAddr = addr }
+}
+
+// WithDefaultEgress sets the egress posture ("none", "deny" or "public") for
+// sandboxes created without one. Unset means "none".
+func WithDefaultEgress(posture string) ServerOption {
+	return func(s *Server) { s.defaultEgress = posture }
 }
 
 // WithBackupBackend sets the S3-compatible backup backend.

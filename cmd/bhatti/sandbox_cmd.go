@@ -82,8 +82,11 @@ with its own kernel, filesystem, and network.`,
   # Autonomous agent (stays hot, never paused)
   bhatti create --name agent --init "hermes gateway" --keep-hot
 
-  # Locked-down egress: deny by default, allow only specific hosts/CIDRs
-  bhatti create --name locked --egress deny --allow-host api.openai.com --allow-cidr 1.1.1.1/32`,
+  # Network: none by default (no network device). Open internet:
+  bhatti create --name web --net
+
+  # Only specific hosts/CIDRs (allow rules imply --egress deny)
+  bhatti create --name locked --allow-host api.openai.com --allow-cidr 1.1.1.1/32`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		setupTiming(cmd)
 		defer printTiming()
@@ -215,9 +218,16 @@ with its own kernel, filesystem, and network.`,
 			req["mounts"] = mounts
 		}
 
-		// Per-sandbox egress policy (network rules). Omitted => public default
-		// (public internet reachable; host/private/metadata denied).
+		// Per-sandbox network posture. Omitted => the server default ("none"
+		// unless configured); allow rules alone imply "deny". The host,
+		// private ranges and metadata are denied in every posture.
 		egress, _ := cmd.Flags().GetString("egress")
+		if wantNet, _ := cmd.Flags().GetBool("net"); wantNet {
+			if egress != "" && egress != "public" {
+				return fmt.Errorf("--net conflicts with --egress %s", egress)
+			}
+			egress = "public"
+		}
 		allowHosts, _ := cmd.Flags().GetStringSlice("allow-host")
 		allowCIDRs, _ := cmd.Flags().GetStringSlice("allow-cidr")
 		if egress != "" || len(allowHosts) > 0 || len(allowCIDRs) > 0 {
@@ -306,7 +316,8 @@ func init() {
 	createCmd.Flags().StringSlice("secret", nil, "Secret name from store (repeatable)")
 	createCmd.Flags().StringSlice("file", nil, "Inject file (local_path:guest_path, repeatable)")
 	createCmd.Flags().StringSlice("label", nil, "Set label key=value (repeatable)")
-	createCmd.Flags().String("egress", "", "Egress posture: public (default) or deny")
+	createCmd.Flags().Bool("net", false, "Give the sandbox open internet access (same as --egress public)")
+	createCmd.Flags().String("egress", "", "Network posture: none (no network device), deny (allow rules only) or public; default from the server (none)")
 	createCmd.Flags().StringSlice("allow-host", nil, "Allow egress to host, exact or *.wildcard (repeatable)")
 	createCmd.Flags().StringSlice("allow-cidr", nil, "Allow egress to CIDR (repeatable)")
 
