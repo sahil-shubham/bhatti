@@ -2,11 +2,17 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
+
+// ErrNotSupported is wrapped by engine errors for operations the engine
+// can't perform in its current build or configuration. The API reports it as
+// 501 with the engine's message, not as an internal error.
+var ErrNotSupported = errors.New("not supported")
 
 // VolumeMount describes a named volume to mount into a sandbox.
 type VolumeMount struct {

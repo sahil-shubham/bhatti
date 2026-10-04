@@ -112,7 +112,7 @@ func (s *Server) collectSnapshot(
 	// Gauge: sandbox counts by thermal state
 	sandboxes, _ := s.store.ListAllSandboxes()
 	snap.SandboxesTotal = len(sandboxes)
-	if te, ok := s.engine.(ThermalEngine); ok {
+	if te, ok := thermalOf(s.engine); ok {
 		for _, sb := range sandboxes {
 			if sb.Status != "running" {
 				snap.SandboxesCold++

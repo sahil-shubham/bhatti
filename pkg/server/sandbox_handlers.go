@@ -84,7 +84,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Thermal state (read-only, no VM interaction)
-		te, hasThermal := s.engine.(ThermalEngine)
+		te, hasThermal := thermalOf(s.engine)
 
 		// Published URLs (single query for all user's rules)
 		rules, _ := s.store.ListUserPublishRules(user.ID)

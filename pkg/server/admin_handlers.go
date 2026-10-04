@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -890,7 +891,13 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, 
 
 // errRespInternal logs the real error and returns a generic message with request ID.
 // Used for 500 errors to avoid leaking internal paths, IPs, or system details.
+// An engine.ErrNotSupported is the caller asking for something this engine
+// can't do, so it's a 501 carrying the engine's (deliberately user-facing) message.
 func errRespInternal(w http.ResponseWriter, r *http.Request, logMsg string, err error) {
+	if errors.Is(err, engine.ErrNotSupported) {
+		errResp(w, 501, err.Error())
+		return
+	}
 	reqID := RequestIDFromContext(r.Context())
 	slog.Error(logMsg, "request_id", reqID, "error", err)
 	writeJSON(w, 500, map[string]string{

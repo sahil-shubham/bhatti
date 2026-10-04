@@ -331,7 +331,7 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 
 	// Wake sandbox with bounded concurrency + singleflight coalescing.
 	wasCold := false
-	if te, ok := h.engine.(ThermalEngine); ok {
+	if te, ok := thermalOf(h.engine); ok {
 		if err := h.ensureHotBounded(ctx, te, route.engineID); err != nil {
 			if err == errServerBusy {
 				h.busy.Add(1)

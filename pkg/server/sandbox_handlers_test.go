@@ -2,11 +2,13 @@ package server
 
 import (
 	"encoding/base64"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
@@ -208,6 +210,23 @@ func TestPatchSandbox_RenameAndKeepHot(t *testing.T) {
 	stored, _ := srv.store.GetSandboxByID(sb.ID)
 	if stored.Name != newName || !stored.KeepHot {
 		t.Fatalf("both fields not persisted: name=%q keep_hot=%v", stored.Name, stored.KeepHot)
+	}
+}
+
+// An engine that can't perform an operation in its current build (krucible
+// without checkpoint support) must answer 501 with the engine's reason, not a
+// generic 500 that sends the operator to the logs.
+func TestStopNotSupportedIs501(t *testing.T) {
+	srv, ts := setup(t)
+	name := uniqueName(t, "nostop")
+	createSandbox(t, ts, name)
+	srv.engine.(*mockEngine).StopErr = fmt.Errorf("%w: no checkpoint support in this build", engine.ErrNotSupported)
+
+	resp := doReq(t, ts, "POST", "/sandboxes/"+name+"/stop", nil)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 501 || !strings.Contains(string(body), "no checkpoint support") {
+		t.Fatalf("stop: got %d %s, want 501 with the engine's reason", resp.StatusCode, body)
 	}
 }
 

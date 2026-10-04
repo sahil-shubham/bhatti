@@ -39,6 +39,30 @@ type ThermalEngine interface {
 	MemSizeMib(id string) int64
 }
 
+// ThermalSupport is implemented by engines whose thermal support depends on
+// runtime configuration (krucible: whether its VMM build can checkpoint).
+// An engine that implements ThermalEngine but reports false here is treated
+// as having no thermal management at all.
+type ThermalSupport interface {
+	ThermalSupported() bool
+}
+
+// thermalOf returns e's thermal interface if it has one and it's usable.
+func thermalOf(e engine.Engine) (ThermalEngine, bool) {
+	te, ok := e.(ThermalEngine)
+	if !ok || !thermalUsable(e) {
+		return nil, false
+	}
+	return te, true
+}
+
+// thermalUsable is false only for an engine that explicitly reports no
+// thermal support.
+func thermalUsable(e engine.Engine) bool {
+	ts, ok := e.(ThermalSupport)
+	return !ok || ts.ThermalSupported()
+}
+
 // ThermalConfig controls automatic thermal transitions.
 type ThermalConfig struct {
 	WarmTimeout time.Duration // idle → warm (default 30s)
@@ -451,6 +475,10 @@ func cronMatch(expr string, t time.Time) bool {
 // as-is and marked in the store so recovery can detect it.
 func (s *Server) SnapshotAll() {
 	slog.Info("snapshotting all running VMs before shutdown")
+	if !thermalUsable(s.engine) {
+		slog.Info("snapshot-all skipped: engine has no checkpoint support")
+		return
+	}
 	sandboxes, err := s.store.ListAllSandboxes()
 	if err != nil {
 		slog.Warn("snapshot-all: list sandboxes", "error", err)
@@ -525,7 +553,7 @@ func (s *Server) SnapshotAll() {
 // StartThermalManager starts the background goroutine that transitions idle
 // sandboxes through thermal states: hot → warm → cold.
 func (s *Server) StartThermalManager(cfg ThermalConfig) {
-	te, ok := s.engine.(ThermalEngine)
+	te, ok := thermalOf(s.engine)
 	if !ok {
 		return // engine doesn't support thermal management
 	}
@@ -733,7 +761,7 @@ func (s *Server) EnsureHot(ctx context.Context, engineID string) error {
 // Returns nil if the engine doesn't support thermal management.
 func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 	s.touchActivity(engineID)
-	te, ok := s.engine.(ThermalEngine)
+	te, ok := thermalOf(s.engine)
 	if !ok {
 		return nil
 	}
