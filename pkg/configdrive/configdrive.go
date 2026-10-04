@@ -24,6 +24,10 @@ type SandboxConfig struct {
 	// Net, if set, tells lohar to configure eth0 (virtio-net gateway path) from
 	// the config drive via netlink — no `ip` binary / kernel IP autoconfig needed.
 	Net *NetConfig `json:"net,omitempty"`
+	// CACert, if set, is the PEM certificate of the sandbox's own CA. lohar
+	// adds it to the guest's trust store so netd can terminate TLS for the
+	// hosts a secret grant names (credential substitution).
+	CACert string `json:"ca_cert,omitempty"`
 }
 
 // NetConfig is the guest's eth0 addressing on the per-owner gateway network.

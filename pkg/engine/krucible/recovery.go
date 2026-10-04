@@ -35,9 +35,10 @@ type vmRecord struct {
 	LogPath    string `json:"log_path"`
 	BaseSpec   VMSpec `json:"base_spec"`
 	HelperPID  int    `json:"helper_pid"`
-	NetdKey    string `json:"netd_key,omitempty"`   // owner key of the shared bhatti-netd (net backend)
-	SubnetIdx  int    `json:"subnet_idx,omitempty"` // owner's vnet subnet index
-	NetIP      string `json:"net_ip,omitempty"`     // guest IP on the netd gateway subnet
+	NetdKey    string `json:"netd_key,omitempty"`    // owner key of the shared bhatti-netd (net backend)
+	SubnetIdx  int    `json:"subnet_idx,omitempty"`  // owner's vnet subnet index
+	NetIP      string `json:"net_ip,omitempty"`      // guest IP on the netd gateway subnet
+	SandboxRef string `json:"sandbox_ref,omitempty"` // the server's sandbox ID, named to the credential broker
 }
 
 // netdRecord is the durable state of one owner's shared bhatti-netd, so recovery
@@ -83,7 +84,7 @@ func (vm *VM) toRecordLocked() vmRecord {
 		ControlUDS: vm.ControlUDS, ForwardUDS: vm.ForwardUDS, CtlSockUDS: vm.CtlSockUDS,
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
 		LogPath: vm.logPath, BaseSpec: vm.baseSpec,
-		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx, NetIP: vm.netIP,
+		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx, NetIP: vm.netIP, SandboxRef: vm.sandboxRef,
 	}
 }
 
@@ -127,7 +128,7 @@ func vmFromRecord(rec vmRecord) *VM {
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
 		baseSpec: rec.BaseSpec, logPath: rec.LogPath,
-		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP,
+		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP, sandboxRef: rec.SandboxRef,
 	}
 }
 

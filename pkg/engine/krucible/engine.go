@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +94,7 @@ type netdInstance struct {
 	pid       int        // the running netd's pid (source of truth for alive/kill)
 	nextGuest int
 	refs      int
+	brokerLn  net.Listener // credential broker socket served to this netd (broker.go); guarded by mu
 }
 
 // netdDir is the deterministic per-owner directory (so recovery finds the same
@@ -178,6 +180,10 @@ func (e *Engine) releaseNetd(ownerKey string) {
 		}
 	}
 	inst.pid = 0
+	if inst.brokerLn != nil {
+		inst.brokerLn.Close()
+		inst.brokerLn = nil
+	}
 	inst.mu.Unlock()
 	os.RemoveAll(inst.dir)
 }
@@ -187,6 +193,7 @@ func (e *Engine) releaseNetd(ownerKey string) {
 func (e *Engine) ensureNetd(ownerKey string) error {
 	e.netdMu.Lock()
 	inst := e.netds[ownerKey]
+	broker := e.broker
 	e.netdMu.Unlock()
 	if inst == nil {
 		return fmt.Errorf("netd instance %q not found", ownerKey)
@@ -202,6 +209,7 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		_, sockErr := os.Stat(inst.sock)
 		_, ctlErr := os.Stat(inst.ctlSock)
 		if sockErr == nil && ctlErr == nil {
+			serveBrokerLocked(inst, broker)
 			return nil
 		}
 		if sockErr == nil {
@@ -220,8 +228,12 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		return fmt.Errorf("netd log: %w", err)
 	}
 	defer lf.Close()
+	// netd's identity once confined is ours to name: the broker socket is
+	// shared with exactly that uid/gid (broker.go).
 	cmd := exec.Command(e.cfg.NetdBinary,
 		"--net-uds", inst.sock, "--ctl-uds", inst.ctlSock,
+		"--broker-uds", brokerSockPath(inst.dir),
+		"--uid", fmt.Sprint(netdUID), "--gid", fmt.Sprint(netdGID),
 		"--gw-ip", netGatewayIPFor(inst.subnetIdx),
 		"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC)
 	cmd.Stdout = lf
@@ -243,6 +255,7 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	inst.cmd = cmd
 	inst.pid = cmd.Process.Pid
 	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
+	serveBrokerLocked(inst, broker)
 	return nil
 }
 
@@ -265,7 +278,7 @@ func (e *Engine) pushSandboxPolicy(vm *VM) error {
 	if inst == nil || inst.ctlSock == "" {
 		return fmt.Errorf("netd control socket unavailable for %s", vm.ID)
 	}
-	msg := gateway.ControlMsg{Op: gateway.ControlSet, GuestIP: vm.netIP, Sandbox: vm.ID, Policy: vm.netPolicy}
+	msg := gateway.ControlMsg{Op: gateway.ControlSet, GuestIP: vm.netIP, Sandbox: vm.brokerRef(), Policy: vm.netPolicy}
 	c := gateway.NewControlClient(inst.ctlSock)
 	defer c.Close()
 	var lastErr error
@@ -332,6 +345,17 @@ type VM struct {
 	subnetIdx  int                    // owner's vnet subnet index (net backend); persisted for recovery
 	netIP      string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
 	netPolicy  *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public
+	sandboxRef string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
+}
+
+// brokerRef is how netd names this sandbox to the credential broker: the
+// server's ID when the server created it, else ours (the broker maps a fork's
+// or restore's engine ID back to the server's record).
+func (vm *VM) brokerRef() string {
+	if vm.sandboxRef != "" {
+		return vm.sandboxRef
+	}
+	return vm.ID
 }
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
@@ -340,8 +364,9 @@ type Engine struct {
 	vms       map[string]*VM
 	cfg       Config
 	baseImgMu sync.Mutex               // guards the one-time base-image build
-	netdMu    sync.Mutex               // guards netds
+	netdMu    sync.Mutex               // guards netds and broker
 	netds     map[string]*netdInstance // owner key → shared bhatti-netd gateway
+	broker    engine.CredentialBroker  // served to every netd (broker.go); nil = no credential substitution
 	caps      VMMCapabilities          // what the bhatti-vmm build supports (probed in New)
 }
 
@@ -431,6 +456,7 @@ func New(cfg Config) (*Engine, error) {
 	if err := os.MkdirAll(cfg.SocketDir, 0700); err != nil {
 		return nil, fmt.Errorf("krucible: create socket dir: %w", err)
 	}
+	shareSocketDir(cfg.SocketDir)
 	caps, err := probeCapabilities(cfg)
 	if err != nil {
 		return nil, err
@@ -688,12 +714,13 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		SandboxDir: sandboxDir, SockDir: sockDir,
 		ControlUDS: controlUDS, ForwardUDS: forwardUDS, CtlSockUDS: ctlSockUDS,
 		MemMiB: memMiB, Thermal: "hot", Status: "stopped", Token: token,
-		baseSpec:  baseSpec,
-		logPath:   filepath.Join(sandboxDir, "vmm.log"),
-		netdKey:   netdKey,
-		subnetIdx: spec.SubnetIndex,
-		netIP:     netIP,
-		netPolicy: spec.NetPolicy,
+		baseSpec:   baseSpec,
+		logPath:    filepath.Join(sandboxDir, "vmm.log"),
+		netdKey:    netdKey,
+		subnetIdx:  spec.SubnetIndex,
+		netIP:      netIP,
+		netPolicy:  spec.NetPolicy,
+		sandboxRef: spec.SandboxID,
 	}
 
 	if opts.snapshotDir != "" && !e.caps.Checkpoint {
@@ -1016,8 +1043,9 @@ func buildSandboxConfig(id, name, token string, spec engine.SandboxSpec, mounts 
 		Net:       net,
 		// Init: the once-after-boot command (create --init); lohar runs it as a
 		// TTY session named "init", as the sandbox user.
-		Init: spec.Init,
-		User: "lohar",
+		Init:   spec.Init,
+		User:   "lohar",
+		CACert: spec.CACert,
 	}
 }
 

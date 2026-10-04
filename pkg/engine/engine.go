@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
@@ -89,6 +90,13 @@ type SandboxSpec struct {
 	SubnetIndex     int              `json:"-"` // owner's subnet index for network isolation
 	BaseImage       string           `json:"-"` // resolved image file path
 	ResolvedVolumes []ResolvedVolume `json:"-"` // resolved volume file paths
+	// SandboxID is the server's ID for the sandbox: the identity netd names
+	// when it asks the credential broker about this guest's traffic.
+	SandboxID string `json:"-"`
+	// CACert is the PEM certificate of the sandbox's own CA, installed in the
+	// guest's trust store so netd can terminate TLS for hosts a secret grant
+	// names. Empty = none (no credential substitution).
+	CACert string `json:"-"`
 }
 
 // FsMount is a live virtio-fs host-directory bind (create --mount): the host
@@ -214,4 +222,20 @@ type Engine interface {
 	// established is engine-specific (Docker: exec socat, Firecracker: vsock
 	// to guest agent). The returned connection must be closed by the caller.
 	Tunnel(ctx context.Context, id string, port int) (io.ReadWriteCloser, error)
+}
+
+// CredentialBroker answers credential requests from one owner's network
+// gateway (netd): placeholder → value, and leaf certificates for granted
+// hosts. Implemented by pkg/broker.
+type CredentialBroker interface {
+	// Serve answers requests arriving on ln, for sandboxes owned by userID
+	// only, until ln is closed.
+	Serve(ln net.Listener, userID string)
+}
+
+// CredentialBrokerHost is optionally implemented by engines whose sandbox
+// network runs through netd. The server attaches its broker once at startup;
+// the engine serves it on a socket each owner's netd can reach.
+type CredentialBrokerHost interface {
+	SetCredentialBroker(b CredentialBroker)
 }
