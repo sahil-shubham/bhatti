@@ -24,7 +24,12 @@ func spawnStandin(t *testing.T) (*exec.Cmd, int) {
 		t.Skipf("cannot spawn stand-in process (%v); skipping", err)
 	}
 	pid := cmd.Process.Pid
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		if cmd.ProcessState == nil {
+			_, _ = cmd.Process.Wait() // only fixtures without their own Cmd.Wait
+		}
+	})
 	return cmd, pid
 }
 
@@ -62,9 +67,10 @@ func TestShutdownKillsAdoptedHelper(t *testing.T) {
 // working after the adopted-path fix.
 func TestShutdownKillsOwnedHelper(t *testing.T) {
 	cmd, pid := spawnStandin(t)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }() // launch owns Wait for its whole lifetime
 	e := &Engine{vms: map[string]*VM{}}
-	e.vms["owned"] = &VM{ID: "owned", Status: "running", cmd: cmd}
-
+	e.vms["owned"] = &VM{ID: "owned", Status: "running", cmd: cmd, waitDone: done}
 	e.Shutdown() // vm.kill() reaps the owned process synchronously
 
 	if pidAlive(pid) {
