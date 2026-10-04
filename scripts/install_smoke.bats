@@ -18,6 +18,9 @@
 # real HTTP 4xx/5xx codes, redirects), that's a separate test.
 
 setup_file() {
+    # The smoke flow intentionally models a fresh CLI host. A real server
+    # config is authoritative to install.sh even when PATH hides its binary.
+    [ ! -f /etc/bhatti/config.yaml ] || skip "host has a server config; cannot exercise fresh CLI install"
     export FAKE_ROOT
     FAKE_ROOT=$(mktemp -d)
     export RELEASE="$FAKE_ROOT/release"

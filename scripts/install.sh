@@ -154,6 +154,7 @@ _cleanup() {
     rm -f /tmp/bhatti.tmp
     rm -f "${BHATTI_STAGE_FILE:-}" 2>/dev/null || true
     rm -f "$DATA_DIR"/images/*.zst.tmp 2>/dev/null || true
+    rm -f "$DATA_DIR"/images/bases/.*.tmp* "$DATA_DIR"/images/.rootfs-*.link.tmp.* 2>/dev/null || true
     if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
     fi
@@ -788,11 +789,25 @@ install_bhatti_binary() {
     BHATTI_STAGE_FILE=""
 }
 
+# A refused flip is safe to abort, but an update may have stopped a running
+# daemon first. Bring it back before reporting the failed migration.
+_rootfs_refuse_flip() {
+    local reason="$1"
+    if [ "${ROOTFS_RESTART_ON_REFUSAL:-false}" = true ]; then
+        if start_service; then
+            die "$reason" "The previously running bhatti service was restarted; the tier was not flipped."
+        fi
+        die "$reason" "The tier was not flipped. The service restart failed; check its logs and restart it manually."
+    fi
+    die "$reason" "The tier was not flipped."
+}
+
 install_rootfs() {
     local tier="$1"
     local asset="rootfs-${tier}-${ARCH}.ext4.zst"
-    local rootfs_path="$DATA_DIR/images/rootfs-${tier}-${ARCH}.ext4"
-    local checksum_file="$DATA_DIR/images/.rootfs-${tier}-${ARCH}.sha256"
+    local images_dir="$DATA_DIR/images"
+    local rootfs_path="$images_dir/rootfs-${tier}-${ARCH}.ext4"
+    local checksum_file="$images_dir/.rootfs-${tier}-${ARCH}.sha256"
 
     # Skip if local rootfs matches the release checksum.
     # We store the compressed (.zst) checksum after install because the
@@ -842,20 +857,58 @@ install_rootfs() {
                    "  sudo yum install zstd       # CentOS"
     fi
 
-    # Download compressed file (with progress bar), verify, then decompress
-    local zst_tmp="${rootfs_path}.zst.tmp"
+    # Never decompress through a tier symlink: it could target a backing file
+    # still in use by an older sandbox. The dotfile stays invisible to GC.
+    local bases_dir="$images_dir/bases" zst_tmp="${rootfs_path}.zst.tmp"
+    local base_tmp base_sha base_name base_path link_tmp bhatti_bin
+    mkdir -p "$bases_dir"
     download_large "${RELEASE_URL}/${asset}" "$zst_tmp"
     verify_checksum "$zst_tmp" "$asset"
 
-    spin "Decompressing ${tier} rootfs" -- zstd -d -q -f -o "$rootfs_path" "$zst_tmp"
+    base_tmp=$(mktemp "$bases_dir/.rootfs-${tier}-${ARCH}.ext4.tmp.XXXXXX") \
+        || die "could not create rootfs staging file in ${bases_dir}"
+    spin "Decompressing ${tier} rootfs" -- zstd -d -q -f -o "$base_tmp" "$zst_tmp"
     rm -f "$zst_tmp"
 
-    [ -s "$rootfs_path" ] \
+    [ -s "$base_tmp" ] \
         || die "rootfs decompression produced an empty file" \
                "This may indicate insufficient disk space." \
                "Available space: $(df -h "$DATA_DIR" 2>/dev/null | tail -1 | awk '{print $4}')"
+    # mktemp creates 0600; the sandbox VMM must be able to open the base.
+    chmod 0644 "$base_tmp"
+    base_sha=$(local_sha256 "$base_tmp")
+    [[ "$base_sha" =~ ^[0-9a-f]{64}$ ]] || die "could not hash decompressed rootfs"
+    base_name="rootfs-${tier}-${ARCH}-${base_sha:0:16}.ext4"
+    base_path="$bases_dir/$base_name"
+    if [ -f "$base_path" ]; then
+        rm -f "$base_tmp"
+    elif [ -e "$base_path" ] || [ -L "$base_path" ]; then
+        die "refusing non-regular base image at ${base_path}"
+    else
+        # -n also protects an existing base if another installer wins the race.
+        mv -n "$base_tmp" "$base_path"
+        rm -f "$base_tmp"
+    fi
 
-    # Store the compressed checksum for future skip checks
+    # The installed CLI must rewrite any overlays that still name the tier
+    # path before unlinking that path. A failed migration must never flip it.
+    bhatti_bin="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
+    "$bhatti_bin" admin migrate-images --data-dir "$DATA_DIR" \
+        || _rootfs_refuse_flip "cannot migrate existing rootfs images; inspect the errors above"
+    if [ -e "$rootfs_path" ] && [ ! -L "$rootfs_path" ]; then
+        _rootfs_refuse_flip "refusing to replace non-symlink tier image at ${rootfs_path}"
+    fi
+
+    link_tmp="$images_dir/.rootfs-${tier}-${ARCH}.link.tmp.$$"
+    ln -s "bases/$base_name" "$link_tmp" || die "could not stage rootfs tier symlink"
+    # GNU -T prevents following a symlink-to-directory; BSD -h does the same.
+    if [ "$(uname -s)" = Darwin ]; then
+        mv -fh "$link_tmp" "$rootfs_path" || die "could not flip rootfs tier symlink"
+    else
+        mv -fT "$link_tmp" "$rootfs_path" || die "could not flip rootfs tier symlink"
+    fi
+
+    # Keep the compressed release checksum for the existing skip predicate.
     if [ -n "$expected" ]; then
         echo "$expected" > "$checksum_file"
     fi
@@ -1342,10 +1395,12 @@ do_server_update() {
     heading "Installing bhatti ${VERSION} + runtime"
     install_bundle 1
     success "bhatti ${VERSION} + krucible runtime"
+    ROOTFS_RESTART_ON_REFUSAL="$was_running"
 
     for t in $tiers_to_install; do
         install_rootfs "$t"
     done
+    ROOTFS_RESTART_ON_REFUSAL=false
     if [ "$OS" = "darwin" ]; then
         write_launchd_daemon
     else

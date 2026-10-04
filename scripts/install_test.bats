@@ -19,7 +19,13 @@ setup() {
     # own bats_error_trap and silently turn failed assertions into
     # "missing tests" — see the matching block in scripts/install.sh.
     export BHATTI_TEST=1
-    source scripts/install.sh
+    source "${BHATTI_TEST_INSTALL_SH:-scripts/install.sh}"
+}
+
+teardown() {
+    if [ "${INSTALL_ROOTFS_FIXTURE:-}" = 1 ]; then
+        rm -rf "$DATA_DIR"
+    fi
 }
 
 # Bats footgun fix: `[[ ]]` is a bash keyword, NOT a simple command, so
@@ -389,6 +395,146 @@ _set_checksums() {
         local tier="$1" sha="$2"; shift 2
         CHECKSUMS="${CHECKSUMS}${sha}  rootfs-${tier}-${ARCH}.ext4.zst"$'\n'
     done
+}
+
+# Exercise the actual installer against a tiny release image and a CLI with
+# only the migration contract. No live data or privileged tools are involved.
+_setup_install_rootfs() {
+    _setup_rootfs_fixture
+    INSTALL_ROOTFS_FIXTURE=1
+    mkdir -p "$DATA_DIR/release" "$DATA_DIR/bin"
+    RELEASE_URL="file://$DATA_DIR/release"
+    BHATTI_TEST_BIN_DEST="$DATA_DIR/bin/bhatti"
+    cat > "$BHATTI_TEST_BIN_DEST" <<'SH'
+#!/bin/bash
+[[ "$1" == admin && "$2" == migrate-images && "$3" == --data-dir ]] || exit 90
+[[ "$4" == "$BHATTI_TEST_DATA_DIR" ]] || exit 91
+case "${BHATTI_TEST_MIGRATE:-ok}" in
+    fail) exit 92 ;;
+    leave) exit 0 ;;
+esac
+for image in "$4"/images/rootfs-*.ext4; do
+    [[ -f "$image" && ! -L "$image" ]] || continue
+    name=$(basename "$image" .ext4)
+    if command -v sha256sum >/dev/null; then
+        sha=$(sha256sum "$image" | cut -c1-16)
+    else
+        sha=$(shasum -a 256 "$image" | cut -c1-16)
+    fi
+    mkdir -p "$4/images/bases"
+    mv "$image" "$4/images/bases/${name}-${sha}.ext4"
+    ln -s "bases/${name}-${sha}.ext4" "$image"
+done
+SH
+    chmod +x "$BHATTI_TEST_BIN_DEST"
+    export BHATTI_TEST_BIN_DEST BHATTI_TEST_DATA_DIR="$DATA_DIR"
+    BHATTI_TEST_MIGRATE=ok
+    export BHATTI_TEST_MIGRATE
+    check_disk_space() { :; }
+}
+
+_release_rootfs() {
+    local tier="$1" content="$2" asset="rootfs-${1}-${ARCH}.ext4.zst"
+    printf '%s' "$content" > "$DATA_DIR/release/${asset%.zst}"
+    zstd -q -f "$DATA_DIR/release/${asset%.zst}" -o "$DATA_DIR/release/$asset"
+    CHECKSUMS="$(local_sha256 "$DATA_DIR/release/$asset")  $asset"
+}
+
+@test "install_rootfs preserves regular-tier bytes while switching to immutable relative base" {
+    _setup_install_rootfs
+    _release_rootfs minimal "new rootfs content"
+    local tier="$DATA_DIR/images/rootfs-minimal-arm64.ext4"
+    printf 'existing VM backing bytes' > "$tier"
+    ln "$tier" "$DATA_DIR/old-inode"
+    local old_sha new_sha
+    old_sha=$(local_sha256 "$tier")
+    new_sha=$(local_sha256 "$DATA_DIR/release/rootfs-minimal-arm64.ext4")
+
+    install_rootfs minimal
+    [ -L "$tier" ]
+    [ "$(readlink "$tier")" = "bases/rootfs-minimal-arm64-${new_sha:0:16}.ext4" ]
+    [ "$(local_sha256 "$DATA_DIR/old-inode")" = "$old_sha" ]
+    [ "$(local_sha256 "$tier")" = "$new_sha" ]
+    [ -f "$DATA_DIR/images/bases/rootfs-minimal-arm64-${old_sha:0:16}.ext4" ]
+    [ "$(stat -c %a "$DATA_DIR/images/bases/rootfs-minimal-arm64-${new_sha:0:16}.ext4" 2>/dev/null || stat -f %Lp "$DATA_DIR/images/bases/rootfs-minimal-arm64-${new_sha:0:16}.ext4")" = 644 ]
+}
+
+@test "install_rootfs reuses identical base without changing inode or mtime" {
+    _setup_install_rootfs
+    _release_rootfs minimal "same content, new compression"
+    local sha base inode mtime
+    sha=$(local_sha256 "$DATA_DIR/release/rootfs-minimal-arm64.ext4")
+    base="$DATA_DIR/images/bases/rootfs-minimal-arm64-${sha:0:16}.ext4"
+    mkdir -p "$DATA_DIR/images/bases"
+    cp "$DATA_DIR/release/rootfs-minimal-arm64.ext4" "$base"
+    touch -t 202001010101 "$base"
+    inode=$(stat -c %i "$base" 2>/dev/null || stat -f %i "$base")
+    mtime=$(stat -c %Y "$base" 2>/dev/null || stat -f %m "$base")
+
+    install_rootfs minimal
+    [ "$(stat -c %i "$base" 2>/dev/null || stat -f %i "$base")" = "$inode" ]
+    [ "$(stat -c %Y "$base" 2>/dev/null || stat -f %m "$base")" = "$mtime" ]
+    [ "$(readlink "$DATA_DIR/images/rootfs-minimal-arm64.ext4")" = "bases/$(basename "$base")" ]
+}
+
+@test "install_rootfs refuses to flip tier when migrate-images fails" {
+    _setup_install_rootfs
+    _release_rootfs minimal "new rootfs content"
+    local tier="$DATA_DIR/images/rootfs-minimal-arm64.ext4" old_sha
+    printf 'old rootfs content' > "$tier"
+    old_sha=$(local_sha256 "$tier")
+    BHATTI_TEST_MIGRATE=fail
+    ROOTFS_RESTART_ON_REFUSAL=true
+    start_service() { printf 'restarted\n' > "$DATA_DIR/restart-marker"; }
+
+    run install_rootfs minimal
+    [ "$status" -ne 0 ]
+    [ ! -L "$tier" ]
+    [ "$(local_sha256 "$tier")" = "$old_sha" ]
+    [ ! -f "$DATA_DIR/images/.rootfs-minimal-arm64.sha256" ]
+    [ "$(cat "$DATA_DIR/restart-marker")" = restarted ]
+    output_contains "previously running bhatti service was restarted"
+}
+
+@test "install_rootfs refuses to flip a regular tier left by migration" {
+    _setup_install_rootfs
+    _release_rootfs minimal "new rootfs content"
+    local tier="$DATA_DIR/images/rootfs-minimal-arm64.ext4" old_sha
+    printf 'old rootfs content' > "$tier"
+    old_sha=$(local_sha256 "$tier")
+    BHATTI_TEST_MIGRATE=leave
+
+    run install_rootfs minimal
+    [ "$status" -ne 0 ]
+    [ ! -L "$tier" ]
+    [ "$(local_sha256 "$tier")" = "$old_sha" ]
+    [ ! -f "$DATA_DIR/images/.rootfs-minimal-arm64.sha256" ]
+}
+
+@test "rootfs helpers follow healthy symlinks and treat dangling symlinks as missing" {
+    _setup_install_rootfs
+    _set_checksums minimal aaaa1111 browser bbbb2222 docker cccc3333
+    mkdir -p "$DATA_DIR/images/bases"
+    printf 'healthy' > "$DATA_DIR/images/bases/rootfs-minimal-arm64-healthy.ext4"
+    ln -s bases/rootfs-minimal-arm64-healthy.ext4 "$DATA_DIR/images/rootfs-minimal-arm64.ext4"
+    printf '%s\n' aaaa1111 > "$DATA_DIR/images/.rootfs-minimal-arm64.sha256"
+    ln -s bases/rootfs-browser-arm64-missing.ext4 "$DATA_DIR/images/rootfs-browser-arm64.ext4"
+    printf '%s\n' bbbb2222 > "$DATA_DIR/images/.rootfs-browser-arm64.sha256"
+    [ "$(detect_tier "$DATA_DIR/no-config.yaml")" = "minimal" ]
+    all_rootfs_up_to_date minimal
+    run all_rootfs_up_to_date minimal browser
+    [ "$status" -ne 0 ]
+    [ -z "$(stale_rootfs_tiers minimal)" ]
+    [ "$(missing_rootfs_tiers minimal)" = "browser docker computer" ]
+    printf '%s\n' stale > "$DATA_DIR/images/.rootfs-minimal-arm64.sha256"
+    [ "$(stale_rootfs_tiers browser)" = "minimal" ]
+    rm "$DATA_DIR/images/rootfs-minimal-arm64.ext4"
+    [ "$(detect_tier "$DATA_DIR/no-config.yaml")" = "minimal" ]
+
+    _release_rootfs minimal "new rootfs content"
+    install_rootfs minimal
+    [ -L "$DATA_DIR/images/rootfs-minimal-arm64.ext4" ]
+    all_rootfs_up_to_date minimal
 }
 
 @test "all_rootfs_up_to_date: returns 0 when every requested tier matches release sha" {
