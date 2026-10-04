@@ -112,6 +112,44 @@ func TestThermalAttachedInteractivePinsHot(t *testing.T) {
 	}
 }
 
+// TestThermalExecInFlightPinsHot: a buffered exec still running when the
+// thermal manager runs keeps its sandbox hot. Before, only the start of the
+// call counted as activity, so a command running past the 30 s idle window was
+// frozen mid-run by the pause.
+func TestThermalExecInFlightPinsHot(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	cfg := ThermalConfig{WarmTimeout: 50 * time.Millisecond, ColdTimeout: time.Hour}
+	sb := createSandbox(t, ts, uniqueName(t, "long-exec"))
+	eng.mu.Lock()
+	eng.thermal[sb.EngineID] = "hot"
+	eng.ActivityResult = &proto.ActivityInfo{LastActivityUnix: time.Now().Add(-time.Minute).Unix()}
+	eng.ExecStarted = make(chan struct{}, 1)
+	eng.ExecRelease = make(chan struct{})
+	eng.mu.Unlock()
+
+	done := make(chan int, 1)
+	go func() {
+		resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{"cmd": []string{"sleep", "60"}})
+		resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+	<-eng.ExecStarted
+	srv.lastActivity.Store(sb.EngineID, time.Now().Add(-time.Minute)) // idle long past WarmTimeout
+	srv.runThermalCycle(srv.engine.(ThermalEngine), cfg)
+
+	eng.mu.Lock()
+	state := eng.thermal[sb.EngineID]
+	eng.mu.Unlock()
+	close(eng.ExecRelease)
+	if code := <-done; code != 200 {
+		t.Fatalf("exec: status %d", code)
+	}
+	if state != "hot" {
+		t.Fatalf("sandbox paused under a running exec: thermal=%q", state)
+	}
+}
+
 func TestThermalAttachedInteractiveNotColdStopped(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)

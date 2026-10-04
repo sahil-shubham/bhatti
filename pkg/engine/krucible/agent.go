@@ -100,12 +100,12 @@ func (e *Engine) ExecStream(ctx context.Context, id string, cmd []string, onEven
 
 // PipedSession implements engine.PipedSessionEngine.
 func (e *Engine) PipedSession(ctx context.Context, id string, cmd []string,
-	env map[string]string, maxIdleSec int) (*proto.SessionInfo, engine.PipedConn, error) {
+	env map[string]string, cwd string, maxIdleSec int) (*proto.SessionInfo, engine.PipedConn, error) {
 	ag, err := e.agentFor(id)
 	if err != nil {
 		return nil, nil, err
 	}
-	return ag.PipedSession(ctx, cmd, env, maxIdleSec)
+	return ag.PipedSession(ctx, cmd, env, cwd, maxIdleSec)
 }
 
 func (e *Engine) PipedSessionAttach(ctx context.Context, id, sessionID string,

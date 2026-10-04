@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
@@ -79,6 +81,12 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		})
 		return
 	}
+
+	// An exec in flight pins the sandbox hot, like an attached shell: the thermal
+	// manager only sees activity at the start of a call, and pausing the VM under
+	// a running command freezes it until something else wakes the sandbox.
+	s.attachInteractive(sb.EngineID)
+	defer s.detachInteractive(sb.EngineID)
 
 	// Streaming NDJSON when requested via Accept header
 	if r.Header.Get("Accept") == "application/x-ndjson" {
@@ -414,6 +422,7 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 		var spec struct {
 			Cmd        []string          `json:"cmd"`
 			Env        map[string]string `json:"env,omitempty"`
+			Cwd        string            `json:"cwd,omitempty"` // default: /
 			MaxIdleSec int               `json:"max_idle_sec,omitempty"`
 		}
 		if json.Unmarshal(msg, &spec) != nil || len(spec.Cmd) == 0 {
@@ -426,7 +435,7 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 			maxIdleSec = 3600 // default 1 hour
 		}
 
-		info, pc, err := pe.PipedSession(context.Background(), sb.EngineID, spec.Cmd, spec.Env, maxIdleSec)
+		info, pc, err := pe.PipedSession(context.Background(), sb.EngineID, spec.Cmd, spec.Env, spec.Cwd, maxIdleSec)
 		if err != nil {
 			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"start: `+err.Error()+`"}`))
@@ -507,6 +516,7 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn) {
 	// Piped session → WebSocket (STDOUT/EXIT frames)
 	go func() {
 		defer closeDone()
+		var out utf8Framer
 		for {
 			frameType, payload, err := pc.ReadFrame()
 			if err != nil {
@@ -514,9 +524,17 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn) {
 			}
 			switch frameType {
 			case proto.STDOUT, proto.STDERR:
-				if err := wsWrite(websocket.TextMessage, payload); err != nil {
-					return
+				if text := out.next(payload); len(text) > 0 {
+					if err := wsWrite(websocket.TextMessage, text); err != nil {
+						return
+					}
 				}
+			case proto.EXIT, proto.ERROR:
+				if tail := out.flush(); len(tail) > 0 {
+					wsWrite(websocket.TextMessage, tail)
+				}
+			}
+			switch frameType {
 			case proto.EXIT:
 				code, _ := proto.ParseExitCode(payload)
 				exitMsg, _ := json.Marshal(map[string]any{
@@ -586,3 +604,46 @@ func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request, i
 }
 
 // --- Checkpoint (named snapshot) ---
+
+// utf8Framer turns a child's output chunks into valid UTF-8 for WebSocket text
+// frames. The guest cuts output at arbitrary byte offsets, so a multi-byte
+// character can straddle two chunks; strict clients reject a text frame
+// holding half of one. An incomplete trailing sequence is held back and
+// prepended to the next chunk. Bytes that aren't UTF-8 at all can't go in a
+// text frame and become U+FFFD.
+type utf8Framer struct {
+	carry []byte
+}
+
+func (f *utf8Framer) next(chunk []byte) []byte {
+	b := append(f.carry, chunk...)
+	f.carry = nil
+	// Hold back at most one incomplete sequence (up to 3 bytes) at the end.
+	cut := len(b)
+	for i := len(b) - 1; i >= 0 && i >= len(b)-3; i-- {
+		if c := b[i]; c&0xC0 != 0x80 { // a lead byte (or ASCII)
+			if !utf8.FullRune(b[i:]) {
+				cut = i
+			}
+			break
+		}
+	}
+	if cut < len(b) {
+		f.carry = append([]byte(nil), b[cut:]...)
+		b = b[:cut]
+	}
+	if utf8.Valid(b) {
+		return b
+	}
+	return []byte(strings.ToValidUTF8(string(b), "\uFFFD"))
+}
+
+// flush returns whatever is still held back (as U+FFFD: the stream ended
+// inside a character).
+func (f *utf8Framer) flush() []byte {
+	if len(f.carry) == 0 {
+		return nil
+	}
+	f.carry = nil
+	return []byte("\uFFFD")
+}

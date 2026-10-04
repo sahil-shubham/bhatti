@@ -668,12 +668,12 @@ func (p *PipedSessionConn) Close() error {
 	return p.conn.Close()
 }
 
-// PipedSession creates a non-TTY session for a long-running process.
-// Returns the session info and a bidirectional connection that relays
-// STDIN/STDOUT frames. The session survives host disconnect and is
-// reattachable via PipedSessionAttach.
+// PipedSession creates a non-TTY session for a long-running process, started
+// in cwd ("" = the guest's default, /). Returns the session info and a
+// bidirectional connection that relays STDIN/STDOUT frames. The session
+// survives host disconnect and is reattachable via PipedSessionAttach.
 func (c *AgentClient) PipedSession(ctx context.Context, argv []string,
-	env map[string]string, maxIdleSec int) (*proto.SessionInfo, *PipedSessionConn, error) {
+	env map[string]string, cwd string, maxIdleSec int) (*proto.SessionInfo, *PipedSessionConn, error) {
 
 	conn, err := c.DialControl(ctx)
 	if err != nil {
@@ -688,6 +688,9 @@ func (c *AgentClient) PipedSession(ctx context.Context, argv []string,
 	}
 	if maxIdleSec > 0 {
 		req.MaxIdleSec = &maxIdleSec
+	}
+	if cwd != "" {
+		req.Cwd = &cwd
 	}
 	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
 		conn.Close()

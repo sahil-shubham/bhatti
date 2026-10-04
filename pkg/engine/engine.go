@@ -181,8 +181,9 @@ type PipedConn interface {
 // PipedSessionEngine is optionally implemented by engines that support
 // non-TTY persistent sessions with scrollback and reattach.
 type PipedSessionEngine interface {
+	// PipedSession starts cmd in cwd ("" = the guest's default, /).
 	PipedSession(ctx context.Context, id string, cmd []string,
-		env map[string]string, maxIdleSec int) (*proto.SessionInfo, PipedConn, error)
+		env map[string]string, cwd string, maxIdleSec int) (*proto.SessionInfo, PipedConn, error)
 	PipedSessionAttach(ctx context.Context, id, sessionID string,
 		ifDetached bool) (*proto.SessionInfo, PipedConn, error)
 }

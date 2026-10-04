@@ -25,6 +25,10 @@ type mockEngine struct {
 	ExecResult     engine.ExecResult
 	CreateErr      error
 	ExecErr        error
+	// ExecStarted/ExecRelease, when set, make Exec signal that it started and
+	// block until released (a command still running).
+	ExecStarted chan struct{}
+	ExecRelease chan struct{}
 	StopErr        error
 	ActivityResult *proto.ActivityInfo
 	ActivityErr    error
@@ -133,6 +137,10 @@ func (m *mockEngine) Exec(_ context.Context, id string, cmd []string) (engine.Ex
 	}
 	if m.ExecErr != nil {
 		return engine.ExecResult{}, m.ExecErr
+	}
+	if m.ExecStarted != nil {
+		m.ExecStarted <- struct{}{}
+		<-m.ExecRelease
 	}
 	return m.ExecResult, nil
 }
