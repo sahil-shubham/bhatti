@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"testing"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
@@ -27,6 +28,9 @@ func TestInfoFrameReportsBakedVersionAndFeatures(t *testing.T) {
 	var info proto.AgentInfo
 	if err := json.Unmarshal(payload, &info); err != nil || info.Version != version || info.Legacy {
 		t.Fatalf("info = %+v, %v; want baked version %q", info, err, version)
+	}
+	if expected := os.Getenv("LOHAR_EXPECT_VERSION"); expected != "" && info.Version != expected {
+		t.Fatalf("info version = %q; want ldflag-stamped %q", info.Version, expected)
 	}
 	for _, f := range []proto.AgentFeature{proto.FeatureNetConfig, proto.FeatureSandboxCA, proto.FeatureRootGrowth, proto.FeaturePipedStderr} {
 		if !info.Has(f) {

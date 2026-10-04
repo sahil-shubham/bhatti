@@ -83,6 +83,12 @@ sudo bhatti update --tiers all  # Server: also pull additional tiers
 > different VMM, so the installer refuses an in-place jump and points you at a fresh
 > v2 install. To stay on v1, pin it: `sudo BHATTI_VERSION=v1.11.12 bhatti update`.
 
+Existing sandboxes keep the lohar binary on their own root disk after a server
+update. They still run, but features added to newer lohar builds do not appear
+in those sandboxes: fork, secret grants, or root-disk growth may return an
+HTTP 409 asking you to recreate the sandbox from the updated image. Piped
+sessions on older agents continue with stderr merged into stdout.
+
 ## Rootfs Tiers
 
 The server install prompts you to pick a rootfs tier. Each tier is a pre-built Ubuntu 24.04 image:

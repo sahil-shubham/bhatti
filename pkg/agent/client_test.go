@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
 
 // startTestAgent starts the lohar binary in test mode.
@@ -50,6 +52,23 @@ func startTestAgent(t *testing.T) (controlSock, forwardSock string, cleanup func
 	return controlSock, forwardSock, func() {
 		cmd.Process.Kill()
 		cmd.Wait()
+	}
+}
+
+func TestClientInfoFromLohar(t *testing.T) {
+	ctrl, fwd, cleanup := startTestAgent(t)
+	defer cleanup()
+	info, err := NewTestClient(ctrl, fwd).Info(context.Background())
+	if err != nil || info.Legacy {
+		t.Fatalf("lohar info = %+v, %v", info, err)
+	}
+	if expected := os.Getenv("LOHAR_EXPECT_VERSION"); expected != "" && info.Version != expected {
+		t.Fatalf("lohar reports %q, want ldflag-stamped %q", info.Version, expected)
+	}
+	for _, feature := range []proto.AgentFeature{proto.FeatureNetConfig, proto.FeatureSandboxCA, proto.FeatureRootGrowth, proto.FeaturePipedStderr} {
+		if !info.Has(feature) {
+			t.Fatalf("lohar does not advertise %q", feature)
+		}
 	}
 }
 

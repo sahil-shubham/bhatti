@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
@@ -75,5 +78,54 @@ func TestOldAgentCreateWithGrantOrGrowthLeavesNoSandbox(t *testing.T) {
 				t.Fatalf("refused create left grants: %+v, %v", grants, err)
 			}
 		})
+	}
+}
+
+// A pre-separation lohar puts stderr on STDOUT, even when the client asked
+// for stderr alone. The server must relay that merged stream rather than
+// filtering every frame away and appearing to hang.
+type oldPipedEngine struct{ *mockEngine }
+
+func (m *oldPipedEngine) PipedSession(_ context.Context, _ string, _ engine.PipedSpec) (*proto.SessionInfo, engine.PipedConn, error) {
+	exit := proto.ExitPayload(0)
+	return &proto.SessionInfo{SessionID: "old-piped"}, &fakePiped{frames: [][2][]byte{
+		{{proto.STDOUT}, []byte("stdout and stderr merged")},
+		{{proto.EXIT}, exit[:]},
+	}}, nil
+}
+
+func (m *oldPipedEngine) PipedSessionAttach(context.Context, string, string, bool) (*proto.SessionInfo, engine.PipedConn, error) {
+	return nil, nil, errors.New("not attached")
+}
+
+func TestOldAgentPipedStderrMergesWithoutHanging(t *testing.T) {
+	srv, ts := setup(t)
+	sb := createSandbox(t, ts, "old-piped")
+	old := srv.engine.(*mockEngine)
+	old.GuestFeatureErr = engine.GuestAgentOutdated("piped_stderr")
+	srv.engine = &oldPipedEngine{old}
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/sandboxes/" + sb.ID + "/exec/ws"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+testAPIKey)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := ws.WriteJSON(map[string]any{"cmd": []string{"echo", "hello"}, "streams": []string{"stderr"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, meta, err := ws.ReadMessage()
+	if err != nil || !strings.Contains(string(meta), `"type":"session"`) {
+		t.Fatalf("session metadata %q: %v", meta, err)
+	}
+	typ, payload, err := ws.ReadMessage()
+	if err != nil || typ != websocket.BinaryMessage || string(payload) != "\x01stdout and stderr merged" {
+		t.Fatalf("old piped output type=%d data=%q err=%v; want merged stdout frame", typ, payload, err)
+	}
+	_, exit, err := ws.ReadMessage()
+	if err != nil || !strings.Contains(string(exit), `"type":"exit"`) {
+		t.Fatalf("session exit %q: %v", exit, err)
 	}
 }

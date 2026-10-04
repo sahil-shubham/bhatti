@@ -120,6 +120,11 @@ func TestCreateRejectsOldLoharGrantAndRootGrowthWithoutVM(t *testing.T) {
 				t.Fatal(err)
 			}
 			e := &Engine{cfg: Config{DataDir: dataDir, SocketDir: sockDir, BaseImage: base, VMMBinary: vmm, BlockRoot: true}, vms: map[string]*VM{}}
+			t.Cleanup(func() {
+				for id := range e.vms {
+					_ = e.Destroy(context.Background(), id)
+				}
+			})
 			tc.spec.NetPolicy = &gateway.NetPolicyWire{Default: gateway.PostureNone}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
