@@ -8,6 +8,11 @@
 // down). The bhatti daemon spawns one of these per sandbox and talks to the
 // guest agent (lohar) over the bridged vsock UDSes.
 //
+// On Linux it runs confined from its first instruction (internal/confine): as
+// the sandbox's own unprivileged user, with no_new_privs, and opening only the
+// files the daemon's policy names. It emulates devices for an untrusted guest,
+// so a bug there should be worth no more than that sandbox's own files.
+//
 // Build: `make vmm` (cgo + libkrun via pkg-config; on macOS codesigned with the
 // com.apple.security.hypervisor entitlement, which HVF requires).
 package main
@@ -80,6 +85,10 @@ import (
 	"unsafe"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
+
+	// Confines this process (Linux) before Go or libkrun code runs; the daemon
+	// passes the policy in krucible.VMMPolicyEnv.
+	_ "github.com/sahil-shubham/bhatti/cmd/vmm/internal/confine"
 )
 
 // capabilities is what this VMM build supports, reported by `vmm capabilities`
