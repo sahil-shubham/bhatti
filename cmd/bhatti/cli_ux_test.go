@@ -40,8 +40,8 @@ func TestCLICreateVerboseOutput(t *testing.T) {
 	if !strings.Contains(stdout, "sandbox/"+name+" created") {
 		t.Errorf("expected 'sandbox/%s created' line, got:\n%s", name, stdout)
 	}
-	if !strings.Contains(stdout, "IP:") {
-		t.Errorf("expected IP line, got:\n%s", stdout)
+	if !strings.Contains(stdout, "Net:   none") {
+		t.Errorf("expected the no-network line (default posture), got:\n%s", stdout)
 	}
 	if !strings.Contains(stdout, "Shell:") {
 		t.Errorf("expected Shell hint line, got:\n%s", stdout)
@@ -100,24 +100,24 @@ func TestCLIStreamingExecNDJSON(t *testing.T) {
 	}
 }
 
-func TestCLIErrorExecOnStopped(t *testing.T) {
+// TestCLIExecWakesStopped: exec on a stopped sandbox boots it and runs the
+// command; the user doesn't have to `bhatti start` first. (A stopped sandbox
+// was powered off, so it comes back from its disk.)
+func TestCLIExecWakesStopped(t *testing.T) {
 	c := setupCLITest(t)
 
-	name := fmt.Sprintf("cli-errstop-%d", time.Now().UnixNano()%100000)
-	c.run("create", "--name", name)
+	name := fmt.Sprintf("cli-execwake-%d", time.Now().UnixNano()%100000)
+	if _, stderr, code := c.run("create", "--name", name); code != 0 {
+		t.Fatalf("create: %s", stderr)
+	}
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
-
-	c.run("stop", name)
-
-	_, stderr, code := c.run("exec", name, "--", "echo", "hi")
-	if code == 0 {
-		t.Fatal("exec on stopped sandbox should fail")
+	if _, stderr, code := c.run("stop", name); code != 0 {
+		t.Fatalf("stop: %s", stderr)
 	}
-	if !strings.Contains(stderr, "not running") {
-		t.Errorf("expected 'not running' in error, got:\n%s", stderr)
-	}
-	if !strings.Contains(stderr, "bhatti start") {
-		t.Errorf("expected recovery hint 'bhatti start' in error, got:\n%s", stderr)
+
+	stdout, stderr, code := c.run("exec", name, "--", "echo", "hi")
+	if code != 0 || strings.TrimSpace(stdout) != "hi" {
+		t.Fatalf("exec on a stopped sandbox: code %d, stdout %q, stderr:\n%s", code, stdout, stderr)
 	}
 }
 
@@ -175,23 +175,23 @@ func TestCLIStopStartRoundTrip(t *testing.T) {
 	c.run("create", "--name", name)
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
 
-	// Write marker
-	c.run("exec", name, "--", "sh", "-c", "echo roundtrip-data > /tmp/marker.txt")
+	// Write marker. On disk: stop powers the VM off, so RAM-only /tmp is gone.
+	c.run("exec", name, "--", "sh", "-c", "echo roundtrip-data > ~/marker.txt")
 
-	// Stop (snapshot)
+	// Stop (power off)
 	_, _, code := c.run("stop", name)
 	if code != 0 {
 		t.Fatalf("stop exit %d", code)
 	}
 
-	// Start (restore)
+	// Start (boot from disk)
 	_, _, code = c.run("start", name)
 	if code != 0 {
 		t.Fatalf("start exit %d", code)
 	}
 
 	// Read marker — data must survive
-	stdout, _, code := c.run("exec", name, "--", "cat", "/tmp/marker.txt")
+	stdout, _, code := c.run("exec", name, "--", "sh", "-c", "cat ~/marker.txt")
 	if code != 0 || !strings.Contains(stdout, "roundtrip-data") {
 		t.Fatalf("data did not survive stop/start: exit=%d out=%q", code, stdout)
 	}
@@ -847,13 +847,13 @@ func TestCLILifecycleFullCycle(t *testing.T) {
 	c.run("create", "--name", name)
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
 
-	// Write marker
-	c.run("exec", name, "--", "sh", "-c", "echo cycle-data > /tmp/lifecycle.txt")
+	// Write marker (on disk: stop powers the VM off)
+	c.run("exec", name, "--", "sh", "-c", "echo cycle-data > ~/lifecycle.txt")
 
 	// Thermal cycle 1
 	c.run("stop", name)
 	c.run("start", name)
-	stdout, _, code := c.run("exec", name, "--", "cat", "/tmp/lifecycle.txt")
+	stdout, _, code := c.run("exec", name, "--", "sh", "-c", "cat ~/lifecycle.txt")
 	if code != 0 || !strings.Contains(stdout, "cycle-data") {
 		t.Fatalf("cycle 1 failed: exit=%d out=%q", code, stdout)
 	}
@@ -861,7 +861,7 @@ func TestCLILifecycleFullCycle(t *testing.T) {
 	// Thermal cycle 2
 	c.run("stop", name)
 	c.run("start", name)
-	stdout, _, code = c.run("exec", name, "--", "cat", "/tmp/lifecycle.txt")
+	stdout, _, code = c.run("exec", name, "--", "sh", "-c", "cat ~/lifecycle.txt")
 	if code != 0 || !strings.Contains(stdout, "cycle-data") {
 		t.Fatalf("cycle 2 failed: exit=%d out=%q", code, stdout)
 	}

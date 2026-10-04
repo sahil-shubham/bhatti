@@ -518,7 +518,11 @@ func printTiming() {
 // the latency of every CLI command — a full RTT wasted on remote links — for
 // no benefit. Kept as a function so call sites read as intent, and as the
 // place to reintroduce client-side resolution if a route ever needs a real ID.
+// resolveID turns a user's sandbox reference into the API's: a name, an ID,
+// or the "sandbox/<name>" form the CLI itself prints (so its output can be
+// pasted back).
 func resolveID(nameOrID string) (string, error) {
+	nameOrID = strings.TrimPrefix(nameOrID, "sandbox/")
 	if nameOrID == "" {
 		return "", fmt.Errorf("sandbox name or ID required")
 	}

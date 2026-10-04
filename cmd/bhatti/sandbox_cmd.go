@@ -321,6 +321,9 @@ with its own kernel, filesystem, and network.`,
 			}
 			if ipVal != "" {
 				fmt.Printf("  IP:    %s\n", ipVal)
+			} else {
+				// No network is the default; say so, and how to get one.
+				fmt.Printf("  Net:   none (create with --net for internet access)\n")
 			}
 			fmt.Printf("  Shell: bhatti shell %s\n", sbName)
 			if grants, ok := sb["secret_grants"].([]any); ok {
