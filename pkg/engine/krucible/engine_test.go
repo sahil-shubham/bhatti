@@ -60,6 +60,20 @@ func shortSockDir(t *testing.T) string {
 	return d
 }
 
+// vmmDir is t.TempDir(), reachable by a confined bhatti-vmm. Run as root, the
+// engine gives each helper its own unprivileged uid and won't start unless that
+// uid can walk down to the data dir — t.TempDir's private parent doesn't let it.
+func vmmDir(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	if os.Geteuid() == 0 {
+		if err := os.Chmod(filepath.Dir(d), 0o711); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return d
+}
+
 // requireLeanKernel returns leanKernel(repo), skipping the test if there is none.
 func requireLeanKernel(t *testing.T, repo string) string {
 	t.Helper()
@@ -102,7 +116,7 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 	kernel := requireLeanKernel(t, repo)
 	ensureVMMSigned(t, vmm)
 	eng, err := New(Config{
-		DataDir:     t.TempDir(),
+		DataDir:     vmmDir(t),
 		BaseRootfs:  buildBaseRootfs(t, repo),
 		VMMBinary:   vmm,
 		LibDir:      libDir(),

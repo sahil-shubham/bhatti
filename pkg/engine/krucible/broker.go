@@ -15,8 +15,9 @@ import (
 // netd's own directory. netd drops to netdUID:netdGID once its sockets are
 // open, so the socket (and the path to it) must be reachable by that identity
 // and nobody else that matters: the socket is owned by netdUID, mode 0600; the
-// netd directory is root:netdGID 0710 (traverse only); the socket directory
-// is 0711 (traverse only — its other children are 0700).
+// netd directory is 0711 (search only — the owner's confined helpers reach the
+// net socket in it too, and every entry keeps its own mode); the socket
+// directory is 0711 (search only — its other children are 0700).
 
 const (
 	netdUID = 65534
@@ -78,10 +79,7 @@ func shareWithNetd(dir, sock string) error {
 	if os.Geteuid() != 0 {
 		return nil
 	}
-	if err := os.Chown(dir, 0, netdGID); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o710); err != nil {
+	if err := os.Chmod(dir, 0o711); err != nil {
 		return err
 	}
 	if err := os.Chown(sock, netdUID, netdGID); err != nil {
@@ -91,8 +89,9 @@ func shareWithNetd(dir, sock string) error {
 }
 
 // shareSocketDir makes the socket directory traversable (not listable) so the
-// confined netd can reach its broker socket below it. Its other children are
-// 0700, so this opens nothing else.
+// confined netd can reach its broker socket below it, and each confined
+// bhatti-vmm its own socket dir. Its other children are 0700, so this opens
+// nothing else.
 func shareSocketDir(dir string) {
 	if os.Geteuid() != 0 {
 		return

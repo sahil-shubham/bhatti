@@ -146,7 +146,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 		t.Fatalf("build credcheck: %v\n%s", err, out)
 	}
 	eng, err := New(Config{
-		DataDir: t.TempDir(), SocketDir: shortSockDir(t), BaseRootfs: root,
+		DataDir: vmmDir(t), SocketDir: shortSockDir(t), BaseRootfs: root,
 		VMMBinary: vmm, LibDir: libDir(), BlockRoot: true, NetdBinary: netd,
 		KernelImage: requireLeanKernel(t, repo),
 	})

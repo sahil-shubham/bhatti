@@ -40,7 +40,7 @@ func TestKrucibleLeanKernel(t *testing.T) {
 	// Create (boot → lohar agent ready), then verifies the guest is usable.
 	bootOnce := func(t *testing.T, kernel string) (time.Duration, string) {
 		eng, err := New(Config{
-			DataDir: t.TempDir(), BaseImage: img, BlockRoot: true,
+			DataDir: vmmDir(t), BaseImage: img, BlockRoot: true,
 			VMMBinary: vmm, LibDir: libDir(), KernelImage: kernel, NetdBinary: requireNetd(t, repoRoot(t)),
 		})
 		if err != nil {

@@ -44,7 +44,7 @@ func reapTerminatedWithin(pid int, d time.Duration) bool {
 // (cmd == nil, only HelperPID) → eng2.Shutdown() must terminate that adopted
 // helper. Before the fix Shutdown skipped adopted helpers entirely.
 func TestKrucibleShutdownKillsAdoptedHelper(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -79,7 +79,7 @@ func TestKrucibleShutdownKillsAdoptedHelper(t *testing.T) {
 // engine that still owns the helper (no restart) kills it on Shutdown. Here
 // kill() reaps via cmd.Wait(), so termination is observable directly.
 func TestKrucibleShutdownKillsOwnedHelper(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

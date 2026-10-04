@@ -44,7 +44,7 @@ func TestKrucibleProductionImage(t *testing.T) {
 	}
 
 	eng, err := New(Config{
-		DataDir:     t.TempDir(),
+		DataDir:     vmmDir(t),
 		BaseImage:   img,
 		BlockRoot:   true,
 		VMMBinary:   vmm,

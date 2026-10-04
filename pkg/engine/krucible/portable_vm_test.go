@@ -26,10 +26,14 @@ func secondHost(t *testing.T, a *Engine, base string) *Engine {
 	if err != nil {
 		t.Fatal(err)
 	}
-	copyB := filepath.Join(t.TempDir(), "images", "rootfs-copy.ext4")
+	copyB := filepath.Join(vmmDir(t), "images", "rootfs-copy.ext4")
 	writeFile(t, copyB, data)
+	// World-readable, as installed: the confined helper reads it as its own user.
+	if err := os.Chmod(copyB, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	b, err := New(Config{
-		DataDir: t.TempDir(), BaseImage: copyB, BlockRoot: true,
+		DataDir: vmmDir(t), BaseImage: copyB, BlockRoot: true,
 		VMMBinary: a.cfg.VMMBinary, LibDir: a.cfg.LibDir, KernelImage: a.cfg.KernelImage,
 		NetdBinary: a.cfg.NetdBinary, SocketDir: shortSockDir(t),
 	})

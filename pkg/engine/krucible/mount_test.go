@@ -7,7 +7,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -59,5 +61,51 @@ func TestKrucibleMount(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(data)); got != guestMark {
 		t.Fatalf("host sees /host/fromguest = %q, want %q", got, guestMark)
+	}
+}
+
+// TestKrucibleMountGuestUserWrites: on a root daemon, the guest's own user
+// (uid 1000) creates a file in a read-write mount, and on the host it is that
+// uid's — as when the helper itself was root. libkrun's file server creates
+// each file as the guest caller, so the confined helper keeps the capabilities
+// that takes when it has a mount. (A daemon that isn't root runs the helper as
+// itself, and only guest ids matching its own can create.)
+func TestKrucibleMountGuestUserWrites(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("needs a root daemon on Linux")
+	}
+	eng := newBlockRootEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	hostDir := t.TempDir()
+	if err := os.Chmod(hostDir, 0o777); err != nil { // the guest user may create in it
+		t.Fatal(err)
+	}
+	info, err := eng.Create(ctx, engine.SandboxSpec{
+		Name: "mntuser", CPUs: 1, MemoryMB: 512,
+		Mounts: []engine.FsMount{{HostPath: hostDir, GuestPath: "/host"}},
+	})
+	if err != nil {
+		t.Fatalf("Create with --mount: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), info.ID) })
+
+	if r, err := eng.Exec(ctx, info.ID, []string{"writeuid", "/host/byuser"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("exec writeuid: err=%v exit=%d", err, r.ExitCode)
+	}
+	path := filepath.Join(hostDir, "byuser")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the guest user's file isn't on the host: %v", err)
+	}
+	if got := string(data); got != "1000" {
+		t.Fatalf("written by guest uid %q, want 1000", got)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid := fi.Sys().(*syscall.Stat_t).Uid; uid != 1000 {
+		t.Fatalf("host file owned by uid %d, want the guest user's 1000", uid)
 	}
 }

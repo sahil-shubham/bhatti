@@ -60,7 +60,7 @@ func helperPID(t *testing.T, e *Engine, id string) int {
 // over the same data dir (a simulated daemon restart) re-adopts the LIVE VM and
 // can exec on it — no reboot, no lost state.
 func TestKrucibleRecoveryAdoptLive(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -102,7 +102,7 @@ func TestKrucibleRecoveryAdoptLive(t *testing.T) {
 // fresh engine marks the sandbox stopped, and Start cold-boots it fresh (rootfs
 // image persists) so it's usable again.
 func TestKrucibleRecoveryDeadHelper(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	sockDir := shortSockDir(t)
 	base := buildBaseRootfs(t, repoRoot(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

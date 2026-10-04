@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -25,7 +25,7 @@ import (
 // newNetEngine builds a block-root engine with the virtio-net gateway backend
 // (bhatti-netd) instead of TSI. Skips if bhatti-netd isn't built.
 func newNetEngine(t *testing.T) engine.Engine {
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	if d := os.Getenv("KRUCIBLE_NET_DATADIR"); d != "" {
 		dataDir = d // fixed dir so vmm.log survives for debugging
 	}
@@ -343,7 +343,7 @@ func readNetdPid(t *testing.T, sockDir string) int {
 // it's still reference-counted, so destroying the owner's last sandbox tears it
 // down.
 func TestKrucibleNetRecovery(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	sockDir := shortSockDir(t)
 	eng1 := newNetEngineAt(t, dataDir, sockDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)

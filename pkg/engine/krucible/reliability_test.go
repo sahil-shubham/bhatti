@@ -168,8 +168,8 @@ func TestKrucibleCreateCleansUpOnLaunchFailure(t *testing.T) {
 		t.Skip("mke2fs not found; skipping")
 	}
 	repo := repoRoot(t)
-	dataDir := t.TempDir()
-	sockDir := t.TempDir()
+	dataDir := vmmDir(t)
+	sockDir := vmmDir(t)
 
 	// Fake helper: answers the startup `capabilities` probe, but on the VM-run
 	// invocation just sleeps — the agent socket never appears, so WaitReady must

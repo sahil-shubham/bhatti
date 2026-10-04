@@ -44,7 +44,7 @@ func TestKrucibleTierRootfsBoots(t *testing.T) {
 	ensureVMMSigned(t, vmm)
 
 	eng, err := New(Config{
-		DataDir:     t.TempDir(),
+		DataDir:     vmmDir(t),
 		SocketDir:   shortSockDir(t),
 		BaseImage:   img, // block-root from the REAL tier image
 		BlockRoot:   true,

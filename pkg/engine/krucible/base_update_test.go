@@ -42,7 +42,7 @@ func TestKrucibleBaseUpdateKeepsSandboxes(t *testing.T) {
 	if _, err := os.Stat(vmm); err != nil {
 		t.Skip("bhatti-vmm not built — run `make vmm`; skipping")
 	}
-	dataDir := t.TempDir()
+	dataDir := vmmDir(t)
 	sockDir := shortSockDir(t)
 	tree := buildBaseRootfs(t, repo)
 	tier := filepath.Join(dataDir, "images", "rootfs-test-"+runtime.GOARCH+".ext4")

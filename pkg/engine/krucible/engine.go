@@ -96,6 +96,7 @@ type netdInstance struct {
 	nextGuest int
 	refs      int
 	brokerLn  net.Listener // credential broker socket served to this netd (broker.go); guarded by mu
+	vmmGID    uint32       // group of the owner's confined helpers, the only one sock opens to (vmmuser.go); 0 = none
 }
 
 // netdDir is the deterministic per-owner directory (so recovery finds the same
@@ -136,7 +137,8 @@ func (e *Engine) acquireNetd(ownerKey string, subnetIdx int) (*netdInstance, int
 	inst := e.netds[ownerKey]
 	if inst == nil {
 		dir := e.netdDir(ownerKey)
-		inst = &netdInstance{owner: ownerKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: subnetIdx}
+		inst = &netdInstance{owner: ownerKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: subnetIdx,
+			vmmGID: e.netdGIDLocked(ownerKey)}
 		e.netds[ownerKey] = inst
 	}
 	inst.refs++
@@ -211,7 +213,7 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		_, ctlErr := os.Stat(inst.ctlSock)
 		if sockErr == nil && ctlErr == nil {
 			serveBrokerLocked(inst, broker)
-			return nil
+			return e.shareNetdSocket(inst)
 		}
 		if sockErr == nil {
 			slog.Warn("krucible: adopted netd lacks control socket; respawning", "owner", ownerKey, "pid", inst.pid)
@@ -224,11 +226,16 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	}
 	_ = os.Remove(inst.sock)
 	_ = os.Remove(inst.ctlSock)
-	lf, err := os.OpenFile(filepath.Join(inst.dir, "netd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	lf, err := os.OpenFile(filepath.Join(inst.dir, "netd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return fmt.Errorf("netd log: %w", err)
 	}
 	defer lf.Close()
+	// Everyone may search its directory (shareNetdSocket), so the log stays
+	// the daemon's alone — also one an older daemon left readable.
+	if err := lf.Chmod(0o600); err != nil {
+		return fmt.Errorf("netd log: %w", err)
+	}
 	// netd's identity once confined is ours to name: the broker socket is
 	// shared with exactly that uid/gid (broker.go).
 	cmd := exec.Command(e.cfg.NetdBinary,
@@ -257,7 +264,7 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	inst.pid = cmd.Process.Pid
 	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
 	serveBrokerLocked(inst, broker)
-	return nil
+	return e.shareNetdSocket(inst)
 }
 
 // pushSandboxPolicy registers this VM's per-sandbox egress state with its
@@ -349,6 +356,7 @@ type VM struct {
 	netIP        string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
 	netPolicy    *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public
 	sandboxRef   string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
+	vmmUID       uint32                 // the helper's own uid and primary gid (vmmuser.go); 0 = runs as the daemon; persisted
 }
 
 // brokerRef is how netd names this sandbox to the credential broker: the
@@ -371,6 +379,11 @@ type Engine struct {
 	netds     map[string]*netdInstance // owner key → shared bhatti-netd gateway
 	broker    engine.CredentialBroker  // served to every netd (broker.go); nil = no credential substitution
 	caps      VMMCapabilities          // what the bhatti-vmm build supports (probed in New)
+	// Confined helpers (vmmuser.go): confineVMM on Linux; dropVMM when the
+	// daemon is root, which gives each helper its own uid from vmmIDs (mu).
+	confineVMM, dropVMM bool
+	vmmIDs              map[uint32]string // helper uid → sandbox id
+	kvmGID              uint32            // group that may open /dev/kvm; 0 = anyone may
 }
 
 // errNoCheckpoint is returned by every operation that needs saved VM state
@@ -465,6 +478,9 @@ func New(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	eng := &Engine{vms: make(map[string]*VM), netds: make(map[string]*netdInstance), cfg: cfg, caps: caps}
+	if err := eng.initConfinement(); err != nil {
+		return nil, err
+	}
 	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
 	return eng, nil
 }
@@ -531,6 +547,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		if err != nil {
 			if vm != nil {
 				vm.kill()
+				e.releaseVMM(vm)
 			}
 			if netdKey != "" {
 				e.releaseNetd(netdKey)
@@ -757,8 +774,22 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 	spec := vm.baseSpec
 	spec.SnapshotDir = snapshotDir
 	specPath := filepath.Join(vm.SandboxDir, "vmspec.json")
+	// On Linux the helper runs confined (vmmuser.go): it is handed the spec it
+	// finds its files by, and the policy that holds it to them.
+	policy := ""
+	if e.confineVMM {
+		var done func()
+		var err error
+		if spec, policy, done, err = e.confineLaunch(vm, spec, specPath); err != nil {
+			return fmt.Errorf("confine vmm helper: %w", err)
+		}
+		defer done()
+	}
 	specBytes, _ := json.MarshalIndent(spec, "", "  ")
 	if err := os.WriteFile(specPath, specBytes, 0600); err != nil {
+		return fmt.Errorf("write vmspec: %w", err)
+	}
+	if err := e.handToVMM(vm, specPath, false, 0o640); err != nil {
 		return fmt.Errorf("write vmspec: %w", err)
 	}
 
@@ -803,6 +834,11 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 			return fmt.Errorf("config server: %w", serr)
 		}
 		vm.configSrv = srv
+		// The helper connects to it for the guest.
+		if err := e.handToVMM(vm, spec.VsockConfigUDS, true, 0o600); err != nil {
+			vm.closeConfigSrv()
+			return fmt.Errorf("config server: %w", err)
+		}
 	}
 
 	vmCtx, vmCancel := context.WithCancel(context.Background())
@@ -817,6 +853,12 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) error {
 			"DYLD_FALLBACK_LIBRARY_PATH="+e.cfg.LibDir,
 			"LD_LIBRARY_PATH="+e.cfg.LibDir,
 		)
+	}
+	if policy != "" {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, VMMPolicyEnv+"="+policy)
 	}
 	if err := cmd.Start(); err != nil {
 		vmCancel()
@@ -924,6 +966,7 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	// restart (only vm.HelperPID set) — the inlined cmd-only kill here used to leak
 	// the latter, leaving a live VM with its backing files deleted.
 	vm.kill()
+	e.releaseVMM(vm)
 	vm.mu.Lock()
 	dir := vm.SandboxDir
 	sockDir := vm.SockDir

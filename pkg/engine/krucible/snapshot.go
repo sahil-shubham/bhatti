@@ -147,16 +147,26 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	}
 	cctx, ccancel := context.WithTimeout(ctx, limit)
 	defer ccancel()
+	var stage string
 	if snapType == "filesystem" {
 		if _, err := controlCmd(cctx, vm.CtlSockUDS, "PAUSE"); err != nil {
 			return nil, fmt.Errorf("checkpoint: pause: %w", err)
 		}
 	} else {
-		// SAVE creates finalDir, freezes RAM/devices, and leaves the VM paused.
-		// No separate PAUSE: SAVE itself owns the quiesce and failure cleanup.
-		if _, err := controlCmd(cctx, vm.CtlSockUDS, "SAVE "+finalDir); err != nil {
+		// SAVE creates a directory, freezes RAM/devices into it and leaves the
+		// VM paused. No separate PAUSE: SAVE itself owns the quiesce and
+		// failure cleanup. The helper may only create files in its save dir,
+		// so it saves there and the result is moved to finalDir below, with
+		// the resume already deferred.
+		s, serr := saveStage(vm)
+		if serr != nil {
+			return nil, fmt.Errorf("checkpoint: %w", serr)
+		}
+		if _, err := controlCmd(cctx, vm.CtlSockUDS, "SAVE "+s); err != nil {
+			_ = os.RemoveAll(s)
 			return nil, fmt.Errorf("checkpoint: save: %w", err)
 		}
+		stage = s
 		ownDir = true
 	}
 	defer func() {
@@ -167,6 +177,12 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 			manifest = nil
 		}
 	}()
+	if stage != "" {
+		if err := e.takeSave(stage, finalDir); err != nil {
+			_ = os.RemoveAll(stage)
+			return nil, fmt.Errorf("checkpoint: save: %w", err)
+		}
+	}
 	// Clone disks at the saved VM's quiescent point. Guest writes cannot
 	// resume until after all clones finish.
 	if err := exec.CommandContext(cctx, "sync").Run(); err != nil {

@@ -39,6 +39,7 @@ type vmRecord struct {
 	SubnetIdx  int    `json:"subnet_idx,omitempty"`  // owner's vnet subnet index
 	NetIP      string `json:"net_ip,omitempty"`      // guest IP on the netd gateway subnet
 	SandboxRef string `json:"sandbox_ref,omitempty"` // the server's sandbox ID, named to the credential broker
+	VMMUID     uint32 `json:"vmm_uid,omitempty"`     // the helper's own uid (vmmuser.go), kept for the sandbox's life
 }
 
 // netdRecord is the durable state of one owner's shared bhatti-netd, so recovery
@@ -51,6 +52,7 @@ type netdRecord struct {
 	SubnetIdx int    `json:"subnet_idx"`
 	Pid       int    `json:"pid"`
 	NextGuest int    `json:"next_guest"`
+	VMMGID    uint32 `json:"vmm_gid,omitempty"` // the group of the owner's helpers, which its socket opens to
 }
 
 func netdStatePath(dir string) string { return filepath.Join(dir, "netd.json") }
@@ -62,7 +64,7 @@ func writeNetdRecord(inst *netdInstance) {
 		return
 	}
 	rec := netdRecord{Owner: inst.owner, Sock: inst.sock, Dir: inst.dir,
-		SubnetIdx: inst.subnetIdx, Pid: inst.pid, NextGuest: inst.nextGuest}
+		SubnetIdx: inst.subnetIdx, Pid: inst.pid, NextGuest: inst.nextGuest, VMMGID: inst.vmmGID}
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return
@@ -85,6 +87,7 @@ func (vm *VM) toRecordLocked() vmRecord {
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
 		LogPath: vm.logPath, BaseSpec: vm.baseSpec,
 		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx, NetIP: vm.netIP, SandboxRef: vm.sandboxRef,
+		VMMUID: vm.vmmUID,
 	}
 }
 
@@ -129,6 +132,7 @@ func vmFromRecord(rec vmRecord) *VM {
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
 		baseSpec: rec.BaseSpec, logPath: rec.LogPath,
 		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP, sandboxRef: rec.SandboxRef,
+		vmmUID: rec.VMMUID,
 	}
 }
 
@@ -156,7 +160,13 @@ func (e *Engine) readoptNetd(vm *VM) {
 			if rec.Pid > 0 && pidAlive(rec.Pid) {
 				inst.pid = rec.Pid // adopt the live gateway
 			}
+			if e.dropVMM {
+				inst.vmmGID = rec.VMMGID
+			}
 		}
+	}
+	if e.dropVMM && inst.vmmGID == 0 {
+		inst.vmmGID = e.netdGIDLocked(vm.netdKey)
 	}
 	e.netds[vm.netdKey] = inst
 }
@@ -204,6 +214,9 @@ func (e *Engine) recover() {
 		}
 		e.mu.Lock()
 		e.vms[rec.ID] = vm
+		if e.dropVMM && vm.vmmUID != 0 {
+			e.vmmIDs[vm.vmmUID] = vm.ID
+		}
 		e.mu.Unlock()
 		e.readoptNetd(vm) // re-adopt the owner's shared gateway (net backend)
 		vm.persist()      // write back the reconciled status/thermal
