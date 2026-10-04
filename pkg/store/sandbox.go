@@ -8,26 +8,26 @@ import (
 )
 
 type Sandbox struct {
-	ID             string          `json:"id"`
-	Name           string          `json:"name"`
-	TemplateID     string          `json:"template_id"`
-	EngineID       string          `json:"engine_id"`
-	Status         string          `json:"status"`
-	IP             string          `json:"ip"`
-	EngineMeta     json.RawMessage `json:"engine_meta"`
-	NetPolicy      json.RawMessage `json:"net_policy,omitempty"`
-	CreatedBy      string          `json:"created_by"`
-	CreatedAt      time.Time       `json:"created_at"`
-	StoppedAt      *time.Time      `json:"stopped_at,omitempty"`
-	KeepHot        bool            `json:"keep_hot"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	TemplateID string          `json:"template_id"`
+	EngineID   string          `json:"engine_id"`
+	Status     string          `json:"status"`
+	IP         string          `json:"ip"`
+	EngineMeta json.RawMessage `json:"engine_meta"`
+	NetPolicy  json.RawMessage `json:"net_policy,omitempty"`
+	CreatedBy  string          `json:"created_by"`
+	CreatedAt  time.Time       `json:"created_at"`
+	StoppedAt  *time.Time      `json:"stopped_at,omitempty"`
+	KeepHot    bool            `json:"keep_hot"`
 	// HasInit: the sandbox runs an --init command at every boot, so apps it
 	// starts come back after an idle stop (which powers the VM off).
-	HasInit        bool            `json:"has_init"`
-	ShellTokenHash string          `json:"-"` // never expose in API responses
-	CPUs           float64         `json:"cpus"`
-	MemoryMB       int             `json:"memory_mb"`
-	DiskSizeMB     int             `json:"disk_size_mb"`
-	Image          string          `json:"image"`
+	HasInit        bool    `json:"has_init"`
+	ShellTokenHash string  `json:"-"` // never expose in API responses
+	CPUs           float64 `json:"cpus"`
+	MemoryMB       int     `json:"memory_mb"`
+	DiskSizeMB     int     `json:"disk_size_mb"`
+	Image          string  `json:"image"`
 	// Labels is operator-controlled metadata for fleet enumeration
 	// (e.g. {"pool": "workers", "env": "prod"}). Persisted as JSON in
 	// the labels column. Empty/nil maps round-trip as the SQL default
@@ -222,6 +222,17 @@ func (s *Store) RenameSandbox(userID, id, newName string) error {
 }
 
 // UpdateSandboxKeepHot sets or clears the keep_hot flag for a sandbox.
+// UpdateSandboxHasInit records whether the sandbox runs an --init command at
+// boot (the engine's boot config is the source of truth).
+func (s *Store) UpdateSandboxHasInit(id string, hasInit bool) error {
+	v := 0
+	if hasInit {
+		v = 1
+	}
+	_, err := s.db.Exec(`UPDATE sandboxes SET has_init = ? WHERE id = ?`, v, id)
+	return err
+}
+
 func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
 	v := 0
 	if keepHot {

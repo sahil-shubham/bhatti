@@ -400,6 +400,7 @@ func (s *Server) Shutdown(sig string) {
 // has no activity time for, which would leave it warm for good. One whose VM
 // died while no daemon was watching is stopped, to boot fresh on next use.
 func (s *Server) RecoverSandboxes(ctx context.Context) {
+	initOf, _ := s.engine.(interface{ HasInit(id string) (bool, bool) })
 	sandboxes, err := s.store.ListAllSandboxes()
 	if err != nil {
 		slog.Warn("recover sandboxes: list", "error", err)
@@ -412,6 +413,14 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 		info, err := s.engine.Status(ctx, sb.EngineID)
 		if err != nil {
 			continue // the engine has no record of it
+		}
+		// has_init came after v2.3: rows from before it read 0. The engine's
+		// boot config knows; without this, a published --init app on such a
+		// sandbox 502s on its first request after an idle stop.
+		if initOf != nil {
+			if has, known := initOf.HasInit(sb.EngineID); known && has != sb.HasInit {
+				s.store.UpdateSandboxHasInit(sb.ID, has)
+			}
 		}
 		switch {
 		case info.Status == "running":

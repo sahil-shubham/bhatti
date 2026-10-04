@@ -84,3 +84,29 @@ func TestRecoverSandboxesAfterRestart(t *testing.T) {
 		t.Fatalf("adopted warm sandbox didn't go cold once idle: %+v (%v)", sb, err)
 	}
 }
+
+// Sandboxes from before has_init existed read 0 even when they boot an --init
+// app; recovery takes the engine's boot config as the truth, so the proxy
+// waits for their app after an idle stop instead of answering 502.
+func TestRecoverSandboxesBackfillsHasInit(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	legacy := createRunningBox(t, srv, eng, "legacy-init")
+	plain := createRunningBox(t, srv, eng, "no-init")
+	unknown := createRunningBox(t, srv, eng, "unknown")
+	if err := srv.store.UpdateSandboxHasInit(unknown, true); err != nil {
+		t.Fatal(err)
+	}
+	eng.mu.Lock()
+	eng.Inits = map[string]bool{legacy: true, plain: false}
+	eng.mu.Unlock()
+
+	srv.RecoverSandboxes(context.Background())
+
+	for id, want := range map[string]bool{legacy: true, plain: false, unknown: true} {
+		sb, err := srv.store.GetSandboxByID(id)
+		if err != nil || sb.HasInit != want {
+			t.Errorf("%s: has_init %v (%v), want %v", id, sb.HasInit, err, want)
+		}
+	}
+}

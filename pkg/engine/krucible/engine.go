@@ -1361,3 +1361,23 @@ func tailFile(path string, n int64) string {
 func (e *Engine) LoharPath() string {
 	return filepath.Join(filepath.Dir(e.cfg.VMMBinary), "lohar")
 }
+
+// HasInit reports whether the sandbox's boot config carries an --init command
+// (known=false when the engine has no config for it).
+func (e *Engine) HasInit(id string) (hasInit, known bool) {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return false, false
+	}
+	raw, err := os.ReadFile(filepath.Join(vm.SandboxDir, "config.json"))
+	if err != nil {
+		return false, false
+	}
+	var cfg struct {
+		Init string `json:"init"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return false, false
+	}
+	return cfg.Init != "", true
+}

@@ -39,6 +39,8 @@ type mockEngine struct {
 	// block until released (a command still running).
 	ExecStarted chan struct{}
 	ExecRelease chan struct{}
+	// Inits answers HasInit: engine ID → has an --init command. Absent = unknown.
+	Inits map[string]bool
 	// TunnelRefusals makes the next N Tunnel calls fail as "nothing listening".
 	TunnelRefusals int
 
@@ -274,4 +276,11 @@ func (t *mockTermConn) Resize(rows, cols int) error { return nil }
 func (t *mockTermConn) Close() error {
 	t.server.Close()
 	return t.conn.Close()
+}
+
+func (m *mockEngine) HasInit(id string) (bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	has, ok := m.Inits[id]
+	return has, ok
 }
