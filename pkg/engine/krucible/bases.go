@@ -14,6 +14,7 @@ package krucible
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func resolveBasePath(p string) (string, error) {
 		if !filepath.IsAbs(t) {
 			t = filepath.Join(filepath.Dir(p), t)
 		}
-		p = t
+		p = filepath.Clean(t)
 	}
 	return "", fmt.Errorf("%s: too many levels of symbolic links", p)
 }
@@ -249,7 +250,8 @@ func qcow2BackingPath(path string) (string, error) {
 
 // walkImages calls fn for every qcow2 image (link=false) and every symlink
 // (link=true) under dataDir, except under bases/: a base is only ever
-// reached through what names it.
+// reached through what names it. A file it can't read goes to fn as an
+// image, whose header fn then fails to read: it might be one.
 func walkImages(dataDir string, fn func(path string, link bool) error) error {
 	skip := basesDir(dataDir)
 	return filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
@@ -264,11 +266,29 @@ func walkImages(dataDir string, fn func(path string, link bool) error) error {
 			return nil
 		case d.Type()&fs.ModeSymlink != 0:
 			return fn(path, true)
-		case d.Type().IsRegular() && isQcow2(path):
+		case d.Type().IsRegular() && maybeQcow2(path):
 			return fn(path, false)
 		}
 		return nil
 	})
+}
+
+// maybeQcow2 is isQcow2 that says yes when it can't read the file.
+func maybeQcow2(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	var magic [4]byte
+	switch _, err := io.ReadFull(f, magic[:]); err {
+	case nil:
+		return magic == [4]byte{'Q', 'F', 'I', 0xfb}
+	case io.EOF, io.ErrUnexpectedEOF:
+		return false // shorter than a qcow2 header
+	default:
+		return true
+	}
 }
 
 type fileKey struct{ dev, ino uint64 }
