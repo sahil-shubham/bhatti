@@ -160,10 +160,23 @@ func runAgent() {
 		writeConfigFiles(cfg.Files)
 		mountVolumes(cfg.Volumes)
 		mountFsMounts(cfg.Mounts)
+		bundle, err := installSandboxCA("/", cfg.CACert, runCACertUpdate, exec.LookPath)
+		if err != nil {
+			logf("install sandbox CA: %v", err)
+		}
+		if bundle != "" && configEnv == nil {
+			configEnv = make(map[string]string, 4)
+		}
+		if bundle != "" {
+			setSandboxCAEnv(configEnv, bundle)
+		}
 		bp("config_applied")
 	} else {
 		applyHostname("bhatti")
 		ensureResolvConf()
+		if err := removeSandboxCA("/", runCACertUpdate, exec.LookPath); err != nil {
+			logf("remove sandbox CA: %v", err)
+		}
 	}
 
 	setupNetworking()
@@ -471,6 +484,7 @@ type SandboxConfig struct {
 	Hostname  string            `json:"hostname"`
 	Token     string            `json:"token"`
 	Env       map[string]string `json:"env"`
+	CACert    string            `json:"ca_cert,omitempty"`
 	Files     map[string]struct {
 		Content string `json:"content"`
 		Mode    string `json:"mode"`
