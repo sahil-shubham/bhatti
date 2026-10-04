@@ -274,6 +274,9 @@ func TestKrucibleRestoreRefusals(t *testing.T) {
 		{"vcpu-mismatch", "vCPU", func(_ *testing.T, _ string, m *krucibleSnapManifest) {
 			m.Vcpus++
 		}},
+		{"ram-mismatch", "RAM layout", func(_ *testing.T, _ string, m *krucibleSnapManifest) {
+			m.MemMiB += 256
+		}},
 		{"device-mismatch", "devices differ", func(_ *testing.T, _ string, m *krucibleSnapManifest) {
 			m.Volumes = nil
 		}},
