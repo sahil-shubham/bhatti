@@ -35,7 +35,7 @@ case "$HOST_ARCH" in
         ;;
 esac
 
-IMG="${IMG:-/var/lib/bhatti/images/rootfs-minimal-${DEB_ARCH}.ext4}"
+IMG="${IMG:-dist/rootfs-minimal-${DEB_ARCH}.ext4}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "error: must run as root (need mount/chroot)" >&2
@@ -45,6 +45,18 @@ fi
 if [[ -z "$AGENT" || ! -f "$AGENT" ]]; then
     echo "error: agent binary not found: $AGENT" >&2
     echo "usage: sudo $0 /path/to/lohar" >&2
+    exit 1
+fi
+
+# Building into a live tier (or its immutable base) would invalidate qcow2
+# overlays. Use dist/ and let install.sh migrate + flip the tier instead.
+case "$IMG" in
+    images/rootfs-*.ext4|images/bases/*|*/images/rootfs-*.ext4|*/images/bases/*)
+        echo "error: refusing to build directly into a live image path: $IMG" >&2
+        exit 1 ;;
+esac
+if [[ -L "$IMG" ]]; then
+    echo "error: refusing to build through image symlink: $IMG" >&2
     exit 1
 fi
 

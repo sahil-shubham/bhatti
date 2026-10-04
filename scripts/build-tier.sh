@@ -44,6 +44,17 @@ case "$ARCH" in
 esac
 
 IMG="${IMG:-dist/rootfs-${TIER}-${ARCH}.ext4}"
+# Never let an explicit IMG write through a live tier symlink or into its
+# immutable backing store. Build in dist/ and publish via install.sh instead.
+case "$IMG" in
+    images/rootfs-*.ext4|images/bases/*|*/images/rootfs-*.ext4|*/images/bases/*)
+        echo "error: refusing to build directly into a live image path: $IMG" >&2
+        exit 1 ;;
+esac
+if [[ -L "$IMG" ]]; then
+    echo "error: refusing to build through image symlink: $IMG" >&2
+    exit 1
+fi
 MOUNT="/mnt/bhatti-${TIER}-$$"
 
 mkdir -p dist
