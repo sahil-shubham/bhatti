@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"testing"
 )
@@ -231,4 +232,89 @@ func asDenied(err error, target **DeniedError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// TestDialerSelectsVettedIP proves the vet-dialer connects to a permitted IP and
+// skips denied ones (multi-address failover + rebinding-safety), using the
+// injected dial seam so no real network is needed.
+func TestDialerSelectsVettedIP(t *testing.T) {
+	res := fakeResolver{
+		// public.test resolves to a denied private IP AND a public IP; only the
+		// public one may be dialed.
+		"public.test": {mustAddr(t, "10.0.0.9"), mustAddr(t, "1.1.1.1")},
+	}
+	var dialed []string
+	d := &Dialer{
+		Policy:   &EgressPolicy{Default: PosturePublic},
+		Resolver: res,
+		dialAddr: func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			return fakeConn{}, nil
+		},
+	}
+	if _, err := d.DialContext(context.Background(), "tcp", "public.test:443"); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != net.JoinHostPort("1.1.1.1", "443") {
+		t.Fatalf("dialed %v, want only the vetted public IP", dialed)
+	}
+
+	// allow-cidr opts the private IP back in — now it's dialable.
+	dialed = nil
+	d.Policy.AllowCIDRs = []netip.Prefix{mustPrefix(t, "10.0.0.0/8")}
+	if _, err := d.DialContext(context.Background(), "tcp", "public.test:443"); err != nil {
+		t.Fatalf("dial with allow-cidr: %v", err)
+	}
+	if len(dialed) == 0 || dialed[0] != net.JoinHostPort("10.0.0.9", "443") {
+		t.Fatalf("with allow-cidr, first vetted (private) IP should dial: %v", dialed)
+	}
+}
+
+type fakeConn struct{ net.Conn }
+
+func (fakeConn) Close() error { return nil }
+
+// TestHostPatternCovers pins the containment rule secret grants are checked
+// with: a grant may only name hosts its sandbox's allow rules already admit.
+func TestHostPatternCovers(t *testing.T) {
+	cases := []struct {
+		allow, grant string
+		want         bool
+	}{
+		{"api.github.com", "api.github.com", true},
+		{"API.github.com.", "api.github.com", true},
+		{"api.github.com", "uploads.github.com", false},
+		{"api.github.com", "*.github.com", false}, // the grant is broader than the rule
+		{"*.github.com", "api.github.com", true},
+		{"*.github.com", "*.github.com", true},
+		{"*.github.com", "*.api.github.com", true},
+		{"*.github.com", "github.com", false}, // a wildcard needs a label before the suffix
+		{"*.github.com", "evilgithub.com", false},
+		{"*.api.github.com", "*.github.com", false},
+	}
+	for _, c := range cases {
+		a, err := ParseHostPattern(c.allow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		g, err := ParseHostPattern(c.grant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := a.Covers(g); got != c.want {
+			t.Errorf("%q covers %q = %v, want %v", c.allow, c.grant, got, c.want)
+		}
+	}
+}
+
+func TestHostPatternString(t *testing.T) {
+	for in, want := range map[string]string{"API.Example.com.": "api.example.com", "*.Example.com": "*.example.com"} {
+		p, err := ParseHostPattern(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.String() != want {
+			t.Errorf("String(%q) = %q, want %q", in, p.String(), want)
+		}
+	}
 }

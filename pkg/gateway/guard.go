@@ -117,6 +117,25 @@ func (h HostPattern) Match(host string) bool {
 	return len(host) > len(h.suffix) && strings.HasSuffix(host, h.suffix)
 }
 
+// String is the normalized pattern: "api.stripe.com" or "*.stripe.com".
+func (h HostPattern) String() string {
+	if h.exact != "" {
+		return h.exact
+	}
+	return "*" + h.suffix
+}
+
+// Covers reports whether every host o matches is also matched by h, so a rule
+// set that admits h admits o (a secret grant may only name hosts its sandbox's
+// allow rules already let through).
+func (h HostPattern) Covers(o HostPattern) bool {
+	if o.exact != "" {
+		return h.Match(o.exact)
+	}
+	// o is a wildcard: only a wildcard whose suffix ends o's is at least as broad.
+	return h.suffix != "" && strings.HasSuffix(o.suffix, h.suffix)
+}
+
 // EgressPolicy is a sandbox's egress rule set, evaluated per connection. Order
 // of evaluation is fixed (not rule-order-dependent), so a manifest diff is
 // stable: hard-deny → allow-cidr → allow-host → soft-deny → default.
