@@ -399,6 +399,18 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 
 	var pipedConn engine.PipedConn
 	var sessionID string
+	// streams: nil = legacy (all output as text frames); otherwise only the
+	// listed streams, as tagged binary frames. A reattach names them in the
+	// query (?streams=stdout,stderr).
+	var streams *streamSet
+	if q := r.URL.Query().Get("streams"); q != "" {
+		var err error
+		if streams, err = parseStreams(strings.Split(q, ",")); err != nil {
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"`+err.Error()+`"}`))
+			return
+		}
+	}
 
 	if sessionParam != "" {
 		// Reattach to existing session
@@ -424,18 +436,32 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 			Env        map[string]string `json:"env,omitempty"`
 			Cwd        string            `json:"cwd,omitempty"` // default: /
 			MaxIdleSec int               `json:"max_idle_sec,omitempty"`
+			Streams    []string          `json:"streams,omitempty"` // e.g. ["stdout","stderr"]; see streamSet
 		}
 		if json.Unmarshal(msg, &spec) != nil || len(spec.Cmd) == 0 {
 			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"cmd required"}`))
 			return
 		}
+		if spec.Streams != nil {
+			var err error
+			if streams, err = parseStreams(spec.Streams); err != nil {
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"`+err.Error()+`"}`))
+				return
+			}
+		}
 		maxIdleSec := spec.MaxIdleSec
 		if maxIdleSec == 0 {
 			maxIdleSec = 3600 // default 1 hour
 		}
 
-		info, pc, err := pe.PipedSession(context.Background(), sb.EngineID, spec.Cmd, spec.Env, spec.Cwd, maxIdleSec)
+		info, pc, err := pe.PipedSession(context.Background(), sb.EngineID, engine.PipedSpec{
+			Cmd: spec.Cmd, Env: spec.Env, Cwd: spec.Cwd, MaxIdleSec: maxIdleSec,
+			// Keep stderr apart whenever the client chose streams, even if it
+			// only wants stdout: then stderr is dropped instead of mixed in.
+			Stderr: streams != nil,
+		})
 		if err != nil {
 			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"start: `+err.Error()+`"}`))
@@ -471,14 +497,45 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id 
 	}()
 
 	// Bidirectional relay
-	pipedWSRelay(conn, pipedConn)
+	pipedWSRelay(conn, pipedConn, streams)
+}
+
+// Stream ids: the first byte of each binary output frame when the client
+// subscribed to streams.
+const (
+	streamStdout byte = 1
+	streamStderr byte = 2
+)
+
+// streamSet is the output streams a piped-exec client subscribed to.
+type streamSet struct{ stdout, stderr bool }
+
+func parseStreams(names []string) (*streamSet, error) {
+	var s streamSet
+	for _, n := range names {
+		switch n {
+		case "stdout":
+			s.stdout = true
+		case "stderr":
+			s.stderr = true
+		default:
+			return nil, fmt.Errorf("unknown stream %q (want stdout, stderr)", n)
+		}
+	}
+	return &s, nil
 }
 
 // pipedWSRelay bridges a WebSocket and a piped session connection.
-// WebSocket text messages → STDIN frames to child.
-// STDOUT frames from child → WebSocket text messages.
-// EXIT frame → WebSocket close.
-func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn) {
+// WebSocket text messages → STDIN frames to child. EXIT/ERROR → a JSON text
+// message, then close.
+//
+// Output, by mode:
+//   - streams == nil (legacy): STDOUT and STDERR frames as text messages,
+//     kept valid UTF-8 (utf8Framer).
+//   - streams != nil: each subscribed stream as a binary message, first byte
+//     the stream id (1 stdout, 2 stderr), then the bytes as written. Text
+//     messages then only ever carry control JSON, so the two can't be confused.
+func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn, streams *streamSet) {
 	var wsMu sync.Mutex
 	wsWrite := func(msgType int, data []byte) error {
 		wsMu.Lock()
@@ -524,13 +581,23 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn) {
 			}
 			switch frameType {
 			case proto.STDOUT, proto.STDERR:
-				if text := out.next(payload); len(text) > 0 {
+				if streams != nil {
+					id, want := streamStdout, streams.stdout
+					if frameType == proto.STDERR {
+						id, want = streamStderr, streams.stderr
+					}
+					if want {
+						if err := wsWrite(websocket.BinaryMessage, append([]byte{id}, payload...)); err != nil {
+							return
+						}
+					}
+				} else if text := out.next(payload); len(text) > 0 {
 					if err := wsWrite(websocket.TextMessage, text); err != nil {
 						return
 					}
 				}
 			case proto.EXIT, proto.ERROR:
-				if tail := out.flush(); len(tail) > 0 {
+				if tail := out.flush(); len(tail) > 0 && streams == nil {
 					wsWrite(websocket.TextMessage, tail)
 				}
 			}

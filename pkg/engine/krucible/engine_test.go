@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
@@ -459,3 +460,48 @@ func main() {
 	}
 }
 `
+
+// TestKruciblePipedStderrStream: a piped session asked to keep stderr apart
+// delivers it as STDERR frames; without the flag it arrives merged into
+// STDOUT, as before. EXIT comes only after stderr has drained.
+func TestKruciblePipedStderrStream(t *testing.T) {
+	eng := newBlockRootEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "piped", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: gateway.PostureNone}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), info.ID) })
+	pe := eng.(engine.PipedSessionEngine)
+
+	collect := func(separate bool) (stdout, stderr string) {
+		t.Helper()
+		_, pc, err := pe.PipedSession(ctx, info.ID, engine.PipedSpec{Cmd: []string{"errcho", "to-stderr"}, Stderr: separate})
+		if err != nil {
+			t.Fatalf("PipedSession: %v", err)
+		}
+		defer pc.Close()
+		for {
+			typ, payload, err := pc.ReadFrame()
+			if err != nil {
+				t.Fatalf("ReadFrame: %v (stdout=%q stderr=%q)", err, stdout, stderr)
+			}
+			switch typ {
+			case proto.STDOUT:
+				stdout += string(payload)
+			case proto.STDERR:
+				stderr += string(payload)
+			case proto.EXIT:
+				return stdout, stderr
+			}
+		}
+	}
+	if out, errs := collect(true); strings.TrimSpace(errs) != "to-stderr" || out != "" {
+		t.Fatalf("separate: stdout=%q stderr=%q, want stderr only", out, errs)
+	}
+	if out, errs := collect(false); strings.TrimSpace(out) != "to-stderr" || errs != "" {
+		t.Fatalf("merged: stdout=%q stderr=%q, want stdout only", out, errs)
+	}
+}

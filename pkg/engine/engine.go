@@ -178,12 +178,21 @@ type PipedConn interface {
 	Close() error
 }
 
+// PipedSpec describes a piped session's process.
+type PipedSpec struct {
+	Cmd        []string
+	Env        map[string]string
+	Cwd        string // "" = the guest's default, /
+	MaxIdleSec int    // detached lifetime before the process group is killed; 0 = forever
+	// Stderr delivers stderr as STDERR frames instead of merging it into
+	// stdout. A guest agent that predates this merges regardless.
+	Stderr bool
+}
+
 // PipedSessionEngine is optionally implemented by engines that support
 // non-TTY persistent sessions with scrollback and reattach.
 type PipedSessionEngine interface {
-	// PipedSession starts cmd in cwd ("" = the guest's default, /).
-	PipedSession(ctx context.Context, id string, cmd []string,
-		env map[string]string, cwd string, maxIdleSec int) (*proto.SessionInfo, PipedConn, error)
+	PipedSession(ctx context.Context, id string, spec PipedSpec) (*proto.SessionInfo, PipedConn, error)
 	PipedSessionAttach(ctx context.Context, id, sessionID string,
 		ifDetached bool) (*proto.SessionInfo, PipedConn, error)
 }

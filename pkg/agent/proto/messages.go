@@ -14,6 +14,7 @@ type ExecRequest struct {
 	Detach     *bool             `json:"detach,omitempty"`         // fire-and-forget: start and return PID immediately
 	OutputFile *string           `json:"output_file,omitempty"`    // detach: redirect stdout/stderr to this file
 	Session    *bool             `json:"session,omitempty"`        // non-TTY session with scrollback+reattach (piped)
+	Stderr     *bool             `json:"stderr,omitempty"`         // piped session: send stderr as STDERR frames instead of merging it into stdout
 }
 
 // ActivityInfo reports the agent's activity state.

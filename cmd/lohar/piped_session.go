@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,7 +53,20 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 	}
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
-	cmd.Stderr = stdoutW // merge stderr into stdout
+	cmd.Stderr = stdoutW // merged into stdout unless the host asked for it apart
+	var stderrR, stderrW *os.File
+	if req.Stderr != nil && *req.Stderr {
+		if stderrR, stderrW, err = os.Pipe(); err != nil {
+			stdinR.Close()
+			stdinW.Close()
+			stdoutR.Close()
+			stdoutW.Close()
+			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("stderr pipe: %v", err)))
+			removeSession(sess.ID)
+			return
+		}
+		cmd.Stderr = stderrW
+	}
 	// setsid: process survives host disconnect.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:     true,
@@ -64,13 +78,44 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 		stdinW.Close()
 		stdoutR.Close()
 		stdoutW.Close()
+		if stderrR != nil {
+			stderrR.Close()
+			stderrW.Close()
+		}
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("start: %v", err)))
 		removeSession(sess.ID)
 		return
 	}
-	// Child has inherited stdinR and stdoutW. Close our copies.
+	// Child has inherited stdinR and stdoutW (and stderrW). Close our copies.
 	stdinR.Close()
 	stdoutW.Close()
+	// stderr frames go live to the attached host only; scrollback (replayed on
+	// reattach) stays stdout. EXIT waits until stderr has drained too.
+	var stderrDone sync.WaitGroup
+	if stderrR != nil {
+		stderrW.Close()
+		stderrDone.Add(1)
+		go func() {
+			defer stderrDone.Done()
+			defer stderrR.Close()
+			buf := make([]byte, 8192)
+			for {
+				n, err := stderrR.Read(buf)
+				if n > 0 {
+					sess.mu.Lock()
+					if sess.Attached != nil {
+						if werr := proto.WriteFrame(sess.Attached, proto.STDERR, buf[:n]); werr != nil {
+							sess.Attached.Close()
+						}
+					}
+					sess.mu.Unlock()
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
 
 	sess.Cmd = cmd
 	// Store the stdin write end in Master so reattach can write to it.
@@ -114,6 +159,7 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 			}
 			if err != nil {
 				// Pipe closed — process exited.
+				stderrDone.Wait()
 				exitCode := exitCodeFromErr(cmd.Wait())
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
