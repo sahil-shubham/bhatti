@@ -38,7 +38,7 @@ func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 
 		// The rootfs survives Stop/Start because it is a persistent block root.
 		const rootMark = "reliability-root-9a1c"
-		if err := fe.FileWrite(ctx, id, "/root/relmark", "0644", int64(len(rootMark)), strings.NewReader(rootMark)); err != nil {
+		if err := fe.FileWrite(ctx, id, "/workspace/relmark", "0644", int64(len(rootMark)), strings.NewReader(rootMark)); err != nil {
 			t.Fatalf("write rootfs marker: %v", err)
 		}
 
@@ -63,7 +63,7 @@ func RunReliabilitySuite(t *testing.T, newEngine NewEngine) {
 				t.Fatalf("cycle %d: exec-after-boot: err=%v out=%q", i, err, r.Stdout)
 			}
 			// rootfs survived every cycle.
-			if got := readFile(t, fe, ctx, id, "/root/relmark"); got != rootMark {
+			if got := readFile(t, fe, ctx, id, "/workspace/relmark"); got != rootMark {
 				t.Fatalf("cycle %d: rootfs marker = %q, want %q (block root not persisted)", i, got, rootMark)
 			}
 		}
