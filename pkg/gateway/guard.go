@@ -283,6 +283,27 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	return nil, dialErr
 }
 
+// DialAs vets a connection the guest made to ip as a connection to host (the
+// name the guest resolved to get ip; "" if unknown) and dials ip itself, so
+// the connection goes where the guest pointed it rather than to a fresh
+// resolution of host.
+func (d *Dialer) DialAs(ctx context.Context, network, host string, ip netip.Addr, port uint16) (net.Conn, error) {
+	if v := d.Policy.Check(host, ip); !v.Allow {
+		if d.OnDeny != nil {
+			d.OnDeny(host, ip, v.Reason)
+		}
+		return nil, &DeniedError{Host: addrForErr(host, ip.String()), Reason: v.Reason}
+	}
+	return d.dialOne(ctx, network, net.JoinHostPort(ip.String(), fmt.Sprint(port)))
+}
+
+// AllowsName reports whether DNS lookups of host should be answered for a
+// guest under this policy: every name under the public posture, only
+// allow-listed names otherwise.
+func (p *EgressPolicy) AllowsName(host string) bool {
+	return p.Default == PosturePublic || p.hostAllowed(host)
+}
+
 func addrForErr(host, addr string) string {
 	if host != "" {
 		return host

@@ -440,6 +440,37 @@ func TestKrucibleNetEgressPolicy(t *testing.T) {
 	}
 }
 
+// TestKrucibleNetAllowHostByName is the F18 regression: under deny with an
+// allow-host rule, the guest resolves the allowed name through netd and can
+// connect to it, while a name that isn't allowed doesn't even resolve. Before
+// netd tracked which name an IP came from, the allowed host was blocked too.
+func TestKrucibleNetAllowHostByName(t *testing.T) {
+	eng := newNetEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := eng.Create(ctx, engine.SandboxSpec{
+		Name: "allowhost", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "deny", AllowHosts: []string{"example.com"}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	id := info.ID
+	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
+
+	if r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", "example.com:443"}); err != nil || r.ExitCode != 0 {
+		t.Fatalf("allow-listed example.com unreachable: err=%v exit=%d out=%q", err, r.ExitCode, strings.TrimSpace(r.Stdout))
+	}
+	r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", "github.com:443"})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if r.ExitCode == 0 {
+		t.Fatalf("github.com reachable under deny + allow-only-example.com: %q", strings.TrimSpace(r.Stdout))
+	}
+}
+
 // TestKrucibleNetdRespawnsCtllessAdopt guards the daemon-upgrade case: a live
 // netd that serves traffic but predates the control channel (has n.sock, no
 // ctl.sock) must be replaced, not adopted — otherwise per-sandbox egress policy

@@ -82,6 +82,7 @@ type guestState struct {
 	sandbox string
 	pol     *gateway.EgressPolicy
 	dialer  *gateway.Dialer
+	names   nameCache // answered IP → the name the guest looked up (dns.go)
 }
 
 // NewGateway builds the stack, assigns the gateway address gwIP/prefix, sets a

@@ -36,10 +36,16 @@ func (g *Gateway) installTCPForwarder() {
 			up, err = gonet.DialContextTCP(context.Background(), g.stack,
 				tcpip.FullAddress{Addr: id.LocalAddress, Port: id.LocalPort}, ipv4.ProtocolNumber)
 		} else {
-			dest := net.JoinHostPort(addrString(id.LocalAddress), fmt.Sprint(id.LocalPort))
 			// Per-sandbox egress: vet the destination against THIS guest's policy
-			// (keyed by source IP), or the default posture if it isn't registered.
-			up, err = g.stateFor(id.RemoteAddress).dialer.DialContext(context.Background(), "tcp", dest)
+			// (keyed by source IP), or the default posture if it isn't registered,
+			// as a connection to the name the guest resolved to get this IP.
+			st := g.stateFor(id.RemoteAddress)
+			ip, perr := netip.ParseAddr(addrString(id.LocalAddress))
+			if perr != nil {
+				r.Complete(true)
+				return
+			}
+			up, err = st.dialer.DialAs(context.Background(), "tcp", st.names.lookup(ip), ip, id.LocalPort)
 		}
 		if err != nil {
 			r.Complete(true) // RST: denied by policy or unreachable
@@ -89,18 +95,33 @@ func addrString(a tcpip.Address) string {
 const udpIdleTimeout = 30 * time.Second
 
 // installUDPForwarder mirrors installTCPForwarder for UDP: it terminates each
-// guest UDP flow and re-originates it host-side, vetted by the SAME egress
-// policy (public allowed; host/private/metadata — and thus siblings in the
-// 100.64/10 space — denied). Its purpose is DNS egress (UDP:53 to the public
-// resolvers in the guest's resolv.conf); the address a guest subsequently
-// TCP-connects to is still vetted by the TCP forwarder, so DNS rebinding into
-// host/private space stays closed.
+// guest UDP flow and re-originates it host-side. DNS (port 53) goes through
+// netd's resolver proxy (dns.go), which records names for allow-host rules and
+// refuses names the policy doesn't allow. Other UDP is vetted by the same
+// egress policy as TCP (siblings in the 100.64/10 space are denied).
 func (g *Gateway) installUDPForwarder() {
 	fwd := udp.NewForwarder(g.stack, func(r *udp.ForwarderRequest) (handled bool) {
 		id := r.ID()
+		st := g.stateFor(id.RemoteAddress)
 		ip, err := netip.ParseAddr(addrString(id.LocalAddress))
-		if err != nil || !g.stateFor(id.RemoteAddress).pol.Check("", ip).Allow {
-			return false // drop: unparseable, or denied by this guest's egress policy
+		if err != nil {
+			return false
+		}
+		dest := net.JoinHostPort(ip.String(), fmt.Sprint(id.LocalPort))
+		if id.LocalPort == dnsPort {
+			if !resolverAllowed(ip, st.pol) {
+				return false
+			}
+			var wq waiter.Queue
+			ep, terr := r.CreateEndpoint(&wq)
+			if terr != nil {
+				return false
+			}
+			go serveDNS(gonet.NewUDPConn(&wq, ep), dest, st)
+			return true
+		}
+		if !st.pol.Check("", ip).Allow {
+			return false // drop: denied by this guest's egress policy
 		}
 		var wq waiter.Queue
 		ep, terr := r.CreateEndpoint(&wq)
@@ -108,7 +129,6 @@ func (g *Gateway) installUDPForwarder() {
 			return false
 		}
 		guest := gonet.NewUDPConn(&wq, ep)
-		dest := net.JoinHostPort(addrString(id.LocalAddress), fmt.Sprint(id.LocalPort))
 		up, derr := net.Dial("udp", dest)
 		if derr != nil {
 			guest.Close()
