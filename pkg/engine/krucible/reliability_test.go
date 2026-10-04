@@ -32,11 +32,9 @@ func makeVolume(t *testing.T, name, mount string) engine.ResolvedVolume {
 	return engine.ResolvedVolume{FilePath: path, DriveID: name, Name: name, Mount: mount}
 }
 
-// TestKrucibleSnapshotFailureRecoverable is the FC `VMRecoverableAfterSnapshotFailure`
-// behavior on the cold path: if the SNAPSHOT write fails mid-Stop, the guest —
-// already PAUSED — must be RESUMEd and left usable, not frozen or half-killed.
-// Injection: make the bundle dir unwritable so the helper's memory.img write
-// (into it) fails with EACCES after the PAUSE. Deterministic, no disk-fill.
+// TestKrucibleSnapshotFailureRecoverable forces SAVE to fail inside libkrun
+// (the Linux /proc parent cannot hold checkpoint files, even as root). The
+// source must remain running; libkrun must not leave a partial directory.
 func TestKrucibleSnapshotFailureRecoverable(t *testing.T) {
 	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
@@ -49,42 +47,54 @@ func TestKrucibleSnapshotFailureRecoverable(t *testing.T) {
 	id := info.ID
 	t.Cleanup(func() { eng.Destroy(context.Background(), id) })
 
-	// Prove it's alive before we sabotage the snapshot.
-	if r, err := eng.Exec(ctx, id, []string{"echo", "pre-fail"}); err != nil || !strings.Contains(r.Stdout, "pre-fail") {
-		t.Fatalf("pre-fail exec: err=%v out=%q", err, r.Stdout)
+	// /proc accepts no new directories on Linux. Unlike a pre-existing final
+	// directory this reaches SAVE itself, after which libkrun must unpause.
+	finalDir := filepath.Join("/proc", "krucible-save-fail-"+id)
+	if _, err := eng.Checkpoint(ctx, id, "", 0, filepath.Base(finalDir), "/proc"); err == nil {
+		t.Fatal("Checkpoint succeeded under /proc; expected SAVE to fail")
 	}
-
-	// Pre-create the bundle dir read-only so the helper cannot write memory.img
-	// into it — SNAPSHOT fails AFTER the PAUSE, exercising the RESUME-on-failure
-	// path in Stop. (MkdirAll on an existing dir is a no-op regardless of mode.)
-	vm, err := eng.getVM(id)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(finalDir); !os.IsNotExist(err) {
+		t.Fatalf("partial checkpoint directory after failed SAVE: %v", err)
 	}
-	if err := os.MkdirAll(vm.BundleDir, 0o500); err != nil {
-		t.Fatalf("pre-create read-only bundle dir: %v", err)
-	}
-	// Restore perms so Destroy / TempDir teardown can clean up.
-	t.Cleanup(func() { os.Chmod(vm.BundleDir, 0o700) })
-
-	// Stop must fail (snapshot couldn't be written)…
-	if err := eng.Stop(ctx, id); err == nil {
-		t.Fatal("Stop succeeded despite an unwritable bundle dir — expected snapshot failure")
-	}
-	// …but the VM must stay running (RESUMEd) and fully usable.
 	if s, err := eng.Status(ctx, id); err != nil || s.Status != "running" {
-		t.Fatalf("post-failure status = %q (err %v), want running (VM should be RESUMEd, not left stopped/frozen)", s.Status, err)
+		t.Fatalf("status after failed SAVE: %q (err %v), want running", s.Status, err)
 	}
 	if r, err := eng.Exec(ctx, id, []string{"echo", "post-fail"}); err != nil || !strings.Contains(r.Stdout, "post-fail") {
-		t.Fatalf("exec after recovered snapshot failure: err=%v out=%q (guest left frozen?)", err, r.Stdout)
+		t.Fatalf("source after failed SAVE: err=%v out=%q (guest left frozen?)", err, r.Stdout)
 	}
 }
 
-// TestKrucibleMultiVolumeSnapshotOrdering is the FC `RecoveryMultiVolumeOrdering`
-// behavior on the bundle path: a memory snapshot of a sandbox with MULTIPLE
-// volumes must restore the device set IN ORDER — so vol0→/data0 and vol1→/data1
-// stay matched, never swapped, and each carries its own data. A swap would show
-// /data1's marker under /data0 (or a missing mount).
+// TestKrucibleLaunchReportsEarlyHelperExit uses a helper that refuses a
+// restore before the agent starts. The exact exit status and diagnostic must
+// reach the caller promptly, not turn into a 30s agent readiness timeout.
+func TestKrucibleLaunchReportsEarlyHelperExit(t *testing.T) {
+	fake := filepath.Join(t.TempDir(), "refusing-vmm")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho 'vmm: build: unsupported checkpoint version' >&2\nexit 42\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, socks := t.TempDir(), t.TempDir()
+	vm := &VM{
+		SandboxDir: dir, SockDir: socks, logPath: filepath.Join(dir, "vmm.log"),
+		ControlUDS: filepath.Join(socks, "agent.sock"), ForwardUDS: filepath.Join(socks, "forward.sock"),
+	}
+	e := &Engine{cfg: Config{VMMBinary: fake}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := e.launch(ctx, vm, filepath.Join(dir, "checkpoint"))
+	if err == nil || !strings.Contains(err.Error(), "exit status 42") || !strings.Contains(err.Error(), "vmm: build: unsupported checkpoint version") {
+		t.Fatalf("early refusal should return process exit and log tail: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("early helper exit took %s; waited for agent readiness", elapsed)
+	}
+	if vm.HelperPID != 0 || vm.cmd != nil {
+		t.Fatalf("failed launch retained a helper: pid=%d cmd=%v", vm.HelperPID, vm.cmd)
+	}
+}
+
+// TestKrucibleMultiVolumeSnapshotOrdering ensures a memory restore preserves
+// independent data volumes in attachment order.
 func TestKrucibleMultiVolumeSnapshotOrdering(t *testing.T) {
 	eng := newCheckpointEngine(t).(*Engine)
 	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)

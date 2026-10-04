@@ -5,7 +5,9 @@ package krucible
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,5 +71,65 @@ func TestKrucibleFork(t *testing.T) {
 	}
 	if got := readWho(fork.ID); got != "fork" {
 		t.Fatalf("fork diverged wrong: /tmp/who = %q, want fork", got)
+	}
+}
+
+// TestKrucibleConcurrentFork forks one source three times in parallel. Every
+// child must inherit the same frozen RAM yet have its own writable RAM/disk.
+func TestKrucibleConcurrentFork(t *testing.T) {
+	e := newCheckpointEngine(t).(*Engine)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	src, err := e.Create(ctx, engine.SandboxSpec{Name: "fork-concurrent", CPUs: 1, MemoryMB: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Destroy(context.Background(), src.ID) })
+	const marker = "three-independent-children"
+	if err := e.FileWrite(ctx, src.ID, "/tmp/fork-original", "0644", int64(len(marker)), strings.NewReader(marker)); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var children [3]engine.SandboxInfo
+	var errs [3]error
+	for i := range children {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			children[i], errs[i] = e.Fork(ctx, src.ID, fmt.Sprintf("child-%d", i))
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Fork %d: %v", i, err)
+		}
+		t.Cleanup(func() { _ = e.Destroy(context.Background(), children[i].ID) })
+	}
+	ids := map[string]bool{src.ID: true}
+	for i, child := range children {
+		if ids[child.ID] {
+			t.Fatalf("duplicate fork ID %s", child.ID)
+		}
+		ids[child.ID] = true
+		checkpointMarker(t, e, ctx, child.ID, "/tmp/fork-original", marker)
+		value := fmt.Sprintf("child-%d", i)
+		for _, path := range []string{"/tmp/diverged", "/workspace/diverged"} {
+			if err := e.FileWrite(ctx, child.ID, path, "0644", int64(len(value)), strings.NewReader(value)); err != nil {
+				t.Fatalf("write child %d %s: %v", i, path, err)
+			}
+		}
+	}
+	for i, child := range children {
+		for _, path := range []string{"/tmp/diverged", "/workspace/diverged"} {
+			checkpointMarker(t, e, ctx, child.ID, path, fmt.Sprintf("child-%d", i))
+		}
+	}
+	checkpointMarker(t, e, ctx, src.ID, "/tmp/fork-original", marker)
+	for _, path := range []string{"/tmp/diverged", "/workspace/diverged"} {
+		var b bytes.Buffer
+		if _, _, err := e.FileRead(ctx, src.ID, path, &b); err == nil {
+			t.Fatalf("source acquired child-only data at %s: %q", path, b.String())
+		}
 	}
 }
