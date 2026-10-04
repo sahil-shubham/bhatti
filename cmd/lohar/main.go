@@ -99,6 +99,10 @@ func runAgent() {
 	mustMount("tmpfs", "/dev/shm", "tmpfs", 0, "")
 	bp("mounts_done")
 
+	if err := growRoot(); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: grow root filesystem (non-fatal): %v\n", err)
+	}
+
 	// cgroups v2 — required by Docker for resource isolation.
 	os.MkdirAll("/sys/fs/cgroup", 0755)
 	if err := syscall.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, ""); err != nil {

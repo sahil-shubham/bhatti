@@ -645,10 +645,13 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			if isQcow2(base) {
 				// A saved qcow2 image is already a CoW node over the raw base;
 				// copy it as this sandbox's root (it keeps backing that base).
+				if spec.DiskSizeMB > 0 {
+					return info, fmt.Errorf("disk size: not supported for sandboxes created from a saved image")
+				}
 				if err = cloneFile(base, rootImg); err != nil {
 					return info, fmt.Errorf("clone qcow2 image: %w", err)
 				}
-			} else if err = e.createRootOverlayQcow2(rootImg, base); err != nil {
+			} else if err = e.createRootOverlayQcow2(rootImg, base, spec.DiskSizeMB); err != nil {
 				return info, fmt.Errorf("create qcow2 root overlay: %w", err)
 			}
 			baseSpec.RootDiskFormat = "qcow2"
@@ -656,6 +659,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			rootImg = filepath.Join(sandboxDir, "root.img")
 			if err = cloneFile(base, rootImg); err != nil {
 				return info, fmt.Errorf("clone base image: %w", err)
+			}
+			if err = growFile(rootImg, spec.DiskSizeMB); err != nil {
+				return info, fmt.Errorf("disk size: %w", err)
 			}
 		}
 		baseSpec.RootDisk = rootImg
@@ -1145,15 +1151,34 @@ func isQcow2(path string) bool {
 func rootQcow2() bool { return os.Getenv("KRUCIBLE_ROOT_RAW") != "1" }
 
 // createRootOverlayQcow2 creates a qcow2 CoW overlay over the shared base ext4
-// at dst (the per-sandbox root): instant and host-FS-independent. The overlay
-// header is written directly (createQcow2Overlay); the VMM's qcow2 driver
-// (imago) opens it at boot.
-func (e *Engine) createRootOverlayQcow2(dst, base string) error {
+// at dst (the per-sandbox root): instant and host-FS-independent. Its virtual
+// size is the base's, or diskMB if that's larger; the guest grows its
+// filesystem into the extra space at boot (lohar growRoot). The overlay header
+// is written directly (createQcow2Overlay); the VMM's qcow2 driver (imago)
+// opens it at boot.
+func (e *Engine) createRootOverlayQcow2(dst, base string, diskMB int) error {
 	fi, err := os.Stat(base)
 	if err != nil {
 		return fmt.Errorf("stat base image %s: %w", base, err)
 	}
-	return createQcow2Overlay(dst, base, uint64(fi.Size()))
+	size := max(uint64(fi.Size()), uint64(diskMB)<<20)
+	return createQcow2Overlay(dst, base, size)
+}
+
+// growFile extends a raw root image to diskMB (sparse) if that's larger than
+// it already is. It never shrinks: a filesystem can't be cut under the guest.
+func growFile(path string, diskMB int) error {
+	if diskMB <= 0 {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if want := int64(diskMB) << 20; want > fi.Size() {
+		return os.Truncate(path, want)
+	}
+	return nil
 }
 
 func (e *Engine) Status(ctx context.Context, id string) (engine.SandboxInfo, error) {

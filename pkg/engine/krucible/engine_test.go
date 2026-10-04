@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -306,7 +307,7 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	// splitting on whitespace and dispatching in-process (no real shell needed).
 	// writeuid: writes the caller's uid to a file — lets a test observe that
 	// --init (and exec) ran as uid 1000 without a full userland.
-	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid"} {
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -383,6 +384,11 @@ func dispatch(name string, args []string) {
 	case "writeuid": // writeuid PATH -> write the caller's uid to PATH (observe --init/exec uid)
 		if len(args) > 0 {
 			os.WriteFile(args[0], []byte(strconv.Itoa(os.Getuid())), 0644)
+		}
+	case "fsbytes": // fsbytes PATH -> total bytes of the filesystem holding PATH
+		var st syscall.Statfs_t
+		if len(args) > 0 && syscall.Statfs(args[0], &st) == nil {
+			fmt.Println(uint64(st.Blocks) * uint64(st.Bsize))
 		}
 	default: // true
 	}
@@ -503,5 +509,31 @@ func TestKruciblePipedStderrStream(t *testing.T) {
 	}
 	if out, errs := collect(false); strings.TrimSpace(out) != "to-stderr" || errs != "" {
 		t.Fatalf("merged: stdout=%q stderr=%q, want stdout only", out, errs)
+	}
+}
+
+// TestKrucibleDiskSize: --disk-size larger than the image gives the sandbox a
+// root filesystem of about that size (the overlay is created at that size and
+// lohar grows ext4 online at boot).
+func TestKrucibleDiskSize(t *testing.T) {
+	eng := newBlockRootEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	const diskMB = 2048
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "disk", CPUs: 1, MemoryMB: 512, DiskSizeMB: diskMB,
+		NetPolicy: &gateway.NetPolicyWire{Default: gateway.PostureNone}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { eng.Destroy(context.Background(), info.ID) })
+	r, err := eng.Exec(ctx, info.ID, []string{"fsbytes", "/"})
+	if err != nil || r.ExitCode != 0 {
+		t.Fatalf("fsbytes: err=%v exit=%d", err, r.ExitCode)
+	}
+	got, _ := strconv.ParseUint(strings.TrimSpace(r.Stdout), 10, 64)
+	// ext4 metadata takes a few percent; a filesystem that wasn't grown is the
+	// test image's size, far below this.
+	if want := uint64(diskMB) << 20 * 9 / 10; got < want {
+		t.Fatalf("root filesystem is %d MiB, want about %d MiB", got>>20, diskMB)
 	}
 }
