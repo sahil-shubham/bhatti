@@ -25,6 +25,13 @@ on:
 permissions:
   contents: write
 
+# The version every binary reports is the tag being released. git describe
+# can't be trusted for this: a stable tag on the same commit as an -rc tag
+# describes as the rc (v2.4.0 shipped reporting v2.4.0-rc.3). Manual runs
+# (no tag) fall back to git describe.
+env:
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
 jobs:
   cli:
     name: CLI + lohar (cross-compile)
@@ -44,7 +51,7 @@ jobs:
 
       - name: Build lohar (guest agent, linux amd64 + arm64)
         run: |
-          VERSION="$(git describe --tags --always --dirty)"
+          VERSION="${VERSION:-$(git describe --tags --always --dirty)}"
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o dist/lohar-linux-amd64 ./cmd/lohar/
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION}" -o dist/lohar-linux-arm64 ./cmd/lohar/
 
@@ -138,7 +145,7 @@ jobs:
           # lohar (the guest agent) for the guest arch: image pull/import write it
           # into converted OCI images. Apple Silicon guests are arm64 too.
           GUEST_ARCH=$([ "$(uname -m)" = x86_64 ] && echo amd64 || echo arm64)
-          GOOS=linux GOARCH=$GUEST_ARCH CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" \
+          GOOS=linux GOARCH=$GUEST_ARCH CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION:-$(git describe --tags --always --dirty)}" \
             -o stage/bin/lohar ./cmd/lohar/
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cp -R libkrucible/_install/lib/libkrun*.dylib stage/lib/

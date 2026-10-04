@@ -3,7 +3,10 @@
 # silently "up to date" — `make lohar` would do nothing.
 .PHONY: build vmm krucible lohar netd test clean release
 
-VERSION ?= $(shell git describe --tags --always --dirty)
+# Set by the release workflow to the tag being built; git describe otherwise.
+ifeq ($(strip $(VERSION)),)
+VERSION := $(shell git describe --tags --always --dirty)
+endif
 
 # libkrucible (our libkrun fork). KRUCIBLE_PREFIX is the link prefix `make vmm`
 # points at; if unbuilt, vmm falls back to the system (Homebrew) libkrun.
