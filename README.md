@@ -117,6 +117,8 @@ bhatti exec ci -- docker buildx build --platform linux/amd64,linux/arm64 -t me/a
 
 The server auto-discovers tiers from `/var/lib/bhatti/images/`. Install more with `sudo bhatti update --tiers all`. Full per-tier docs (operator UX, env knobs, sizing, troubleshooting) live at [bhatti.sh/docs/managing/tiers/](https://bhatti.sh/docs/managing/tiers/); see [Adding a tier](https://bhatti.sh/docs/contributing/adding-a-tier/) for building your own.
 
+Each tier name (`images/rootfs-<tier>-<arch>.ext4`) is a symlink to an immutable, content-named base under `images/bases/`. A sandbox's disk records the base itself, so an update that ships a new tier image adds a base and re-points the symlink: existing sandboxes, snapshots and saved images keep the base they were made on (and the guest agent on it), new sandboxes get the new one. The daemon migrates older installs at startup and removes bases nothing uses any more; `sudo bhatti admin migrate-images` and `sudo bhatti admin gc-images [--dry-run]` do the same by hand.
+
 ## CLI Commands
 
 ### Core
@@ -179,6 +181,8 @@ The server auto-discovers tiers from `/var/lib/bhatti/images/`. Install more wit
 | `admin status` | System overview (sandboxes, memory, disk) |
 | `admin events` | Query the event log |
 | `admin metrics` | Query metrics snapshots |
+| `admin migrate-images` | Move tier images to immutable bases and point disks at them |
+| `admin gc-images` | Remove base images nothing uses any more |
 
 ### Setup
 
