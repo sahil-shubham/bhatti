@@ -1477,11 +1477,12 @@ func tailFile(path string, n int64) string {
 // confinement failure looks like an unanswered socket) and its last log lines.
 func netdStartFailed(cmd *exec.Cmd, logPath string, cause error) error {
 	_ = cmd.Process.Kill()
-	_, _ = cmd.Process.Wait()
 	// Killing a process that already exited changes nothing, so anything but
 	// our SIGKILL in the wait status is netd's own exit.
-	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && !(ws.Signaled() && ws.Signal() == syscall.SIGKILL) {
-		cause = fmt.Errorf("%w (bhatti-netd exited at startup: %s)", cause, cmd.ProcessState)
+	if state, err := cmd.Process.Wait(); err == nil {
+		if ws, ok := state.Sys().(syscall.WaitStatus); ok && !(ws.Signaled() && ws.Signal() == syscall.SIGKILL) {
+			cause = fmt.Errorf("%w (bhatti-netd exited at startup: %s)", cause, state)
+		}
 	}
 	if tail := strings.TrimSpace(tailFile(logPath, 1024)); tail != "" {
 		cause = fmt.Errorf("%w; netd log: %s", cause, tail)
