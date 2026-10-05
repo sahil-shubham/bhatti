@@ -246,15 +246,22 @@ func (u *Unit) IsActivating() bool {
 	return err == nil
 }
 
-// ReadPID returns the running PID for this unit, or an error if no
-// pidfile exists. The pidfile is keyed by canonical name, so calling
-// ReadPID through any alias returns the same PID.
+// ReadPID returns the running PID for this unit, or an error if the pidfile
+// is missing or unsafe to signal. Every signal path must reject PID ≤ 1:
+// negative process-group targets can broadcast signals from PID 1.
 func (u *Unit) ReadPID() (int, error) {
 	data, err := os.ReadFile(u.PidPath())
 	if err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("invalid pidfile for %s: %w", u.Canonical, err)
+	}
+	if pid <= 1 {
+		return 0, fmt.Errorf("refusing to signal pid %d (corrupt pidfile)", pid)
+	}
+	return pid, nil
 }
 
 // WritePID stores the PID for this unit in the canonical pidfile.
@@ -388,12 +395,12 @@ func (r *Registry) WaitForWatchers() { r.watcherWG.Wait() }
 // in byKey) until the next access.
 //
 // Surfaced twice during the G1.3 kubelet spike:
-//   1. notFound cache: probe-then-write-then-start (k3s install).
-//      Pre-fix: "Unit k3s not found" on start.
-//   2. byKey cache: edit unit file in place, daemon-reload, restart.
-//      Pre-fix: cached parse still has Type=notify even though file
-//      now says Type=exec, so waitForNotifyReady fires for the
-//      wrong unit shape.
+//  1. notFound cache: probe-then-write-then-start (k3s install).
+//     Pre-fix: "Unit k3s not found" on start.
+//  2. byKey cache: edit unit file in place, daemon-reload, restart.
+//     Pre-fix: cached parse still has Type=notify even though file
+//     now says Type=exec, so waitForNotifyReady fires for the
+//     wrong unit shape.
 func (r *Registry) Reload() {
 	r.mu.Lock()
 	r.notFound = make(map[string]struct{})

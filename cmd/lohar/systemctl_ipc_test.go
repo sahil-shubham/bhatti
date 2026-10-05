@@ -152,6 +152,9 @@ func TestSvcStopRefusesPID1(t *testing.T) {
 
 	for _, badPID := range []string{"0", "1"} {
 		os.WriteFile(u.PidPath(), []byte(badPID), 0644)
+		if pid, err := u.ReadPID(); err == nil || pid != 0 {
+			t.Errorf("ReadPID with pidfile=%s returned unsafe pid %d, error %v", badPID, pid, err)
+		}
 		err := svcStop(u)
 		if err == nil {
 			t.Errorf("svcStop with pidfile=%s should return error, got nil", badPID)

@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS users (
 `
 
 // migrations runs ALTER TABLE statements for columns added after initial schema.
-// Duplicate column errors are silently ignored (idempotent).
+// A duplicate column is the only expected failure when reopening a migrated database.
 const migrations = `
 ALTER TABLE templates ADD COLUMN mounts_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE sandboxes ADD COLUMN rootfs_path TEXT DEFAULT '';
@@ -88,7 +88,7 @@ ALTER TABLE sandboxes ADD COLUMN mem_size_mib INTEGER DEFAULT 512;
 ALTER TABLE sandboxes ADD COLUMN socket_path TEXT DEFAULT '';
 ALTER TABLE sandboxes ADD COLUMN vsock_path TEXT DEFAULT '';
 ALTER TABLE secrets ADD COLUMN value_encrypted BLOB DEFAULT NULL;
-ALTER TABLE secrets ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE secrets ADD COLUMN updated_at DATETIME DEFAULT NULL;
 ALTER TABLE sandboxes ADD COLUMN created_by TEXT NOT NULL DEFAULT '';
 ALTER TABLE secrets ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE sandboxes ADD COLUMN agent_token TEXT DEFAULT '';
@@ -110,24 +110,41 @@ ALTER TABLE sandboxes ADD COLUMN has_init INTEGER NOT NULL DEFAULT 0;
 
 // New opens (or creates) the SQLite database and runs migrations.
 func New(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+		return nil, fmt.Errorf("store: open db: %w", err)
+	}
+	// Four connections bound concurrent readers while allowing writes when
+	// callers keep query rows open; one connection would block nested queries.
+	db.SetMaxOpenConns(4)
+	ok := false
+	defer func() {
+		if !ok {
+			db.Close()
+		}
+	}()
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		return nil, fmt.Errorf("store: read journal mode: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		return nil, fmt.Errorf("store: journal mode %q, want wal", journalMode)
 	}
 	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, fmt.Errorf("store: migrate base schema: %w", err)
 	}
-	// Run additive migrations — ignore "duplicate column" errors
 	for _, stmt := range strings.Split(migrations, ";") {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
 		}
-		db.Exec(stmt) // ignore errors (column already exists)
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
+			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
+		}
 	}
-
 	// v0.3 tables: persistent volumes, images, snapshots, tasks
-	db.Exec(`CREATE TABLE IF NOT EXISTS volumes_v2 (
+	createStatements := []string{
+		`CREATE TABLE IF NOT EXISTS volumes_v2 (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		name TEXT NOT NULL,
@@ -136,16 +153,16 @@ func New(dbPath string) (*Store, error) {
 		status TEXT NOT NULL DEFAULT 'ready',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(user_id, name)
-	)`)
-	db.Exec(`CREATE TABLE IF NOT EXISTS volume_attachments (
+	)`,
+		`CREATE TABLE IF NOT EXISTS volume_attachments (
 		volume_id TEXT NOT NULL,
 		sandbox_id TEXT NOT NULL,
 		mount TEXT NOT NULL,
 		read_only INTEGER NOT NULL DEFAULT 0,
 		attached_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (volume_id, sandbox_id)
-	)`)
-	db.Exec(`CREATE TABLE IF NOT EXISTS images (
+	)`,
+		`CREATE TABLE IF NOT EXISTS images (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL DEFAULT '',
 		name TEXT NOT NULL,
@@ -156,8 +173,8 @@ func New(dbPath string) (*Store, error) {
 		oci_config_json TEXT NOT NULL DEFAULT '{}',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(user_id, name)
-	)`)
-	db.Exec(`CREATE TABLE IF NOT EXISTS snapshots (
+	)`,
+		`CREATE TABLE IF NOT EXISTS snapshots (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		name TEXT NOT NULL,
@@ -170,8 +187,8 @@ func New(dbPath string) (*Store, error) {
 		size_mb INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(user_id, name)
-	)`)
-	db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+	)`,
+		`CREATE TABLE IF NOT EXISTS tasks (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		type TEXT NOT NULL,
@@ -181,11 +198,11 @@ func New(dbPath string) (*Store, error) {
 		error TEXT NOT NULL DEFAULT '',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		completed_at DATETIME
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)`)
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)`,
 
-	// v0.4: publish rules for public proxy
-	db.Exec(`CREATE TABLE IF NOT EXISTS publish_rules (
+		// v0.4: publish rules for public proxy
+		`CREATE TABLE IF NOT EXISTS publish_rules (
 		id TEXT PRIMARY KEY,
 		sandbox_id TEXT NOT NULL,
 		user_id TEXT NOT NULL,
@@ -193,11 +210,11 @@ func New(dbPath string) (*Store, error) {
 		alias TEXT NOT NULL UNIQUE,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(sandbox_id, port)
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_publish_rules_sandbox ON publish_rules(sandbox_id)`)
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_publish_rules_sandbox ON publish_rules(sandbox_id)`,
 
-	// v0.5: volume backups
-	db.Exec(`CREATE TABLE IF NOT EXISTS volume_backups (
+		// v0.5: volume backups
+		`CREATE TABLE IF NOT EXISTS volume_backups (
 		id TEXT PRIMARY KEY,
 		volume_name TEXT NOT NULL,
 		user_id TEXT NOT NULL,
@@ -205,13 +222,19 @@ func New(dbPath string) (*Store, error) {
 		size_bytes INTEGER NOT NULL,
 		sha256 TEXT NOT NULL DEFAULT '',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_volume_backups_name ON volume_backups(user_id, volume_name, created_at DESC)`)
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_volume_backups_name ON volume_backups(user_id, volume_name, created_at DESC)`,
 
-	// Create unique index on (created_by, name) for non-destroyed sandboxes.
-	// Prevents a user from having two sandboxes with the same name.
-	db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_user_name
-		ON sandboxes(created_by, name) WHERE status != 'destroyed'`)
+		// Create unique index on (created_by, name) for non-destroyed sandboxes.
+		// Prevents a user from having two sandboxes with the same name.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_user_name
+		ON sandboxes(created_by, name) WHERE status != 'destroyed'`,
+	}
+	for _, stmt := range createStatements {
+		if _, err := db.Exec(stmt); err != nil {
+			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
+		}
+	}
 
 	// Migrate secrets from v1 (PRIMARY KEY name) to v2 (PRIMARY KEY
 	// (user_id, name)). Idempotent — a no-op once the table is v2.
@@ -220,26 +243,27 @@ func New(dbPath string) (*Store, error) {
 	}
 
 	// Image sharing table — allows sharing images with specific users
-	db.Exec(`CREATE TABLE IF NOT EXISTS image_shares (
+	createStatements = []string{
+		`CREATE TABLE IF NOT EXISTS image_shares (
 		image_id TEXT NOT NULL,
 		user_id TEXT NOT NULL,
 		PRIMARY KEY (image_id, user_id)
-	)`)
+	)`,
 
-	// Observability: events + metrics snapshots
-	db.Exec(`CREATE TABLE IF NOT EXISTS events (
+		// Observability: events + metrics snapshots
+		`CREATE TABLE IF NOT EXISTS events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 		type TEXT NOT NULL,
 		user_id TEXT NOT NULL DEFAULT '',
 		sandbox_id TEXT NOT NULL DEFAULT '',
 		meta TEXT NOT NULL DEFAULT '{}'
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, ts)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, ts)`)
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, ts)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, ts)`,
 
-	db.Exec(`CREATE TABLE IF NOT EXISTS metrics_snapshots (
+		`CREATE TABLE IF NOT EXISTS metrics_snapshots (
 		ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 		api_requests INTEGER NOT NULL DEFAULT 0,
 		api_errors INTEGER NOT NULL DEFAULT 0,
@@ -260,10 +284,10 @@ func New(dbPath string) (*Store, error) {
 		host_load_1m REAL NOT NULL DEFAULT 0,
 		host_mem_total_mb INTEGER NOT NULL DEFAULT 0,
 		host_mem_avail_mb INTEGER NOT NULL DEFAULT 0
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_ms_ts ON metrics_snapshots(ts)`)
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_ms_ts ON metrics_snapshots(ts)`,
 
-	db.Exec(`CREATE TABLE IF NOT EXISTS secret_grants (
+		`CREATE TABLE IF NOT EXISTS secret_grants (
 		id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		secret_name TEXT NOT NULL,
@@ -273,17 +297,23 @@ func New(dbPath string) (*Store, error) {
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		expires_at DATETIME,
 		revoked_at DATETIME
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_secret_grants_sandbox ON secret_grants(sandbox_id)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_secret_grants_user_created ON secret_grants(user_id, created_at)`)
-	db.Exec(`CREATE TABLE IF NOT EXISTS sandbox_cas (
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_secret_grants_sandbox ON secret_grants(sandbox_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_secret_grants_user_created ON secret_grants(user_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS sandbox_cas (
 		sandbox_id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
 		cert_pem TEXT NOT NULL,
 		key_enc BLOB NOT NULL,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`)
-
+	)`,
+	}
+	for _, stmt := range createStatements {
+		if _, err := db.Exec(stmt); err != nil {
+			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
+		}
+	}
+	ok = true
 	return &Store{db: db}, nil
 }
 

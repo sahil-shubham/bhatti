@@ -89,7 +89,12 @@ func (s *Store) ListVolumes() ([]Volume, error) {
 // DeleteVolume removes a volume record. Fails if any sandbox is using it.
 func (s *Store) DeleteVolume(name string) error {
 	var count int
-	s.db.QueryRow(`SELECT COUNT(*) FROM sandbox_volumes WHERE volume_name = ?`, name).Scan(&count)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sandbox_volumes WHERE volume_name = ?`, name).Scan(&count); err != nil {
+		return fmt.Errorf("store: count volume mounts: %w", err)
+	}
+	if count < 0 {
+		return fmt.Errorf("store: count volume mounts: invalid count %d", count)
+	}
 	if count > 0 {
 		return fmt.Errorf("volume %q is in use by %d sandbox(es)", name, count)
 	}
@@ -167,21 +172,39 @@ func (s *Store) GetPersistentVolume(userID, name string) (*PersistentVolume, err
 	if err != nil {
 		return nil, err
 	}
-	// Load attachments
 	rows, err := s.db.Query(
 		`SELECT sandbox_id, mount, read_only FROM volume_attachments WHERE volume_id = ?`, v.ID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var a VolumeAttachment
-			var ro int
-			if err := rows.Scan(&a.SandboxID, &a.Mount, &ro); err == nil {
-				a.ReadOnly = ro != 0
-				v.Attachments = append(v.Attachments, a)
-			}
+	if err != nil {
+		return nil, fmt.Errorf("store: list volume attachments: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a VolumeAttachment
+		var ro int
+		if err := rows.Scan(&a.SandboxID, &a.Mount, &ro); err != nil {
+			return nil, fmt.Errorf("store: scan volume attachment: %w", err)
 		}
+		a.ReadOnly = ro != 0
+		v.Attachments = append(v.Attachments, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list volume attachments: %w", err)
 	}
 	return &v, nil
+}
+
+// PersistentVolumeExists checks only the volume row; attachment scan failures
+// must never make startup mistake an existing volume file for an orphan.
+func (s *Store) PersistentVolumeExists(userID, name string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM volumes_v2 WHERE user_id = ? AND name = ?`, userID, name).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: check persistent volume existence: %w", err)
+	}
+	return true, nil
 }
 
 // ListPersistentVolumes returns all persistent volumes for a user.
@@ -220,12 +243,19 @@ func (s *Store) DeletePersistentVolume(userID, name string) error {
 	}
 
 	var count int
-	tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ?`, volID).Scan(&count)
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ?`, volID).Scan(&count); err != nil {
+		return fmt.Errorf("store: count volume attachments: %w", err)
+	}
+	if count < 0 {
+		return fmt.Errorf("store: count volume attachments: invalid count %d", count)
+	}
 	if count > 0 {
 		return fmt.Errorf("volume %q has %d active attachment(s)", name, count)
 	}
 
-	tx.Exec(`DELETE FROM volumes_v2 WHERE id = ?`, volID)
+	if _, err := tx.Exec(`DELETE FROM volumes_v2 WHERE id = ?`, volID); err != nil {
+		return fmt.Errorf("store: delete persistent volume: %w", err)
+	}
 	return tx.Commit()
 }
 
@@ -248,10 +278,17 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 	}
 
 	var rwCount, roCount int
-	tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 0`,
-		volID).Scan(&rwCount)
-	tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 1`,
-		volID).Scan(&roCount)
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 0`,
+		volID).Scan(&rwCount); err != nil {
+		return fmt.Errorf("store: count read-write attachments: %w", err)
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 1`,
+		volID).Scan(&roCount); err != nil {
+		return fmt.Errorf("store: count read-only attachments: %w", err)
+	}
+	if rwCount < 0 || roCount < 0 {
+		return fmt.Errorf("store: count volume attachments: invalid counts rw=%d ro=%d", rwCount, roCount)
+	}
 
 	if !readOnly {
 		if rwCount > 0 || roCount > 0 {
@@ -379,7 +416,12 @@ func (s *Store) UpdatePersistentVolumeStatus(userID, name, status string) error 
 // UserVolumeStorageUsed returns the total size_mb of all persistent volumes for a user.
 func (s *Store) UserVolumeStorageUsed(userID string) (int, error) {
 	var total sql.NullInt64
-	s.db.QueryRow(`SELECT SUM(size_mb) FROM volumes_v2 WHERE user_id = ?`, userID).Scan(&total)
+	if err := s.db.QueryRow(`SELECT SUM(size_mb) FROM volumes_v2 WHERE user_id = ?`, userID).Scan(&total); err != nil {
+		return 0, fmt.Errorf("store: sum volume storage: %w", err)
+	}
+	if total.Valid && (total.Int64 < 0 || int64(int(total.Int64)) != total.Int64) {
+		return 0, fmt.Errorf("store: sum volume storage: invalid total %d", total.Int64)
+	}
 	if !total.Valid {
 		return 0, nil
 	}

@@ -74,11 +74,20 @@ func (s *Store) ListUsers() ([]User, error) {
 
 // DeleteUser removes a user. Fails if the user has active sandboxes or secrets.
 func (s *Store) DeleteUser(id string) error {
-	count, _ := s.CountUserSandboxes(id)
+	count, err := s.CountUserSandboxes(id)
+	if err != nil {
+		return fmt.Errorf("store: count user sandboxes: %w", err)
+	}
+	if count < 0 {
+		return fmt.Errorf("store: count user sandboxes: invalid count %d", count)
+	}
 	if count > 0 {
 		return fmt.Errorf("user has %d active sandbox(es) — destroy them first", count)
 	}
-	secrets, _ := s.ListUserSecrets(id)
+	secrets, err := s.ListUserSecrets(id)
+	if err != nil {
+		return fmt.Errorf("store: list user secrets: %w", err)
+	}
 	if len(secrets) > 0 {
 		return fmt.Errorf("user has %d secret(s) — delete them first", len(secrets))
 	}
@@ -96,9 +105,14 @@ func (s *Store) DeleteUser(id string) error {
 // NextSubnetIndex returns MAX(subnet_index)+1 for allocating new user networks.
 func (s *Store) NextSubnetIndex() (int, error) {
 	var maxIdx sql.NullInt64
-	s.db.QueryRow(`SELECT MAX(subnet_index) FROM users`).Scan(&maxIdx)
+	if err := s.db.QueryRow(`SELECT MAX(subnet_index) FROM users`).Scan(&maxIdx); err != nil {
+		return 0, fmt.Errorf("store: next subnet index: %w", err)
+	}
 	if !maxIdx.Valid {
 		return 1, nil
+	}
+	if maxIdx.Int64 < 0 || maxIdx.Int64 >= int64(^uint(0)>>1) {
+		return 0, fmt.Errorf("store: next subnet index: invalid maximum %d", maxIdx.Int64)
 	}
 	return int(maxIdx.Int64) + 1, nil
 }

@@ -958,21 +958,12 @@ func svcStop(u *Unit) error {
 	pid, err := u.ReadPID()
 	if err != nil {
 		u.reg.clearStopRequested(u.Canonical) // no watcher to consume the flag
-		u.RemoveCgroup()                      // best-effort cleanup of empty cgroup
-		return nil                            // not running, nothing to do
-	}
-	// Defensive guard: never signal PID ≤ 1.
-	//
-	//   pid == 0  → kill(-0, ...) broadcasts to the caller's process group
-	//   pid == 1  → kill(-1, ...) is the POSIX "send to ALL processes I'm
-	//                allowed to signal" sentinel — catastrophic from PID 1
-	//
-	// Neither is a legitimate state (svcStart never writes 1 or 0), but a
-	// corrupt pidfile or a manual-edit accident must not be allowed to
-	// turn `systemctl stop` into a system-wide kill.
-	if pid <= 1 {
+		if os.IsNotExist(err) {
+			u.RemoveCgroup() // best-effort cleanup of empty cgroup
+			return nil       // not running, nothing to do
+		}
 		u.RemovePID()
-		return fmt.Errorf("refusing to signal pid %d (corrupt pidfile)", pid)
+		return err
 	}
 	if !processAlive(pid) {
 		u.RemovePID()

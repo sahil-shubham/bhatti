@@ -24,14 +24,14 @@ func TestTemplatesCRUD(t *testing.T) {
 	s := testStore(t)
 
 	tmpl := Template{
-		ID:       "t1",
-		Name:     "ubuntu-dev",
-		Engine:   "docker",
-		Image:    "ubuntu:22.04",
-		CPUs:     2,
-		MemoryMB: 1024,
-		Secrets:  []string{"github-token"},
-		Labels:   map[string]string{"env": "dev"},
+		ID:        "t1",
+		Name:      "ubuntu-dev",
+		Engine:    "docker",
+		Image:     "ubuntu:22.04",
+		CPUs:      2,
+		MemoryMB:  1024,
+		Secrets:   []string{"github-token"},
+		Labels:    map[string]string{"env": "dev"},
 		CreatedAt: time.Now().Truncate(time.Second),
 	}
 
@@ -601,7 +601,10 @@ func TestNextSubnetIndex(t *testing.T) {
 		SubnetIndex: 1, CreatedAt: time.Now(),
 	})
 
-	idx, _ = s.NextSubnetIndex()
+	idx, err = s.NextSubnetIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if idx != 2 {
 		t.Fatalf("expected 2, got %d", idx)
 	}
@@ -612,7 +615,10 @@ func TestNextSubnetIndex(t *testing.T) {
 		SubnetIndex: 5, CreatedAt: time.Now(),
 	})
 
-	idx, _ = s.NextSubnetIndex()
+	idx, err = s.NextSubnetIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if idx != 6 {
 		t.Fatalf("expected 6, got %d", idx)
 	}
@@ -1175,4 +1181,3 @@ func TestShellTokenRoundTrip(t *testing.T) {
 		t.Fatalf("expected scopedhash via GetSandbox, got %q", sb.ShellTokenHash)
 	}
 }
-

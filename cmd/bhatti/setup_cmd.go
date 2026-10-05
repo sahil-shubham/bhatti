@@ -120,13 +120,11 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 		fmt.Print("Testing connection... ")
 		apiURL = endpoint
 		apiToken = key
+		unixSocketPath = "" // A local daemon socket must not override the newly selected endpoint.
 		var sandboxes []any
 		if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
 			fmt.Printf("✗ %v\n", err)
-			if nonInteractive {
-				return fmt.Errorf("authentication failed: %w", err)
-			}
-			return nil
+			return fmt.Errorf("connection test failed: %w", err)
 		}
 		fmt.Printf("✓ authenticated (%d sandboxes)\n", len(sandboxes))
 

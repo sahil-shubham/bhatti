@@ -244,8 +244,9 @@ func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
 
 // UpdateSandboxLabels merges labels for a sandbox: keys in `set` are
 // inserted or overwritten, keys in `remove` are deleted. Other existing
-// labels are preserved (no full replace). Runs in a transaction so
-// concurrent updates from another writer don't lose entries.
+// labels are preserved (no full replace). The store's immediate transaction
+// reserves the writer before reading, so concurrent merges cannot overwrite
+// each other's changes.
 //
 // Empty set + empty remove is a no-op (still does one round-trip to
 // validate ownership; returns "not found" if the (id, userID) pair is
