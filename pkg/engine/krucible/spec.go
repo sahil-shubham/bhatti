@@ -113,13 +113,11 @@ type VMSpec struct {
 	// guest console readable.
 	LogLevel uint32 `json:"log_level"`
 
-	// NetUDS, if set, attaches a virtio-net device wired to the per-owner gateway
-	// (bhatti-netd) LISTENING on this unixstream socket (krun_add_net_unixstream).
-	// Adding a net device disables libkrun's implicit TSI backend, so the guest's
-	// inet flows over eth0 through the gateway (egress policy + secret substitution
-	// + isolation live there). Empty = the legacy TSI backend. NetMAC is the guest
-	// NIC's MAC (e.g. "52:54:00:00:00:02"); lohar configures eth0's IP/gw/dns from
-	// the config drive.
-	NetUDS string `json:"net_uds,omitempty"`
-	NetMAC string `json:"net_mac,omitempty"`
+	// NetUDS is the owner's gateway unixstream. The VMM authenticates its
+	// connection with NetToken BEFORE handing the fd to libkrun; guest Ethernet
+	// frames cannot select another VM's policy. NetMAC is the assigned NIC MAC.
+	// Empty NetUDS means no NIC.
+	NetUDS   string `json:"net_uds,omitempty"`
+	NetMAC   string `json:"net_mac,omitempty"`
+	NetToken string `json:"net_token,omitempty"`
 }

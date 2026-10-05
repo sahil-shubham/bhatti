@@ -570,6 +570,34 @@ func (c *AgentClient) NetConfig(ctx context.Context, ipCIDR, gateway string) err
 	return nil
 }
 
+// Reseed credits fresh host entropy to the restored guest's kernel CRNG.
+// It must be acknowledged before the caller can use a cloned memory image.
+func (c *AgentClient) Reseed(ctx context.Context, seed [proto.ReseedBytes]byte) error {
+	defer clear(seed[:])
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return fmt.Errorf("agent connect for reseed: %w", err)
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	if err := proto.WriteFrame(conn, proto.RESEED, seed[:]); err != nil {
+		return fmt.Errorf("agent send reseed: %w", err)
+	}
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("agent read reseed ack: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return fmt.Errorf("guest reseed failed: %s", payload)
+	}
+	if msgType != proto.RESEED || len(payload) != 0 {
+		return fmt.Errorf("expected empty RESEED ack, got 0x%02x (%d bytes)", msgType, len(payload))
+	}
+	return nil
+}
+
 // SessionKill sends SIGTERM to a session's process.
 func (c *AgentClient) SessionKill(ctx context.Context, sessionID string) error {
 	conn, err := c.DialControl(ctx)

@@ -2,8 +2,10 @@ package krucible
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -133,6 +135,33 @@ func (vm *VM) requireFeature(feature proto.AgentFeature) error {
 		return engine.GuestAgentOutdated(string(feature))
 	}
 	return nil
+}
+
+// A restored memory image inherits its source's kernel CRNG state. Unlike
+// capabilities that only affect an optional operation, an unknown capability
+// cannot safely permit this restore.
+func reseedRestoredGuest(ctx context.Context, vmID string, ag *agent.AgentClient, info proto.AgentInfo, infoErr error) (unsupported bool, err error) {
+	if infoErr != nil {
+		return false, fmt.Errorf("guest agent capabilities unavailable: %w", infoErr)
+	}
+	if !info.Legacy && info.Version == "" {
+		return false, fmt.Errorf("guest agent capabilities unavailable: no response cached")
+	}
+	if !info.Has(proto.FeatureReseedCRNG) {
+		slog.Warn("krucible.guest_reseed_unsupported", "id", vmID, "agent_version", info.Version)
+		return true, nil
+	}
+	var seed [proto.ReseedBytes]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return false, fmt.Errorf("generate host entropy: %w", err)
+	}
+	defer clear(seed[:])
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := ag.Reseed(rctx, seed); err != nil {
+		return false, fmt.Errorf("agent reseed: %w", err)
+	}
+	return false, nil
 }
 
 // PipedSession implements engine.PipedSessionEngine.

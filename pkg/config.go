@@ -23,9 +23,14 @@ type Config struct {
 	AuthToken string `yaml:"auth_token"` // CLI: API key for remote requests
 	DataDir   string `yaml:"data_dir"`   // defaults to ~/.bhatti
 
-	// ConfigPath is the file path LoadConfig actually loaded from.
-	// Not persisted — set at load time for logging/debugging.
-	ConfigPath string `yaml:"-"`
+	// MountRoots permits live --mount sources only beneath these host directories.
+	// Empty disables live mounts. Roots must not expose bhatti's data or config directory.
+	MountRoots []string `yaml:"mount_roots,omitempty"`
+
+	// ConfigPath is the primary config file for diagnostics. ConfigPaths tracks
+	// every file read, including layered user credentials, for mount protection.
+	ConfigPath  string   `yaml:"-"`
+	ConfigPaths []string `yaml:"-"`
 
 	// Public proxy (Phase 1: path-based, for dev/testing)
 	PublicProxyListen string `yaml:"public_proxy_listen,omitempty"` // e.g. ":8443"
@@ -218,63 +223,53 @@ func LoadConfig() (*Config, error) {
 			cfg.DataDir = dir
 		}
 		cfg.ConfigPath = envPath
+		cfg.ConfigPaths = []string{envPath}
 		return cfg, nil
 	}
 
-	// Layer 1: system config (server settings)
-	var loadedFrom string
-	for _, path := range []string{
-		"/etc/bhatti/config.yaml",
-	} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse config %s: %w", path, err)
-		}
-		loadedFrom = path
-		break
+	if err := loadLayeredConfig(cfg, "/etc/bhatti/config.yaml", "/var/lib/bhatti/config.yaml", filepath.Join(dir, "config.yaml")); err != nil {
+		return nil, err
 	}
-
-	// Migration fallback: old location inside data dir.
-	// TODO: remove after a few releases (added v1.6.0).
-	if loadedFrom == "" {
-		const deprecated = "/var/lib/bhatti/config.yaml"
-		if data, err := os.ReadFile(deprecated); err == nil {
-			if err := yaml.Unmarshal(data, cfg); err != nil {
-				return nil, fmt.Errorf("parse config %s: %w", deprecated, err)
-			}
-			loadedFrom = deprecated
-			fmt.Fprintf(os.Stderr, "⚠ config loaded from deprecated location %s\n  move to /etc/bhatti/config.yaml\n\n", deprecated)
-		}
-	}
-
-	// Layer 2: user config (client credentials)
-	// Only fills in api_url and auth_token if they're still empty.
-	userConfig := filepath.Join(dir, "config.yaml")
-	if data, err := os.ReadFile(userConfig); err == nil {
-		var userCfg Config
-		if err := yaml.Unmarshal(data, &userCfg); err == nil {
-			if cfg.APIURL == "" && userCfg.APIURL != "" {
-				cfg.APIURL = userCfg.APIURL
-			}
-			if cfg.AuthToken == "" && userCfg.AuthToken != "" {
-				cfg.AuthToken = userCfg.AuthToken
-			}
-			if loadedFrom == "" {
-				loadedFrom = userConfig
-			}
-		}
-	}
-
 	if cfg.DataDir == "" {
 		cfg.DataDir = dir
 	}
-	if loadedFrom != "" {
-		cfg.ConfigPath = loadedFrom
-	}
 	return cfg, nil
+}
+
+func loadLayeredConfig(cfg *Config, systemPath, deprecatedPath, userPath string) error {
+	// The first server config wins; user config only provides CLI credentials.
+	if data, err := os.ReadFile(systemPath); err == nil {
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return fmt.Errorf("parse config %s: %w", systemPath, err)
+		}
+		cfg.ConfigPath = systemPath
+		cfg.ConfigPaths = append(cfg.ConfigPaths, systemPath)
+	} else if data, err := os.ReadFile(deprecatedPath); err == nil {
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return fmt.Errorf("parse config %s: %w", deprecatedPath, err)
+		}
+		cfg.ConfigPath = deprecatedPath
+		cfg.ConfigPaths = append(cfg.ConfigPaths, deprecatedPath)
+		fmt.Fprintf(os.Stderr, "⚠ config loaded from deprecated location %s\n  move to %s\n\n", deprecatedPath, systemPath)
+	}
+
+	if data, err := os.ReadFile(userPath); err == nil {
+		// Protect even a malformed credentials file: the daemon opened it.
+		cfg.ConfigPaths = append(cfg.ConfigPaths, userPath)
+		var userCfg Config
+		if err := yaml.Unmarshal(data, &userCfg); err == nil {
+			if cfg.APIURL == "" {
+				cfg.APIURL = userCfg.APIURL
+			}
+			if cfg.AuthToken == "" {
+				cfg.AuthToken = userCfg.AuthToken
+			}
+			if cfg.ConfigPath == "" {
+				cfg.ConfigPath = userPath
+			}
+		}
+	}
+	return nil
 }
 
 // EnsureKeypair generates an ed25519 SSH keypair in DataDir if missing.

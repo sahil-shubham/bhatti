@@ -27,6 +27,11 @@ const (
 	// with nil payload; failure = ERROR. Host → guest.
 	NET_CONFIG byte = 0x14
 
+	// A memory restore clones the kernel CRNG state. Host entropy must be
+	// credited before the restored sandbox is handed to its caller.
+	// Host → guest: exactly 64 bytes; ack = empty RESEED frame, failure = ERROR.
+	RESEED byte = 0x17
+
 	// Agent capability discovery. Older lohar replies with ERROR
 	// "unexpected frame type 0x15"; it does not answer AUTH.
 	INFO_REQ  byte = 0x15 // host → guest: empty payload
@@ -90,3 +95,6 @@ const (
 // MaxFrameSize is the maximum allowed frame size (1 MB).
 // The length field value (1 byte type + payload) must not exceed this.
 const MaxFrameSize = 1 << 20
+
+// ReseedBytes is the fresh host entropy supplied after each memory restore.
+const ReseedBytes = 64

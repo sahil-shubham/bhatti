@@ -567,6 +567,12 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 
 	info, err := sr.ResumeFromManifestJSON(r.Context(), snapDir, []byte(snap.ManifestJSON), sandboxName, user.ID)
 	if err != nil {
+		if errors.Is(err, engine.ErrGuestReseedFailed) {
+			s.RecordEvent(store.Event{
+				Type: "guest.reseed_failed", UserID: user.ID, SandboxID: snap.SourceSandbox,
+				Meta: map[string]any{"operation": "snapshot_restore", "snapshot": snapName, "new_sandbox": sandboxName, "error": err.Error()},
+			})
+		}
 		if strings.Contains(err.Error(), "in use") {
 			errResp(w, 409, err.Error())
 		} else {
@@ -634,6 +640,12 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		Type: "snapshot.resumed", UserID: user.ID, SandboxID: sbID,
 		Meta: map[string]any{"name": snapName, "new_sandbox": sandboxName},
 	})
+	if info.GuestReseedUnsupported {
+		s.RecordEvent(store.Event{
+			Type: "guest.reseed_unsupported", UserID: user.ID, SandboxID: sbID,
+			Meta: map[string]any{"operation": "snapshot_restore", "snapshot": snapName},
+		})
+	}
 	writeJSON(w, 201, sb)
 }
 

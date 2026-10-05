@@ -1,11 +1,9 @@
 package gateway
 
-// This file is the daemon->netd control channel. netd runs one gateway per
-// owner and, until now, applied a single hardcoded egress policy to every
-// guest. The daemon is the real source of truth for per-sandbox state (egress
-// rules today; secret alias bindings next), so it pushes that state over a
-// dedicated control UDS, keyed by the guest's gateway IP. The daemon (re)pushes
-// on create/destroy and after adopting a netd that survived a daemon restart.
+// This file is the daemon->netd control channel. The daemon owns each guest's
+// policy and pushes it over a dedicated control UDS keyed by guest IP. A missing
+// or malformed policy registers deny, rather than retaining a previous grant.
+// The daemon (re)pushes on create/destroy and when adopting a surviving netd.
 //
 // Wire framing is newline-delimited JSON (one ControlMsg per json.Encode); a
 // single connection carries many messages. HostPattern is opaque, so the wire
@@ -14,15 +12,18 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 )
 
 // NetPolicyWire is the JSON form of an EgressPolicy, plus the "none" posture:
 // a sandbox with no network device at all (never reaches netd).
 type NetPolicyWire struct {
-	Default    string   `json:"default,omitempty"`     // "none" | "deny" | "public"; "" = public
+	Default    string   `json:"default"`               // "none" | "deny" | "public"; required
+	Siblings   string   `json:"siblings,omitempty"`    // "allow" | "deny"; omitted = deny
 	AllowHosts []string `json:"allow_hosts,omitempty"` // exact ("api.x.com") or wildcard ("*.x.com")
 	AllowCIDRs []string `json:"allow_cidrs,omitempty"`
 }
@@ -37,6 +38,9 @@ func (w *NetPolicyWire) NoNetwork() bool { return w != nil && w.Default == Postu
 // parseable allow rules that only make sense with a network.
 func ValidateWire(w NetPolicyWire) error {
 	if w.Default == PostureNone {
+		if w.Siblings != "" && w.Siblings != "deny" {
+			return fmt.Errorf("gateway: siblings need a network (egress deny or public, not none)")
+		}
 		if len(w.AllowHosts) > 0 || len(w.AllowCIDRs) > 0 {
 			return fmt.Errorf("gateway: allow rules need a network (egress deny or public, not none)")
 		}
@@ -46,18 +50,27 @@ func ValidateWire(w NetPolicyWire) error {
 	return err
 }
 
-// PolicyFromWire builds an EgressPolicy from its wire form. The private-range /
-// SSRF hard-deny is applied unconditionally by Check regardless of this policy,
-// so an allow rule can never widen past it.
+// PolicyFromWire builds an EgressPolicy from its wire form. netd supplies
+// deployment-specific hard-denied addresses before using the policy.
 func PolicyFromWire(w NetPolicyWire) (*EgressPolicy, error) {
 	p := &EgressPolicy{}
 	switch w.Default {
-	case "", "public":
+	case "":
+		return nil, fmt.Errorf("gateway: egress posture required")
+	case "public":
 		p.Default = PosturePublic
 	case "deny":
 		p.Default = PostureDeny
 	default:
 		return nil, fmt.Errorf("gateway: unknown egress posture %q (want none|deny|public)", w.Default)
+	}
+	switch w.Siblings {
+	case "", "deny":
+		p.Siblings = PostureDeny
+	case "allow":
+		p.Siblings = PosturePublic
+	default:
+		return nil, fmt.Errorf("gateway: unknown siblings posture %q (want allow|deny)", w.Siblings)
 	}
 	for _, h := range w.AllowHosts {
 		hp, err := ParseHostPattern(h)
@@ -80,30 +93,42 @@ func PolicyFromWire(w NetPolicyWire) (*EgressPolicy, error) {
 type ControlOp string
 
 const (
-	ControlSet ControlOp = "set" // upsert a guest's per-sandbox state
-	ControlDel ControlOp = "del" // drop a guest (on destroy)
+	// EnforcementVersion changes whenever netd's enforcement or guest-link
+	// protocol changes. A daemon must not adopt a netd with another version.
+	EnforcementVersion = 1
+	GuestHelloSize     = 64 // hex-encoded, 256-bit per-VM attachment secret
+
+	ControlHello ControlOp = "hello"
+	ControlSet   ControlOp = "set"
+	ControlDel   ControlOp = "del"
 )
 
 // ControlMsg is one framed control message.
 type ControlMsg struct {
-	Op      ControlOp      `json:"op"`
-	GuestIP string         `json:"guest_ip"`
-	Sandbox string         `json:"sandbox_id,omitempty"`
-	Policy  *NetPolicyWire `json:"policy,omitempty"`
+	Op         ControlOp      `json:"op"`
+	GuestIP    string         `json:"guest_ip,omitempty"`
+	GuestMAC   string         `json:"guest_mac,omitempty"`
+	GuestToken string         `json:"guest_token,omitempty"`
+	Sandbox    string         `json:"sandbox_id,omitempty"`
+	Policy     *NetPolicyWire `json:"policy,omitempty"`
 	// Aliases []AliasWire — added by the secret-substitution tranche.
 }
 
-// ControlHandler applies control messages to a gateway. The per-owner gateway
-// implements it; nil pol means "no explicit policy" (gateway uses its default).
+type controlReply struct {
+	Version int    `json:"version"`
+	Error   string `json:"error,omitempty"`
+}
+
+// ControlHandler applies control messages to a gateway. A nil policy means
+// deny, including when the sender omitted the policy.
 type ControlHandler interface {
-	SetSandbox(guestIP, sandboxID string, pol *EgressPolicy)
+	SetSandbox(guestIP, sandboxID string, pol *EgressPolicy, mac, token string) error
 	DelSandbox(guestIP string)
 }
 
-// ServeControl accepts control connections on ln and applies each decoded
-// message to h until ln closes. A malformed policy is skipped (logged nowhere —
-// the daemon is trusted; a decode error just means resync on the next push)
-// rather than tearing down the connection.
+// ServeControl accepts control connections on ln and applies decoded messages
+// until ln closes. Every operation is acknowledged after it takes effect: the
+// daemon cannot launch a NIC against a policy still in the socket buffer.
 func ServeControl(ln net.Listener, h ControlHandler) error {
 	for {
 		conn, err := ln.Accept()
@@ -117,26 +142,64 @@ func ServeControl(ln net.Listener, h ControlHandler) error {
 func serveControlConn(conn net.Conn, h ControlHandler) {
 	defer conn.Close()
 	dec := json.NewDecoder(conn)
+	enc := json.NewEncoder(conn)
 	for {
 		var m ControlMsg
 		if err := dec.Decode(&m); err != nil {
-			return // EOF or malformed framing: daemon will redial + re-push
+			return
 		}
+		reply := controlReply{Version: EnforcementVersion}
 		switch m.Op {
+		case ControlHello:
 		case ControlSet:
-			var pol *EgressPolicy
+			pol := &EgressPolicy{}
 			if m.Policy != nil {
 				p, err := PolicyFromWire(*m.Policy)
 				if err != nil {
-					continue // skip this message; keep the connection
+					slog.Warn("netd.policy_rejected", "sandbox_id", m.Sandbox, "guest_ip", m.GuestIP, "error", err)
+				} else {
+					pol = p
 				}
-				pol = p
+			} else {
+				slog.Warn("netd.policy_rejected", "sandbox_id", m.Sandbox, "guest_ip", m.GuestIP, "error", "egress policy required")
 			}
-			h.SetSandbox(m.GuestIP, m.Sandbox, pol)
+			if err := h.SetSandbox(m.GuestIP, m.Sandbox, pol, m.GuestMAC, m.GuestToken); err != nil {
+				h.DelSandbox(m.GuestIP)
+				reply.Error = err.Error()
+			}
 		case ControlDel:
 			h.DelSandbox(m.GuestIP)
+		default:
+			reply.Error = "unknown control operation"
+		}
+		if err := enc.Encode(reply); err != nil {
+			return
 		}
 	}
+}
+
+// ProbeVersion treats old netds (which ignore hello), malformed answers and
+// unresponsive sockets as incompatible, not as evidence of current enforcement.
+func ProbeVersion(path string) error {
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		return err
+	}
+	if err := json.NewEncoder(conn).Encode(ControlMsg{Op: ControlHello}); err != nil {
+		return err
+	}
+	var reply controlReply
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		return fmt.Errorf("netd hello: %w", err)
+	}
+	if reply.Version != EnforcementVersion || reply.Error != "" {
+		return fmt.Errorf("netd enforcement version %d (want %d): %s", reply.Version, EnforcementVersion, reply.Error)
+	}
+	return nil
 }
 
 // ControlClient is the daemon side: a persistent, lazily-dialed sender to one
@@ -147,26 +210,36 @@ type ControlClient struct {
 	mu   sync.Mutex
 	conn net.Conn
 	enc  *json.Encoder
+	dec  *json.Decoder
 }
 
 // NewControlClient returns a client for the control UDS at path.
 func NewControlClient(path string) *ControlClient { return &ControlClient{path: path} }
 
-// Send delivers one message, dialing if needed. On a write error it drops the
-// connection so the next Send redials.
+// Send delivers one message, dialing if needed. It waits for the netd to
+// apply the operation and acknowledge the matching enforcement version.
 func (c *ControlClient) Send(m ControlMsg) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.enc == nil {
-		conn, err := net.Dial("unix", c.path)
+		conn, err := net.DialTimeout("unix", c.path, time.Second)
 		if err != nil {
 			return err
 		}
-		c.conn, c.enc = conn, json.NewEncoder(conn)
+		c.conn, c.enc, c.dec = conn, json.NewEncoder(conn), json.NewDecoder(conn)
 	}
-	if err := c.enc.Encode(m); err != nil {
+	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
+	var reply controlReply
+	err := c.enc.Encode(m)
+	if err == nil {
+		err = c.dec.Decode(&reply)
+	}
+	if err == nil && (reply.Version != EnforcementVersion || reply.Error != "") {
+		err = fmt.Errorf("netd control version %d (want %d): %s", reply.Version, EnforcementVersion, reply.Error)
+	}
+	if err != nil {
 		c.conn.Close()
-		c.conn, c.enc = nil, nil
+		c.conn, c.enc, c.dec = nil, nil, nil
 		return err
 	}
 	return nil
@@ -180,6 +253,6 @@ func (c *ControlClient) Close() error {
 		return nil
 	}
 	err := c.conn.Close()
-	c.conn, c.enc = nil, nil
+	c.conn, c.enc, c.dec = nil, nil, nil
 	return err
 }

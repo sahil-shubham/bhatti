@@ -221,16 +221,34 @@ kernel, filesystem, and network. Paused sandboxes resume in under 3ms.</div>
       <section class="command" id="bhatti-create">
         <h2><a href="#bhatti-create">bhatti create</a></h2>
         <p>Create a new sandbox</p>
-        <div class="description">Create a new sandbox VM. Each sandbox is an isolated Linux environment
-with its own kernel, filesystem, and network.</div>
+        <div class="description">Create an isolated Linux sandbox. By default it
+has no network device; use --net for public internet or --allow-siblings for
+same-owner TCP/UDP without granting public internet access.</div>
         <pre>  bhatti create --name dev
-  bhatti create --name ml --cpus 4 --memory 4096
-  bhatti create --name api --env API_KEY=sk-abc --init &#34;npm install&#34;
-  bhatti create --name py --image python-3.12
-  bhatti create --name work --volume workspace:/workspace
-  bhatti create --name agent --init &#34;hermes gateway&#34; --keep-hot</pre>
+  bhatti create --name web --net
+  bhatti create --name locked --allow-host api.openai.com
+  bhatti create --name workers --allow-siblings</pre>
+        <p>The create API accepts <code>net_policy: {&#34;siblings&#34;: &#34;allow&#34;}</code>.
+Without an explicit egress posture, this resolves to <code>default: &#34;deny&#34;</code>;
+inspect reports the stored posture and sibling grant. Sibling access defaults
+to deny even when egress is public.</p>
         <table>
           <tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+          <tr>
+            <td>--allow-cidr</td>
+            <td>—</td>
+            <td>Allow egress to CIDR (repeatable; cannot override host, gateway or other-owner denies)</td>
+          </tr>
+          <tr>
+            <td>--allow-host</td>
+            <td>—</td>
+            <td>Allow egress to host, exact or *.wildcard (repeatable)</td>
+          </tr>
+          <tr>
+            <td>--allow-siblings</td>
+            <td><span class="default-val">false</span></td>
+            <td>Allow TCP/UDP to sandboxes of the same owner, without public internet egress</td>
+          </tr>
           <tr>
             <td>--cpus</td>
             <td><span class="default-val">1</span></td>
@@ -245,6 +263,11 @@ with its own kernel, filesystem, and network.</div>
             <td>--env</td>
             <td>—</td>
             <td>Environment variables (K=V,K=V)</td>
+          </tr>
+          <tr>
+            <td>--egress</td>
+            <td>none</td>
+            <td>Network posture: none, deny, or public; server-configured default applies</td>
           </tr>
           <tr>
             <td>--image</td>
@@ -265,6 +288,16 @@ with its own kernel, filesystem, and network.</div>
             <td>--memory</td>
             <td><span class="default-val">0</span></td>
             <td>Memory in MB (0 = server default: 2048)</td>
+          </tr>
+          <tr>
+            <td>--mount</td>
+            <td><span class="default-val">[]</span></td>
+            <td>Live host-dir bind, virtio-fs (absolute host:guest[:ro]; requires server mount_roots) — krucible only</td>
+          </tr>
+          <tr>
+            <td>--net</td>
+            <td><span class="default-val">false</span></td>
+            <td>Give the sandbox public internet access (same as --egress public)</td>
           </tr>
           <tr>
             <td>--name</td>

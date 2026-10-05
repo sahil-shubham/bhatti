@@ -94,19 +94,24 @@ func sandboxEgress(sb *store.Sandbox) *gateway.NetPolicyWire {
 	return &np
 }
 
-// grantHosts normalizes a grant's host patterns and checks each is one the
-// sandbox may reach at all: under "deny" it must fall inside an allow_host
-// rule; under "public" (or an unknown policy) anything goes — the egress guard
-// still vets every connection. A sandbox without a network gets no grants.
+// grantHosts accepts grants only for a known network policy. Under deny, a
+// grant host must already be covered by allow_host; missing/invalid policies
+// cannot authorize substitution on an otherwise unreachable destination.
 func grantHosts(hosts []string, np *gateway.NetPolicyWire) ([]string, error) {
 	if len(hosts) == 0 {
 		return nil, errors.New("at least one host is required")
+	}
+	if np == nil {
+		return nil, errors.New("the sandbox has no valid network policy")
+	}
+	if err := gateway.ValidateWire(*np); err != nil {
+		return nil, fmt.Errorf("invalid sandbox network policy: %w", err)
 	}
 	if np.NoNetwork() {
 		return nil, errors.New("the sandbox has no network (egress none)")
 	}
 	var allow []gateway.HostPattern
-	deny := np != nil && np.Default == "deny"
+	deny := np.Default == "deny"
 	if deny {
 		for _, h := range np.AllowHosts {
 			if p, err := gateway.ParseHostPattern(h); err == nil {

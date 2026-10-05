@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -120,6 +121,52 @@ func TestParseHostPatternRejectsBad(t *testing.T) {
 	for _, bad := range []string{"", "*", "*.", "a.*.com", "*.*.com", "foo.*"} {
 		if _, err := ParseHostPattern(bad); err == nil {
 			t.Errorf("ParseHostPattern(%q) should error", bad)
+		}
+	}
+}
+
+func TestZeroValueEgressPolicyDeniesPublic(t *testing.T) {
+	var p EgressPolicy
+	if v := p.Check("", mustAddr(t, "1.1.1.1")); v.Allow {
+		t.Fatalf("zero-value policy admitted public destination: %+v", v)
+	}
+}
+
+func TestMissingWirePostureRejected(t *testing.T) {
+	w := NetPolicyWire{AllowCIDRs: []string{"1.1.1.1/32"}}
+	if err := ValidateWire(w); err == nil || !strings.Contains(err.Error(), "egress posture required") {
+		t.Fatalf("ValidateWire missing default = %v", err)
+	}
+	if _, err := PolicyFromWire(w); err == nil || !strings.Contains(err.Error(), "egress posture required") {
+		t.Fatalf("PolicyFromWire missing default = %v", err)
+	}
+}
+
+func TestWireSiblingPosture(t *testing.T) {
+	own := mustPrefix(t, "100.64.0.0/24")
+	for _, posture := range []string{"public", "deny"} {
+		for _, sibling := range []string{"", "deny", "allow"} {
+			w := NetPolicyWire{Default: posture, Siblings: sibling}
+			if err := ValidateWire(w); err != nil {
+				t.Fatal(err)
+			}
+			p, err := PolicyFromWire(w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.SiblingSubnet = own
+			v := p.Check("", mustAddr(t, "100.64.0.5"))
+			if v.Allow != (sibling == "allow") {
+				t.Errorf("default=%q siblings=%q returned %+v", posture, sibling, v)
+			}
+		}
+	}
+	for _, w := range []NetPolicyWire{
+		{Default: "deny", Siblings: "public"},
+		{Default: PostureNone, Siblings: "allow"},
+	} {
+		if err := ValidateWire(w); err == nil {
+			t.Errorf("ValidateWire accepted %+v", w)
 		}
 	}
 }

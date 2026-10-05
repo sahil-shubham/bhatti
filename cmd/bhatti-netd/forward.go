@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
@@ -18,34 +19,31 @@ import (
 
 const maxInFlightConn = 2048
 
-// installTCPForwarder terminates EVERY guest TCP connection here and
-// re-originates it: a sibling destination (same owner subnet) is dialed via the
-// stack, which routes to that guest's link; everything else goes through the
-// egress guard's vetting dialer — host/private/metadata denied, public allowed
-// (the isolation TSI couldn't give). Dial-first so a denied or unreachable
-// destination RSTs the guest cleanly.
+// installTCPForwarder terminates guest TCP and checks the source sandbox's
+// policy before dialing either the host network or an in-stack sibling.
+// Dial-first RSTs a denied or unreachable destination cleanly.
 func (g *Gateway) installTCPForwarder() {
 	fwd := tcp.NewForwarder(g.stack, 0, maxInFlightConn, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 
+		st := g.stateFor(id.RemoteAddress)
+		ip, perr := netip.ParseAddr(addrString(id.LocalAddress))
+		if perr != nil {
+			r.Complete(true)
+			return
+		}
+		sibling := g.isSibling(id.LocalAddress)
 		var up net.Conn
 		var err error
-		var st *guestState
-		if g.isSibling(id.LocalAddress) {
-			// Same-owner sibling: dial via the stack so it routes to the sibling's
-			// link (native checksums, mediated + observable by netd).
-			up, err = gonet.DialContextTCP(context.Background(), g.stack,
-				tcpip.FullAddress{Addr: id.LocalAddress, Port: id.LocalPort}, ipv4.ProtocolNumber)
-		} else {
-			// Per-sandbox egress: vet the destination against THIS guest's policy
-			// (keyed by source IP), or the default posture if it isn't registered,
-			// as a connection to the name the guest resolved to get this IP.
-			st = g.stateFor(id.RemoteAddress)
-			ip, perr := netip.ParseAddr(addrString(id.LocalAddress))
-			if perr != nil {
+		if sibling {
+			if !g.siblingAllowed(st, "tcp", ip, id.LocalPort) {
 				r.Complete(true)
 				return
 			}
+			// In-stack dialing routes to the sibling's link, not the host.
+			up, err = gonet.DialContextTCP(context.Background(), g.stack,
+				tcpip.FullAddress{Addr: id.LocalAddress, Port: id.LocalPort}, ipv4.ProtocolNumber)
+		} else {
 			up, err = st.dialer.DialAs(context.Background(), "tcp", st.names.lookup(ip), ip, id.LocalPort)
 		}
 		if err != nil {
@@ -64,13 +62,22 @@ func (g *Gateway) installTCPForwarder() {
 		// TLS to the internet from a registered sandbox may carry a placeholder
 		// for a granted host (intercept.go); the policy check above already
 		// passed, and up is the address the guest asked for.
-		if g.cred != nil && st != nil && st.sandbox != "" && id.LocalPort == tlsPort {
+		if g.cred != nil && !sibling && st.sandbox != "" && id.LocalPort == tlsPort {
 			go g.cred.serve(guest, up, st.sandbox)
 			return
 		}
 		go splice(guest, up)
 	})
 	g.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+}
+
+// siblingAllowed uses the same verdict for TCP and UDP, before either transport
+// dials. A debug verdict records both granted and denied sibling attempts.
+func (g *Gateway) siblingAllowed(st *guestState, protocol string, ip netip.Addr, port uint16) bool {
+	v := st.pol.Check("", ip)
+	slog.Debug("netd.egress_verdict", "sandbox_id", st.sandbox, "protocol", protocol,
+		"destination", ip, "port", port, "allow", v.Allow, "reason", v.Reason)
+	return v.Allow
 }
 
 // splice copies bidirectionally between the guest endpoint and the upstream,
@@ -103,45 +110,57 @@ func addrString(a tcpip.Address) string {
 
 const udpIdleTimeout = 30 * time.Second
 
-// installUDPForwarder mirrors installTCPForwarder for UDP: it terminates each
-// guest UDP flow and re-originates it host-side. DNS (port 53) goes through
-// netd's resolver proxy (dns.go), which records names for allow-host rules and
-// refuses names the policy doesn't allow. Other UDP is vetted by the same
-// egress policy as TCP (siblings in the 100.64/10 space are denied).
+// installUDPForwarder mirrors TCP: sibling datagrams are checked and routed
+// inside the stack, while non-sibling datagrams use the host dialer. External
+// DNS is still proxied for allow-host name recording (dns.go).
 func (g *Gateway) installUDPForwarder() {
 	fwd := udp.NewForwarder(g.stack, func(r *udp.ForwarderRequest) (handled bool) {
 		id := r.ID()
 		st := g.stateFor(id.RemoteAddress)
 		ip, err := netip.ParseAddr(addrString(id.LocalAddress))
 		if err != nil {
-			return false
+			return true
 		}
 		dest := net.JoinHostPort(ip.String(), fmt.Sprint(id.LocalPort))
-		if id.LocalPort == dnsPort {
+		sibling := g.isSibling(id.LocalAddress)
+		if sibling {
+			if !g.siblingAllowed(st, "udp", ip, id.LocalPort) {
+				return true // handled and dropped, not relayed to the host
+			}
+		} else if id.LocalPort == dnsPort {
 			if !resolverAllowed(ip, st.pol) {
-				return false
+				return true
 			}
 			var wq waiter.Queue
 			ep, terr := r.CreateEndpoint(&wq)
 			if terr != nil {
-				return false
+				return true
 			}
 			go serveDNS(gonet.NewUDPConn(&wq, ep), dest, st)
 			return true
-		}
-		if !st.pol.Check("", ip).Allow {
-			return false // drop: denied by this guest's egress policy
+		} else if !st.pol.Check("", ip).Allow {
+			return true // handled and dropped
 		}
 		var wq waiter.Queue
 		ep, terr := r.CreateEndpoint(&wq)
 		if terr != nil {
-			return false
+			return true
 		}
 		guest := gonet.NewUDPConn(&wq, ep)
-		up, derr := net.Dial("udp", dest)
+		var up net.Conn
+		var derr error
+		if sibling {
+			// Spoofing lets an unbound UDP socket select the sibling's IP
+			// as its source, producing a self-addressed frame to our MAC.
+			// Bind the re-originated leg to the gateway's assigned IP.
+			up, derr = gonet.DialUDP(g.stack, &tcpip.FullAddress{NIC: nicID, Addr: g.gwIP},
+				&tcpip.FullAddress{NIC: nicID, Addr: id.LocalAddress, Port: id.LocalPort}, ipv4.ProtocolNumber)
+		} else {
+			up, derr = g.hostUDPDial("udp", dest)
+		}
 		if derr != nil {
 			guest.Close()
-			return false
+			return true
 		}
 		go udpRelay(guest, up, udpIdleTimeout)
 		return true

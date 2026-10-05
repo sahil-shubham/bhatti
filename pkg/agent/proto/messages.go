@@ -9,6 +9,7 @@ const (
 	FeatureSandboxCA   AgentFeature = "sandbox_ca"
 	FeatureRootGrowth  AgentFeature = "root_growth"
 	FeaturePipedStderr AgentFeature = "piped_stderr"
+	FeatureReseedCRNG  AgentFeature = "reseed_crng"
 )
 
 // AgentInfo is returned by INFO_RESP. Legacy is host-only: an old lohar

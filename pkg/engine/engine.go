@@ -25,6 +25,10 @@ func GuestAgentOutdated(feature string) error {
 	return fmt.Errorf("%w: this sandbox runs an older guest agent; recreate it to use %s", ErrGuestAgentOutdated, feature)
 }
 
+// ErrGuestReseedFailed identifies a memory restore refused because the guest
+// CRNG state could not be made independent of its source.
+var ErrGuestReseedFailed = errors.New("guest CRNG reseed failed")
+
 // GuestAgentCapabilities is optional. Engines without guest capability
 // discovery do not claim support for credential-substitution grants.
 type GuestAgentCapabilities interface {
@@ -96,7 +100,7 @@ type SandboxSpec struct {
 	NewVolumes []VolumeSpec           `json:"new_volumes,omitempty"`
 	Init       string                 `json:"init,omitempty"`
 	Hugepages  bool                   `json:"hugepages,omitempty"`  // 2MB hugepages, faster boot, no Diff snapshots
-	NetPolicy  *gateway.NetPolicyWire `json:"net_policy,omitempty"` // per-sandbox network posture + allow rules; nil = public (the server always sets it; "none" = no NIC)
+	NetPolicy  *gateway.NetPolicyWire `json:"net_policy,omitempty"` // per-sandbox posture, allow rules and siblings; nil = none (no NIC)
 
 	// v0.3: Persistent volume references (replaces VolumeMount for persistent vols)
 	PersistentVolumes []PersistentVolume `json:"persistent_volumes,omitempty"`
@@ -136,6 +140,9 @@ type SandboxInfo struct {
 	Status   string `json:"status"` // "running", "stopped", "unknown"
 	IP       string `json:"ip"`
 	EngineID string `json:"engine_id"`
+	// GuestReseedUnsupported is host-only: a restored memory image still
+	// has its source's CRNG state if its baked-in lohar cannot reseed it.
+	GuestReseedUnsupported bool `json:"-"`
 }
 
 // ExecResult holds the output of a command execution.

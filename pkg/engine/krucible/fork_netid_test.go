@@ -24,9 +24,8 @@ import (
 //     (SandboxInfo.IP) — i.e. the guest was reconciled to its fresh identity,
 //     not left presenting the source's;
 //  2. it differs from the source's guest IP; and
-//  3. source and fork can reach each other across the shared netd (proves the
-//     fork joined the owner fabric AND both IPs route), while the source is
-//     undisturbed.
+//  3. source and fork share an owner subnet, while the source is undisturbed.
+//     Network identity does not imply sibling reachability without an opt-in.
 func TestKrucibleForkNetIdentity(t *testing.T) {
 	eng := newNetEngine(t)
 	ke := eng.(*Engine)
@@ -36,7 +35,8 @@ func TestKrucibleForkNetIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
 	defer cancel()
 
-	src, err := eng.Create(ctx, engine.SandboxSpec{Name: "fork-netid-src", CPUs: 1, MemoryMB: 512, UserID: "forkowner"})
+	src, err := eng.Create(ctx, engine.SandboxSpec{Name: "fork-netid-src", CPUs: 1, MemoryMB: 512, UserID: "forkowner",
+		NetPolicy: &gateway.NetPolicyWire{Default: "deny"}})
 	if err != nil {
 		t.Fatalf("Create src: %v", err)
 	}

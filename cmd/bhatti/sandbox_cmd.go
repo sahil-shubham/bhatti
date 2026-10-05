@@ -103,7 +103,10 @@ with its own kernel, filesystem, and network.`,
   bhatti create --name web --net
 
   # Only specific hosts/CIDRs (allow rules imply --egress deny)
-  bhatti create --name locked --allow-host api.openai.com --allow-cidr 1.1.1.1/32`,
+  bhatti create --name locked --allow-host api.openai.com --allow-cidr 1.1.1.1/32
+
+  # Sibling access without granting public internet egress
+  bhatti create --name workers --allow-siblings`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		setupTiming(cmd)
 		defer printTiming()
@@ -111,6 +114,13 @@ with its own kernel, filesystem, and network.`,
 		name, _ := cmd.Flags().GetString("name")
 		image, _ := cmd.Flags().GetString("image")
 		from, _ := cmd.Flags().GetString("from")
+		if from != "" {
+			for _, flag := range []string{"net", "egress", "allow-host", "allow-cidr", "allow-siblings"} {
+				if cmd.Flags().Changed(flag) {
+					return fmt.Errorf("a fork inherits the source's net_policy; --%s cannot override it", flag)
+				}
+			}
+		}
 		cpus, _ := cmd.Flags().GetFloat64("cpus")
 		memory, _ := cmd.Flags().GetInt("memory")
 		diskSize, _ := cmd.Flags().GetInt("disk-size")
@@ -234,11 +244,10 @@ with its own kernel, filesystem, and network.`,
 				if len(parts) < 2 {
 					return fmt.Errorf("invalid --mount format %q (expected host:guest[:ro])", mf)
 				}
-				hostAbs, err := filepath.Abs(parts[0])
-				if err != nil {
-					return fmt.Errorf("--mount %q: %w", mf, err)
+				if !filepath.IsAbs(parts[0]) {
+					return fmt.Errorf("--mount host path %q must be absolute and under server mount_roots", parts[0])
 				}
-				m := map[string]any{"host_path": hostAbs, "guest_path": parts[1], "read_only": false}
+				m := map[string]any{"host_path": parts[0], "guest_path": parts[1], "read_only": false}
 				if len(parts) == 3 && parts[2] == "ro" {
 					m["read_only"] = true
 				}
@@ -247,9 +256,9 @@ with its own kernel, filesystem, and network.`,
 			req["mounts"] = mounts
 		}
 
-		// Per-sandbox network posture. Omitted => the server default ("none"
-		// unless configured); allow rules alone imply "deny". The host,
-		// private ranges and metadata are denied in every posture.
+		// Per-sandbox network posture. Omitted => the server default (none
+		// unless configured); allow rules or sibling-only opt-in imply deny.
+		// Host and gateway addresses are never reopened by --allow-cidr.
 		egress, _ := cmd.Flags().GetString("egress")
 		if wantNet, _ := cmd.Flags().GetBool("net"); wantNet {
 			if egress != "" && egress != "public" {
@@ -259,7 +268,8 @@ with its own kernel, filesystem, and network.`,
 		}
 		allowHosts, _ := cmd.Flags().GetStringSlice("allow-host")
 		allowCIDRs, _ := cmd.Flags().GetStringSlice("allow-cidr")
-		if egress != "" || len(allowHosts) > 0 || len(allowCIDRs) > 0 {
+		allowSiblings, _ := cmd.Flags().GetBool("allow-siblings")
+		if egress != "" || len(allowHosts) > 0 || len(allowCIDRs) > 0 || allowSiblings {
 			np := map[string]any{}
 			if egress != "" {
 				np["default"] = egress
@@ -269,6 +279,9 @@ with its own kernel, filesystem, and network.`,
 			}
 			if len(allowCIDRs) > 0 {
 				np["allow_cidrs"] = allowCIDRs
+			}
+			if allowSiblings {
+				np["siblings"] = "allow"
 			}
 			req["net_policy"] = np
 		}
@@ -362,7 +375,7 @@ func init() {
 	createCmd.Flags().Bool("hugepages", false, "Use 2MB hugepages (faster boot, no diff snapshots)")
 	createCmd.Flags().String("template", "", "Template name or ID")
 	createCmd.Flags().StringSlice("volume", nil, "Persistent volume (name:mount[:ro])")
-	createCmd.Flags().StringSlice("mount", nil, "Live host-dir bind, virtio-fs (host:guest[:ro]) — krucible only")
+	createCmd.Flags().StringSlice("mount", nil, "Live host-dir bind, virtio-fs (absolute host:guest[:ro]; requires server mount_roots) — krucible only")
 	createCmd.Flags().StringSlice("secret", nil, "Secret name from store (repeatable)")
 	createCmd.Flags().StringArray("secret-grant", nil, "Grant a secret for HTTPS headers at hosts (NAME@host[,host...], repeatable)")
 	createCmd.Flags().StringSlice("file", nil, "Inject file (local_path:guest_path, repeatable)")
@@ -371,6 +384,7 @@ func init() {
 	createCmd.Flags().String("egress", "", "Network posture: none (no network device), deny (allow rules only) or public; default from the server (none)")
 	createCmd.Flags().StringSlice("allow-host", nil, "Allow egress to host, exact or *.wildcard (repeatable)")
 	createCmd.Flags().StringSlice("allow-cidr", nil, "Allow egress to CIDR (repeatable)")
+	createCmd.Flags().Bool("allow-siblings", false, "Allow TCP/UDP to other sandboxes of the same owner (does not grant public internet)")
 
 	editCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions (for autonomous agents)")
 	editCmd.Flags().Bool("allow-cold", false, "Re-enable thermal transitions")
@@ -633,6 +647,33 @@ var inspectCmd = &cobra.Command{
 		fmt.Println()
 		fmt.Println("Network:")
 		fmt.Printf("  IP:       %s\n", sb["ip"])
+		egress, siblings := "none", "deny"
+		if policy, ok := sb["net_policy"].(map[string]any); ok {
+			if value, ok := policy["default"].(string); ok && value != "" {
+				egress = value
+			}
+			if value, ok := policy["siblings"].(string); ok && value == "allow" {
+				siblings = value
+			}
+			fmt.Printf("  Egress:   %s\n", egress)
+			fmt.Printf("  Siblings: %s\n", siblings)
+			for _, rule := range []struct {
+				key, label string
+			}{
+				{"allow_hosts", "Allow hosts"},
+				{"allow_cidrs", "Allow CIDRs"},
+			} {
+				if entries, ok := policy[rule.key].([]any); ok && len(entries) > 0 {
+					values := make([]string, 0, len(entries))
+					for _, entry := range entries {
+						values = append(values, fmt.Sprint(entry))
+					}
+					fmt.Printf("  %s: %s\n", rule.label, strings.Join(values, ", "))
+				}
+			}
+		} else {
+			fmt.Printf("  Egress:   %s\n  Siblings: %s\n", egress, siblings)
+		}
 
 		if kh, ok := sb["keep_hot"]; ok && kh == true {
 			fmt.Println()

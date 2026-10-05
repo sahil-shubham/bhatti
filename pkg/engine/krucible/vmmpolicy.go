@@ -6,9 +6,8 @@ import (
 )
 
 // VMMPolicyEnv names the file holding a bhatti-vmm's VMMPolicy. The helper
-// applies it before any of its Go or libkrun code runs (cmd/vmm/internal/
-// confine); unset, the helper runs unconfined, as `capabilities` and
-// `check-checkpoint` do.
+// applies it before any Go or libkrun code runs (cmd/vmm/internal/confine);
+// only `capabilities` and non-root callers may run without one on Linux.
 const VMMPolicyEnv = "BHATTI_VMM_CONFINE"
 
 // VMMPolicy is what a confined bhatti-vmm may do: the identity it drops to,
@@ -18,10 +17,14 @@ type VMMPolicy struct {
 	// UID and GID are the identity to drop to (both, or neither: 0 keeps the
 	// one the helper was started with, which is only allowed when that isn't
 	// root).
-	UID, GID uint32
-	Groups   []uint32 // supplementary groups
-	Caps     []uint   // capabilities kept (CAP_* numbers); normally none
-	Rules    []VMMRule
+	UID, GID  uint32
+	Groups    []uint32 // supplementary groups
+	Caps      []uint   // capabilities kept (CAP_* numbers); normally none
+	NoNetwork bool     // checkpoint probes cannot create sockets, even without Landlock
+	Rules     []VMMRule
+	// Mounts are virtio-fs directories. They must not be started without
+	// Landlock, and their paths must be symlink-free when the helper opens them.
+	Mounts []VMMRule
 }
 
 // VMMRule allows Access beneath Path (or on it, for a file). Access is a set
@@ -72,8 +75,14 @@ func (p VMMPolicy) Encode() []byte {
 	for _, c := range p.Caps {
 		rec("cap", strconv.FormatUint(uint64(c), 10))
 	}
+	if p.NoNetwork {
+		rec("network", "deny")
+	}
 	for _, r := range p.Rules {
 		rec("path", strconv.FormatUint(r.Access, 16)+" "+r.Path)
+	}
+	for _, r := range p.Mounts {
+		rec("mount", strconv.FormatUint(r.Access, 16)+" "+r.Path)
 	}
 	return b.Bytes()
 }

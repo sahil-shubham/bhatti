@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -499,9 +500,9 @@ func TestSnapshotImportRefusesHostsThatCantRunIt(t *testing.T) {
 			t.Fatalf("filesystem snapshot: %v", err)
 		}
 	})
-	t.Run("cpu", func(t *testing.T) {
+	t.Run("cpu despite Landlock warning", func(t *testing.T) {
 		const why = "CPU vendor differs: the checkpoint was taken on GenuineIntel family 6 model 158 stepping 13; this host is AuthenticAMD family 25 model 33 stepping 0"
-		e := portableEngine(t, base, "echo 'vmm: check-checkpoint: checkpoint: "+why+"' >&2; exit 1")
+		e := portableEngine(t, base, "echo 'vmm: confine: Landlock unavailable on this kernel (Function not implemented); running without filesystem confinement' >&2\necho 'vmm: check-checkpoint: checkpoint: "+why+"' >&2\nexit 1")
 		am, entries := smallArchive(t, base)
 		dest, _, err := importArchive(e, craftArchive(t, am, entries))
 		if !errors.Is(err, engine.ErrSnapshotIncompatible) || !strings.HasSuffix(err.Error(), ": "+why) {
@@ -512,6 +513,118 @@ func TestSnapshotImportRefusesHostsThatCantRunIt(t *testing.T) {
 			t.Fatalf("the check saw %q; the refusal must come before the RAM image arrives", log)
 		}
 	})
+}
+
+func TestCheckCheckpointHostFatalConfinement(t *testing.T) {
+	e := portableEngine(t, "", "echo 'vmm: confine: fatal: open /bad/path: Too many levels of symbolic links' >&2\nexit 1")
+	err := e.checkCheckpointHost(context.Background(), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "check-checkpoint confinement:") ||
+		errors.Is(err, engine.ErrSnapshotIncompatible) {
+		t.Fatalf("fatal confinement classified as checkpoint incompatibility: %v", err)
+	}
+}
+
+func TestConfineLaunchMarksVirtioFSMounts(t *testing.T) {
+	dir := t.TempDir()
+	vm := &VM{SandboxDir: dir, SockDir: filepath.Join(dir, "sock")}
+	mount := filepath.Join(dir, "host")
+	if err := os.Mkdir(mount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, readOnly := range []bool{false, true} {
+		t.Run(strconv.FormatBool(readOnly), func(t *testing.T) {
+			e := &Engine{}
+			_, path, cleanup, err := e.confineLaunch(vm, VMSpec{
+				RootDisk: filepath.Join(dir, "rootfs.raw"),
+				Mounts:   []VMFsMount{{HostPath: mount, ReadOnly: readOnly}},
+			}, filepath.Join(dir, "spec.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			access := vmmMountRW
+			if readOnly {
+				access = vmmReadTree
+			}
+			want := "mount " + strconv.FormatUint(access, 16) + " " + mount + "\x00"
+			if !bytes.Contains(data, []byte(want)) {
+				t.Fatalf("virtio-fs mount not marked as requiring Landlock: %q", data)
+			}
+		})
+	}
+}
+
+// A checkpoint probe has no VM to supply a policy; it must still be confined
+// to the one checkpoint, /dev/kvm, and no network.
+func TestCheckCheckpointHostConfined(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux helper confinement")
+	}
+	e := portableEngine(t, "", "test -n \"$BHATTI_VMM_CONFINE\" || exit 19\ntr '\\000' '\\n' < \"$BHATTI_VMM_CONFINE\" > \"$2/policy-seen\"")
+	e.confineVMM = true
+	e.dropVMM = os.Geteuid() == 0
+	e.vmmIDs = make(map[uint32]string)
+	if e.dropVMM {
+		// t.TempDir has two private ancestors outside DataDir. The daemon
+		// cannot make directories it doesn't own searchable by its helpers.
+		for _, parent := range []string{filepath.Dir(e.cfg.DataDir), filepath.Dir(filepath.Dir(e.cfg.DataDir))} {
+			if err := os.Chmod(parent, 0o711); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	dir := filepath.Join(e.cfg.DataDir, "snapshots", "import.tmp")
+	writeFile(t, filepath.Join(dir, checkpointFile), []byte("checkpoint"))
+	before, err := os.Stat(filepath.Join(dir, checkpointFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.checkCheckpointHost(context.Background(), dir); err != nil {
+		t.Fatalf("check-checkpoint: %v", err)
+	}
+	records, err := os.ReadFile(filepath.Join(dir, "policy-seen"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := string(records)
+	for _, record := range []string{"network deny\n", "path 4 " + filepath.Join(dir, checkpointFile) + "\n", "path 8006 /dev/kvm\n"} {
+		if !strings.Contains(policy, record) {
+			t.Errorf("missing %q in policy %q", record, policy)
+		}
+	}
+	if strings.Contains(policy, "cap ") {
+		t.Errorf("checkpoint checker kept capabilities: %q", policy)
+	}
+	if e.dropVMM {
+		var uid string
+		for _, record := range strings.Split(policy, "\n") {
+			if strings.HasPrefix(record, "uid ") {
+				uid = strings.TrimPrefix(record, "uid ")
+				break
+			}
+		}
+		if uid == "" || !strings.Contains(policy, "gid "+uid+"\n") ||
+			!strings.Contains(policy, "group 1879048192\n") {
+			t.Errorf("root daemon did not give checker a VM helper identity: %q", policy)
+		}
+		if len(e.vmmIDs) != 0 {
+			t.Errorf("checkpoint checker UID is still reserved: %v", e.vmmIDs)
+		}
+	}
+	if policies, err := filepath.Glob(filepath.Join(dir, ".vmm-check-*.policy")); err != nil || len(policies) != 0 {
+		t.Errorf("temporary policy survived: %v (%v)", policies, err)
+	}
+	if e.dropVMM {
+		fi, err := os.Stat(filepath.Join(dir, checkpointFile))
+		if err != nil || fi.Mode().Perm() != before.Mode().Perm() ||
+			fi.Sys().(*syscall.Stat_t).Gid != before.Sys().(*syscall.Stat_t).Gid {
+			t.Errorf("checkpoint permissions not restored: %v (%v)", fi, err)
+		}
+	}
 }
 
 // TestSnapshotExportRefusesBeforeWriting: what makes a snapshot unexportable

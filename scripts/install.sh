@@ -928,6 +928,10 @@ generate_config() {
 engine: krucible
 listen: :8080
 data_dir: ${DATA_DIR}
+# Live --mount is disabled unless mount_roots names absolute, existing directories.
+# Roots and selected sources cannot be / or overlap data_dir (including age.key)
+# or the directory containing this config. Symlinks are resolved before checking.
+# mount_roots: [/srv/bhatti-shared]
 # Guests are networked only through the per-owner bhatti-netd gateway: isolated
 # from the host, egress policed, same-owner siblings reachable.
 krucible_vmm: ${rt}/bin/bhatti-vmm

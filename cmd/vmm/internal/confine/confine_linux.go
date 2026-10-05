@@ -2,8 +2,8 @@
 
 package confine
 
-// Why a C constructor, not Go: no_new_privs, credentials, capabilities and
-// Landlock domains all belong to a thread, and a thread only inherits them
+// Why a C constructor, not Go: no_new_privs, credentials, capabilities,
+// Landlock and seccomp belong to a thread, and a thread only inherits them
 // from the one that creates it. Go's syscall.AllThreadsSyscall would set them
 // on every thread, but it refuses to run in a cgo binary, and bhatti-vmm is
 // one. Setting them from main.main, even locked to the main thread, is too
@@ -19,7 +19,7 @@ package confine
 // The helper drops its own identity (rather than the daemon starting it as the
 // unprivileged user) so that exec, the dynamic loader and libkrun's load run
 // as root, wherever the binary and libraries live, and identity, capabilities,
-// no_new_privs and Landlock are set in one place, in this order:
+// no_new_privs, Landlock and seccomp are set in one place, in this order:
 //
 //   - capability bounding set reduced to what the policy keeps;
 //   - supplementary groups, gid and uid set to the policy's (all three ids);
@@ -29,22 +29,27 @@ package confine
 //   - no_new_privs;
 //   - Landlock: every filesystem right this kernel knows is denied except on
 //     the policy's paths; TCP bind/connect denied (ABI >= 4); signals and
-//     abstract unix sockets scoped to the helper itself (ABI >= 6).
+//     abstract unix sockets scoped to the helper itself (ABI >= 6);
+//   - seccomp: the build architecture is enforced (tagged and legacy untagged
+//     x32 syscalls killed on x86_64); dangerous kernel-control, module, mount,
+//     keyring, tracing and namespace syscalls return EPERM; clone3 returns
+//     ENOSYS so libc falls back to clone, which rejects namespace flags.
+//     Checkpoint probes also deny socket operations, including on kernels
+//     without Landlock's TCP restrictions.
 //
-// Any failure exits before the VM exists. A kernel without Landlock only loses
-// that layer, with a warning, as bhatti-netd does.
-//
-// seccomp is not applied: libkrun's syscall surface (KVM ioctls, eventfd,
-// epoll, vectored I/O, mmap of guest RAM and checkpoints) hasn't been profiled,
-// and an enforcing filter that misses one kills a guest at a random moment.
-// The next layer is an allowlist built from that profile, logged before it is
-// enforced.
+// Any failure exits before the VM exists. A kernel without Landlock can only
+// run helpers without virtio-fs mounts, with a warning; a mount requires
+// inode-based filesystem confinement to prevent path-swap escapes.
+// An allowlist needs libkrun's full syscall surface (KVM ioctls, eventfd,
+// epoll, vectored I/O, guest RAM and checkpoints) profiled first; it is future
+// work, not a reason to leave known-dangerous syscalls open.
 
 /*
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,7 +58,11 @@ package confine
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <linux/audit.h>
 #include <linux/capability.h>
+#include <linux/filter.h>
+#include <linux/sched.h>
+#include <linux/seccomp.h>
 #include <linux/securebits.h>
 
 #ifndef PR_CAP_AMBIENT
@@ -65,6 +74,17 @@ package confine
 #define SYS_landlock_add_rule 445
 #define SYS_landlock_restrict_self 446
 #endif
+#ifndef SYS_openat2
+#define SYS_openat2 437
+#endif
+#define BV_RESOLVE_NO_MAGICLINKS 0x02u
+#define BV_RESOLVE_NO_SYMLINKS 0x04u
+
+struct bv_open_how {
+	uint64_t flags;
+	uint64_t mode;
+	uint64_t resolve;
+};
 
 // Landlock's uapi (linux/landlock.h), spelled out so older headers build.
 #define BV_LL_VERSION 1u
@@ -98,7 +118,7 @@ struct bv_path_beneath_attr {
 #define BV_MAX_POLICY (1 << 20)
 
 static void bv_die(const char *what, const char *arg, int err) {
-	fprintf(stderr, "vmm: confine: %s%s%s: %s\n", what, arg ? " " : "", arg ? arg : "",
+	fprintf(stderr, "vmm: confine: fatal: %s%s%s: %s\n", what, arg ? " " : "", arg ? arg : "",
 		err ? strerror(err) : "refused");
 	_exit(1);
 }
@@ -140,6 +160,200 @@ static unsigned long long bv_number(const char *s, int base, const char *what) {
 	return v;
 }
 
+// On kernels without openat2, pin each component with an O_PATH directory fd
+// before resolving the next. O_NOFOLLOW at the final component alone would
+// still let a changed ancestor redirect a mount outside its authorized root.
+static int bv_open_walk(const char *path) {
+	if (*path != '/') {
+		errno = EINVAL;
+		return -1;
+	}
+	int dir = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (dir < 0 || path[1] == '\0')
+		return dir;
+	char *parts = strdup(path + 1);
+	if (!parts) {
+		close(dir);
+		errno = ENOMEM;
+		return -1;
+	}
+	for (char *part = parts; ; ) {
+		char *next = strchr(part, '/');
+		if (next)
+			*next = '\0';
+		if (!*part || !strcmp(part, ".") || !strcmp(part, "..")) {
+			errno = EINVAL;
+			goto fail;
+		}
+		int fd = openat(dir, part, O_PATH | O_NOFOLLOW | O_CLOEXEC |
+			(next ? O_DIRECTORY : 0));
+		if (fd < 0)
+			goto fail;
+		struct stat st;
+		if (fstat(fd, &st) != 0) {
+			int err = errno;
+			close(fd);
+			errno = err;
+			goto fail;
+		}
+		if (S_ISLNK(st.st_mode)) {
+			close(fd);
+			errno = ELOOP;
+			goto fail;
+		}
+		close(dir);
+		dir = fd;
+		if (!next)
+			break;
+		part = next + 1;
+	}
+	free(parts);
+	return dir;
+fail:
+	{
+		int err = errno;
+		free(parts);
+		close(dir);
+		errno = err;
+		return -1;
+	}
+}
+
+static int bv_open_rule(const char *path) {
+	if (*path != '/') {
+		errno = EINVAL;
+		return -1;
+	}
+	struct bv_open_how how = {
+		.flags = O_PATH | O_CLOEXEC,
+		.resolve = BV_RESOLVE_NO_SYMLINKS | BV_RESOLVE_NO_MAGICLINKS,
+	};
+	int fd = (int)syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof how);
+	if (fd < 0 && errno == ENOSYS)
+		return bv_open_walk(path);
+	return fd;
+}
+
+
+// Each installed filter inherits no_new_privs. TSYNC is unnecessary: this
+// constructor runs before the Go runtime or libkrun creates any threads.
+#if defined(__x86_64__)
+#define BV_AUDIT_ARCH AUDIT_ARCH_X86_64
+#ifndef __X32_SYSCALL_BIT
+#define __X32_SYSCALL_BIT 0x40000000
+#endif
+#elif defined(__aarch64__)
+#define BV_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#error "bhatti-vmm seccomp supports x86_64 and aarch64"
+#endif
+
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x00000080
+#endif
+#define BV_NS_FLAGS (CLONE_NEWTIME | CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | \
+	CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET)
+#define BV_DENY(name) \
+	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_##name, 0, 1), \
+	BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+
+static void bv_install_filter(struct sock_filter *filter, size_t count) {
+	struct sock_fprog prog = {(unsigned short)count, filter};
+	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0)
+		bv_die("seccomp", NULL, errno);
+}
+
+static void bv_seccomp(int no_network) {
+	static struct sock_filter filter[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, BV_AUDIT_ARCH, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+#if defined(__x86_64__)
+		BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, __X32_SYSCALL_BIT, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		// Linux before 5.4 dispatched 512..547 as x32 even without the
+		// x32 tag (521 was ptrace). Neither Go's amd64 runtime nor libkrun
+		// uses the x32 ABI; kill rather than let these bypass BV_DENY.
+		BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 512, 0, 2),
+		BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 548, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+#endif
+		BV_DENY(kexec_load),
+		BV_DENY(kexec_file_load),
+		BV_DENY(init_module),
+		BV_DENY(finit_module),
+		BV_DENY(delete_module),
+		BV_DENY(bpf),
+		BV_DENY(perf_event_open),
+		BV_DENY(ptrace),
+		BV_DENY(process_vm_readv),
+		BV_DENY(process_vm_writev),
+		BV_DENY(keyctl),
+		BV_DENY(add_key),
+		BV_DENY(request_key),
+		BV_DENY(mount),
+		BV_DENY(umount2),
+		BV_DENY(pivot_root),
+		BV_DENY(move_mount),
+		BV_DENY(open_tree),
+		BV_DENY(fsopen),
+		BV_DENY(fsconfig),
+		BV_DENY(fsmount),
+		BV_DENY(fspick),
+		BV_DENY(swapon),
+		BV_DENY(swapoff),
+		BV_DENY(reboot),
+		BV_DENY(setns),
+		BV_DENY(unshare),
+		BV_DENY(userfaultfd),
+		BV_DENY(open_by_handle_at),
+		BV_DENY(name_to_handle_at),
+		BV_DENY(kcmp),
+		BV_DENY(acct),
+		BV_DENY(quotactl),
+#if defined(__x86_64__)
+		BV_DENY(iopl),
+		BV_DENY(ioperm),
+#endif
+		BV_DENY(personality),
+		// Rust and glibc both fall back to clone when clone3 reports ENOSYS;
+		// EPERM instead would break thread creation after this constructor.
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 3),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+		BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, BV_NS_FLAGS, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	bv_install_filter(filter, sizeof(filter) / sizeof(filter[0]));
+
+	if (no_network) {
+		// Unlike Landlock's ABI 4 TCP hooks, this also blocks UDP and
+		// socket operations on inherited descriptors. Go's exec child
+		// inherits only stdio pipes.
+		static struct sock_filter sockets[] = {
+			BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+			BV_DENY(socket),
+			BV_DENY(socketpair),
+			BV_DENY(connect),
+			BV_DENY(bind),
+			BV_DENY(listen),
+			BV_DENY(accept),
+			BV_DENY(accept4),
+			BV_DENY(sendto),
+			BV_DENY(sendmsg),
+			BV_DENY(sendmmsg),
+			BV_DENY(recvfrom),
+			BV_DENY(recvmsg),
+			BV_DENY(recvmmsg),
+			BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		};
+		bv_install_filter(sockets, sizeof(sockets) / sizeof(sockets[0]));
+	}
+}
+
 __attribute__((constructor, used)) static void bv_confine(void) {
 	const char *path = getenv("BHATTI_VMM_CONFINE");
 	if (!path || !*path)
@@ -150,8 +364,9 @@ __attribute__((constructor, used)) static void bv_confine(void) {
 	unsigned long long uid = 0, gid = 0, keep = 0;
 	gid_t groups[BV_MAX_GROUPS];
 	int ngroups = 0;
-	struct { uint64_t access; const char *path; } rules[BV_MAX_RULES];
-	int nrules = 0;
+	struct { uint64_t access; const char *path; int mount; } rules[BV_MAX_RULES];
+	int nrules = 0, nmounts = 0;
+	int no_network = 0;
 
 	// Records are "<key> <value>", each NUL-terminated.
 	for (char *rec = policy; rec < policy + len; rec += strlen(rec) + 1) {
@@ -168,14 +383,20 @@ __attribute__((constructor, used)) static void bv_confine(void) {
 			if (c > 63)
 				bv_die("policy: bad cap", rec + 4, EINVAL);
 			keep |= 1ull << c;
-		} else if (!strncmp(rec, "path ", 5)) {
-			char *sp = strchr(rec + 5, ' ');
+		} else if (!strcmp(rec, "network deny")) {
+			no_network = 1;
+		} else if (!strncmp(rec, "path ", 5) || !strncmp(rec, "mount ", 6)) {
+			int mount = !strncmp(rec, "mount ", 6);
+			char *value = rec + (mount ? 6 : 5);
+			char *sp = strchr(value, ' ');
 			if (!sp || !sp[1])
 				bv_die("policy: bad path record", rec, EINVAL);
 			if (nrules == BV_MAX_RULES)
 				bv_die("policy: too many paths", NULL, E2BIG);
-			rules[nrules].access = bv_number(rec + 5, 16, "access");
+			rules[nrules].access = bv_number(value, 16, "access");
 			rules[nrules].path = sp + 1;
+			rules[nrules].mount = mount;
+			nmounts += mount;
 			nrules++;
 		} else if (*rec) {
 			bv_die("policy: unknown record", rec, EINVAL);
@@ -229,10 +450,11 @@ __attribute__((constructor, used)) static void bv_confine(void) {
 	if (abi < 0) {
 		if (errno != ENOSYS && errno != EOPNOTSUPP)
 			bv_die("landlock", NULL, errno);
+		if (nmounts)
+			bv_die("Landlock required for virtio-fs mounts", NULL, ENOTSUP);
 		fprintf(stderr, "vmm: confine: Landlock unavailable on this kernel (%s); running without filesystem confinement\n",
 			strerror(errno));
-		free(policy);
-		return;
+		goto install_seccomp;
 	}
 	struct bv_ruleset_attr attr = {BV_FS_ABI1, 0, 0};
 	if (abi >= 2)
@@ -250,12 +472,14 @@ __attribute__((constructor, used)) static void bv_confine(void) {
 	if (ruleset < 0)
 		bv_die("landlock ruleset", NULL, errno);
 	for (int i = 0; i < nrules; i++) {
-		int fd = open(rules[i].path, O_PATH | O_CLOEXEC);
+		int fd = bv_open_rule(rules[i].path);
 		if (fd < 0)
 			bv_die("open", rules[i].path, errno);
 		struct stat st;
 		if (fstat(fd, &st) != 0)
 			bv_die("stat", rules[i].path, errno);
+		if (rules[i].mount && !S_ISDIR(st.st_mode))
+			bv_die("mount is not a directory", rules[i].path, ENOTDIR);
 		uint64_t allowed = rules[i].access & attr.handled_access_fs;
 		if (!S_ISDIR(st.st_mode))
 			allowed &= BV_FS_FILE;
@@ -269,7 +493,9 @@ __attribute__((constructor, used)) static void bv_confine(void) {
 	if (syscall(SYS_landlock_restrict_self, ruleset, 0) != 0)
 		bv_die("landlock restrict", NULL, errno);
 	close(ruleset);
-	fprintf(stderr, "vmm: confined: uid=%u gid=%u caps=%#llx landlock abi %ld, %d paths\n",
+install_seccomp:
+	bv_seccomp(no_network);
+	fprintf(stderr, "vmm: confined: uid=%u gid=%u caps=%#llx landlock abi %ld, %d paths, seccomp\n",
 		(unsigned)getuid(), (unsigned)getgid(), keep, abi, nrules);
 	free(policy);
 }

@@ -117,6 +117,7 @@ func handleControlConnection(conn net.Conn) {
 			Features: []proto.AgentFeature{
 				proto.FeatureNetConfig, proto.FeatureSandboxCA,
 				proto.FeatureRootGrowth, proto.FeaturePipedStderr,
+				proto.FeatureReseedCRNG,
 			},
 		})
 
@@ -170,6 +171,14 @@ func handleControlConnection(conn net.Conn) {
 			return
 		}
 		proto.WriteFrame(conn, proto.NET_CONFIG, nil)
+
+	case proto.RESEED:
+		defer clear(payload)
+		if err := reseedEntropy(payload); err != nil {
+			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("reseed CRNG: %v", err)))
+			return
+		}
+		proto.WriteFrame(conn, proto.RESEED, nil)
 
 	default:
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("unexpected frame type 0x%02x", msgType)))

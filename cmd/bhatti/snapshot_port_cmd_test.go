@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -124,5 +126,65 @@ func TestSnapshotImportShowsTheRefusal(t *testing.T) {
 	_, err = importSnapshot(path, "dev")
 	if err == nil || err.Error() != "422 Unprocessable Entity: "+why {
 		t.Fatalf("import: %v", err)
+	}
+}
+
+func TestCreateAllowSiblingsAndInspectPolicy(t *testing.T) {
+	var sent map[string]any
+	serveCLI(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandboxes":
+			if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+				t.Errorf("decode create: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"name":"","ip":"100.64.0.2"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/sandboxes/workers":
+			io.WriteString(w, `{"id":"workers","name":"workers","status":"stopped","created_at":"now","ip":"100.64.0.2","net_policy":{"default":"deny","siblings":"allow"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	flags := createCmd.Flags()
+	oldName, _ := flags.GetString("name")
+	oldAllow, _ := flags.GetBool("allow-siblings")
+	nameChanged := flags.Lookup("name").Changed
+	allowChanged := flags.Lookup("allow-siblings").Changed
+	t.Cleanup(func() {
+		flags.Set("name", oldName)
+		flags.Set("allow-siblings", fmt.Sprint(oldAllow))
+		flags.Lookup("name").Changed = nameChanged
+		flags.Lookup("allow-siblings").Changed = allowChanged
+	})
+	flags.Set("name", "workers")
+	flags.Set("allow-siblings", "true")
+	if err := createCmd.RunE(createCmd, nil); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	np, ok := sent["net_policy"].(map[string]any)
+	if !ok || np["siblings"] != "allow" || np["default"] != nil {
+		t.Fatalf("--allow-siblings request = %+v", sent)
+	}
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := os.Stdout
+	os.Stdout = write
+	err = inspectCmd.RunE(inspectCmd, []string{"workers"})
+	write.Close()
+	os.Stdout = prior
+	defer read.Close()
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	out, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "Egress:   deny") || !strings.Contains(string(out), "Siblings: allow") {
+		t.Fatalf("inspect policy missing: %s", out)
 	}
 }

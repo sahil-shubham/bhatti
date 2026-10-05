@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -51,7 +52,8 @@ type createSandboxReq struct {
 	// G1.6: operator-controlled labels for fleet enumeration
 	Labels map[string]string `json:"labels,omitempty"`
 
-	// Per-sandbox egress policy (network rules); nil => public default.
+	// Per-sandbox network policy; nil resolves to the configured default (none
+	// unless the operator explicitly configures another posture).
 	NetPolicy *gateway.NetPolicyWire `json:"net_policy,omitempty"`
 }
 
@@ -124,6 +126,19 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 		handlerPhase("request_parsed")
 
+		if req.From != "" && len(req.Mounts) > 0 {
+			errResp(w, 400, "mounts cannot be added to a fork; create a fresh sandbox instead")
+			return
+		}
+		if req.From != "" && req.NetPolicy != nil {
+			errResp(w, http.StatusBadRequest, "a fork inherits the source's net_policy; explicit network overrides are not supported")
+			return
+		}
+		if status, message := s.authorizeMounts(req.Mounts); status != 0 {
+			errResp(w, status, message)
+			return
+		}
+
 		// Enforce per-user sandbox count limit
 		count, _ := s.store.CountUserSandboxes(user.ID)
 		if count >= user.MaxSandboxes {
@@ -153,17 +168,16 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Resolve the egress posture: an explicit one wins; allow rules alone
-		// imply "deny" (allow only these); otherwise the server default, which
-		// is "none" (no network device) unless configured. Validated up front so
-		// the caller gets a clear 400 instead of a deep engine error.
+		// Resolve posture explicitly before persisting or pushing the policy.
+		// A sibling-only opt-in needs a NIC but must not imply public internet.
+		// Without rules the server default is none unless configured otherwise.
 		np := gateway.NetPolicyWire{}
 		if req.NetPolicy != nil {
 			np = *req.NetPolicy
 		}
 		if np.Default == "" {
 			switch {
-			case len(np.AllowHosts) > 0 || len(np.AllowCIDRs) > 0:
+			case np.Siblings == "allow" || len(np.AllowHosts) > 0 || len(np.AllowCIDRs) > 0:
 				np.Default = "deny"
 			case s.defaultEgress != "":
 				np.Default = s.defaultEgress
@@ -599,6 +613,12 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 		handlerPhase("engine_create_done")
 		if err != nil {
+			if src != nil && errors.Is(err, engine.ErrGuestReseedFailed) {
+				s.RecordEvent(store.Event{
+					Type: "guest.reseed_failed", UserID: user.ID, SandboxID: src.ID,
+					Meta: map[string]any{"operation": "fork", "new_sandbox": spec.Name, "error": err.Error()},
+				})
+			}
 			// Rollback persistent volume attachments on engine failure
 			if len(resolvedVolumes) > 0 {
 				s.store.DetachAllPersistentVolumesForSandbox(sbID)
@@ -688,6 +708,12 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				"keep_hot": req.KeepHot,
 			},
 		})
+		if src != nil && info.GuestReseedUnsupported {
+			s.RecordEvent(store.Event{
+				Type: "guest.reseed_unsupported", UserID: user.ID, SandboxID: sb.ID,
+				Meta: map[string]any{"operation": "fork", "source_sandbox": src.ID},
+			})
+		}
 		created := struct {
 			store.Sandbox
 			SecretGrants []grantView `json:"secret_grants,omitempty"`
@@ -961,6 +987,10 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 	}
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
+		return
+	}
+	if err := s.checkStoredMounts(sb.EngineID); err != nil {
+		errResp(w, http.StatusForbidden, err.Error())
 		return
 	}
 

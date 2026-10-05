@@ -79,7 +79,8 @@ func TestKrucibleNetEgress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netegress", CPUs: 1, MemoryMB: 512})
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netegress", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("Create(net): %v", err)
 	}
@@ -147,7 +148,8 @@ func TestKrucibleNetDNS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netdns", CPUs: 1, MemoryMB: 512})
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netdns", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("Create(net): %v", err)
 	}
@@ -172,7 +174,8 @@ func TestKrucibleNetIPReported(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netip", CPUs: 1, MemoryMB: 512})
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netip", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("Create(net): %v", err)
 	}
@@ -215,7 +218,8 @@ func TestKrucibleNetHostIsolation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netiso", CPUs: 1, MemoryMB: 512})
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netiso", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("Create(net): %v", err)
 	}
@@ -242,7 +246,8 @@ func TestKrucibleNetForward(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netfwd", CPUs: 1, MemoryMB: 512})
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "netfwd", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("Create(net): %v", err)
 	}
@@ -267,16 +272,18 @@ func TestKrucibleNetForward(t *testing.T) {
 	}
 }
 
-// TestKrucibleNetSiblings is the sibling-reachability gate: two sandboxes of the
-// SAME owner share one bhatti-netd and reach each other across the L2 switch,
-// while a sandbox of a DIFFERENT owner (separate netd) cannot.
+// TestKrucibleNetSiblings exercises default-denied and explicitly granted
+// same-owner sibling access; another owner remains unreachable with an opt-in.
 func TestKrucibleNetSiblings(t *testing.T) {
 	eng := newNetEngine(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	mk := func(name, owner string) string {
-		info, err := eng.Create(ctx, engine.SandboxSpec{Name: name, CPUs: 1, MemoryMB: 512, UserID: owner})
+	mk := func(name, owner, posture, sibling string) string {
+		info, err := eng.Create(ctx, engine.SandboxSpec{
+			Name: name, CPUs: 1, MemoryMB: 512, UserID: owner,
+			NetPolicy: &gateway.NetPolicyWire{Default: posture, Siblings: sibling},
+		})
 		if err != nil {
 			t.Fatalf("Create %s: %v", name, err)
 		}
@@ -284,8 +291,8 @@ func TestKrucibleNetSiblings(t *testing.T) {
 		return info.ID
 	}
 	// owner1 gets two sandboxes → 100.64.0.2 (a) and 100.64.0.3 (b).
-	a := mk("sib-a", "owner1")
-	b := mk("sib-b", "owner1")
+	a := mk("sib-a", "owner1", "public", "")
+	b := mk("sib-b", "owner1", "deny", "")
 
 	const port = 18090
 	const bAddr = "100.64.0.3:18090"
@@ -294,7 +301,7 @@ func TestKrucibleNetSiblings(t *testing.T) {
 		t.Fatalf("serve in B: %v", err)
 	}
 
-	// A reaches B across the sibling link (retry until B's server is up).
+	// Deny is independent of the public/deny internet posture.
 	dialOK := func(id, addr string) bool {
 		for i := 0; i < 40; i++ {
 			if r, err := eng.Exec(ctx, id, []string{"netcheck", "dial", addr}); err == nil && r.ExitCode == 0 {
@@ -304,13 +311,23 @@ func TestKrucibleNetSiblings(t *testing.T) {
 		}
 		return false
 	}
-	if !dialOK(a, bAddr) {
-		t.Fatalf("sibling A could not reach B at %s", bAddr)
+	r, err := eng.Exec(ctx, a, []string{"netcheck", "dial", bAddr})
+	if err != nil || r.ExitCode == 0 {
+		t.Fatalf("public without sibling grant reached B: err=%v exit=%d", err, r.ExitCode)
+	}
+	locked := mk("sib-locked", "owner1", "deny", "")
+	r, err = eng.Exec(ctx, locked, []string{"netcheck", "dial", bAddr})
+	if err != nil || r.ExitCode == 0 {
+		t.Fatalf("deny without sibling grant reached B: err=%v exit=%d", err, r.ExitCode)
+	}
+	granted := mk("sib-granted", "owner1", "deny", "allow")
+	if !dialOK(granted, bAddr) {
+		t.Fatalf("granted sibling could not reach B at %s", bAddr)
 	}
 
-	// A different owner is isolated: separate netd, must NOT reach B's address.
-	c := mk("other", "owner2")
-	r, err := eng.Exec(ctx, c, []string{"netcheck", "dial", bAddr})
+	// A different owner remains isolated even when it asks for siblings.
+	c := mk("other", "owner2", "public", "allow")
+	r, err = eng.Exec(ctx, c, []string{"netcheck", "dial", bAddr})
 	if err != nil {
 		t.Fatalf("exec dial from C: %v", err)
 	}
@@ -349,7 +366,8 @@ func TestKrucibleNetRecovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 
-	info, err := eng1.Create(ctx, engine.SandboxSpec{Name: "rec", CPUs: 1, MemoryMB: 512, UserID: "recowner"})
+	info, err := eng1.Create(ctx, engine.SandboxSpec{Name: "rec", CPUs: 1, MemoryMB: 512, UserID: "recowner",
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

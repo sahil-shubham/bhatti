@@ -192,6 +192,16 @@ func (r *EventRecorder) Close() {
 // StartEventRecorder creates and attaches an EventRecorder to the server.
 func (s *Server) StartEventRecorder() {
 	s.events = NewEventRecorder(s.store)
+	if e, ok := s.engine.(interface {
+		SetNetdEventRecorder(func(userID, sandboxID, reason string))
+	}); ok {
+		e.SetNetdEventRecorder(func(userID, sandboxID, reason string) {
+			s.RecordEvent(store.Event{
+				Type: "sandbox.network_disconnected", UserID: userID, SandboxID: sandboxID,
+				Meta: map[string]any{"reason": "gateway disconnected", "detail": reason},
+			})
+		})
+	}
 }
 
 // RecordEvent is a convenience method that records an event if the recorder exists.

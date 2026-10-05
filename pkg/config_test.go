@@ -164,6 +164,47 @@ func TestLoadConfigPathIsSet(t *testing.T) {
 	}
 }
 
+func TestLoadConfigTracksEveryReadFile(t *testing.T) {
+	base := t.TempDir()
+	systemPath := filepath.Join(base, "system", "config.yaml")
+	userPath := filepath.Join(base, "user", "config.yaml")
+	for _, path := range []string{systemPath, userPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(systemPath, []byte("listen: :9090\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte("auth_token: secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{DataDir: filepath.Join(base, "data")}
+	if err := loadLayeredConfig(cfg, systemPath, filepath.Join(base, "missing.yaml"), userPath); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConfigPath != systemPath || len(cfg.ConfigPaths) != 2 ||
+		cfg.ConfigPaths[0] != systemPath || cfg.ConfigPaths[1] != userPath ||
+		cfg.AuthToken != "secret" {
+		t.Fatalf("loaded paths and credentials = %+v", cfg)
+	}
+}
+
+func TestLoadConfigExplicitPathTracksOnlyThatFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := os.WriteFile(file, []byte("listen: :9090\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BHATTI_CONFIG", file)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ConfigPaths) != 1 || cfg.ConfigPaths[0] != file {
+		t.Fatalf("explicit config paths = %v, want only %s", cfg.ConfigPaths, file)
+	}
+}
+
 // TestDefaultDataDirHonorsSudoUser verifies that running under sudo
 // resolves the data dir to the *invoking* user's home, not root's.
 // This is the bug that caused `sudo bhatti setup` to write to

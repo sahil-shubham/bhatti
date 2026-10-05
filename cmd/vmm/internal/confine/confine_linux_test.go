@@ -3,9 +3,12 @@
 package confine
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -13,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"unsafe"
 
@@ -36,6 +40,11 @@ type expect struct {
 	Readable   string // file it can read
 	Unreadable string // file it can't, though the mode would let it
 	TCP        string // a listener it can't connect to (Landlock ABI >= 4)
+	NoNetwork  bool   // checkpoint checks must not create any network socket
+	X32        bool   // this child should die on a tagged x32 syscall
+	OldX32     bool   // this child should die on an untagged legacy x32 syscall
+	JustStart  bool   // test whether the constructor accepted the policy
+	SwapMount  string // path to check after the unconfined parent swaps it
 	// SwitchUID: switching the thread's euid away and back (as libkrun's
 	// virtio-fs server does per request) leaves its capabilities in place.
 	SwitchUID bool
@@ -47,6 +56,27 @@ func TestMain(m *testing.M) {
 		if err := json.Unmarshal([]byte(e), &want); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
+		}
+		if want.JustStart {
+			os.Exit(0)
+		}
+		if want.SwapMount != "" {
+			file := filepath.Join(want.SwapMount, "canary")
+			if _, err := os.ReadFile(file); err != nil {
+				fmt.Fprintf(os.Stderr, "mount before swap: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stdout, "mount-ready")
+			var signal [1]byte
+			if _, err := io.ReadFull(os.Stdin, signal[:]); err != nil {
+				fmt.Fprintf(os.Stderr, "wait for swap: %v\n", err)
+				os.Exit(1)
+			}
+			if _, err := os.ReadFile(file); !errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(os.Stderr, "mount after swap: %v; want permission denied\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}
 		if errs := check(want); len(errs) > 0 {
 			fmt.Fprintln(os.Stderr, strings.Join(errs, "\n"))
@@ -81,6 +111,9 @@ func check(want expect) (errs []string) {
 				fail("thread %s: %s %x, want %x", task.Name(), k, got, want.CapEff)
 			}
 		}
+		if f["Seccomp"] != "2" {
+			fail("thread %s: Seccomp %q, want filter mode", task.Name(), f["Seccomp"])
+		}
 		if want.UID != 0 {
 			id := strconv.FormatUint(uint64(want.UID), 10)
 			for _, k := range []string{"Uid", "Gid"} {
@@ -92,6 +125,35 @@ func check(want expect) (errs []string) {
 	}
 	if len(tasks) < 2 {
 		fail("only %d thread(s): the check proves nothing about the runtime's own", len(tasks))
+	}
+
+	// personality(-1) is a harmless query on an unconfined process. A denial
+	// here proves seccomp is actually filtering, not merely installed.
+	if _, _, errno := unix.RawSyscall(unix.SYS_PERSONALITY, ^uintptr(0), 0, 0); errno != unix.EPERM {
+		fail("personality query: %v, want EPERM", errno)
+	}
+	if want.NoNetwork {
+		if _, _, errno := unix.RawSyscall(unix.SYS_SOCKET, unix.AF_INET, unix.SOCK_DGRAM, 0); errno != unix.EPERM {
+			fail("IPv4 UDP socket: %v, want EPERM", errno)
+		}
+		if _, _, errno := unix.RawSyscall(unix.SYS_SOCKET, unix.AF_INET6, unix.SOCK_STREAM, 0); errno != unix.EPERM {
+			fail("IPv6 TCP socket: %v, want EPERM", errno)
+		}
+	}
+
+	if _, _, errno := unix.RawSyscall(unix.SYS_CLONE3, 0, 0, 0); errno != unix.ENOSYS {
+		fail("clone3: %v, want ENOSYS for libc fallback", errno)
+	}
+	if want.X32 {
+		_, _, _ = unix.RawSyscall(unix.SYS_GETPID|0x40000000, 0, 0, 0)
+		fail("x32 syscall survived")
+		return errs
+	}
+	if want.OldX32 {
+		// On kernels before 5.4, 521 dispatches x32 ptrace without its tag.
+		_, _, _ = unix.RawSyscall(521, 0, 0, 0)
+		fail("untagged x32 syscall survived")
+		return errs
 	}
 
 	if err := os.WriteFile(filepath.Join(want.Writable, "ok"), nil, 0o600); err != nil {
@@ -282,5 +344,156 @@ func TestConfineRefusesToStayRoot(t *testing.T) {
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) || !strings.Contains(string(out), "started as root without an identity") {
 		t.Fatalf("child ran as root: err=%v\n%s", err, out)
+	}
+}
+
+// The checkpoint policy's network mode must reject UDP and TCP even on
+// kernels where Landlock does not mediate network operations.
+func TestConfinedProcessNoNetwork(t *testing.T) {
+	f := newFixture(t, 0o644)
+	policy := krucible.VMMPolicy{NoNetwork: true, Rules: f.rules()}
+	want := expect{NoNetwork: true, Writable: f.allowedDir, Unwritable: f.deniedDir, Readable: f.allowedFile, Unreadable: f.deniedFile, TCP: f.tcp}
+	if os.Geteuid() == 0 {
+		policy.UID, policy.GID = testUID, testUID
+		want.UID = testUID
+	} else if eff := threadCapEff(); eff != 0 {
+		t.Skipf("non-root test process with capabilities %x", eff)
+	}
+	if out, err := runConfined(t, policy, want); err != nil {
+		if strings.Contains(string(out), "Landlock unavailable") {
+			t.Skip("kernel without Landlock")
+		}
+		t.Fatalf("confined child: %v\n%s", err, out)
+	}
+}
+
+// x32 reports the same audit architecture as x86_64. It must terminate the
+// process rather than slip through the deny list with a different syscall ABI.
+func TestConfineKillsX32(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("x32 exists only on x86_64")
+	}
+	policy := krucible.VMMPolicy{}
+	if os.Geteuid() == 0 {
+		policy.UID, policy.GID = testUID, testUID
+	}
+	out, err := runConfined(t, policy, expect{X32: true})
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || !ee.Sys().(syscall.WaitStatus).Signaled() ||
+		ee.Sys().(syscall.WaitStatus).Signal() != syscall.SIGSYS {
+		t.Fatalf("x32 ABI was not killed: %v\n%s", err, out)
+	}
+}
+
+// Go/libkrun use the x86-64 syscall table, not the x32 ABI. Linux before
+// 5.4 also accepted x32 numbers 512..547 *without* the usual ABI tag.
+func TestConfineKillsUntaggedX32(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("x32 exists only on x86_64")
+	}
+	policy := krucible.VMMPolicy{}
+	if os.Geteuid() == 0 {
+		policy.UID, policy.GID = testUID, testUID
+	}
+	out, err := runConfined(t, policy, expect{OldX32: true})
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || !ee.Sys().(syscall.WaitStatus).Signaled() ||
+		ee.Sys().(syscall.WaitStatus).Signal() != syscall.SIGSYS {
+		t.Fatalf("untagged x32 ABI was not killed: %v\n%s", err, out)
+	}
+}
+
+func mountPolicy(path string) krucible.VMMPolicy {
+	p := krucible.VMMPolicy{Mounts: []krucible.VMMRule{
+		{Path: path, Access: krucible.LandlockReadFile | krucible.LandlockReadDir},
+	}}
+	if os.Geteuid() == 0 {
+		p.UID, p.GID = testUID, testUID
+	}
+	return p
+}
+
+func TestConfineMountRejectsSymlinkedAncestor(t *testing.T) {
+	f := newFixture(t, 0o644)
+	realParent := filepath.Join(f.allowedDir, "real")
+	if err := os.Mkdir(realParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(f.allowedDir, "redirect")
+	if err := os.Symlink(realParent, link); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(link, "mount")
+	if err := os.Mkdir(filepath.Join(realParent, "mount"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Both an ordinary rule and an explicitly tagged virtio-fs mount must
+	// reject a symlink in an intermediate component, not only at the leaf.
+	ordinary := krucible.VMMPolicy{Rules: []krucible.VMMRule{
+		{Path: mount, Access: krucible.LandlockReadFile | krucible.LandlockReadDir},
+	}}
+	if os.Geteuid() == 0 {
+		ordinary.UID, ordinary.GID = testUID, testUID
+	}
+	for name, policy := range map[string]krucible.VMMPolicy{"rule": ordinary, "mount": mountPolicy(mount)} {
+		t.Run(name, func(t *testing.T) {
+			out, err := runConfined(t, policy, expect{JustStart: true})
+			if !strings.Contains(string(out), "vmm: confine: fatal: open "+mount+":") || err == nil {
+				t.Fatalf("symlinked intermediate component accepted: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestConfineMountSwapCannotRedirect(t *testing.T) {
+	f := newFixture(t, 0o644)
+	mount := filepath.Join(f.allowedDir, "mount")
+	if err := os.Mkdir(mount, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{mount, f.deniedDir} {
+		if err := os.WriteFile(filepath.Join(dir, "canary"), []byte("readable"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "policy")
+	if err := os.WriteFile(path, mountPolicy(mount).Encode(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := json.Marshal(expect{SwapMount: mount})
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), krucible.VMMPolicyEnv+"="+path, childEnv+"="+string(w))
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	ready, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || ready != "mount-ready\n" {
+		stdin.Close()
+		cmd.Wait()
+		t.Fatalf("confined child did not open mount: ready=%q err=%v\n%s", ready, err, stderr.String())
+	}
+	if err := os.Rename(mount, mount+"-original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(f.deniedDir, mount); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("swapped path reached forbidden inode: %v\n%s", err, stderr.String())
 	}
 }

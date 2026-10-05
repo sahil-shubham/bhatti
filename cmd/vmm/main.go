@@ -76,15 +76,18 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 
 	// Confines this process (Linux) before Go or libkrun code runs; the daemon
 	// passes the policy in krucible.VMMPolicyEnv.
@@ -118,6 +121,9 @@ func main() {
 	// check-checkpoint <dir>: whether this host can restore the checkpoint in
 	// dir, judged by libkrun as a restore would be; exits 1 with the reason.
 	if len(os.Args) == 3 && os.Args[1] == "check-checkpoint" {
+		if runtime.GOOS == "linux" && os.Geteuid() == 0 && os.Getenv(krucible.VMMPolicyEnv) == "" {
+			fail("check-checkpoint: root needs a confinement policy")
+		}
 		var kerr C.KrunError
 		C.krun_checkpoint_check_host(cstr(os.Args[2]), &kerr)
 		noErr(kerr, "check-checkpoint")
@@ -246,17 +252,40 @@ func run(spec krucible.VMSpec) {
 	}
 	C.krun_mmio_device_manager_add(devs, C.KrunAttachDevice(vsock))
 
-	// virtio-net to the owner's bhatti-netd gateway over a unixstream socket.
-	// Absent for an egress-"none" sandbox: no network device at all.
+	// Establish and authenticate the connection in the trusted VMM, then give
+	// libkrun the already-connected fd. A guest may send raw Ethernet frames but
+	// cannot choose the secret that binds this stream to its netd IP/MAC.
 	if spec.NetUDS != "" {
+		if len(spec.NetToken) != gateway.GuestHelloSize {
+			fail("missing netd attachment secret")
+		}
 		mac, err := net.ParseMAC(spec.NetMAC)
 		if err != nil || len(mac) != 6 {
 			fail("bad net_mac %q: %v", spec.NetMAC, err)
 		}
+		conn, err := net.Dial("unix", spec.NetUDS)
+		if err != nil {
+			fail("connect netd: %v", err)
+		}
+		if _, err := io.WriteString(conn, spec.NetToken); err != nil {
+			fail("authenticate netd: %v", err)
+		}
+		file, err := conn.(*net.UnixConn).File()
+		if err != nil {
+			fail("netd fd: %v", err)
+		}
+		// File duplicates the Go socket; duplicate once more so libkrun owns
+		// its fd independently of Go's os.File finalizer.
+		fd, err := syscall.Dup(int(file.Fd()))
+		file.Close()
+		conn.Close()
+		if err != nil {
+			fail("duplicate netd fd: %v", err)
+		}
 		cmac := C.CBytes(mac)
 		// CSUM, GUEST_CSUM, GUEST_TSO4, GUEST_UFO, HOST_TSO4, HOST_UFO.
 		const features = 1<<0 | 1<<1 | 1<<7 | 1<<10 | 1<<11 | 1<<14
-		nic := C.krun_net_device_new_unixstream_path(cstr("eth0"), cstr(spec.NetUDS),
+		nic := C.krun_net_device_new_unixstream_fd(cstr("eth0"), C.int(fd),
 			C.KrunBytes{data: (*C.uint8_t)(cmac), len: 6}, features, 0, &kerr)
 		noErr(kerr, "net "+spec.NetUDS)
 		C.krun_mmio_device_manager_add(devs, C.KrunAttachDevice(nic))

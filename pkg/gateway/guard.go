@@ -5,10 +5,10 @@
 // both the TSI egress filter and the virtio-net gateway share.
 //
 // Design: docs/internal/DESIGN-bhatti-v2-networking.md (§5.3) +
-// docs/internal/DESIGN-bhatti-v2-secrets-and-trust.md (§3.6a). The guard is
-// deny-by-construction for the host: a sandbox reaches the internet by default
-// but never the host, loopback, link-local (incl. cloud metadata), or other
-// tenants — and only reaches RFC-1918 with an explicit opt-in.
+// docs/internal/DESIGN-bhatti-v2-secrets-and-trust.md (§3.6a). An omitted
+// egress posture denies traffic; public access requires an explicit policy.
+// Host, loopback, link-local, metadata and other owners' networks cannot be
+// opened by allow rules.
 package gateway
 
 import (
@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 )
 
@@ -74,8 +75,8 @@ func classify(a netip.Addr, extraHardDeny []netip.Prefix) class {
 type Posture int
 
 const (
-	PosturePublic Posture = iota // allow the public internet (deny host/private) — the default
-	PostureDeny                  // deny everything not explicitly allow-listed (locked-down agent box)
+	PostureDeny   Posture = iota // deny everything not explicitly allow-listed
+	PosturePublic                // allow the public internet (not host/private/siblings)
 )
 
 // HostPattern matches a destination hostname: either an exact host or a
@@ -137,13 +138,30 @@ func (h HostPattern) Covers(o HostPattern) bool {
 }
 
 // EgressPolicy is a sandbox's egress rule set, evaluated per connection. Order
-// of evaluation is fixed (not rule-order-dependent), so a manifest diff is
-// stable: hard-deny → allow-cidr → allow-host → soft-deny → default.
+// is fixed: hard-deny → siblings → allow-cidr → allow-host → soft-deny → default.
+// SiblingSubnet, ExtraHardDeny and HostServices are assigned by netd, never by
+// the wire policy.
 type EgressPolicy struct {
 	Default       Posture
+	Siblings      Posture
+	SiblingSubnet netip.Prefix
 	AllowCIDRs    []netip.Prefix
 	AllowHosts    []HostPattern
-	ExtraHardDeny []netip.Prefix // host addrs, daemon API, other tenants' vnets
+	ExtraHardDeny []netip.Prefix // host addrs, daemon API, gateway, other owners' vnets
+	// HostServices are the daemon's own TCP listeners on host addresses. The
+	// internet can already reach them, so a guest may too: that is how a
+	// sandbox calls its node's bhatti API or a published URL. Only the
+	// hard-deny on that address and port is lifted; the rest of the policy
+	// still decides, and every other port on the host stays hard-denied.
+	HostServices []netip.AddrPort
+}
+
+// AllowAllEgress allows a guest to reach public internet IPs, but not private
+// ranges (including CGNAT), siblings, the host, the gateway, loopback,
+// link-local addresses or cloud metadata; allow-cidr may opt into private
+// ranges except destinations protected by netd's ExtraHardDeny.
+func AllowAllEgress() *EgressPolicy {
+	return &EgressPolicy{Default: PosturePublic}
 }
 
 // Verdict is the outcome of a policy check.
@@ -179,9 +197,44 @@ func cidrsContain(cidrs []netip.Prefix, a netip.Addr) bool {
 // name the guest asked for (may be empty for a literal-IP dial); ip is a
 // resolved destination address.
 func (p *EgressPolicy) Check(host string, ip netip.Addr) Verdict {
-	c := classify(ip, p.ExtraHardDeny)
+	return p.check(host, ip, p.ExtraHardDeny)
+}
+
+// CheckTCP is Check for a TCP connection to dst, which may be one of
+// HostServices.
+func (p *EgressPolicy) CheckTCP(host string, dst netip.AddrPort) Verdict {
+	a := canonical(dst.Addr())
+	for _, s := range p.HostServices {
+		if s.Port() == dst.Port() && canonical(s.Addr()) == a {
+			return p.check(host, a, withoutAddr(p.ExtraHardDeny, a))
+		}
+	}
+	return p.check(host, dst.Addr(), p.ExtraHardDeny)
+}
+
+// withoutAddr is prefixes minus the single-address entries for a, so lifting a
+// host service never lifts a wider range (another owner's subnet) around it.
+func withoutAddr(prefixes []netip.Prefix, a netip.Addr) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(prefixes))
+	for _, p := range prefixes {
+		if p.IsSingleIP() && canonical(p.Addr()) == a {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func (p *EgressPolicy) check(host string, ip netip.Addr, extraHardDeny []netip.Prefix) Verdict {
+	c := classify(ip, extraHardDeny)
 	if c == classHardDeny {
 		return deny("destination is in a hard-denied range (host/loopback/link-local/metadata)")
+	}
+	if p.SiblingSubnet.IsValid() && p.SiblingSubnet.Contains(canonical(ip)) {
+		if p.Siblings == PosturePublic {
+			return allow("siblings")
+		}
+		return deny("sibling access denied (use --allow-siblings to opt in)")
 	}
 	// Explicit allow-cidr opts back into an otherwise soft-denied private range.
 	if cidrsContain(p.AllowCIDRs, ip) {
@@ -274,10 +327,14 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		}
 	}
 
+	portNum, err := net.LookupPort(network, port)
+	if err != nil {
+		return nil, fmt.Errorf("gateway dial: bad port %q: %w", port, err)
+	}
 	var vetted []netip.Addr
 	lastReason := "no addresses resolved"
 	for _, ip := range ips {
-		v := d.Policy.Check(host, ip)
+		v := d.vet(network, host, ip, uint16(portNum))
 		if v.Allow {
 			vetted = append(vetted, ip)
 			continue
@@ -307,13 +364,22 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 // the connection goes where the guest pointed it rather than to a fresh
 // resolution of host.
 func (d *Dialer) DialAs(ctx context.Context, network, host string, ip netip.Addr, port uint16) (net.Conn, error) {
-	if v := d.Policy.Check(host, ip); !v.Allow {
+	if v := d.vet(network, host, ip, port); !v.Allow {
 		if d.OnDeny != nil {
 			d.OnDeny(host, ip, v.Reason)
 		}
 		return nil, &DeniedError{Host: addrForErr(host, ip.String()), Reason: v.Reason}
 	}
-	return d.dialOne(ctx, network, net.JoinHostPort(ip.String(), fmt.Sprint(port)))
+	return d.dialOne(ctx, network, net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
+}
+
+// vet applies the port-aware TCP check to TCP dials and the address check to
+// everything else.
+func (d *Dialer) vet(network, host string, ip netip.Addr, port uint16) Verdict {
+	if strings.HasPrefix(network, "tcp") {
+		return d.Policy.CheckTCP(host, netip.AddrPortFrom(ip, port))
+	}
+	return d.Policy.Check(host, ip)
 }
 
 // AllowsName reports whether DNS lookups of host should be answered for a

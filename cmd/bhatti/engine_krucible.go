@@ -84,15 +84,23 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 		}
 	}
 
+	daemonListen := []string{cfg.Listen, cfg.PublicProxyListen}
+	if cfg.Domain != nil {
+		// Domain mode listens on wildcard :443/:80; netd also snapshots every
+		// host interface address so either listener stays unreachable to guests.
+		daemonListen = []string{":443", ":80"}
+	}
+
 	return krucible.New(krucible.Config{
-		DataDir:     cfg.DataDir,
-		BaseRootfs:  cfg.KrucibleRootfs,
-		BaseImage:   cfg.KrucibleBaseImage,
-		BlockRoot:   blockRoot,
-		VMMBinary:   vmm,
-		LibDir:      libDir,
-		SocketDir:   cfg.KrucibleSocketDir,
-		KernelImage: kernelImage,
-		NetdBinary:  netd,
+		DataDir:      cfg.DataDir,
+		BaseRootfs:   cfg.KrucibleRootfs,
+		BaseImage:    cfg.KrucibleBaseImage,
+		BlockRoot:    blockRoot,
+		VMMBinary:    vmm,
+		LibDir:       libDir,
+		SocketDir:    cfg.KrucibleSocketDir,
+		KernelImage:  kernelImage,
+		NetdBinary:   netd,
+		DaemonListen: daemonListen,
 	})
 }

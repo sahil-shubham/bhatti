@@ -46,8 +46,7 @@ type vmRecord struct {
 	NetIP      string `json:"net_ip,omitempty"`      // guest IP on the netd gateway subnet
 	SandboxRef string `json:"sandbox_ref,omitempty"` // the server's sandbox ID, named to the credential broker
 	VMMUID     uint32 `json:"vmm_uid,omitempty"`     // the helper's own uid (vmmuser.go), kept for the sandbox's life
-	// The egress rules netd enforces for the guest; nil = public, and all a
-	// record from before this field can say.
+	// Missing legacy policy is deny at netd; never infer public from absence.
 	NetPolicy *gateway.NetPolicyWire `json:"net_policy,omitempty"`
 }
 
@@ -243,7 +242,7 @@ var errAgentInfoPaused = errors.New("not asked yet: the guest was paused when th
 // are skipped.
 func (e *Engine) recover() {
 	matches, _ := filepath.Glob(filepath.Join(e.cfg.DataDir, "sandboxes", "*", stateFile))
-	var adopted []*VM
+	var recovered []*VM
 	for _, p := range matches {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -255,7 +254,44 @@ func (e *Engine) recover() {
 			continue
 		}
 		vm := vmFromRecord(rec)
-		helper := e.adoptHelper(vm, rec.Status)
+		recovered = append(recovered, vm)
+		e.mu.Lock()
+		e.vms[rec.ID] = vm
+		if e.dropVMM && vm.vmmUID != 0 {
+			e.vmmIDs[vm.vmmUID] = vm.ID
+		}
+		e.mu.Unlock()
+		e.readoptNetd(vm)
+	}
+	// Verify/replace the gateways before probing ANY recovered guest. Running
+	// workloads can send packets without waiting for the daemon's API startup;
+	// leaving an obsolete gateway alive during helper adoption is not safe.
+	checked := make(map[string]bool)
+	unverified := make(map[string]error)
+	for _, vm := range recovered {
+		if vm.netdKey == "" || checked[vm.netdKey] {
+			continue
+		}
+		checked[vm.netdKey] = true
+		if err := e.ensureNetd(vm.netdKey); err != nil {
+			slog.Error("krucible.netd_recovery_failed", "owner", vm.netdKey, "error", err)
+			if e.netdRunning(vm.netdKey) {
+				unverified[vm.netdKey] = err
+			}
+		}
+	}
+	for _, vm := range recovered {
+		recStatus := vm.Status
+		helper := ""
+		if reason := unverified[vm.netdKey]; reason != nil && recStatus == "running" {
+			// If the gateway cannot be safely replaced, keeping a connected
+			// VMM alive would leave its unverified egress policy in effect.
+			slog.Error("krucible.netd_quarantine", "sandbox_id", vm.ID, "error", reason)
+			killHelper(vm.HelperPID, vm.specPath())
+			e.emitNetdEvent(vm.UserID, vm.brokerRef(), "gateway recovery failed: "+reason.Error())
+		} else {
+			helper = e.adoptHelper(vm, recStatus)
+		}
 		switch helper {
 		case "running", "paused":
 			vm.Status, vm.Thermal = "running", "hot"
@@ -265,28 +301,20 @@ func (e *Engine) recover() {
 			} else if vm.AgentInfo, vm.AgentInfoErr = queryAgentInfo(context.Background(), vm.Agent); vm.AgentInfoErr != nil {
 				slog.Warn("krucible.agent.info", "id", vm.ID, "error", vm.AgentInfoErr)
 			}
-			adopted = append(adopted, vm)
 		default:
 			vm.Status, vm.Thermal, vm.HelperPID = "stopped", "cold", 0
 		}
-		e.mu.Lock()
-		e.vms[rec.ID] = vm
-		if e.dropVMM && vm.vmmUID != 0 {
-			e.vmmIDs[vm.vmmUID] = vm.ID
-		}
-		e.mu.Unlock()
-		e.readoptNetd(vm) // re-adopt the owner's shared gateway (net backend)
-		vm.persist()      // write back the reconciled status/thermal
-		slog.Info("krucible recovered sandbox", "id", rec.ID, "name", rec.Name,
+		vm.persist()
+		slog.Info("krucible recovered sandbox", "id", vm.ID, "name", vm.Name,
 			"helper", helper, "status", vm.Status, "thermal", vm.Thermal)
 	}
-	// netd kept each guest's egress state across the restart, but the records
-	// are its source of truth (gateway/control.go). A nil policy is netd's own
-	// default and all a record from before net_policy can say: pushing it could
-	// only loosen what netd holds.
-	for _, vm := range adopted {
-		if vm.netPolicy != nil && e.netdRunning(vm.netdKey) {
-			_ = e.pushSandboxPolicy(vm)
+	// Replay even absent policies: a registered old grant must be replaced by
+	// deny. No helper is allowed to rely on a versionless control socket.
+	for _, vm := range recovered {
+		if vm.Status == "running" && e.netdRunning(vm.netdKey) {
+			if err := e.pushSandboxPolicy(vm); err != nil {
+				slog.Warn("krucible.netd_policy_replay_failed", "sandbox_id", vm.ID, "error", err)
+			}
 		}
 	}
 }

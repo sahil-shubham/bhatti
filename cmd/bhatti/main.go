@@ -202,6 +202,7 @@ func runDaemon() {
 		slog.Error("invalid default_egress (want none, deny or public)", "value", cfg.DefaultEgress)
 		os.Exit(1)
 	}
+	srvOpts = append(srvOpts, server.WithMountRoots(cfg.MountRoots, cfg.ConfigPaths))
 	if cfg.Domain != nil {
 		srvOpts = append(srvOpts,
 			server.WithProxyZone(cfg.Domain.ProxyZone),
@@ -628,10 +629,17 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 				continue
 			}
 			volName := strings.TrimSuffix(f.Name(), ".ext4")
-			if _, err := st.GetPersistentVolume(userID, volName); err != nil {
+			exists, err := st.PersistentVolumeExists(userID, volName)
+			if err != nil {
+				slog.Warn("skipping volume file cleanup: database lookup failed", "user_id", userID, "volume", volName, "error", err)
+				continue
+			}
+			if !exists {
 				orphanPath := filepath.Join(userPath, f.Name())
 				slog.Info("removing orphaned volume file", "path", orphanPath)
-				os.Remove(orphanPath)
+				if err := os.Remove(orphanPath); err != nil {
+					slog.Warn("remove orphaned volume file", "path", orphanPath, "error", err)
+				}
 			}
 		}
 	}

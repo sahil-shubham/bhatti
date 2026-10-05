@@ -277,3 +277,19 @@ func TestParseTTL(t *testing.T) {
 		}
 	}
 }
+
+func TestGrantRejectsMissingOrInvalidNetworkPolicy(t *testing.T) {
+	for _, np := range []*gateway.NetPolicyWire{
+		nil,
+		{},
+		{Default: "unknown"},
+		{Default: gateway.PostureNone},
+	} {
+		if hosts, err := grantHosts([]string{"api.example.com"}, np); err == nil {
+			t.Errorf("grantHosts(%+v) authorized %v without a valid network policy", np, hosts)
+		}
+	}
+	if hosts, err := grantHosts([]string{"api.example.com"}, &gateway.NetPolicyWire{Default: "public"}); err != nil || len(hosts) != 1 {
+		t.Fatalf("public guest grant = %v, %v", hosts, err)
+	}
+}

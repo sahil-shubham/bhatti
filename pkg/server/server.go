@@ -73,7 +73,10 @@ type ThermalConfig struct {
 type Server struct {
 	engine           engine.Engine
 	store            *store.Store
-	dataDir          string // path to data directory (for age.key)
+	dataDir          string   // path to data directory (for age.key)
+	mountRoots       []string // configured roots for live host-directory binds; nil disables mounts
+	configPath       string   // primary loaded server config, for diagnostics
+	configPaths      []string // all files read by the daemon, protected from live mounts
 	mux              *http.ServeMux
 	limiter          *rateLimiter
 	stopThermal      context.CancelFunc
@@ -257,6 +260,18 @@ func WithDefaultEgress(posture string) ServerOption {
 	return func(s *Server) { s.defaultEgress = posture }
 }
 
+// WithMountRoots permits live host-directory mounts only below these roots.
+// Empty roots disable mounts; configPaths lists every file read by LoadConfig.
+func WithMountRoots(roots, configPaths []string) ServerOption {
+	return func(s *Server) {
+		s.mountRoots = append([]string(nil), roots...)
+		s.configPaths = append([]string(nil), configPaths...)
+		if len(configPaths) > 0 {
+			s.configPath = configPaths[0]
+		}
+	}
+}
+
 // WithBackupBackend sets the S3-compatible backup backend.
 func WithBackupBackend(b backup.Backend) ServerOption {
 	return func(s *Server) { s.backupBackend = b }
@@ -424,6 +439,13 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 		}
 		switch {
 		case info.Status == "running":
+			if err := s.checkStoredMounts(sb.EngineID); err != nil {
+				slog.Warn("sandbox.mount_policy_violation", "sandbox_id", sb.ID, "name", sb.Name, "error", err)
+				s.RecordEvent(store.Event{
+					Type: "sandbox.mount_policy_violation", UserID: sb.CreatedBy, SandboxID: sb.ID,
+					Meta: map[string]any{"name": sb.Name, "error": err.Error()},
+				})
+			}
 			s.lastActivity.Store(sb.EngineID, time.Now())
 			if sb.Status != "running" {
 				slog.Info("sandbox running after restart", "sandbox", sb.Name, "id", sb.ID, "from_status", sb.Status)
@@ -759,6 +781,9 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 	fromState := te.ThermalState(engineID)
 	if fromState == "hot" {
 		return nil // already hot, no wake needed
+	}
+	if err := s.checkStoredMounts(engineID); err != nil {
+		return err
 	}
 
 	start := time.Now()

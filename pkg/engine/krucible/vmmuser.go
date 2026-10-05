@@ -14,8 +14,8 @@ import (
 )
 
 // Confined helpers. On Linux every bhatti-vmm runs confined from its first
-// instruction (cmd/vmm/internal/confine): no_new_privs, and a Landlock policy
-// (VMMPolicy) naming the only files it may open — its sandbox's root disk,
+// instruction (cmd/vmm/internal/confine): no_new_privs, seccomp and a Landlock
+// policy (VMMPolicy) naming the only files it may open — its sandbox's root disk,
 // volumes, save dir and spec, its socket dir, the images its root disk backs
 // onto, the kernel, /dev/kvm, and any virtio-fs mount. When the daemon is root
 // it also gives each sandbox's helper an unprivileged uid of its own
@@ -315,6 +315,82 @@ func (e *Engine) shareNetdSocket(inst *netdInstance) error {
 	return os.Chmod(inst.sock, 0o660)
 }
 
+// confineCheckpoint gives a short-lived checker the same unprivileged identity
+// pool as a VM, without exposing a stored snapshot to every VM's shared group.
+// The loader has already opened the binary and libraries before the constructor;
+// libkrun's host probe reads checkpoint.bin and opens /dev/kvm for ioctls.
+func (e *Engine) confineCheckpoint(dir string) (string, func() error, error) {
+	checkpoint := filepath.Join(dir, checkpointFile)
+	p := VMMPolicy{NoNetwork: true, Rules: []VMMRule{
+		{checkpoint, vmmReadFile},
+		{"/dev/kvm", vmmDevice},
+	}}
+	cleanup := func() error { return nil }
+	fail := func(err error) (string, func() error, error) {
+		return "", nil, errors.Join(err, cleanup())
+	}
+
+	if e.dropVMM {
+		vm := &VM{ID: "check-checkpoint:" + dir}
+		uid, err := e.vmmUIDFor(vm)
+		if err != nil {
+			return fail(err)
+		}
+		cleanup = func() error { e.releaseVMM(vm); return nil }
+		p.UID, p.GID = uid, uid
+		p.Groups = []uint32{vmmGroup}
+		if e.kvmGID != 0 {
+			p.Groups = append(p.Groups, e.kvmGID)
+		}
+		fi, err := os.Lstat(checkpoint)
+		if err != nil {
+			return fail(err)
+		}
+		if !fi.Mode().IsRegular() {
+			return fail(fmt.Errorf("checkpoint: %s isn't a plain file", checkpoint))
+		}
+		real, err := filepath.EvalSymlinks(checkpoint)
+		if err != nil {
+			return fail(err)
+		}
+		for _, parent := range []string{filepath.Dir(checkpoint), filepath.Dir(real)} {
+			if err := e.vmmReachable(parent); err != nil {
+				return fail(err)
+			}
+		}
+		st := fi.Sys().(*syscall.Stat_t)
+		if err := os.Lchown(checkpoint, int(st.Uid), int(uid)); err != nil {
+			return fail(err)
+		}
+		release := cleanup
+		cleanup = func() error {
+			err := errors.Join(
+				os.Lchown(checkpoint, int(st.Uid), int(st.Gid)),
+				os.Chmod(checkpoint, fi.Mode().Perm()),
+			)
+			return errors.Join(err, release())
+		}
+		if err := os.Chmod(checkpoint, fi.Mode().Perm()|0o040); err != nil {
+			return fail(err)
+		}
+	}
+	f, err := os.CreateTemp(dir, ".vmm-check-*.policy")
+	if err != nil {
+		return fail(err)
+	}
+	policy := f.Name()
+	release := cleanup
+	cleanup = func() error { return errors.Join(os.Remove(policy), release()) }
+	if _, err := f.Write(p.Encode()); err != nil {
+		f.Close()
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		return fail(err)
+	}
+	return policy, cleanup, nil
+}
+
 // confineLaunch readies vm's helper to run confined. It returns the spec to
 // hand the helper — spec, but with volumes and a restore's checkpoint linked
 // into the sandbox dir — the policy file to name in VMMPolicyEnv, and what to
@@ -482,7 +558,7 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 		if m.ReadOnly {
 			access, caps = vmmReadTree, vmmMountROCaps
 		}
-		p.Rules = append(p.Rules, VMMRule{m.HostPath, access})
+		p.Mounts = append(p.Mounts, VMMRule{m.HostPath, access})
 		if e.dropVMM {
 			for _, c := range caps {
 				if !slices.Contains(p.Caps, c) {

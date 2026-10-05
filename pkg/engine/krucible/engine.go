@@ -57,6 +57,9 @@ type Config struct {
 	// gateway, which polices egress and isolates the host. (libkrun's TSI needs
 	// a patched guest kernel; the lean kernel isn't one.)
 	NetdBinary string
+	// DaemonListen lists API/proxy TCP listeners; netd protects their bind
+	// addresses in addition to all host interface addresses.
+	DaemonListen []string
 }
 
 // maxUnixPath is the conservative AF_UNIX sun_path cap (macOS = 104).
@@ -204,24 +207,32 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	}
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
-	// Already running — we spawned it, or adopted it across a daemon restart.
-	// A live netd that serves traffic (n.sock) but has no control socket
-	// (ctl.sock) is an older binary that survived a daemon upgrade: it can never
-	// receive per-sandbox egress policy, so replace it instead of silently
-	// running guests on the open default.
+	// libkrun's Unixstream holds its connected fd for the VM's lifetime
+	// (no reconnect after EOF). Replacing an incompatible netd therefore
+	// disconnects existing guests permanently until they are restarted. Kill it
+	// FIRST so its obsolete rules cannot forward another packet; the fresh
+	// gateway serves new sandboxes only. Report each affected running sandbox.
 	if inst.pid > 0 && isNetd(inst.pid, inst.sock) {
 		_, sockErr := os.Stat(inst.sock)
 		_, ctlErr := os.Stat(inst.ctlSock)
+		var versionErr error
 		if sockErr == nil && ctlErr == nil {
-			serveBrokerLocked(inst, broker)
-			return e.shareNetdSocket(inst)
+			versionErr = gateway.ProbeVersion(inst.ctlSock)
+			if versionErr == nil {
+				serveBrokerLocked(inst, broker)
+				return e.shareNetdSocket(inst)
+			}
+		} else {
+			versionErr = fmt.Errorf("netd sockets unavailable (network: %v, control: %v)", sockErr, ctlErr)
 		}
-		if sockErr == nil {
-			slog.Warn("krucible: adopted netd lacks control socket; respawning", "owner", ownerKey, "pid", inst.pid)
-			_ = syscall.Kill(-inst.pid, syscall.SIGKILL)
-			inst.pid = 0
+		if err := e.replaceNetdLocked(inst, versionErr); err != nil {
+			return err // fail closed: never unlink sockets while old netd lives
 		}
+	} else {
+		inst.pid = 0 // dead process / reused pid, never signal an unrelated pid
+		inst.cmd = nil
 	}
+
 	if err := os.MkdirAll(inst.dir, 0700); err != nil {
 		return fmt.Errorf("netd dir: %w", err)
 	}
@@ -239,12 +250,19 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	}
 	// netd's identity once confined is ours to name: the broker socket is
 	// shared with exactly that uid/gid (broker.go).
-	cmd := exec.Command(e.cfg.NetdBinary,
+	args := []string{
 		"--net-uds", inst.sock, "--ctl-uds", inst.ctlSock,
 		"--broker-uds", brokerSockPath(inst.dir),
 		"--uid", fmt.Sprint(netdUID), "--gid", fmt.Sprint(netdGID),
 		"--gw-ip", netGatewayIPFor(inst.subnetIdx),
-		"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC)
+		"--prefix", fmt.Sprintf("%d", netPrefixLen), "--mac", netGatewayMAC,
+	}
+	for _, listen := range e.cfg.DaemonListen {
+		if listen != "" {
+			args = append(args, "--daemon-listen", listen)
+		}
+	}
+	cmd := exec.Command(e.cfg.NetdBinary, args...)
 	cmd.Stdout = lf
 	cmd.Stderr = lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -261,6 +279,22 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		_, _ = cmd.Process.Wait()
 		return fmt.Errorf("bhatti-netd control socket not listening: %w", werr)
 	}
+	// The socket path appears before netd finishes confinement and starts its
+	// accept loop. Give this newly spawned process time to answer, but never
+	// accept an unverified policy engine if the handshake keeps failing.
+	var verr error
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if verr = gateway.ProbeVersion(inst.ctlSock); verr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			return fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	inst.cmd = cmd
 	inst.pid = cmd.Process.Pid
 	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
@@ -268,11 +302,47 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	return e.shareNetdSocket(inst)
 }
 
-// pushSandboxPolicy registers this VM's per-sandbox egress state with its
-// owner's netd over the control UDS, retrying briefly since netd may have only
-// just started listening. Returns an error when the policy could not be
-// delivered, so the caller can fail closed rather than boot the guest on the
-// open default. No-op on TSI (no netd IP).
+// replaceNetdLocked stops a verified old netd before its sockets are reused.
+// It is called with inst.mu held and records the unavoidable disconnection of
+// helpers still using the old, non-reconnecting Unixstream fd.
+func (e *Engine) replaceNetdLocked(inst *netdInstance, reason error) error {
+	slog.Error("krucible.netd_incompatible", "owner", inst.owner, "pid", inst.pid, "error", reason)
+	if inst.cmd != nil && inst.cmd.Process != nil {
+		if err := inst.cmd.Process.Kill(); err != nil && err != os.ErrProcessDone {
+			return fmt.Errorf("stop incompatible netd: %w", err)
+		}
+		_, _ = inst.cmd.Process.Wait()
+	} else {
+		if err := syscall.Kill(inst.pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return fmt.Errorf("stop incompatible netd %d: %w", inst.pid, err)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for isNetd(inst.pid, inst.sock) {
+			var ws syscall.WaitStatus
+			_, _ = syscall.Wait4(inst.pid, &ws, syscall.WNOHANG, nil)
+			if !isNetd(inst.pid, inst.sock) {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("incompatible netd %d did not exit after SIGKILL", inst.pid)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	inst.cmd, inst.pid = nil, 0
+	writeNetdRecord(inst)
+	e.mu.RLock()
+	for _, vm := range e.vms {
+		if vm.netdKey == inst.owner && vm.Status == "running" {
+			e.emitNetdEvent(vm.UserID, vm.brokerRef(), reason.Error())
+		}
+	}
+	e.mu.RUnlock()
+	return nil
+}
+
+// pushSandboxPolicy sends this VM's policy before boot. A failed push aborts
+// boot even if the policy was absent; an unregistered guest never gets egress.
 func (e *Engine) pushSandboxPolicy(vm *VM) error {
 	if vm.netIP == "" || vm.netdKey == "" {
 		return nil
@@ -283,7 +353,8 @@ func (e *Engine) pushSandboxPolicy(vm *VM) error {
 	if inst == nil || inst.ctlSock == "" {
 		return fmt.Errorf("netd control socket unavailable for %s", vm.ID)
 	}
-	msg := gateway.ControlMsg{Op: gateway.ControlSet, GuestIP: vm.netIP, Sandbox: vm.brokerRef(), Policy: vm.netPolicy}
+	msg := gateway.ControlMsg{Op: gateway.ControlSet, GuestIP: vm.netIP, GuestMAC: vm.baseSpec.NetMAC,
+		GuestToken: vm.baseSpec.NetToken, Sandbox: vm.brokerRef(), Policy: vm.netPolicy}
 	c := gateway.NewControlClient(inst.ctlSock)
 	defer c.Close()
 	var lastErr error
@@ -351,9 +422,12 @@ type VM struct {
 	netdKey      string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
 	subnetIdx    int                    // owner's vnet subnet index (net backend); persisted for recovery
 	netIP        string                 // guest IP on the netd gateway subnet (net backend); "" on TSI; reported in SandboxInfo + persisted for restart
-	netPolicy    *gateway.NetPolicyWire // per-sandbox egress rules pushed to netd; nil = public; persisted, so a relaunch after a restart pushes it again
+	netPolicy    *gateway.NetPolicyWire // per-sandbox egress rules; nil on older recovered state means deny in netd
 	sandboxRef   string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
 	vmmUID       uint32                 // the helper's own uid and primary gid (vmmuser.go); 0 = runs as the daemon; persisted
+
+	// Report an older restored agent without persisting this launch-only result.
+	reseedUnsupported bool
 }
 
 // brokerRef is how netd names this sandbox to the credential broker: the
@@ -372,14 +446,17 @@ func (vm *VM) specPath() string { return filepath.Join(vm.SandboxDir, "vmspec.js
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
 type Engine struct {
-	mu        sync.RWMutex
-	vms       map[string]*VM
-	cfg       Config
-	baseImgMu sync.Mutex               // guards the one-time base-image build
-	netdMu    sync.Mutex               // guards netds and broker
-	netds     map[string]*netdInstance // owner key → shared bhatti-netd gateway
-	broker    engine.CredentialBroker  // served to every netd (broker.go); nil = no credential substitution
-	caps      VMMCapabilities          // what the bhatti-vmm build supports (probed in New)
+	mu                sync.RWMutex
+	vms               map[string]*VM
+	cfg               Config
+	baseImgMu         sync.Mutex               // guards the one-time base-image build
+	netdMu            sync.Mutex               // guards netds and broker
+	netds             map[string]*netdInstance // owner key → shared bhatti-netd gateway
+	broker            engine.CredentialBroker  // served to every netd (broker.go); nil = no credential substitution
+	netdEventMu       sync.Mutex
+	onNetdEvent       func(userID, sandboxID, reason string)
+	pendingNetdEvents []netdEvent
+	caps              VMMCapabilities // what the bhatti-vmm build supports (probed in New)
 	// Confined helpers (vmmuser.go): confineVMM on Linux; dropVMM when the
 	// daemon is root, which gives each helper its own uid from vmmIDs (mu).
 	confineVMM, dropVMM bool
@@ -535,6 +612,14 @@ func (e *Engine) Create(ctx context.Context, spec engine.SandboxSpec) (engine.Sa
 }
 
 func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts createOpts) (info engine.SandboxInfo, err error) {
+	// Direct engine callers also get the server's no-NIC default; neither a
+	// missing pointer nor an invalid wire policy may start an open guest.
+	if spec.NetPolicy == nil {
+		spec.NetPolicy = &gateway.NetPolicyWire{Default: gateway.PostureNone}
+	}
+	if err := gateway.ValidateWire(*spec.NetPolicy); err != nil {
+		return info, fmt.Errorf("create sandbox net policy: %w", err)
+	}
 	id, err := generateID()
 	if err != nil {
 		return info, err
@@ -551,6 +636,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 				e.releaseVMM(vm)
 			}
 			if netdKey != "" {
+				if vm != nil {
+					e.delSandboxPolicy(vm) // also covers failed pushes with a lost ACK
+				}
 				e.releaseNetd(netdKey)
 			}
 			os.RemoveAll(sandboxDir)
@@ -614,6 +702,10 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	if netInst != nil {
 		baseSpec.NetUDS = netUDS
 		baseSpec.NetMAC = netGuestMACFor(netGuestIdx)
+		baseSpec.NetToken, err = genNetToken()
+		if err != nil {
+			return info, err
+		}
 		netIP = netGuestIPFor(netInst.subnetIdx, netGuestIdx)
 		cdNet = &configdrive.NetConfig{
 			IP:      netGuestCIDRFor(netInst.subnetIdx, netGuestIdx),
@@ -733,6 +825,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
 		return info, err
 	}
+	reseedUnsupported := vm.reseedUnsupported
 	if spec.RequireGuestCA {
 		if err = vm.requireFeature(proto.FeatureSandboxCA); err != nil {
 			return info, fmt.Errorf("create with secret grants: %w", err)
@@ -765,13 +858,21 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	e.mu.Unlock()
 
 	slog.Info("krucible sandbox created", "id", id, "name", name, "vcpus", vcpus, "mem_mib", memMiB, "block_root", e.cfg.BlockRoot)
-	return engine.SandboxInfo{ID: id, Name: name, Status: "running", EngineID: id, IP: vm.netIP}, nil
+	return engine.SandboxInfo{ID: id, Name: name, Status: "running", EngineID: id, IP: vm.netIP, GuestReseedUnsupported: reseedUnsupported}, nil
 }
 
 // launch spawns the bhatti-vmm helper for vm and waits for the agent. When
 // snapshotDir is non-empty the helper restores from that checkpoint directory
 // instead of booting. Sets vm.cmd/cancel/Agent/Status on success.
 func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err error) {
+	if vm.netdKey != "" && vm.baseSpec.NetToken == "" {
+		// A stopped pre-upgrade VM has no authenticated NIC yet. The old
+		// helper cannot reconnect; a fresh boot gets a fresh identity.
+		vm.baseSpec.NetToken, err = genNetToken()
+		if err != nil {
+			return err
+		}
+	}
 	spec := vm.baseSpec
 	spec.SnapshotDir = snapshotDir
 	specPath := vm.specPath()
@@ -813,9 +914,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 		if nerr := e.ensureNetd(vm.netdKey); nerr != nil {
 			return nerr
 		}
-		if perr := e.pushSandboxPolicy(vm); perr != nil && vm.netPolicy != nil {
-			// A policy was explicitly requested but couldn't be delivered to
-			// netd — fail closed rather than boot the guest on the open default.
+		if perr := e.pushSandboxPolicy(vm); perr != nil {
 			return fmt.Errorf("enforce egress policy: %w", perr)
 		}
 	}
@@ -921,6 +1020,18 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 	if infoErr != nil {
 		slog.Warn("krucible.agent.info", "id", vm.ID, "error", infoErr)
 	}
+	var reseedUnsupported bool
+	if snapshotDir != "" {
+		reseedUnsupported, err = reseedRestoredGuest(ctx, vm.ID, ag, agentInfo, infoErr)
+		if err != nil {
+			slog.Error("krucible.guest_reseed_failed", "id", vm.ID, "error", err)
+			_ = cmd.Process.Kill()
+			<-waitDone
+			vmCancel()
+			vm.closeConfigSrv()
+			return fmt.Errorf("restore: %w: %w", engine.ErrGuestReseedFailed, err)
+		}
+	}
 	vm.mu.Lock()
 	vm.cmd = cmd
 	vm.cancel = vmCancel
@@ -929,6 +1040,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 	vm.Agent = ag
 	vm.AgentInfo = agentInfo
 	vm.AgentInfoErr = infoErr
+	vm.reseedUnsupported = reseedUnsupported
 	vm.Status = "running"
 	vm.Thermal = "hot"
 	vm.mu.Unlock()
@@ -1054,6 +1166,7 @@ func (e *Engine) Start(ctx context.Context, id string) error {
 	}
 	vm.mu.Unlock()
 	if err := e.launch(ctx, vm, ""); err != nil {
+		e.delSandboxPolicy(vm) // a failed restart must not leave an unused grant
 		return fmt.Errorf("start (fresh boot): %w", err)
 	}
 	slog.Info("krucible sandbox started", "id", id, "mode", "fresh boot")
@@ -1299,6 +1412,14 @@ func generateID() (string, error) {
 		return "", fmt.Errorf("generate id: %w", err)
 	}
 	return fmt.Sprintf("%x", b), nil
+}
+
+func genNetToken() (string, error) {
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate netd attachment secret: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
 }
 
 // buildBaseImage builds an ext4 image populated from srcDir (the rootfs tree)

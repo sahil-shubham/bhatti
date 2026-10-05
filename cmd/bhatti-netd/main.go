@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -32,6 +33,11 @@ func main() {
 	brokerUDS := flag.String("broker-uds", "", "credential broker socket the daemon serves (optional; enables credential substitution)")
 	uid := flag.Int("uid", 65534, "user to run as once the sockets are open, when started as root")
 	gid := flag.Int("gid", 65534, "group to run as once the sockets are open, when started as root")
+	var daemonListeners []string
+	flag.Func("daemon-listen", "daemon API or proxy TCP listen address (repeatable)", func(addr string) error {
+		daemonListeners = append(daemonListeners, addr)
+		return nil
+	})
 	flag.Parse()
 
 	if *netUDS == "" {
@@ -40,6 +46,16 @@ func main() {
 	cfg, err := parseConfig(*gwIP, *prefix, *macStr)
 	if err != nil {
 		log.Fatalf("bhatti-netd: %v", err)
+	}
+	// Landlock later restricts filesystem access; enumerate the host's actual
+	// interface addresses before confinement, even for wildcard API listeners.
+	interfaceAddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Fatalf("bhatti-netd: enumerate host interfaces: %v", err)
+	}
+	cfg.host, err = protectHost(interfaceAddrs, daemonListeners)
+	if err != nil {
+		log.Fatalf("bhatti-netd: host addresses: %v", err)
 	}
 
 	_ = os.Remove(*netUDS) // clear any stale socket from a prior incarnation
@@ -86,6 +102,13 @@ type gwConfig struct {
 	ip     tcpip.Address
 	prefix int
 	mac    tcpip.LinkAddress
+	host   hostProtection
+}
+
+// hostProtection is what netd guards on the host, fixed at startup.
+type hostProtection struct {
+	addrs    []netip.Prefix   // every host address: hard-denied to guests
+	services []netip.AddrPort // the daemon's listeners on those addresses
 }
 
 func parseConfig(gwIP string, prefix int, macStr string) (gwConfig, error) {
@@ -123,12 +146,76 @@ func listenControl(path string) (net.Listener, error) {
 	return ln, nil
 }
 
-// serve builds the owner's gateway and accepts guest links as the owner's VMs
-// connect (each libkrun virtio-net backend dials this socket). Every accepted
-// connection becomes a switch port; siblings on the same netd reach each other.
-// Closing the listener on ctx.Done unblocks a pending Accept.
+// protectHost snapshots both interface addresses and configured daemon
+// listeners. A wildcard listener is covered by every interface address; an
+// explicit bind address is still protected if it has not appeared on an
+// interface yet. A discovery failure must abort startup, not erase this deny.
+// Each listener also becomes a service on the addresses it binds, the one
+// host port a guest's policy may reach (EgressPolicy.HostServices).
+func protectHost(interfaceAddrs []net.Addr, daemonListeners []string) (hostProtection, error) {
+	var hp hostProtection
+	var ifaces []netip.Addr
+	add := func(ip net.IP) (netip.Addr, bool) {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			return netip.Addr{}, false
+		}
+		addr = addr.Unmap()
+		hp.addrs = append(hp.addrs, netip.PrefixFrom(addr, addr.BitLen()))
+		return addr, true
+	}
+	for _, a := range interfaceAddrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		default:
+			return hostProtection{}, fmt.Errorf("unsupported host interface address %T", a)
+		}
+		if addr, ok := add(ip); ok {
+			ifaces = append(ifaces, addr)
+		}
+	}
+	for _, listen := range daemonListeners {
+		host, portStr, err := net.SplitHostPort(listen)
+		if err != nil {
+			return hostProtection{}, fmt.Errorf("daemon listener %q: %w", listen, err)
+		}
+		port, err := net.LookupPort("tcp", portStr)
+		if err != nil {
+			return hostProtection{}, fmt.Errorf("daemon listener %q: %w", listen, err)
+		}
+		bound := ifaces // wildcard: every interface address
+		if host != "" {
+			addr, err := net.ResolveTCPAddr("tcp", listen)
+			if err != nil {
+				return hostProtection{}, fmt.Errorf("daemon listener %q: %w", listen, err)
+			}
+			if !addr.IP.IsUnspecified() {
+				a, ok := add(addr.IP)
+				if !ok {
+					return hostProtection{}, fmt.Errorf("daemon listener %q: unusable address", listen)
+				}
+				bound = []netip.Addr{a}
+			}
+		}
+		for _, a := range bound {
+			hp.services = append(hp.services, netip.AddrPortFrom(a, uint16(port)))
+		}
+	}
+	if len(hp.addrs) == 0 {
+		return hostProtection{}, fmt.Errorf("no host interface addresses discovered")
+	}
+	return hp, nil
+}
+
+// serve accepts guest links on this owner's network. Every link uses the
+// startup snapshot of host addresses, independent of its wire policy.
+// Closing the listener on ctx.Done unblocks Accept.
 func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlLn net.Listener, cred *credProxy) error {
-	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac)
+	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac, cfg.host)
 	if err != nil {
 		return err
 	}
@@ -151,6 +238,6 @@ func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlLn net.Listene
 			}
 			return err
 		}
-		gw.AddGuest(gateway.NewFrameConn(conn))
+		go gw.authenticateGuest(conn)
 	}
 }

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -109,5 +110,44 @@ func TestOldAgentNetConfigMapsOnlyUnknownFrameToOutdated(t *testing.T) {
 	})
 	if err := broken.NetConfig(ctx, "100.64.1.2/24", "100.64.1.1"); err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
 		t.Fatalf("real network failure mislabeled outdated: %v", err)
+	}
+}
+
+func TestReseedSendsEntropyAndRequiresGuestAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var seed [proto.ReseedBytes]byte
+	for i := range seed {
+		seed[i] = byte(i + 1)
+	}
+	received := make(chan []byte, 1)
+	guest := fakeAgent(t, func(typ byte, payload []byte) (byte, []byte) {
+		if typ != proto.RESEED {
+			return proto.ERROR, []byte("unexpected frame")
+		}
+		received <- bytes.Clone(payload)
+		return proto.RESEED, nil
+	})
+	if err := guest.Reseed(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-received; !bytes.Equal(got, seed[:]) {
+		t.Fatalf("reseed sent %x, want %x", got, seed)
+	}
+	for _, tc := range []struct {
+		name    string
+		typ     byte
+		payload []byte
+	}{
+		{"guest error", proto.ERROR, []byte("RNDADDENTROPY: permission denied")},
+		{"wrong ack", proto.ACTIVITY_RESP, nil},
+		{"nonempty ack", proto.RESEED, []byte("ignored")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broken := fakeAgent(t, func(byte, []byte) (byte, []byte) { return tc.typ, tc.payload })
+			if err := broken.Reseed(ctx, seed); err == nil {
+				t.Fatal("guest reseed without a successful acknowledgement was accepted")
+			}
+		})
 	}
 }

@@ -16,11 +16,12 @@ import (
 
 type refusingForkEngine struct {
 	*mockEngine
-	err error
+	err  error
+	info engine.SandboxInfo
 }
 
 func (m *refusingForkEngine) Fork(context.Context, string, string) (engine.SandboxInfo, error) {
-	return engine.SandboxInfo{}, m.err
+	return m.info, m.err
 }
 
 func TestOldAgentForkReturnsConflict(t *testing.T) {
@@ -33,6 +34,41 @@ func TestOldAgentForkReturnsConflict(t *testing.T) {
 	}
 	if _, err := srv.store.GetActiveSandboxByName("usr_test", "fork-from-old"); err == nil {
 		t.Fatal("failed fork left a sandbox record")
+	}
+}
+
+func TestForkReportsOldGuestReseedAndFailedReseed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		info   engine.SandboxInfo
+		err    error
+		event  string
+		status int
+	}{
+		{"old", engine.SandboxInfo{ID: "old-clone", EngineID: "old-clone", Status: "running", GuestReseedUnsupported: true}, nil, "guest.reseed_unsupported", http.StatusCreated},
+		{"failed", engine.SandboxInfo{}, fmt.Errorf("fork: %w", engine.ErrGuestReseedFailed), "guest.reseed_failed", http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ts := setup(t)
+			src := createSandbox(t, ts, "reseed-src")
+			srv.StartEventRecorder()
+			events := srv.events.Subscribe(SubscriptionFilter{TypePrefix: "guest.reseed"})
+			defer events.Cancel()
+			srv.engine = &refusingForkEngine{mockEngine: srv.engine.(*mockEngine), info: tc.info, err: tc.err}
+			resp := doReq(t, ts, http.MethodPost, "/sandboxes", map[string]any{"name": "reseed-fork", "from": src.ID})
+			resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("fork HTTP status = %d, want %d", resp.StatusCode, tc.status)
+			}
+			select {
+			case event := <-events.C:
+				if event.Type != tc.event || event.UserID != "usr_test" {
+					t.Fatalf("reseed event = %+v, want %s", event, tc.event)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("fork did not record %s", tc.event)
+			}
+		})
 	}
 }
 

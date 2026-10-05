@@ -173,11 +173,13 @@ func refused(hdr dnsmessage.Header, q dnsmessage.Question) []byte {
 	return out
 }
 
-// resolverAllowed is the only vetting a DNS flow's destination gets: anything
-// but the hard-denied ranges (host, loopback, link-local, metadata). The
-// resolver is whatever the guest's resolv.conf names; what's guarded is the
-// names it may ask about.
+// resolverAllowed checks the DNS server's destination independently of which
+// names a guest may resolve; netd's deployment hard-denials still apply.
 func resolverAllowed(ip netip.Addr, pol *gateway.EgressPolicy) bool {
-	open := &gateway.EgressPolicy{Default: gateway.PosturePublic, ExtraHardDeny: pol.ExtraHardDeny}
+	if pol == nil {
+		return false
+	}
+	open := gateway.AllowAllEgress()
+	open.ExtraHardDeny = pol.ExtraHardDeny
 	return open.Check("", ip).Allow
 }

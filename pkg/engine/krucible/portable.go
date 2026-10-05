@@ -228,9 +228,8 @@ func planExport(snapDir string, manifestJSON []byte, opts engine.SnapshotExport)
 	return am, paths, nil
 }
 
-// portableManifest is m as another host restores it: no host paths, and of
-// the network posture only the egress rules. Anything the policy may come to
-// refer to on this host (credentials, grants) stays here.
+// portableManifest strips host-local secrets and paths but retains the exact
+// network policy, including the sibling opt-in, across export and import.
 func portableManifest(m krucibleSnapManifest) krucibleSnapManifest {
 	m.KernelImage = ""
 	m.Mounts = nil
@@ -240,6 +239,7 @@ func portableManifest(m krucibleSnapManifest) krucibleSnapManifest {
 	if p := m.NetPolicy; p != nil {
 		m.NetPolicy = &gateway.NetPolicyWire{
 			Default:    p.Default,
+			Siblings:   p.Siblings,
 			AllowHosts: slices.Clone(p.AllowHosts),
 			AllowCIDRs: slices.Clone(p.AllowCIDRs),
 		}
@@ -699,7 +699,7 @@ func (e *Engine) keepBase(src, sum, name string) (string, error) {
 // checkCheckpointHost asks bhatti-vmm whether this host can restore the
 // checkpoint in dir (it reads only checkpoint.bin): libkrun's verdict, the one
 // a restore here would reach.
-func (e *Engine) checkCheckpointHost(ctx context.Context, dir string) error {
+func (e *Engine) checkCheckpointHost(ctx context.Context, dir string) (retErr error) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, e.cfg.VMMBinary, "check-checkpoint", dir)
@@ -709,6 +709,21 @@ func (e *Engine) checkCheckpointHost(ctx context.Context, dir string) error {
 			"LD_LIBRARY_PATH="+e.cfg.LibDir,
 		)
 	}
+	if e.confineVMM {
+		policy, cleanup, err := e.confineCheckpoint(dir)
+		if err != nil {
+			return fmt.Errorf("check-checkpoint confinement: %w", err)
+		}
+		defer func() {
+			if err := cleanup(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("check-checkpoint cleanup: %w", err))
+			}
+		}()
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, VMMPolicyEnv+"="+policy)
+	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -716,12 +731,20 @@ func (e *Engine) checkCheckpointHost(ctx context.Context, dir string) error {
 			return ctx.Err()
 		}
 		lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
-		why := strings.TrimPrefix(lines[len(lines)-1], "vmm: check-checkpoint: ")
-		why = strings.TrimPrefix(why, "checkpoint: ")
-		if why == "" {
-			why = err.Error()
+		for _, line := range lines {
+			if strings.HasPrefix(line, "vmm: confine: fatal: ") {
+				return fmt.Errorf("check-checkpoint confinement: %s", line)
+			}
 		}
-		return incompatible("%s", why)
+		// A missing Landlock ABI is a nonfatal warning for a probe, not
+		// libkrun's verdict about the checkpoint.
+		for i := len(lines) - 1; i >= 0; i-- {
+			if why, ok := strings.CutPrefix(lines[i], "vmm: check-checkpoint: "); ok {
+				return incompatible("%s", strings.TrimPrefix(why, "checkpoint: "))
+			}
+		}
+		// Failure without a checkpoint verdict is not proof of incompatibility.
+		return fmt.Errorf("check-checkpoint: %s: %w", strings.TrimSpace(stderr.String()), err)
 	}
 	return nil
 }

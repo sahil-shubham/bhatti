@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
@@ -554,10 +556,8 @@ func TestCreateSandbox_NetPolicyInvalid(t *testing.T) {
 	}
 }
 
-// TestCreateSandbox_NetPostureResolution pins how the server picks a sandbox's
-// network posture: an explicit one wins, allow rules alone imply deny, and
-// otherwise the configured default applies, which is "none" (no network
-// device) when unset. "none" with allow rules is contradictory and rejected.
+// TestCreateSandbox_NetPostureResolution pins explicit and implicit posture:
+// a sibling-only opt-in creates a NIC but never grants public internet access.
 func TestCreateSandbox_NetPostureResolution(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -569,8 +569,11 @@ func TestCreateSandbox_NetPostureResolution(t *testing.T) {
 		{"unset default is none", "", nil, 201, "none"},
 		{"configured default applies", "public", nil, 201, "public"},
 		{"allow rules imply deny", "public", map[string]any{"allow_hosts": []string{"api.example.com"}}, 201, "deny"},
+		{"sibling-only implies deny even with public server default", "public", map[string]any{"siblings": "allow"}, 201, "deny"},
 		{"explicit beats default", "none", map[string]any{"default": "public"}, 201, "public"},
 		{"none with allow rules rejected", "", map[string]any{"default": "none", "allow_hosts": []string{"x.com"}}, 400, ""},
+		{"none with sibling access rejected", "", map[string]any{"default": "none", "siblings": "allow"}, 400, ""},
+		{"invalid sibling posture rejected", "", map[string]any{"default": "deny", "siblings": "public"}, 400, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -594,5 +597,37 @@ func TestCreateSandbox_NetPostureResolution(t *testing.T) {
 				t.Fatalf("engine posture = %+v, want %q", np, tc.wantPosture)
 			}
 		})
+	}
+}
+
+func TestCreateSandbox_SiblingPolicyPersistsThroughInspect(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
+		"name":       uniqueName(t, "siblings"),
+		"net_policy": map[string]any{"siblings": "allow"},
+	})
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create = %d: %s", resp.StatusCode, body)
+	}
+	var created store.Sandbox
+	decodeJSON(t, resp, &created)
+	t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+created.ID, nil).Body.Close() })
+	if p := eng.LastCreateSpec.NetPolicy; p == nil || p.Default != "deny" || p.Siblings != "allow" {
+		t.Fatalf("engine policy = %+v", p)
+	}
+	inspect := doReq(t, ts, "GET", "/sandboxes/"+created.ID, nil)
+	if inspect.StatusCode != 200 {
+		t.Fatalf("inspect status = %d", inspect.StatusCode)
+	}
+	var sb store.Sandbox
+	decodeJSON(t, inspect, &sb)
+	var policy gateway.NetPolicyWire
+	if err := json.Unmarshal(sb.NetPolicy, &policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.Default != "deny" || policy.Siblings != "allow" {
+		t.Fatalf("stored inspect policy = %+v", policy)
 	}
 }
