@@ -19,6 +19,8 @@ type frameMsg struct {
 	payload []byte
 }
 
+var execSync = syscall.Sync
+
 // handleDetachedExec starts a command in a new session (setsid) with stdout/stderr
 // redirected to a file, then returns immediately with the child PID and output
 // file path. The process survives vsock connection close.
@@ -184,7 +186,9 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 	ioWg.Wait()
 	exitCode := exitCodeFromErr(cmd.Wait())
 
-	syscall.Sync()
+	if req.Sync != nil && *req.Sync {
+		execSync()
+	}
 	exit := proto.ExitPayload(int32(exitCode))
 	tx <- frameMsg{proto.EXIT, exit[:]}
 	close(tx)

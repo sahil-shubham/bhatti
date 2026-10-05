@@ -87,6 +87,12 @@ func handleControlConnection(conn net.Conn) {
 			proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("bad exec request: %v", err)))
 			return
 		}
+		if req.Sync != nil && *req.Sync &&
+			(req.SessionID != nil || req.Detach != nil && *req.Detach ||
+				req.TTY != nil && *req.TTY || req.Session != nil && *req.Session) {
+			proto.WriteFrame(conn, proto.ERROR, []byte("sync requires a one-shot non-TTY exec"))
+			return
+		}
 		if req.SessionID != nil {
 			// Attach to existing session
 			ifDetached := req.IfDetached != nil && *req.IfDetached
@@ -107,6 +113,10 @@ func handleControlConnection(conn net.Conn) {
 			handlePipedExec(conn, req)
 		}
 
+	case proto.FREEZE_REQ, proto.THAW_REQ:
+		updateActivity()
+		handleFSFreeze(conn, msgType, payload)
+
 	case proto.EXEC_LIST_REQ:
 		sessions := listSessions()
 		proto.SendJSON(conn, proto.EXEC_LIST_RESP, sessions)
@@ -118,6 +128,7 @@ func handleControlConnection(conn net.Conn) {
 				proto.FeatureNetConfigMAC, proto.FeatureSandboxCA,
 				proto.FeatureRootGrowth, proto.FeaturePipedStderr,
 				proto.FeatureReseedCRNG,
+				proto.FeatureExecSync, proto.FeatureFSFreeze,
 			},
 		})
 

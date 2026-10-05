@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -11,6 +12,14 @@ import (
 // Store wraps SQLite operations.
 type Store struct {
 	db *sql.DB
+
+	volumeGateMu sync.Mutex
+	volumeGates  map[string]*volumeAttachmentGate
+}
+
+type volumeAttachmentGate struct {
+	mu   sync.Mutex
+	refs int
 }
 
 const schema = `
@@ -221,6 +230,7 @@ func New(dbPath string) (*Store, error) {
 		s3_key TEXT NOT NULL,
 		size_bytes INTEGER NOT NULL,
 		sha256 TEXT NOT NULL DEFAULT '',
+		consistency_mode TEXT NOT NULL DEFAULT 'unverified',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	)`,
 		`CREATE INDEX IF NOT EXISTS idx_volume_backups_name ON volume_backups(user_id, volume_name, created_at DESC)`,
@@ -234,6 +244,12 @@ func New(dbPath string) (*Store, error) {
 		if _, err := db.Exec(stmt); err != nil {
 			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
 		}
+	}
+	// volume_backups is created after the legacy migrations above, so upgrade
+	// existing tables only after CREATE TABLE IF NOT EXISTS has run.
+	if _, err := db.Exec(`ALTER TABLE volume_backups ADD COLUMN consistency_mode TEXT NOT NULL DEFAULT 'unverified'`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
+		return nil, fmt.Errorf("store: migrate volume backup consistency mode: %w", err)
 	}
 
 	// Migrate secrets from v1 (PRIMARY KEY name) to v2 (PRIMARY KEY

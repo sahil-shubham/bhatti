@@ -25,6 +25,19 @@ func (e *Engine) Exec(ctx context.Context, id string, cmd []string) (engine.Exec
 	return ag.Exec(ctx, cmd, nil, "")
 }
 
+func (e *Engine) ExecWithSync(ctx context.Context, id string, cmd []string, sync bool) (engine.ExecResult, error) {
+	if sync {
+		if err := e.RequireGuestAgentFeature(ctx, id, proto.FeatureExecSync); err != nil {
+			return engine.ExecResult{}, err
+		}
+	}
+	ag, err := e.agentFor(id)
+	if err != nil {
+		return engine.ExecResult{}, err
+	}
+	return ag.ExecWithSync(ctx, cmd, nil, "", sync)
+}
+
 func (e *Engine) Shell(ctx context.Context, id string) (engine.TerminalConn, error) {
 	_, term, err := e.ShellSession(ctx, id)
 	return term, err
@@ -64,6 +77,15 @@ func (e *Engine) ExecDetached(ctx context.Context, id string, cmd []string, outp
 
 // ExecStream implements engine.StreamExecEngine.
 func (e *Engine) ExecStream(ctx context.Context, id string, cmd []string, onEvent func(engine.StreamEvent)) error {
+	return e.ExecStreamWithSync(ctx, id, cmd, false, onEvent)
+}
+
+func (e *Engine) ExecStreamWithSync(ctx context.Context, id string, cmd []string, sync bool, onEvent func(engine.StreamEvent)) error {
+	if sync {
+		if err := e.RequireGuestAgentFeature(ctx, id, proto.FeatureExecSync); err != nil {
+			return err
+		}
+	}
 	ag, err := e.agentFor(id)
 	if err != nil {
 		return err
@@ -76,7 +98,11 @@ func (e *Engine) ExecStream(ctx context.Context, id string, cmd []string, onEven
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	}
-	if err := proto.SendJSON(conn, proto.EXEC_REQ, proto.ExecRequest{Argv: cmd}); err != nil {
+	req := proto.ExecRequest{Argv: cmd}
+	if sync {
+		req.Sync = &sync
+	}
+	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
 		return fmt.Errorf("agent send exec: %w", err)
 	}
 	for {
@@ -133,6 +159,37 @@ func (vm *VM) requireFeature(feature proto.AgentFeature) error {
 	}
 	if !info.Has(feature) {
 		return engine.GuestAgentOutdated(string(feature))
+	}
+	return nil
+}
+
+// syncGuest is used at lifecycle durability boundaries. A legacy lohar does
+// not understand the sync field, but can still run the guest's sync command.
+func (vm *VM) syncGuest(ctx context.Context) error {
+	vm.mu.Lock()
+	ag, info, infoErr := vm.Agent, vm.AgentInfo, vm.AgentInfoErr
+	vm.mu.Unlock()
+	if ag == nil {
+		return fmt.Errorf("guest agent unavailable for sync")
+	}
+	if infoErr != nil {
+		return fmt.Errorf("guest agent capabilities unavailable: %w", infoErr)
+	}
+	if !info.Legacy && info.Version == "" {
+		return fmt.Errorf("guest agent capabilities unavailable: no response cached")
+	}
+	var result engine.ExecResult
+	var err error
+	if info.Has(proto.FeatureExecSync) {
+		result, err = ag.ExecWithSync(ctx, []string{"true"}, nil, "", true)
+	} else {
+		result, err = ag.Exec(ctx, []string{"sync"}, nil, "")
+	}
+	if err != nil {
+		return fmt.Errorf("guest sync: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("guest sync exited %d: %s", result.ExitCode, result.Stderr)
 	}
 	return nil
 }

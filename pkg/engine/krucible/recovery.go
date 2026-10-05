@@ -298,8 +298,10 @@ func (e *Engine) recover() {
 			vm.Agent = agent.NewKrucibleClient(vm.ControlUDS, vm.ForwardUDS, vm.Token)
 			if helper == "paused" {
 				vm.Thermal, vm.AgentInfoErr = "warm", errAgentInfoPaused
-			} else if vm.AgentInfo, vm.AgentInfoErr = queryAgentInfo(context.Background(), vm.Agent); vm.AgentInfoErr != nil {
-				slog.Warn("krucible.agent.info", "id", vm.ID, "error", vm.AgentInfoErr)
+			} else {
+				if vm.AgentInfo, vm.AgentInfoErr = queryAgentInfo(context.Background(), vm.Agent); vm.AgentInfoErr != nil {
+					slog.Warn("krucible.agent.info", "id", vm.ID, "error", vm.AgentInfoErr)
+				}
 			}
 		default:
 			vm.Status, vm.Thermal, vm.HelperPID = "stopped", "cold", 0

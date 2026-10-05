@@ -2,6 +2,7 @@ package krucible
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -216,6 +217,43 @@ func TestKrucibleStopPowersOff(t *testing.T) {
 	}
 }
 
+// This exercises the physical disk boundary: a write immediately before idle
+// PAUSE must still be on disk after the warm VM is resumed, synced and stopped.
+func TestKrucibleLastSecondWriteSurvivesWarmStop(t *testing.T) {
+	eng := newPauseEngine(t).(*Engine)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "warm-durable", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: gateway.PostureNone}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = eng.Destroy(context.Background(), info.ID) })
+	write, err := eng.Exec(ctx, info.ID, []string{"writeuid", "/workspace/last-write"})
+	if err != nil || write.ExitCode != 0 {
+		t.Fatalf("last-second write: %+v, %v", write, err)
+	}
+	if prePause, err := eng.Exec(ctx, info.ID, []string{"cat", "/workspace/last-write"}); err != nil || prePause.ExitCode != 0 || prePause.Stdout != "1000" {
+		t.Fatalf("file was not written before pausing: %+v, %v", prePause, err)
+	}
+	if err := eng.Pause(ctx, info.ID); err != nil {
+		t.Fatalf("pause after dirty write: %v", err)
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	err = eng.Stop(stopCtx, info.ID)
+	stopCancel()
+	if err != nil {
+		t.Fatalf("warm→cold power-off did not sync after RESUME: %v", err)
+	}
+	if err := eng.Start(ctx, info.ID); err != nil {
+		t.Fatal(err)
+	}
+	read, err := eng.Exec(ctx, info.ID, []string{"cat", "/workspace/last-write"})
+	if err != nil || read.ExitCode != 0 || read.Stdout != "1000" {
+		t.Fatalf("write lost on warm→cold transition: %+v, %v", read, err)
+	}
+}
+
 // TestKrucibleStopIgnoresCheckpointCapability exercises the cold transition
 // without a hypervisor: a checkpoint-capable engine must still terminate its
 // helper rather than try to PAUSE/save to a control socket.
@@ -237,8 +275,9 @@ func TestKrucibleStopIgnoresCheckpointCapability(t *testing.T) {
 		caps: VMMCapabilities{Checkpoint: true},
 		vms:  map[string]*VM{id: vm},
 	}
-	if err := e.Stop(context.Background(), id); err != nil {
-		t.Fatalf("Stop with checkpoint support: %v", err)
+	var unclean *UncleanStopError
+	if err := e.Stop(context.Background(), id); !errors.As(err, &unclean) {
+		t.Fatalf("Stop without guest agent should report unclean power-off: %v", err)
 	}
 	if vm.Status != "stopped" || vm.Thermal != "cold" || vm.HelperPID != 0 || vm.cmd != nil {
 		t.Fatalf("power-off did not clear helper: status=%q thermal=%q pid=%d cmd=%v",

@@ -15,8 +15,19 @@ import (
 // Memory model: libkrun maps guest RAM MAP_PRIVATE|MAP_ANONYMOUS (lazy commit),
 // so a paused VM's host RSS only counts touched pages. No balloon is needed.
 
-// Pause: hot → warm. Idempotent on warm.
+// Pause syncs the running guest before parking its vCPUs. Stop always resumes
+// and syncs again: a writer can dirty the disk after this pre-pause sync.
 func (e *Engine) Pause(ctx context.Context, id string) error {
+	return e.pause(ctx, id, true)
+}
+
+// ForcePause is used when the guest agent has stopped answering Activity. It
+// never attempts a guest sync and leaves the next Stop responsible for one.
+func (e *Engine) ForcePause(ctx context.Context, id string) error {
+	return e.pause(ctx, id, false)
+}
+
+func (e *Engine) pause(ctx context.Context, id string, syncGuest bool) error {
 	if !e.caps.Pause {
 		return errNoPause
 	}
@@ -27,15 +38,28 @@ func (e *Engine) Pause(ctx context.Context, id string) error {
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
 	if vm.Status != "running" {
-		return fmt.Errorf("sandbox %q is not running (status=%s)", id, vm.Status)
+		status := vm.Status
+		vm.mu.Unlock()
+		return fmt.Errorf("sandbox %q is not running (status=%s)", id, status)
 	}
 	if vm.Thermal == "warm" {
+		vm.mu.Unlock()
 		return nil
 	}
-	// controlCmd briefly holds vm.mu; acceptable (bounded by the socket deadline)
-	// and serialized against Start/Stop/Resume by launchMu (acquired below).
+	vm.mu.Unlock()
+
+	if syncGuest {
+		syncCtx, cancel := context.WithTimeout(ctx, guestSyncTimeout)
+		err := vm.syncGuest(syncCtx)
+		cancel()
+		if err != nil {
+			slog.Warn("krucible pause: guest sync failed; final stop will retry", "id", id, "error", err)
+		}
+	}
+	// Keep the VMM's acknowledged thermal state durable for daemon adoption.
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
 	if _, err := controlCmd(ctx, vm.CtlSockUDS, "PAUSE"); err != nil {
 		return fmt.Errorf("pause: %w", err)
 	}

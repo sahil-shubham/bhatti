@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,12 +42,16 @@ func fakeAgent(t *testing.T, reply func(byte, []byte) (byte, []byte)) *AgentClie
 			go func() {
 				defer conn.Close()
 				conn.SetDeadline(time.Now().Add(2 * time.Second))
-				typ, payload, err := proto.ReadFrame(conn)
-				if err != nil {
-					return
+				for {
+					typ, payload, err := proto.ReadFrame(conn)
+					if err != nil {
+						return
+					}
+					resp, data := reply(typ, payload)
+					if err := proto.WriteFrame(conn, resp, data); err != nil {
+						return
+					}
 				}
-				resp, data := reply(typ, payload)
-				proto.WriteFrame(conn, resp, data)
 			}()
 		}
 	}()
@@ -177,5 +182,200 @@ func TestReseedSendsEntropyAndRequiresGuestAcknowledgement(t *testing.T) {
 				t.Fatal("guest reseed without a successful acknowledgement was accepted")
 			}
 		})
+	}
+}
+
+func TestExecSyncFramesAreOptInAndRequireAdvertisedCapability(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	received := make(chan struct {
+		typ     byte
+		payload []byte
+	}, 8)
+	guest := fakeAgent(t, func(typ byte, payload []byte) (byte, []byte) {
+		received <- struct {
+			typ     byte
+			payload []byte
+		}{typ, bytes.Clone(payload)}
+		switch typ {
+		case proto.INFO_REQ:
+			return proto.INFO_RESP, []byte(`{"version":"v2.5.1","features":["exec_sync"]}`)
+		case proto.EXEC_REQ:
+			exit := proto.ExitPayload(0)
+			return proto.EXIT, exit[:]
+		default:
+			return oldAgentReply(typ, payload)
+		}
+	})
+	if _, err := guest.Exec(ctx, []string{"true"}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guest.ExecWithSync(ctx, []string{"true"}, nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if first, second, third := <-received, <-received, <-received; first.typ != proto.EXEC_REQ ||
+		bytes.Contains(first.payload, []byte(`"sync"`)) || second.typ != proto.INFO_REQ ||
+		third.typ != proto.EXEC_REQ || !bytes.Contains(third.payload, []byte(`"sync":true`)) {
+		t.Fatalf("default / probe / sync frames = %d %s; %d %s; %d %s",
+			first.typ, first.payload, second.typ, second.payload, third.typ, third.payload)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		reply func(byte, []byte) (byte, []byte)
+		want  error
+	}{
+		{"legacy", oldAgentReply, engine.ErrGuestAgentOutdated},
+		{"prior INFO", func(typ byte, payload []byte) (byte, []byte) {
+			if typ == proto.INFO_REQ {
+				return proto.INFO_RESP, []byte(`{"version":"v2.5.0","features":["reseed_crng"]}`)
+			}
+			return oldAgentReply(typ, payload)
+		}, engine.ErrGuestAgentOutdated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frames := make(chan byte, 2)
+			old := fakeAgent(t, func(typ byte, payload []byte) (byte, []byte) {
+				frames <- typ
+				return tc.reply(typ, payload)
+			})
+			_, err := old.ExecWithSync(ctx, []string{"true"}, nil, "", true)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("sync on old lohar = %v, want %v", err, tc.want)
+			}
+			if typ := <-frames; typ != proto.INFO_REQ || len(frames) != 0 {
+				t.Fatalf("old lohar received frames %d, additional=%d; must never send sync field", typ, len(frames))
+			}
+		})
+	}
+	brokenFrames := make(chan byte, 2)
+	broken := fakeAgent(t, func(typ byte, _ []byte) (byte, []byte) {
+		brokenFrames <- typ
+		return proto.ERROR, []byte("auth required")
+	})
+	if _, err := broken.ExecWithSync(ctx, []string{"true"}, nil, "", true); err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
+		t.Fatalf("INFO failure incorrectly treated as old guest: %v", err)
+	}
+	if typ := <-brokenFrames; typ != proto.INFO_REQ || len(brokenFrames) != 0 {
+		t.Fatalf("INFO failure sent exec request: first=0x%02x, additional=%d", typ, len(brokenFrames))
+	}
+}
+
+func TestFSFreezeRequiresFeatureAndEmptyAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	received := make(chan struct {
+		typ     byte
+		payload []byte
+	}, 3)
+	guest := fakeAgent(t, func(typ byte, payload []byte) (byte, []byte) {
+		if typ == proto.INFO_REQ {
+			return proto.INFO_RESP, []byte(`{"version":"v2.5.1","features":["fs_freeze"]}`)
+		}
+		received <- struct {
+			typ     byte
+			payload []byte
+		}{typ, bytes.Clone(payload)}
+		switch typ {
+		case proto.FREEZE_REQ:
+			return proto.FREEZE_ACK, nil
+		case proto.THAW_REQ:
+			return proto.THAW_ACK, nil
+		default:
+			return oldAgentReply(typ, payload)
+		}
+	})
+	if err := guest.Freeze(ctx, "/mnt/data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := guest.Thaw(ctx, "/mnt/data"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []byte{proto.FREEZE_REQ, proto.THAW_REQ} {
+		frame := <-received
+		if frame.typ != want || string(frame.payload) != `{"mount":"/mnt/data"}` {
+			t.Fatalf("quiesce frame = 0x%02x %s, want 0x%02x and mount", frame.typ, frame.payload, want)
+		}
+	}
+	for _, reply := range []struct {
+		typ      byte
+		payload  []byte
+		rejected bool
+	}{
+		{proto.ERROR, []byte("FIFREEZE: device or resource busy"), true},
+		{proto.FREEZE_ACK, []byte("not empty"), false},
+		{proto.THAW_ACK, nil, false},
+	} {
+		broken := fakeAgent(t, func(typ byte, _ []byte) (byte, []byte) {
+			if typ == proto.INFO_REQ {
+				return proto.INFO_RESP, []byte(`{"version":"v2.5.1","features":["fs_freeze"]}`)
+			}
+			return reply.typ, reply.payload
+		})
+		err := broken.Freeze(ctx, "/mnt/data")
+		if err == nil || errors.Is(err, ErrFSFreezeRejected) != reply.rejected {
+			t.Fatalf("freeze reply 0x%02x %q => %v, want rejected=%v", reply.typ, reply.payload, err, reply.rejected)
+		}
+		if reply.rejected && !strings.Contains(err.Error(), "resource busy") {
+			t.Fatalf("freeze rejection lost guest EBUSY reason: %v", err)
+		}
+	}
+	oldFrames := make(chan byte, 2)
+	old := fakeAgent(t, func(typ byte, payload []byte) (byte, []byte) {
+		oldFrames <- typ
+		return oldAgentReply(typ, payload)
+	})
+	if err := old.Freeze(ctx, "/mnt/data"); !errors.Is(err, engine.ErrGuestAgentOutdated) || !errors.Is(err, ErrFSFreezeRejected) {
+		t.Fatalf("old lohar freeze = %v; want definitive pre-send rejection", err)
+	}
+	if typ := <-oldFrames; typ != proto.INFO_REQ || len(oldFrames) != 0 {
+		t.Fatalf("old lohar received frames %d, additional=%d; must never send FREEZE_REQ", typ, len(oldFrames))
+	}
+	probeFrames := make(chan byte, 2)
+	probeFailed := fakeAgent(t, func(typ byte, _ []byte) (byte, []byte) {
+		probeFrames <- typ
+		return proto.ERROR, []byte("INFO unavailable")
+	})
+	if err := probeFailed.Freeze(ctx, "/mnt/data"); !errors.Is(err, ErrFSFreezeRejected) {
+		t.Fatalf("failed pre-send probe = %v; want definitive rejection", err)
+	}
+	if first := <-probeFrames; first != proto.INFO_REQ || len(probeFrames) != 0 {
+		t.Fatalf("failed probe sent freeze frame: 0x%02x, extras=%d", first, len(probeFrames))
+	}
+}
+
+func TestThawStillSendsAfterCapabilityProbeFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var probes atomic.Int32
+	frames := make(chan byte, 2)
+	guest := fakeAgent(t, func(typ byte, _ []byte) (byte, []byte) {
+		switch typ {
+		case proto.INFO_REQ:
+			if probes.Add(1) == 1 {
+				return proto.INFO_RESP, []byte(`{"version":"v2.5.1","features":["fs_freeze"]}`)
+			}
+			return proto.ERROR, []byte("INFO unavailable")
+		case proto.FREEZE_REQ:
+			frames <- typ
+			return proto.FREEZE_ACK, nil
+		case proto.THAW_REQ:
+			frames <- typ
+			return proto.THAW_ACK, nil
+		default:
+			return oldAgentReply(typ, nil)
+		}
+	})
+	if err := guest.Freeze(ctx, "/mnt/data"); err != nil {
+		t.Fatalf("initial freeze: %v", err)
+	}
+	if _, err := guest.Info(ctx); err == nil {
+		t.Fatal("INFO did not fail after freeze")
+	}
+	if err := guest.Thaw(ctx, "/mnt/data"); err != nil {
+		t.Fatalf("THAW blocked by unrelated INFO failure: %v", err)
+	}
+	if first, second := <-frames, <-frames; first != proto.FREEZE_REQ || second != proto.THAW_REQ || probes.Load() != 2 {
+		t.Fatalf("requests after failed INFO = 0x%02x, 0x%02x; INFO probes=%d", first, second, probes.Load())
 	}
 }

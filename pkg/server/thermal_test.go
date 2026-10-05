@@ -642,3 +642,313 @@ func TestProxyWSKeepsActivityAlive(t *testing.T) {
 		t.Fatalf("expected warm after activity stopped, got %q", state)
 	}
 }
+
+type uncleanStopTestError struct{ reason string }
+
+func (e uncleanStopTestError) Error() string             { return "power-off succeeded, sync failed: " + e.reason }
+func (e uncleanStopTestError) UncleanStopReason() string { return e.reason }
+
+// A real Stop implementation kills the helper and returns a durability warning.
+// This wrapper models that outcome without treating the warning as a failed Stop.
+type uncleanStopTestEngine struct {
+	*mockEngine
+	reason string
+}
+
+func (e *uncleanStopTestEngine) Stop(ctx context.Context, id string) error {
+	if err := e.mockEngine.Stop(ctx, id); err != nil {
+		return err
+	}
+	return uncleanStopTestError{reason: e.reason}
+}
+
+func TestThermalUncleanPowerOffRecordsReasonWithoutRetry(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	eid := createRunningBox(t, srv, eng, "thermal-unclean")
+	srv.engine = &uncleanStopTestEngine{mockEngine: eng, reason: "guest sync exited 1"}
+	srv.events = NewEventRecorder(srv.store)
+	eng.mu.Lock()
+	eng.thermal[eid] = "warm"
+	eng.mu.Unlock()
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
+
+	srv.runThermalCycle(srv.engine.(ThermalEngine), ThermalConfig{ColdTimeout: time.Second})
+
+	if sb := findSandbox(t, srv, eid); sb.Status != "stopped" {
+		t.Fatalf("powered-off VM left store at status %q", sb.Status)
+	}
+	if n := srv.snapshotFailuresCount(eid); n != 0 {
+		t.Fatalf("sync warning wrongly scheduled thermal retries: %d", n)
+	}
+	srv.events.Close()
+	srv.events = nil
+	events, err := srv.store.QueryEvents(store.EventFilter{SandboxID: eid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotUnclean, gotStopped bool
+	for _, event := range events {
+		switch event.Type {
+		case "sandbox.unclean_stop":
+			gotUnclean = event.Meta["reason"] == "guest sync exited 1"
+		case "sandbox.stopped":
+			gotStopped = event.Meta["reason"] == "thermal"
+		case "thermal.snapshot_failed":
+			t.Fatal("powered-off VM recorded as failed snapshot")
+		}
+	}
+	if !gotUnclean || !gotStopped {
+		t.Fatalf("missing persisted unclean and stopped events: %+v", events)
+	}
+}
+
+type forcePauseTestEngine struct {
+	*mockEngine
+	forced, ordinary int
+}
+
+func (e *forcePauseTestEngine) Pause(ctx context.Context, id string) error {
+	e.ordinary++
+	return e.mockEngine.Pause(ctx, id)
+}
+
+func (e *forcePauseTestEngine) ForcePause(ctx context.Context, id string) error {
+	e.forced++
+	return e.mockEngine.Pause(ctx, id)
+}
+
+func TestThermalAgentFailureUsesForcePause(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	eid := createRunningBox(t, srv, eng, "force-pause")
+	wrapped := &forcePauseTestEngine{mockEngine: eng}
+	srv.engine = wrapped
+	eng.mu.Lock()
+	eng.ActivityErr = fmt.Errorf("agent unreachable")
+	eng.mu.Unlock()
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
+	for range maxThermalFailures {
+		srv.runThermalCycle(wrapped, ThermalConfig{WarmTimeout: time.Second})
+	}
+	if wrapped.forced != 1 || wrapped.ordinary != 0 || wrapped.ThermalState(eid) != "warm" {
+		t.Fatalf("unresponsive guest: forced=%d ordinary=%d state=%s",
+			wrapped.forced, wrapped.ordinary, wrapped.ThermalState(eid))
+	}
+}
+
+type pinBeforePauseEngine struct {
+	*mockEngine
+	activityStarted chan struct{}
+	activityRelease chan struct{}
+}
+
+func (e *pinBeforePauseEngine) Activity(ctx context.Context, id string) (*proto.ActivityInfo, error) {
+	close(e.activityStarted)
+	select {
+	case <-e.activityRelease:
+		return e.mockEngine.Activity(ctx, id)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestThermalPinAcquiredDuringActivityPreventsPause(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	eid := createRunningBox(t, srv, eng, "pinned-during-activity")
+	eng.mu.Lock()
+	eng.ActivityResult = &proto.ActivityInfo{LastActivityUnix: time.Now().Add(-time.Hour).Unix()}
+	eng.mu.Unlock()
+	wrapped := &pinBeforePauseEngine{
+		mockEngine: eng, activityStarted: make(chan struct{}), activityRelease: make(chan struct{}),
+	}
+	srv.engine = wrapped
+	srv.lastActivity.Store(eid, time.Now().Add(-time.Hour))
+	done := make(chan struct{})
+	go func() {
+		srv.runThermalCycle(wrapped, ThermalConfig{WarmTimeout: time.Second})
+		close(done)
+	}()
+	<-wrapped.activityStarted
+	// A backup pins the VM after the first host-side pin check, while the
+	// guest Activity request is in flight. It must not be paused at its end.
+	srv.attachInteractive(eid)
+	close(wrapped.activityRelease)
+	<-done
+	if got := eng.ThermalState(eid); got != "hot" {
+		t.Fatalf("guest paused after backup acquired thermal pin: %s", got)
+	}
+	srv.detachInteractive(eid)
+}
+
+type blockedThermalTransition struct {
+	*mockEngine
+	id, operation string
+	entered       chan struct{}
+	release       chan struct{}
+}
+
+func (e *blockedThermalTransition) hold(id, operation string) {
+	if id == e.id && operation == e.operation {
+		close(e.entered)
+		<-e.release
+	}
+}
+
+func (e *blockedThermalTransition) Pause(ctx context.Context, id string) error {
+	e.hold(id, "pause")
+	return e.mockEngine.Pause(ctx, id)
+}
+
+func (e *blockedThermalTransition) ForcePause(ctx context.Context, id string) error {
+	e.hold(id, "force")
+	return e.mockEngine.Pause(ctx, id)
+}
+
+func (e *blockedThermalTransition) Stop(ctx context.Context, id string) error {
+	e.hold(id, "stop")
+	return e.mockEngine.Stop(ctx, id)
+}
+
+func TestThermalSlowTransitionDoesNotBlockAnotherSandboxPin(t *testing.T) {
+	for _, operation := range []string{"pause", "force", "stop"} {
+		t.Run(operation, func(t *testing.T) {
+			srv, _ := setup(t)
+			eng := srv.engine.(*mockEngine)
+			slow := createRunningBox(t, srv, eng, "slow-"+operation)
+			other := createRunningBox(t, srv, eng, "other-"+operation)
+			wrapped := &blockedThermalTransition{
+				mockEngine: eng, id: slow, operation: operation,
+				entered: make(chan struct{}), release: make(chan struct{}),
+			}
+			srv.engine = wrapped
+			srv.lastActivity.Store(slow, time.Now().Add(-2*time.Hour))
+			srv.lastActivity.Store(other, time.Now())
+			eng.mu.Lock()
+			switch operation {
+			case "stop":
+				eng.thermal[slow] = "warm"
+			case "pause":
+				eng.ActivityResult = &proto.ActivityInfo{LastActivityUnix: time.Now().Add(-2 * time.Hour).Unix()}
+			case "force":
+				eng.ActivityErr = fmt.Errorf("unresponsive agent")
+			}
+			eng.mu.Unlock()
+			if operation == "force" {
+				for range maxThermalFailures - 1 {
+					srv.incrementThermalFails(slow)
+				}
+			}
+
+			cycleDone := make(chan struct{})
+			go func() {
+				srv.runThermalCycle(wrapped, ThermalConfig{WarmTimeout: time.Hour, ColdTimeout: time.Hour})
+				close(cycleDone)
+			}()
+			<-wrapped.entered // guest A is held inside Pause/ForcePause/Stop
+			pinned := make(chan struct{})
+			go func() {
+				srv.attachInteractive(other)
+				close(pinned)
+			}()
+			free := false
+			select {
+			case <-pinned:
+				free = true
+			case <-time.After(time.Second):
+			}
+			close(wrapped.release)
+			<-cycleDone
+			<-pinned
+			if !free {
+				t.Fatal("guest A's slow transition blocked guest B's backup/interactive pin")
+			}
+			if got := wrapped.ThermalState(other); got != "hot" {
+				t.Fatalf("unrelated guest B cooled during pin: %s", got)
+			}
+			srv.detachInteractive(other)
+			srv.transitionMu.Lock()
+			n := len(srv.transitionGates)
+			srv.transitionMu.Unlock()
+			if n != 0 {
+				t.Fatalf("%d unused per-sandbox transition gates leaked", n)
+			}
+		})
+	}
+}
+
+type parallelColdStopEngine struct {
+	*mockEngine
+	entered chan string
+	release chan struct{}
+}
+
+func (e *parallelColdStopEngine) Stop(ctx context.Context, id string) error {
+	select {
+	case e.entered <- id:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-e.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return e.mockEngine.Stop(ctx, id)
+}
+
+func TestThermalColdStopsDoNotSerializeOtherSandboxes(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	hot := createRunningBox(t, srv, eng, "hot-after-cold")
+	warmA := createRunningBox(t, srv, eng, "cold-first")
+	warmB := createRunningBox(t, srv, eng, "cold-second")
+	eng.mu.Lock()
+	eng.thermal[warmA], eng.thermal[warmB] = "warm", "warm"
+	eng.ActivityResult = &proto.ActivityInfo{LastActivityUnix: time.Now().Add(-2 * time.Hour).Unix()}
+	eng.mu.Unlock()
+	for _, id := range []string{hot, warmA, warmB} {
+		srv.lastActivity.Store(id, time.Now().Add(-2*time.Hour))
+	}
+	wrapped := &parallelColdStopEngine{
+		mockEngine: eng, entered: make(chan string, 2), release: make(chan struct{}),
+	}
+	srv.engine = wrapped
+	cycleDone := make(chan struct{})
+	go func() {
+		srv.runThermalCycle(wrapped, ThermalConfig{WarmTimeout: time.Hour, ColdTimeout: time.Hour})
+		close(cycleDone)
+	}()
+
+	// Both warm guests must reach Stop without either completing its guest sync.
+	// The hot guest must already have been processed, even though it was
+	// created before the warm guests and appears later in the store's list.
+	entered := make(map[string]bool)
+	for range 2 {
+		select {
+		case id := <-wrapped.entered:
+			entered[id] = true
+		case <-time.After(time.Second):
+			close(wrapped.release)
+			<-cycleDone
+			t.Fatal("a slow warm→cold stop serialized the thermal cycle")
+		}
+	}
+	if !entered[warmA] || !entered[warmB] {
+		close(wrapped.release)
+		<-cycleDone
+		t.Fatalf("cold stop called for unexpected sandboxes: %v", entered)
+	}
+	hotState := wrapped.ThermalState(hot)
+	close(wrapped.release)
+	<-cycleDone // all store updates and events complete before the cycle returns
+	if hotState != "warm" {
+		t.Fatalf("idle hot guest was not paused before cold stops: %s", hotState)
+	}
+	for _, id := range []string{warmA, warmB} {
+		if sb := findSandbox(t, srv, id); sb.Status != "stopped" {
+			t.Fatalf("cold stop for %s finished without updating store: %s", id, sb.Status)
+		}
+	}
+}

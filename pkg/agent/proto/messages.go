@@ -10,6 +10,8 @@ const (
 	FeatureRootGrowth   AgentFeature = "root_growth"
 	FeaturePipedStderr  AgentFeature = "piped_stderr"
 	FeatureReseedCRNG   AgentFeature = "reseed_crng"
+	FeatureExecSync     AgentFeature = "exec_sync"
+	FeatureFSFreeze     AgentFeature = "fs_freeze"
 )
 
 // AgentInfo is returned by INFO_RESP. Legacy is host-only: an old lohar
@@ -44,6 +46,12 @@ type ExecRequest struct {
 	OutputFile *string           `json:"output_file,omitempty"`  // detach: redirect stdout/stderr to this file
 	Session    *bool             `json:"session,omitempty"`      // non-TTY session with scrollback+reattach (piped)
 	Stderr     *bool             `json:"stderr,omitempty"`       // piped session: send stderr as STDERR frames instead of merging it into stdout
+	Sync       *bool             `json:"sync,omitempty"`         // explicitly sync guest filesystems before EXIT
+}
+
+// FSFreezeRequest identifies an exact mounted filesystem inside the guest.
+type FSFreezeRequest struct {
+	Mount string `json:"mount"`
 }
 
 // ActivityInfo reports the agent's activity state.

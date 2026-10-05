@@ -1,10 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -229,6 +233,48 @@ func TestStopNotSupportedIs501(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 501 || !strings.Contains(string(body), "no checkpoint support") {
 		t.Fatalf("stop: got %d %s, want 501 with the engine's reason", resp.StatusCode, body)
+	}
+}
+
+// A durability warning is not a failed power-off: the client must see the
+// stopped sandbox, and operators must receive a persisted unclean event.
+func TestManualWarmStopUncleanResultPersistsEvent(t *testing.T) {
+	srv, ts := setup(t)
+	sb := createSandbox(t, ts, uniqueName(t, "unclean-manual"))
+	eng := srv.engine.(*mockEngine)
+	eng.mu.Lock()
+	eng.thermal[sb.EngineID] = "warm"
+	eng.mu.Unlock()
+	srv.engine = &uncleanStopTestEngine{mockEngine: eng, reason: "guest sync timed out"}
+	srv.events = NewEventRecorder(srv.store)
+
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.Name+"/stop", nil)
+	var stopped store.Sandbox
+	decodeJSON(t, resp, &stopped)
+	if resp.StatusCode != 200 || stopped.Status != "stopped" || stopped.ID != sb.ID {
+		t.Fatalf("manual stop replied %d %+v, want this sandbox stopped", resp.StatusCode, stopped)
+	}
+	stored, err := srv.store.GetSandboxByID(sb.ID)
+	if err != nil || stored.Status != "stopped" || eng.ThermalState(sb.EngineID) != "cold" {
+		t.Fatalf("manual power-off diverged from store: %+v, err=%v", stored, err)
+	}
+	srv.events.Close()
+	srv.events = nil
+	events, err := srv.store.QueryEvents(store.EventFilter{SandboxID: sb.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotUnclean, gotStopped bool
+	for _, event := range events {
+		switch event.Type {
+		case "sandbox.unclean_stop":
+			gotUnclean = event.UserID == sb.CreatedBy && event.Meta["reason"] == "guest sync timed out"
+		case "sandbox.stopped":
+			gotStopped = event.Meta["reason"] == "api"
+		}
+	}
+	if !gotUnclean || !gotStopped {
+		t.Fatalf("manual stop did not persist unclean reason and stopped event: %+v", events)
 	}
 }
 
@@ -629,5 +675,126 @@ func TestCreateSandbox_SiblingPolicyPersistsThroughInspect(t *testing.T) {
 	}
 	if policy.Default != "deny" || policy.Siblings != "allow" {
 		t.Fatalf("stored inspect policy = %+v", policy)
+	}
+}
+
+// Journal repair on the first RO attach must hold the same per-volume gate as
+// RW attach and backup cloning. A RW guest must not mount while e2fsck runs.
+func TestReadOnlyAttachJournalRepairBlocksReadWriteAttach(t *testing.T) {
+	srv, ts := setup(t)
+	commands := t.TempDir()
+	started := filepath.Join(commands, "repair-started")
+	release := filepath.Join(commands, "repair-release")
+	t.Setenv("BHATTI_RO_REPAIR_STARTED", started)
+	t.Setenv("BHATTI_RO_REPAIR_RELEASE", release)
+	t.Setenv("PATH", commands+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for name, script := range map[string]string{
+		"tune2fs": "#!/bin/sh\nprintf 'Filesystem state: dirty\\n'\n",
+		"e2fsck":  "#!/bin/sh\n: > \"$BHATTI_RO_REPAIR_STARTED\"\nwhile [ ! -e \"$BHATTI_RO_REPAIR_RELEASE\" ]; do /bin/sleep 0.01; done\n",
+	} {
+		if err := os.WriteFile(filepath.Join(commands, name), []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Always release the waiting HTTP request if this test detects a failure.
+	defer os.WriteFile(release, nil, 0600)
+
+	volName := uniqueName(t, "repair")
+	vol := store.PersistentVolume{
+		ID: genID(), UserID: "usr_test", Name: volName, SizeMB: 64,
+		Status: "ready", FilePath: filepath.Join(commands, "volume.ext4"),
+		CreatedAt: time.Now(),
+	}
+	if err := srv.store.CreatePersistentVolume(vol); err != nil {
+		t.Fatal(err)
+	}
+	sbName := uniqueName(t, "ro-repair")
+	body, err := json.Marshal(map[string]any{
+		"name": sbName,
+		"persistent_volumes": []map[string]any{
+			{"name": volName, "mount": "/workspace", "read_only": true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	type httpResult struct {
+		status int
+		err    error
+	}
+	roDone := make(chan httpResult, 1)
+	go func() {
+		resp, err := testHTTPClient.Do(req)
+		if err != nil {
+			roDone <- httpResult{err: err}
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		roDone <- httpResult{status: resp.StatusCode}
+	}()
+
+	waitUntil := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(waitUntil) {
+			t.Fatal("RO attach never entered e2fsck on a dirty, detached volume")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rwStarted := make(chan struct{})
+	rwDone := make(chan error, 1)
+	go func() {
+		close(rwStarted)
+		rwDone <- srv.store.AttachPersistentVolume("usr_test", volName, "competing-rw", "/data", false)
+	}()
+	<-rwStarted
+	premature := false
+	select {
+	case <-rwDone:
+		premature = true // a live RW mount overlapped e2fsck
+	case <-time.After(250 * time.Millisecond):
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var ro httpResult
+	select {
+	case ro = <-roDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("RO attach did not complete after releasing e2fsck")
+	}
+	var rwErr error
+	if !premature {
+		select {
+		case rwErr = <-rwDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("RW attachment remained blocked after journal repair")
+		}
+	}
+	if premature {
+		t.Fatal("RW attachment completed while e2fsck was running")
+	}
+	if ro.err != nil {
+		t.Fatal(ro.err)
+	}
+	if (ro.status == http.StatusCreated) == (rwErr == nil) {
+		t.Fatalf("RO HTTP attach status=%d, RW attach error=%v: exactly one must win", ro.status, rwErr)
+	}
+	if ro.status != http.StatusCreated && ro.status != http.StatusConflict {
+		t.Fatalf("RO HTTP attach returned unexpected status %d", ro.status)
+	}
+	updated, err := srv.store.GetPersistentVolume("usr_test", volName)
+	if err != nil || len(updated.Attachments) != 1 {
+		t.Fatalf("competing attaches left unexpected volume attachments: %+v, %v", updated, err)
 	}
 }

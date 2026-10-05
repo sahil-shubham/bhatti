@@ -63,7 +63,7 @@ func TestReadFrameUnexpectedEOFMidPayload(t *testing.T) {
 	// Valid length header claiming 10 bytes, but only 3 bytes of data follow.
 	var buf bytes.Buffer
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x0A}) // length = 10
-	buf.Write([]byte{STDOUT, 0x01, 0x02})      // only 3 bytes (need 10)
+	buf.Write([]byte{STDOUT, 0x01, 0x02})     // only 3 bytes (need 10)
 	_, _, err := ReadFrame(&buf)
 	if err != io.ErrUnexpectedEOF {
 		t.Fatalf("expected io.ErrUnexpectedEOF, got %v", err)
@@ -518,6 +518,7 @@ func TestExecRequestOptionalFields(t *testing.T) {
 		Rows: &rows,
 		Cols: &cols,
 		Cwd:  &cwd,
+		Sync: &ttyTrue,
 	}
 
 	data, err := json.Marshal(req)
@@ -542,12 +543,15 @@ func TestExecRequestOptionalFields(t *testing.T) {
 	if got.Cwd == nil || *got.Cwd != "/workspace" {
 		t.Errorf("Cwd: %v, want /workspace", got.Cwd)
 	}
+	if got.Sync == nil || !*got.Sync {
+		t.Error("Sync should be true")
+	}
 
 	// Verify omitempty: nil fields should not appear in JSON.
 	minimal := ExecRequest{Argv: []string{"ls"}}
 	data, _ = json.Marshal(minimal)
 	s := string(data)
-	for _, key := range []string{"tty", "rows", "cols", "cwd", "env"} {
+	for _, key := range []string{"tty", "rows", "cols", "cwd", "env", "sync"} {
 		if bytes.Contains(data, []byte(`"`+key+`"`)) {
 			t.Errorf("nil field %q should be omitted from JSON: %s", key, s)
 		}

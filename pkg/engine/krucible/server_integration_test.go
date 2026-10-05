@@ -4,6 +4,7 @@ package krucible
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,9 +21,9 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
-// TestKrucibleServerIntegration drives the full daemon stack (HTTP API + store
-// + thermal manager). Exec against a powered-off sandbox auto-boots from disk
-// through the server's ensureHot -> EnsureHot -> Start path.
+// TestKrucibleServerIntegration drives the real HTTP API and store. Exec
+// against a powered-off sandbox auto-boots from disk through the server's
+// ensureHot -> EnsureHot -> Start path.
 func TestKrucibleServerIntegration(t *testing.T) {
 	_, do := krucibleServer(t, newBlockRootEngine) // skips without VM prerequisites
 
@@ -66,13 +67,172 @@ func TestKrucibleServerIntegration(t *testing.T) {
 	t.Run("ExecAutoWakesFromCold", func(t *testing.T) { exec("woke-cold", "echo", "woke-cold") })
 }
 
+// The real server's idle clock, Activity query, PAUSE and cold Stop must be
+// durable as a single lifecycle: a write just before idle cooling survives
+// power-off, including the final guest sync after RESUME.
+func TestKrucibleServerThermalDurability(t *testing.T) {
+	var eng *Engine
+	srv, do := krucibleServer(t, func(t *testing.T) engine.Engine {
+		eng = newPauseEngine(t).(*Engine)
+		return eng
+	})
+	resp := do("POST", "/sandboxes", map[string]any{"name": "thermal-durable", "memory_mb": 512})
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("create: status=%d body=%s", resp.StatusCode, body)
+	}
+	var sb store.Sandbox
+	err := json.NewDecoder(resp.Body).Decode(&sb)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { do("DELETE", "/sandboxes/"+sb.ID, nil).Body.Close() })
+
+	if err := srv.StartThermalManager(server.ThermalConfig{
+		WarmTimeout: time.Millisecond, ColdTimeout: time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The manager ticks every 10s. Write close to its first idle decision,
+	// rather than letting background writeback persist a file long beforehand.
+	time.Sleep(6 * time.Second)
+	resp = do("POST", "/sandboxes/"+sb.ID+"/exec",
+		map[string]any{"cmd": []string{"writeuid", "/workspace/thermal-last-write"}})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("last write: status=%d body=%s", resp.StatusCode, body)
+	}
+	var write engine.ExecResult
+	err = json.NewDecoder(resp.Body).Decode(&write)
+	resp.Body.Close()
+	if err != nil || write.ExitCode != 0 {
+		t.Fatalf("last write: %+v, %v", write, err)
+	}
+	prePause, err := eng.Exec(context.Background(), sb.EngineID, []string{"cat", "/workspace/thermal-last-write"})
+	if err != nil || prePause.ExitCode != 0 || prePause.Stdout != "1000" {
+		t.Fatalf("file was not written before thermal pause: %+v, %v", prePause, err)
+	}
+
+	deadline := time.Now().Add(40 * time.Second) // includes a delayed first idle tick
+	var warmAt time.Time
+	for time.Now().Before(deadline) {
+		resp = do("GET", "/sandboxes", nil)
+		var listed []struct {
+			store.Sandbox
+			Thermal string `json:"thermal"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&listed)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || err != nil {
+			t.Fatalf("list during cooling: status=%d err=%v", resp.StatusCode, err)
+		}
+		if len(listed) != 1 || listed[0].ID != sb.ID {
+			t.Fatalf("thermal sandbox disappeared: %+v", listed)
+		}
+		switch {
+		case listed[0].Status == "running" && listed[0].Thermal == "warm":
+			if warmAt.IsZero() {
+				warmAt = time.Now()
+			}
+		case listed[0].Status == "stopped":
+			if warmAt.IsZero() {
+				t.Fatal("server cold-stopped sandbox without observing a warm pause")
+			}
+			if elapsed := time.Since(warmAt); elapsed > 17*time.Second {
+				t.Fatalf("warm→cold took %s, expected bounded guest resync", elapsed)
+			}
+			resp = do("POST", "/sandboxes/"+sb.ID+"/exec",
+				map[string]any{"cmd": []string{"cat", "/workspace/thermal-last-write"}})
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				t.Fatalf("wake from cold: status=%d body=%s", resp.StatusCode, body)
+			}
+			var read engine.ExecResult
+			err = json.NewDecoder(resp.Body).Decode(&read)
+			resp.Body.Close()
+			if err != nil || read.ExitCode != 0 || read.Stdout != "1000" {
+				t.Fatalf("thermal cold stop lost last write: %+v, err=%v", read, err)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("server never completed the real hot→warm→cold transition")
+}
+
+// The HTTP manual stop also resumes and syncs a warm VM before powering it off.
+func TestKrucibleServerManualWarmStop(t *testing.T) {
+	var eng *Engine
+	_, do := krucibleServer(t, func(t *testing.T) engine.Engine {
+		eng = newPauseEngine(t).(*Engine)
+		return eng
+	})
+	resp := do("POST", "/sandboxes", map[string]any{"name": "manual-warm-stop", "memory_mb": 512})
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("create: status=%d body=%s", resp.StatusCode, body)
+	}
+	var sb store.Sandbox
+	err := json.NewDecoder(resp.Body).Decode(&sb)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { do("DELETE", "/sandboxes/"+sb.ID, nil).Body.Close() })
+	resp = do("POST", "/sandboxes/"+sb.ID+"/exec",
+		map[string]any{"cmd": []string{"writeuid", "/workspace/manual-warm-write"}})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("write: status=%d body=%s", resp.StatusCode, body)
+	}
+	var write engine.ExecResult
+	err = json.NewDecoder(resp.Body).Decode(&write)
+	resp.Body.Close()
+	if err != nil || write.ExitCode != 0 {
+		t.Fatalf("write: %+v, %v", write, err)
+	}
+	prePause, err := eng.Exec(context.Background(), sb.EngineID, []string{"cat", "/workspace/manual-warm-write"})
+	if err != nil || prePause.ExitCode != 0 || prePause.Stdout != "1000" {
+		t.Fatalf("file was not written before manual pause: %+v, %v", prePause, err)
+	}
+	if err := eng.Pause(context.Background(), sb.EngineID); err != nil {
+		t.Fatalf("pause before manual stop: %v", err)
+	}
+	start := time.Now()
+	resp = do("POST", "/sandboxes/"+sb.ID+"/stop", nil)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		resp.Body.Close()
+		t.Fatalf("manual warm stop exceeded bounded guest resync: %s", elapsed)
+	}
+	var stopped store.Sandbox
+	err = json.NewDecoder(resp.Body).Decode(&stopped)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || err != nil || stopped.Status != "stopped" {
+		t.Fatalf("manual warm stop status=%d body=%+v err=%v", resp.StatusCode, stopped, err)
+	}
+	resp = do("POST", "/sandboxes/"+sb.ID+"/exec",
+		map[string]any{"cmd": []string{"cat", "/workspace/manual-warm-write"}})
+	var read engine.ExecResult
+	err = json.NewDecoder(resp.Body).Decode(&read)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || err != nil || read.ExitCode != 0 || read.Stdout != "1000" {
+		t.Fatalf("manual warm stop lost write: status=%d result=%+v err=%v", resp.StatusCode, read, err)
+	}
+}
+
 // doFunc issues an authenticated request against the krucible-backed test daemon.
 type doFunc func(method, path string, body any) *http.Response
 
-// krucibleServer stands up the full daemon (HTTP API + store + thermal) over a
-// real krucible block-root engine and returns an httptest server + an
-// authenticated request helper. Skips if libkrun/vmm/mke2fs are unavailable.
-func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*httptest.Server, doFunc) {
+// krucibleServer stands up the HTTP API and store over a real krucible
+// block-root engine. Callers may start its thermal manager explicitly.
+// Skips if libkrun/vmm/mke2fs are unavailable.
+func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*server.Server, doFunc) {
 	t.Helper()
 	eng := newEngine(t)
 	dir := t.TempDir()
@@ -112,7 +272,7 @@ func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*ht
 		}
 		return resp
 	}
-	return ts, do
+	return srv, do
 }
 
 // TestKrucibleServerForward drives `bhatti forward` end to end through the full

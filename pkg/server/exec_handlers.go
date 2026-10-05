@@ -23,6 +23,7 @@ type execReq struct {
 	TimeoutSec int      `json:"timeout_sec,omitempty"` // default 300, max 86400
 	Detach     bool     `json:"detach,omitempty"`      // fire-and-forget
 	OutputFile string   `json:"output_file,omitempty"` // detach: redirect output to this file
+	Sync       bool     `json:"sync,omitempty"`        // flush guest filesystems before EXIT
 }
 
 func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id string) {
@@ -43,9 +44,25 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		errResp(w, 400, "cmd required")
 		return
 	}
+	if req.Sync && req.Detach {
+		errResp(w, 400, "sync requires an attached exec")
+		return
+	}
 	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
 		errResp(w, 500, "wake sandbox: "+err.Error())
 		return
+	}
+	if req.Sync {
+		if _, ok := s.engine.(engine.SyncExecEngine); !ok {
+			errResp(w, 501, "engine does not support synchronized exec")
+			return
+		}
+		if caps, ok := s.engine.(engine.GuestAgentCapabilities); ok {
+			if err := caps.RequireGuestAgentFeature(r.Context(), sb.EngineID, proto.FeatureExecSync); err != nil {
+				errRespInternal(w, r, "guest agent does not support synchronized exec", err)
+				return
+			}
+		}
 	}
 
 	// Apply exec timeout (default 300s, max 86400s / 24h)
@@ -96,7 +113,13 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	// Buffered JSON (existing behavior)
-	result, err := s.engine.Exec(execCtx, sb.EngineID, req.Cmd)
+	var result engine.ExecResult
+	var err error
+	if req.Sync {
+		result, err = s.engine.(engine.SyncExecEngine).ExecWithSync(execCtx, sb.EngineID, req.Cmd, true)
+	} else {
+		result, err = s.engine.Exec(execCtx, sb.EngineID, req.Cmd)
+	}
 	if err != nil {
 		errRespInternal(w, r, "exec failed", err)
 		return
@@ -113,12 +136,32 @@ func (s *Server) handleSandboxExecStream(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	if req.Sync {
+		if _, ok := s.engine.(engine.SyncExecEngine); !ok {
+			errResp(w, 501, "engine does not support synchronized exec")
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(200)
 
 	enc := json.NewEncoder(w)
 
+	// Opt-in sync must use an agent path that waits for the guest's sync
+	// before emitting EXIT, rather than a buffered fallback.
+	if req.Sync {
+		err := s.engine.(engine.SyncExecEngine).ExecStreamWithSync(r.Context(), sb.EngineID, req.Cmd, true, func(event engine.StreamEvent) {
+			enc.Encode(event)
+			flusher.Flush()
+		})
+		if err != nil {
+			enc.Encode(engine.StreamEvent{Type: "error", Data: err.Error()})
+			flusher.Flush()
+		}
+		return
+	}
 	// If engine supports streaming, use it directly
 	if se, ok := s.engine.(engine.StreamExecEngine); ok {
 		se.ExecStream(r.Context(), sb.EngineID, req.Cmd, func(event engine.StreamEvent) {

@@ -23,13 +23,14 @@ func TestVolumeBackupCRUD(t *testing.T) {
 	st := newTestStore(t)
 
 	b := VolumeBackup{
-		ID:         "bk_001",
-		VolumeName: "workspace",
-		UserID:     "usr_test",
-		S3Key:      "volumes/usr_test/workspace/2026-04-02T03:00:00Z.ext4.zst",
-		SizeBytes:  1024 * 1024 * 50,
-		SHA256:     "abc123",
-		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+		ID:              "bk_001",
+		VolumeName:      "workspace",
+		UserID:          "usr_test",
+		S3Key:           "volumes/usr_test/workspace/2026-04-02T03:00:00Z.ext4.zst",
+		SizeBytes:       1024 * 1024 * 50,
+		SHA256:          "abc123",
+		ConsistencyMode: "frozen",
+		CreatedAt:       time.Now().UTC().Truncate(time.Second),
 	}
 
 	// Create
@@ -42,7 +43,7 @@ func TestVolumeBackupCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatal("get:", err)
 	}
-	if got.VolumeName != "workspace" || got.S3Key != b.S3Key || got.SizeBytes != b.SizeBytes {
+	if got.VolumeName != "workspace" || got.S3Key != b.S3Key || got.SizeBytes != b.SizeBytes || got.ConsistencyMode != "frozen" {
 		t.Errorf("got %+v, want %+v", got, b)
 	}
 
@@ -53,6 +54,9 @@ func TestVolumeBackupCRUD(t *testing.T) {
 	}
 	if len(list) != 1 {
 		t.Fatalf("expected 1 backup, got %d", len(list))
+	}
+	if list[0].ConsistencyMode != "frozen" {
+		t.Fatalf("list lost backup consistency mode: %+v", list[0])
 	}
 
 	// Delete
@@ -104,12 +108,13 @@ func TestVolumeBackupRetention(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		created := time.Date(2026, 4, i+1, 3, 0, 0, 0, time.UTC)
 		st.CreateVolumeBackup(VolumeBackup{
-			ID:         fmt.Sprintf("bk_%d", i),
-			VolumeName: "workspace",
-			UserID:     "usr_test",
-			S3Key:      fmt.Sprintf("key_%d", i),
-			SizeBytes:  100,
-			CreatedAt:  created,
+			ID:              fmt.Sprintf("bk_%d", i),
+			VolumeName:      "workspace",
+			UserID:          "usr_test",
+			S3Key:           fmt.Sprintf("key_%d", i),
+			SizeBytes:       100,
+			ConsistencyMode: "sync_only",
+			CreatedAt:       created,
 		})
 	}
 
@@ -120,6 +125,9 @@ func TestVolumeBackupRetention(t *testing.T) {
 	}
 	if len(old) != 2 {
 		t.Fatalf("expected 2 old backups, got %d", len(old))
+	}
+	if old[0].ConsistencyMode != "sync_only" || old[1].ConsistencyMode != "sync_only" {
+		t.Fatalf("retention query lost consistency mode: %+v", old)
 	}
 	// Should be the oldest ones (bk_0, bk_1)
 	ids := map[string]bool{}
@@ -182,5 +190,42 @@ func TestStoreOpenClose(t *testing.T) {
 
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatal("db file missing:", err)
+	}
+}
+
+func TestVolumeBackupMigrationPreservesHistoricalUnverifiedMode(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "before-backup-mode.db")
+	st, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`DROP TABLE volume_backups`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`CREATE TABLE volume_backups (
+		id TEXT PRIMARY KEY, volume_name TEXT NOT NULL, user_id TEXT NOT NULL,
+		s3_key TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+		sha256 TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`INSERT INTO volume_backups
+		(id, volume_name, user_id, s3_key, size_bytes, created_at)
+		VALUES ('older', 'data', 'usr', 'key', 123, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	st, err = New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	got, err := st.GetVolumeBackup("usr", "older")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConsistencyMode != "unverified" {
+		t.Fatalf("old unquiesced backup mislabeled %q", got.ConsistencyMode)
 	}
 }

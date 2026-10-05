@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
@@ -263,19 +266,30 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 	}
 }
 
+// volumeBackupEngine holds the VM lifecycle through the local clone even when
+// the guest agent only supports sync, not FIFREEZE.
+type volumeBackupEngine interface {
+	BeginVolumeBackup(ctx context.Context, id, mount string) (thaw func(context.Context) error, mode string, err error)
+}
+
+// A stopped attachment still owns the image. Its lifecycle must be held
+// across the clone so an explicit Start cannot race a "detached" backup.
+type stoppedVolumeBackupEngine interface {
+	BeginStoppedVolumeBackup(ctx context.Context, id string) (release func(), err error)
+}
+
 func (s *Server) performVolumeBackup(ctx context.Context, user *store.User, vol *store.PersistentVolume) (*store.VolumeBackup, error) {
-	// Clone the volume file for a consistent snapshot.
-	// On btrfs this is instant (reflink), on ext4 it's a full copy.
-	tmpFile := vol.FilePath + ".backup-tmp"
-	defer os.Remove(tmpFile)
-	if err := exec.CommandContext(ctx, "cp", "--reflink=auto", "--sparse=always", vol.FilePath, tmpFile).Run(); err != nil {
-		return nil, fmt.Errorf("clone volume: %w", err)
+	tmpFile, mode, err := s.cloneVolumeForBackup(ctx, vol)
+	if err != nil {
+		return nil, err
 	}
+	defer os.Remove(tmpFile)
 
-	// Compress with zstd and stream to S3
+	// Compression and upload happen after thaw; a guest need not stay frozen
+	// for an S3 upload or a slow zstd pass.
+	id := genID()
 	timestamp := time.Now().UTC().Format(time.RFC3339)
-	s3Key := fmt.Sprintf("volumes/%s/%s/%s.ext4.zst", user.ID, vol.Name, timestamp)
-
+	s3Key := fmt.Sprintf("volumes/%s/%s/%s-%s.ext4.zst", user.ID, vol.Name, timestamp, id)
 	compressedFile := tmpFile + ".zst"
 	defer os.Remove(compressedFile)
 	if err := exec.CommandContext(ctx, "zstd", "-3", "-q", tmpFile, "-o", compressedFile).Run(); err != nil {
@@ -283,46 +297,198 @@ func (s *Server) performVolumeBackup(ctx context.Context, user *store.User, vol 
 	}
 	os.Remove(tmpFile) // free space early
 
-	// Get compressed size and compute hash
 	f, err := os.Open(compressedFile)
 	if err != nil {
 		return nil, fmt.Errorf("open compressed: %w", err)
 	}
 	defer f.Close()
-
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-
-	// Upload to S3
 	if err := s.backupBackend.Upload(ctx, s3Key, f, fi.Size()); err != nil {
 		return nil, fmt.Errorf("upload to s3: %w", err)
 	}
 
-	// Record in DB
-	id := genID()
 	record := store.VolumeBackup{
-		ID:         id,
-		VolumeName: vol.Name,
-		UserID:     user.ID,
-		S3Key:      s3Key,
-		SizeBytes:  fi.Size(),
-		CreatedAt:  time.Now().UTC(),
+		ID: id, VolumeName: vol.Name, UserID: user.ID, S3Key: s3Key,
+		SizeBytes: fi.Size(), ConsistencyMode: mode, CreatedAt: time.Now().UTC(),
 	}
 	if err := s.store.CreateVolumeBackup(record); err != nil {
 		return nil, fmt.Errorf("record backup: %w", err)
 	}
-
 	slog.Info("volume backup created",
 		"volume", vol.Name, "backup_id", id,
-		"size", fi.Size(), "s3_key", s3Key)
+		"size", fi.Size(), "s3_key", s3Key, "consistency_mode", mode)
 	s.RecordEvent(store.Event{
 		Type: "volume.backup_created", UserID: user.ID,
-		Meta: map[string]any{"name": vol.Name, "backup_id": id, "size_bytes": fi.Size(), "s3_key": s3Key},
+		Meta: map[string]any{"name": vol.Name, "backup_id": id, "size_bytes": fi.Size(), "s3_key": s3Key, "consistency_mode": mode},
 	})
-
 	return &record, nil
+}
+
+// A thaw failure can mean FIFREEZE is still in effect. The krucible engine
+// powers off before returning an unclean-stop error; mirror that state in the
+// store and event stream so an operator cannot mistake the VM for running.
+func (s *Server) reconcileBackupUncleanStop(sb *store.Sandbox, backupErr error) error {
+	reason, unclean := uncleanStopReason(backupErr)
+	if !unclean {
+		return backupErr
+	}
+	if err := s.store.StopSandbox(sb.ID); err != nil {
+		backupErr = errors.Join(backupErr, fmt.Errorf("record stopped sandbox %q after thaw failure: %w", sb.ID, err))
+	}
+	s.recordUncleanStop(*sb, reason)
+	return backupErr
+}
+
+// cloneVolumeForBackup holds each attached sandbox through the clone in
+// stable order: running guests quiesce; stopped guests cannot start mid-copy.
+func (s *Server) cloneVolumeForBackup(ctx context.Context, vol *store.PersistentVolume) (tmpFile, mode string, err error) {
+	unlockAttachments := s.store.LockPersistentVolumeAttachments(vol.UserID, vol.Name)
+	defer unlockAttachments()
+	// The lock covers both this read and the clone, not the S3 upload.
+	current, err := s.store.GetPersistentVolume(vol.UserID, vol.Name)
+	if err != nil {
+		return "", "", fmt.Errorf("load volume attachments: %w", err)
+	}
+	if current.ID != vol.ID {
+		return "", "", fmt.Errorf("volume %q changed before backup", vol.Name)
+	}
+	vol = current
+
+	attachments := append([]store.VolumeAttachment(nil), vol.Attachments...)
+	sort.Slice(attachments, func(i, j int) bool { return attachments[i].SandboxID < attachments[j].SandboxID })
+	engineIDs := make([]string, 0, len(attachments))
+	sandboxes := make([]*store.Sandbox, 0, len(attachments))
+	for _, attachment := range attachments {
+		sb, err := s.store.GetSandboxByID(attachment.SandboxID)
+		if err != nil {
+			return "", "", fmt.Errorf("load attached sandbox %q: %w", attachment.SandboxID, err)
+		}
+		if sb.CreatedBy != vol.UserID || sb.EngineID == "" {
+			return "", "", fmt.Errorf("invalid attached sandbox %q for volume %q", attachment.SandboxID, vol.Name)
+		}
+		sandboxes = append(sandboxes, sb)
+		engineIDs = append(engineIDs, sb.EngineID)
+	}
+	for _, engineID := range engineIDs {
+		s.attachInteractive(engineID)
+	}
+	defer func() {
+		for _, engineID := range engineIDs {
+			s.detachInteractive(engineID)
+		}
+	}()
+
+	running := make([]bool, len(attachments))
+	for i, engineID := range engineIDs {
+		state, err := s.engine.Status(ctx, engineID)
+		if err != nil {
+			return "", "", fmt.Errorf("status of attached sandbox %q: %w", engineID, err)
+		}
+		switch state.Status {
+		case "stopped":
+			if _, ok := s.engine.(stoppedVolumeBackupEngine); !ok {
+				return "", "", fmt.Errorf("engine cannot hold stopped attached sandbox %q during backup", engineID)
+			}
+		case "running":
+			if _, ok := s.engine.(volumeBackupEngine); !ok {
+				return "", "", fmt.Errorf("engine cannot hold live attached sandbox %q during backup: %w", engineID, engine.ErrNotSupported)
+			}
+			running[i] = true
+		default:
+			return "", "", fmt.Errorf("attached sandbox %q status %q is not safe for backup", engineID, state.Status)
+		}
+	}
+	for i, engineID := range engineIDs {
+		if running[i] {
+			if err := s.ensureHot(ctx, engineID); err != nil {
+				return "", "", fmt.Errorf("wake attached sandbox %q for backup: %w", engineID, err)
+			}
+		}
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(vol.FilePath), filepath.Base(vol.FilePath)+".backup-*")
+	if err != nil {
+		return "", "", fmt.Errorf("create temporary volume clone: %w", err)
+	}
+	tmpFile = tmp.Name()
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpFile)
+		return "", "", fmt.Errorf("close temporary volume clone: %w", err)
+	}
+	clonePath := tmpFile
+	defer func() {
+		if err != nil {
+			os.Remove(clonePath)
+		}
+	}()
+
+	mode = "detached"
+	type backupLease struct {
+		release func(context.Context) error
+		sandbox *store.Sandbox
+	}
+	var leases []backupLease
+	defer func() {
+		for i := len(leases) - 1; i >= 0; i-- {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			releaseErr := leases[i].release(cleanupCtx)
+			cancel()
+			if releaseErr != nil {
+				releaseErr = s.reconcileBackupUncleanStop(leases[i].sandbox, releaseErr)
+				err = errors.Join(err, fmt.Errorf("release attached volume backup lease: %w", releaseErr))
+			}
+		}
+	}()
+	for i, attachment := range attachments {
+		engineID := engineIDs[i]
+		if !running[i] {
+			release, leaseErr := s.engine.(stoppedVolumeBackupEngine).BeginStoppedVolumeBackup(ctx, engineID)
+			if leaseErr != nil {
+				return "", "", fmt.Errorf("hold stopped attached sandbox %q for backup: %w", engineID, leaseErr)
+			}
+			if release == nil {
+				return "", "", fmt.Errorf("engine returned no stopped backup lease for sandbox %q", engineID)
+			}
+			leases = append(leases, backupLease{
+				release: func(context.Context) error { release(); return nil },
+				sandbox: sandboxes[i],
+			})
+			continue
+		}
+		var thaw func(context.Context) error
+		var guestMode string
+		thaw, guestMode, err = s.engine.(volumeBackupEngine).BeginVolumeBackup(ctx, engineID, filepath.Clean(attachment.Mount))
+		if thaw != nil {
+			leases = append(leases, backupLease{release: thaw, sandbox: sandboxes[i]})
+		}
+		if err != nil {
+			err = s.reconcileBackupUncleanStop(sandboxes[i], err)
+			return "", "", fmt.Errorf("quiesce sandbox %q volume mount %q: %w", engineID, attachment.Mount, err)
+		}
+		switch guestMode {
+		case "frozen":
+			if thaw == nil {
+				return "", "", fmt.Errorf("sandbox %q reported frozen without a thaw function", engineID)
+			}
+			if mode == "detached" {
+				mode = "frozen"
+			}
+		case "sync_only":
+			if thaw == nil {
+				return "", "", fmt.Errorf("sandbox %q reported sync_only without a lifecycle release", engineID)
+			}
+			mode = "sync_only"
+		default:
+			return "", "", fmt.Errorf("sandbox %q returned unknown backup mode %q", engineID, guestMode)
+		}
+	}
+	if err := exec.CommandContext(ctx, "cp", "--reflink=auto", "--sparse=always", vol.FilePath, tmpFile).Run(); err != nil {
+		return "", "", fmt.Errorf("clone volume: %w", err)
+	}
+	return tmpFile, mode, nil
 }
 
 func (s *Server) performVolumeRestore(ctx context.Context, vol *store.PersistentVolume, b *store.VolumeBackup) error {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path"
 	"sync"
 	"time"
 
@@ -21,6 +22,11 @@ type AgentClient struct {
 	controlSock string
 	forwardSock string
 	token       string // auth token, empty = no auth
+	infoMu      sync.RWMutex
+	info        proto.AgentInfo // a successful INFO response from this guest boot
+	infoKnown   bool
+	leaseMu     sync.Mutex
+	leases      map[string]net.Conn // successful FREEZE_ACK held open until THAW
 }
 
 // NewTestClient connects to the agent's test-mode Unix sockets.
@@ -96,13 +102,20 @@ func (c *AgentClient) Info(ctx context.Context) (proto.AgentInfo, error) {
 	if err := proto.WriteFrame(conn, proto.INFO_REQ, nil); err != nil {
 		return proto.AgentInfo{}, fmt.Errorf("agent send info: %w", err)
 	}
+	// A failed probe cannot establish that the guest is old or supports a
+	// feature. Invalidate any previous answer rather than using stale info.
+	c.infoMu.Lock()
+	c.infoKnown = false
+	c.infoMu.Unlock()
 	msgType, payload, err := proto.ReadFrame(conn)
 	if err != nil {
 		return proto.AgentInfo{}, fmt.Errorf("agent read info: %w", err)
 	}
 	if msgType == proto.ERROR {
 		if unexpectedFrame(payload, proto.INFO_REQ) {
-			return proto.AgentInfo{Legacy: true}, nil
+			info := proto.AgentInfo{Legacy: true}
+			c.cacheInfo(info)
+			return info, nil
 		}
 		return proto.AgentInfo{}, fmt.Errorf("guest agent info failed: %s", payload)
 	}
@@ -116,6 +129,7 @@ func (c *AgentClient) Info(ctx context.Context) (proto.AgentInfo, error) {
 	if info.Version == "" || info.Features == nil {
 		return proto.AgentInfo{}, fmt.Errorf("incomplete guest agent info")
 	}
+	c.cacheInfo(info)
 	return info, nil
 }
 
@@ -123,8 +137,42 @@ func unexpectedFrame(payload []byte, msgType byte) bool {
 	return string(payload) == fmt.Sprintf("unexpected frame type 0x%02x", msgType)
 }
 
-// Exec runs a command non-interactively and returns after it exits.
+func (c *AgentClient) cacheInfo(info proto.AgentInfo) {
+	c.infoMu.Lock()
+	c.info, c.infoKnown = info, true
+	c.infoMu.Unlock()
+}
+
+func (c *AgentClient) requireFeature(ctx context.Context, feature proto.AgentFeature) error {
+	c.infoMu.RLock()
+	info, known := c.info, c.infoKnown
+	c.infoMu.RUnlock()
+	if !known {
+		var err error
+		info, err = c.Info(ctx)
+		if err != nil {
+			return fmt.Errorf("guest agent capabilities unavailable: %w", err)
+		}
+	}
+	if !info.Has(feature) {
+		return engine.GuestAgentOutdated(string(feature))
+	}
+	return nil
+}
+
+// Exec runs a command non-interactively without an implicit guest-wide sync.
 func (c *AgentClient) Exec(ctx context.Context, argv []string, env map[string]string, cwd string) (engine.ExecResult, error) {
+	return c.ExecWithSync(ctx, argv, env, cwd, false)
+}
+
+// ExecWithSync requests a guest-wide sync before EXIT only when explicitly
+// enabled and the baked-in guest advertised the new request field.
+func (c *AgentClient) ExecWithSync(ctx context.Context, argv []string, env map[string]string, cwd string, sync bool) (engine.ExecResult, error) {
+	if sync {
+		if err := c.requireFeature(ctx, proto.FeatureExecSync); err != nil {
+			return engine.ExecResult{}, err
+		}
+	}
 	conn, err := c.DialControl(ctx)
 	if err != nil {
 		return engine.ExecResult{}, fmt.Errorf("agent connect: %w", err)
@@ -140,6 +188,9 @@ func (c *AgentClient) Exec(ctx context.Context, argv []string, env map[string]st
 		cwdPtr = &cwd
 	}
 	req := proto.ExecRequest{Argv: argv, Env: env, Cwd: cwdPtr}
+	if sync {
+		req.Sync = &sync
+	}
 	if err := proto.SendJSON(conn, proto.EXEC_REQ, req); err != nil {
 		return engine.ExecResult{}, fmt.Errorf("agent send exec: %w", err)
 	}
@@ -506,6 +557,117 @@ func (c *AgentClient) Reseed(ctx context.Context, seed [proto.ReseedBytes]byte) 
 	}
 	if msgType != proto.RESEED || len(payload) != 0 {
 		return fmt.Errorf("expected empty RESEED ack, got 0x%02x (%d bytes)", msgType, len(payload))
+	}
+	return nil
+}
+
+// ErrFSFreezeRejected means the guest explicitly refused FREEZE, or the
+// host rejected it before sending the request. No new lease exists; callers
+// must not send an independent THAW that could release another owner's freeze.
+var ErrFSFreezeRejected = errors.New("guest filesystem freeze rejected")
+
+// ErrFSFreezeReleaseUnconfirmed means no THAW_ACK was received. The control
+// connection has been closed, which asks the guest to auto-thaw on EOF, but
+// the caller must not assume the filesystem is released without confirmation.
+var ErrFSFreezeReleaseUnconfirmed = errors.New("guest filesystem thaw not confirmed")
+
+// Freeze flushes and suspends writes to an exact guest mountpoint. A successful
+// ACK retains this control connection as a lease until Thaw; a failed or timed
+// out request closes it so even a delayed guest freeze is undone on EOF.
+func (c *AgentClient) Freeze(ctx context.Context, mount string) error {
+	if err := c.requireFeature(ctx, proto.FeatureFSFreeze); err != nil {
+		return fmt.Errorf("%w: %w", ErrFSFreezeRejected, err)
+	}
+	key := path.Clean(mount)
+	c.leaseMu.Lock()
+	_, held := c.leases[key]
+	c.leaseMu.Unlock()
+	if held {
+		return fmt.Errorf("%w: guest filesystem %q already has a freeze lease", ErrFSFreezeRejected, mount)
+	}
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: agent connect for filesystem quiescence: %w", ErrFSFreezeRejected, err)
+	}
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	if err := sendFSFreeze(ctx, conn, mount, proto.FREEZE_REQ, proto.FREEZE_ACK); err != nil {
+		return err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear freeze lease deadline: %w", err)
+	}
+	c.leaseMu.Lock()
+	if c.leases == nil {
+		c.leases = make(map[string]net.Conn)
+	}
+	if _, held := c.leases[key]; held {
+		c.leaseMu.Unlock()
+		return fmt.Errorf("guest filesystem %q already has a freeze lease", mount)
+	}
+	c.leases[key] = conn
+	c.leaseMu.Unlock()
+	conn = nil // ownership moved to Thaw, not to the request context
+	return nil
+}
+
+// Thaw sends THAW_REQ on the retained freeze connection and always closes
+// that connection after the response. Without a lease (ambiguous failed
+// Freeze), it sends a separate request without re-probing INFO so an already
+// frozen filesystem can still be released.
+func (c *AgentClient) Thaw(ctx context.Context, mount string) error {
+	key := path.Clean(mount)
+	c.leaseMu.Lock()
+	conn := c.leases[key]
+	delete(c.leases, key)
+	c.leaseMu.Unlock()
+	if conn == nil {
+		var err error
+		conn, err = c.DialControl(ctx)
+		if err != nil {
+			return fmt.Errorf("%w: agent connect: %w", ErrFSFreezeReleaseUnconfirmed, err)
+		}
+	}
+	defer conn.Close() // EOF asks the guest to thaw even if the ACK is lost
+	if err := sendFSFreeze(ctx, conn, mount, proto.THAW_REQ, proto.THAW_ACK); err != nil {
+		return fmt.Errorf("%w: %w", ErrFSFreezeReleaseUnconfirmed, err)
+	}
+	return nil
+}
+
+func sendFSFreeze(ctx context.Context, conn net.Conn, mount string, request, ack byte) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			if request == proto.FREEZE_REQ {
+				return fmt.Errorf("%w: set filesystem quiescence deadline: %w", ErrFSFreezeRejected, err)
+			}
+			return fmt.Errorf("set filesystem quiescence deadline: %w", err)
+		}
+	}
+	if err := proto.SendJSON(conn, request, proto.FSFreezeRequest{Mount: mount}); err != nil {
+		return fmt.Errorf("agent send filesystem quiescence: %w", err)
+	}
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("agent read filesystem quiescence ack: %w", err)
+	}
+	if msgType == proto.ERROR {
+		if unexpectedFrame(payload, request) {
+			if request == proto.FREEZE_REQ {
+				return fmt.Errorf("%w: %w", ErrFSFreezeRejected, engine.GuestAgentOutdated(string(proto.FeatureFSFreeze)))
+			}
+			return engine.GuestAgentOutdated(string(proto.FeatureFSFreeze))
+		}
+		if request == proto.FREEZE_REQ {
+			return fmt.Errorf("%w: guest filesystem quiescence failed: %s", ErrFSFreezeRejected, payload)
+		}
+		return fmt.Errorf("guest filesystem quiescence failed: %s", payload)
+	}
+	if msgType != ack || len(payload) != 0 {
+		return fmt.Errorf("expected empty filesystem quiescence ack 0x%02x, got 0x%02x (%d bytes)", ack, msgType, len(payload))
 	}
 	return nil
 }

@@ -260,6 +260,52 @@ func TestPersistentVolumeUniqueConstraint(t *testing.T) {
 	}
 }
 
+func TestVolumeAttachmentGateBlocksSameVolumeOnly(t *testing.T) {
+	s := testStore(t)
+	createTestUser(t, s, "usr_a", "alice")
+	createTestVolume(t, s, "usr_a", "data", 1024)
+	createTestVolume(t, s, "usr_a", "other", 1024)
+	createTestSandbox(t, s, "usr_a", "sb1", "first")
+	createTestSandbox(t, s, "usr_a", "sb2", "second")
+
+	unlock := s.LockPersistentVolumeAttachments("usr_a", "data")
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+	started := make(chan struct{})
+	attached := make(chan error, 1)
+	go func() {
+		close(started)
+		attached <- s.AttachPersistentVolume("usr_a", "data", "sb1", "/data", true)
+	}()
+	<-started
+	select {
+	case err := <-attached:
+		t.Fatalf("attach entered locked volume before clone finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := s.AttachPersistentVolume("usr_a", "other", "sb2", "/other", true); err != nil {
+		t.Fatalf("unrelated volume blocked by per-volume gate: %v", err)
+	}
+	unlock()
+	locked = false
+	select {
+	case err := <-attached:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("attach did not resume after backup released volume gate")
+	}
+	got, err := s.GetPersistentVolume("usr_a", "data")
+	if err != nil || len(got.Attachments) != 1 || got.Attachments[0].SandboxID != "sb1" {
+		t.Fatalf("racing attachment lost after gate release: volume=%+v err=%v", got, err)
+	}
+}
+
 // ==========================================================================
 // Publish Rules
 // ==========================================================================
@@ -275,4 +321,3 @@ func createTestSandbox(t *testing.T, s *Store, userID, sbID, name string) {
 		t.Fatal(err)
 	}
 }
-

@@ -52,7 +52,8 @@ Sleeping sandboxes wake automatically.`,
 	Example: `  bhatti exec dev -- echo hello
   bhatti exec dev echo hello           # -- is optional
   bhatti exec dev -- sudo apt-get install -y ripgrep
-  bhatti exec dev --timeout 60 -- long-running-script.sh`,
+  bhatti exec dev --timeout 60 -- long-running-script.sh
+  bhatti exec dev --sync -- write-important-data`,
 	Args:              minimumArgs(1),
 	ValidArgsFunction: completeSandboxNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -74,6 +75,7 @@ Sleeping sandboxes wake automatically.`,
 
 		timeout, _ := cmd.Flags().GetInt("timeout")
 		detach, _ := cmd.Flags().GetBool("detach")
+		syncFiles, _ := cmd.Flags().GetBool("sync")
 
 		reqBody := map[string]any{"cmd": cmdArgs}
 		if timeout > 0 {
@@ -81,6 +83,9 @@ Sleeping sandboxes wake automatically.`,
 		}
 		if detach {
 			reqBody["detach"] = true
+		}
+		if syncFiles {
+			reqBody["sync"] = true
 		}
 
 		// B2: stream when stdout is a TTY (or BHATTI_FORCE_STREAM=1)
@@ -165,6 +170,7 @@ Sleeping sandboxes wake automatically.`,
 func init() {
 	execCmd.Flags().Int("timeout", 0, "Exec timeout in seconds (default: 300, max: 86400)")
 	execCmd.Flags().Bool("detach", false, "Run in background, return PID immediately")
+	execCmd.Flags().Bool("sync", false, "Sync guest filesystems before reporting command completion")
 }
 
 // --- shell ---

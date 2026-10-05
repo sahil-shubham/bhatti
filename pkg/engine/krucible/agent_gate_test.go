@@ -47,6 +47,26 @@ func TestForkRefusesOldLoharBeforeCheckpoint(t *testing.T) {
 	}
 }
 
+func TestSynchronizedExecRejectsCachedOldGuestBeforeSendingRequest(t *testing.T) {
+	vm := &VM{ID: "old", Status: "running", Thermal: "hot", AgentInfo: proto.AgentInfo{Legacy: true}}
+	e := &Engine{vms: map[string]*VM{"old": vm}}
+	_, err := e.ExecWithSync(context.Background(), "old", []string{"true"}, true)
+	if !errors.Is(err, engine.ErrGuestAgentOutdated) {
+		t.Fatalf("sync on cached old guest = %v; want actionable outdated error before dialing", err)
+	}
+	err = e.ExecStreamWithSync(context.Background(), "old", []string{"true"}, true, func(engine.StreamEvent) {
+		t.Fatal("old guest must not receive a streaming sync request")
+	})
+	if !errors.Is(err, engine.ErrGuestAgentOutdated) {
+		t.Fatalf("stream sync on cached old guest = %v; want outdated before dialing", err)
+	}
+	vm.AgentInfoErr = errors.New("INFO timed out")
+	_, err = e.ExecWithSync(context.Background(), "old", []string{"true"}, true)
+	if err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
+		t.Fatalf("unknown cached capabilities = %v; must not be mislabeled old", err)
+	}
+}
+
 // TestOldAgentVMMProcess is a fake helper, not a hypervisor. It accepts the
 // auth/exec/info frames used by launch(), answering the unknown frame exactly
 // as a pre-handshake lohar does. The caller owns its PID and cleanup.

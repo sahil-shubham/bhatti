@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -35,6 +36,33 @@ type ThermalEngine interface {
 	ThermalState(id string) string
 	Pause(ctx context.Context, id string) error
 	Activity(ctx context.Context, id string) (*proto.ActivityInfo, error)
+}
+
+// ForcePause is an optional thermal capability for an unresponsive guest.
+// Unlike a normal pause, it must not wait for (or claim) a guest sync.
+type ForcePause interface {
+	ForcePause(ctx context.Context, id string) error
+}
+
+// A stopped VM can still return an error if its last guest sync failed.
+// Callers must distinguish that durability warning from a failed power-off.
+type uncleanStop interface {
+	UncleanStopReason() string
+}
+
+func uncleanStopReason(err error) (string, bool) {
+	var stopped uncleanStop
+	if !errors.As(err, &stopped) {
+		return "", false
+	}
+	return stopped.UncleanStopReason(), true
+}
+
+func (s *Server) recordUncleanStop(sb store.Sandbox, reason string) {
+	s.RecordEvent(store.Event{
+		Type: "sandbox.unclean_stop", UserID: sb.CreatedBy, SandboxID: sb.ID,
+		Meta: map[string]any{"name": sb.Name, "reason": reason},
+	})
 }
 
 // ThermalSupport is implemented by engines whose thermal support depends on
@@ -126,6 +154,43 @@ type Server struct {
 	// exec WS) per engineID; a non-zero count pins the sandbox hot.
 	interactiveMu     sync.Mutex
 	interactiveAttach map[string]int
+
+	// transitionGates serialize a sandbox's thermal transition with a new
+	// interactive/backup pin. The global mutex only guards this small map:
+	// one guest's slow sync must never block another tenant's attachment.
+	transitionMu    sync.Mutex
+	transitionGates map[string]*transitionGate
+}
+
+type transitionGate struct {
+	mu   sync.Mutex
+	refs int // holders and waiters; delete only when neither remains
+}
+
+func (s *Server) lockTransition(engineID string) *transitionGate {
+	s.transitionMu.Lock()
+	if s.transitionGates == nil {
+		s.transitionGates = make(map[string]*transitionGate)
+	}
+	gate := s.transitionGates[engineID]
+	if gate == nil {
+		gate = &transitionGate{}
+		s.transitionGates[engineID] = gate
+	}
+	gate.refs++
+	s.transitionMu.Unlock()
+	gate.mu.Lock()
+	return gate
+}
+
+func (s *Server) unlockTransition(engineID string, gate *transitionGate) {
+	gate.mu.Unlock()
+	s.transitionMu.Lock()
+	gate.refs--
+	if gate.refs == 0 {
+		delete(s.transitionGates, engineID)
+	}
+	s.transitionMu.Unlock()
 }
 
 // maxThermalFailures is the number of consecutive Activity query failures
@@ -196,15 +261,18 @@ func (s *Server) touchActivity(engineID string) {
 // strands the shell with no way back. Host-authoritative, so it does not depend
 // on the guest agent's AttachedSessions report.
 func (s *Server) attachInteractive(engineID string) {
+	gate := s.lockTransition(engineID)
 	s.interactiveMu.Lock()
 	s.interactiveAttach[engineID]++
 	s.interactiveMu.Unlock()
 	s.touchActivity(engineID)
+	s.unlockTransition(engineID, gate)
 }
 
 // detachInteractive releases one interactive client and restarts the idle clock
 // from detach, so a just-closed shell isn't cold-stopped on stale activity.
 func (s *Server) detachInteractive(engineID string) {
+	gate := s.lockTransition(engineID)
 	s.interactiveMu.Lock()
 	if n := s.interactiveAttach[engineID] - 1; n <= 0 {
 		delete(s.interactiveAttach, engineID)
@@ -213,6 +281,7 @@ func (s *Server) detachInteractive(engineID string) {
 	}
 	s.interactiveMu.Unlock()
 	s.touchActivity(engineID)
+	s.unlockTransition(engineID, gate)
 }
 
 // hasInteractiveAttach reports whether any interactive client is attached.
@@ -604,7 +673,15 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 	if err != nil {
 		return
 	}
-	for _, sb := range sandboxes {
+	// Process hot guests before scheduling the potentially slow guest-wide
+	// sync of warm→cold stops, even if the warm guests appear first in the list.
+	type coldCandidate struct {
+		sandbox *store.Sandbox
+		idle    time.Duration
+	}
+	var coldStops []coldCandidate
+	for i := range sandboxes {
+		sb := &sandboxes[i]
 		if sb.Status != "running" {
 			continue
 		}
@@ -627,10 +704,7 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 
 		thermal := te.ThermalState(sb.EngineID)
 
-		// --- Warm → Cold: host-side timing only, no agent query ---
-		// vCPUs are paused — the agent can't respond. Querying it either
-		// times out (skipping the cold check) or wakes the VM via TCP.
-		// Use lastActivity timestamp instead, set when hot→warm fired.
+		// --- Warm → Cold: Stop resumes the vCPUs and syncs the guest. ---
 		if thermal == "warm" {
 			ts, ok := s.lastActivity.Load(sb.EngineID)
 			if !ok {
@@ -638,47 +712,7 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			}
 			idle := time.Since(ts.(time.Time))
 			if idle > cfg.ColdTimeout {
-				stopCtx, stopCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				err := s.engine.Stop(stopCtx, sb.EngineID)
-				stopCancel()
-
-				if err != nil {
-					// Track consecutive failures. The VM is still warm
-					// (alive, vCPUs paused) — retry on next cycle.
-					// Only mark unknown after 3 consecutive failures.
-					count := s.incrementSnapshotFailures(sb.EngineID)
-
-					if count >= 3 {
-						slog.Error("thermal snapshot failed 3 times — marking unknown",
-							"sandbox", sb.Name, "id", sb.ID, "error", err,
-							"attempts", count)
-						s.store.UpdateSandboxStatus(sb.ID, "unknown")
-						s.resetSnapshotFailures(sb.EngineID)
-					} else {
-						slog.Warn("thermal snapshot failed — will retry",
-							"sandbox", sb.Name, "id", sb.ID, "error", err,
-							"attempt", count, "max_attempts", 3)
-					}
-					s.RecordEvent(store.Event{
-						Type: "thermal.snapshot_failed", SandboxID: sb.ID,
-						Meta: map[string]any{"sandbox": sb.Name, "error": err.Error(), "attempt": count, "max_attempts": 3},
-					})
-					continue
-				}
-
-				// Success — clear failure counter
-				s.resetSnapshotFailures(sb.EngineID)
-				s.store.StopSandbox(sb.ID)
-				slog.Info("thermal transition", "sandbox", sb.Name,
-					"from", "warm", "to", "cold", "idle", idle.Round(time.Second))
-				s.RecordEvent(store.Event{
-					Type: "sandbox.stopped", SandboxID: sb.ID,
-					Meta: map[string]any{"name": sb.Name, "reason": "thermal"},
-				})
-				s.RecordEvent(store.Event{
-					Type: "thermal.snapshot", SandboxID: sb.ID,
-					Meta: map[string]any{"sandbox": sb.Name, "idle_s": int(idle.Seconds())},
-				})
+				coldStops = append(coldStops, coldCandidate{sandbox: sb, idle: idle})
 			}
 			continue
 		}
@@ -708,11 +742,29 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			if count >= maxThermalFailures {
 				slog.Error("thermal force-pause: agent unresponsive",
 					"sandbox", sb.Name, "failures", count)
-				// Pausing the VMM doesn't require the guest agent.
-				if err := te.Pause(context.Background(), sb.EngineID); err != nil {
-					slog.Warn("thermal force-pause failed", "sandbox", sb.Name, "error", err)
+				gate := s.lockTransition(sb.EngineID)
+				if s.hasInteractiveAttach(sb.EngineID) {
+					s.unlockTransition(sb.EngineID, gate)
+					s.resetThermalFails(sb.EngineID)
+					continue
+				}
+				// Never call the normal Pause fallback here: it may wait
+				// on an agent that has already failed ten probes.
+				pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				var pauseErr error
+				if force, ok := s.engine.(ForcePause); ok {
+					pauseErr = force.ForcePause(pauseCtx, sb.EngineID)
 				} else {
+					pauseErr = fmt.Errorf("engine %T has no agentless force pause", s.engine)
+				}
+				pauseCancel()
+				if pauseErr == nil {
 					s.lastActivity.Store(sb.EngineID, time.Now())
+				}
+				s.unlockTransition(sb.EngineID, gate)
+				if pauseErr != nil {
+					slog.Warn("thermal force-pause failed", "sandbox", sb.Name, "error", pauseErr)
+				} else {
 					slog.Info("thermal transition", "sandbox", sb.Name,
 						"from", "hot", "to", "warm", "reason", "force-pause")
 					s.RecordEvent(store.Event{
@@ -729,13 +781,24 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 		idle := time.Since(time.Unix(activity.LastActivityUnix, 0))
 
 		if idle > cfg.WarmTimeout && activity.AttachedSessions == 0 {
-			if err := te.Pause(context.Background(), sb.EngineID); err != nil {
-				slog.Warn("thermal pause failed", "sandbox", sb.Name, "error", err)
+			gate := s.lockTransition(sb.EngineID)
+			if s.hasInteractiveAttach(sb.EngineID) {
+				s.unlockTransition(sb.EngineID, gate)
 				continue
 			}
-			// Record pause time so warm→cold timer starts from now,
-			// not from the last user interaction.
-			s.lastActivity.Store(sb.EngineID, time.Now())
+			pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			pauseErr := te.Pause(pauseCtx, sb.EngineID)
+			pauseCancel()
+			if pauseErr == nil {
+				// Cold timeout begins at the completed pause, not at the
+				// last user operation or the earlier Activity query.
+				s.lastActivity.Store(sb.EngineID, time.Now())
+			}
+			s.unlockTransition(sb.EngineID, gate)
+			if pauseErr != nil {
+				slog.Warn("thermal pause failed", "sandbox", sb.Name, "error", pauseErr)
+				continue
+			}
 			slog.Info("thermal transition", "sandbox", sb.Name,
 				"from", "hot", "to", "warm", "idle", idle.Round(time.Second))
 			s.RecordEvent(store.Event{
@@ -747,6 +810,87 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 				"sandbox", sb.Name, "sessions", activity.AttachedSessions)
 		}
 	}
+	// Cold transitions can each spend a bounded interval on guest sync; do
+	// several at once without serializing N guests or spawning N goroutines.
+	// Wait here so Close and synchronous callers observe completed transitions.
+	if len(coldStops) == 1 {
+		s.stopColdSandbox(coldStops[0].sandbox, coldStops[0].idle)
+		return
+	}
+	if len(coldStops) == 0 {
+		return
+	}
+	jobs := make(chan coldCandidate)
+	var workers sync.WaitGroup
+	for range min(8, len(coldStops)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for candidate := range jobs {
+				s.stopColdSandbox(candidate.sandbox, candidate.idle)
+			}
+		}()
+	}
+	for _, candidate := range coldStops {
+		jobs <- candidate
+	}
+	close(jobs)
+	workers.Wait()
+}
+
+func (s *Server) stopColdSandbox(sb *store.Sandbox, idle time.Duration) {
+	// Pinning and this transition are serialized for this sandbox, without
+	// blocking other tenants' attachments during Stop.
+	gate := s.lockTransition(sb.EngineID)
+	if s.hasInteractiveAttach(sb.EngineID) {
+		s.unlockTransition(sb.EngineID, gate)
+		return
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	stopErr := s.engine.Stop(stopCtx, sb.EngineID)
+	stopCancel()
+	reason, poweredOffUnclean := uncleanStopReason(stopErr)
+	if stopErr == nil || poweredOffUnclean {
+		s.store.StopSandbox(sb.ID)
+	}
+
+	if stopErr != nil && !poweredOffUnclean {
+		// A genuine power-off failure leaves the VM warm; retry.
+		count := s.incrementSnapshotFailures(sb.EngineID)
+		if count >= 3 {
+			slog.Error("thermal cold stop failed 3 times — marking unknown",
+				"sandbox", sb.Name, "id", sb.ID, "error", stopErr,
+				"attempts", count)
+			s.store.UpdateSandboxStatus(sb.ID, "unknown")
+			s.resetSnapshotFailures(sb.EngineID)
+		} else {
+			slog.Warn("thermal cold stop failed — will retry",
+				"sandbox", sb.Name, "id", sb.ID, "error", stopErr,
+				"attempt", count, "max_attempts", 3)
+		}
+		s.unlockTransition(sb.EngineID, gate)
+		s.RecordEvent(store.Event{
+			Type: "thermal.snapshot_failed", SandboxID: sb.ID,
+			Meta: map[string]any{"sandbox": sb.Name, "error": stopErr.Error(), "attempt": count, "max_attempts": 3},
+		})
+		return
+	}
+
+	s.resetSnapshotFailures(sb.EngineID)
+	s.unlockTransition(sb.EngineID, gate)
+	if poweredOffUnclean {
+		s.recordUncleanStop(*sb, reason)
+	}
+	slog.Info("thermal transition", "sandbox", sb.Name,
+		"from", "warm", "to", "cold", "idle", idle.Round(time.Second))
+	s.RecordEvent(store.Event{
+		Type: "sandbox.stopped", SandboxID: sb.ID,
+		Meta: map[string]any{"name": sb.Name, "reason": "thermal"},
+	})
+	s.RecordEvent(store.Event{
+		Type: "thermal.snapshot", SandboxID: sb.ID,
+		Meta: map[string]any{"sandbox": sb.Name, "idle_s": int(idle.Seconds())},
+	})
 }
 
 // EnsureHot is the exported version of ensureHot for use by main.go's

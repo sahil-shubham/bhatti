@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1110,8 +1111,36 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
-// Stop powers off the VM after a best-effort guest sync. The root disk
-// persists; Start boots it fresh, without processes or files in tmpfs.
+// guestSyncTimeout bounds each guest-wide sync independently of the caller's
+// deadline. Stopping a fleet with unresponsive agents must not take 30s/VM.
+const guestSyncTimeout = 2 * time.Second
+
+// UncleanStopError means the VM was powered off without a confirmed guest
+// sync or thaw. Callers must record the stopped state and durability risk.
+type UncleanStopError struct{ Reason error }
+
+func (e *UncleanStopError) Error() string {
+	return fmt.Sprintf("sandbox powered off without confirmed durability: %v", e.Reason)
+}
+func (e *UncleanStopError) Unwrap() error             { return e.Reason }
+func (e *UncleanStopError) UncleanStopReason() string { return e.Reason.Error() }
+
+// powerOffLocked kills a VM even when guest cooperation is unavailable. The
+// caller owns launchMu, so thaw failure can share Stop's final state transition
+// without reacquiring the lock held for the volume backup lease.
+func (vm *VM) powerOffLocked() {
+	vm.kill()
+	vm.mu.Lock()
+	vm.Status = "stopped"
+	vm.Thermal = "cold"
+	vm.Agent = nil
+	vm.persistLocked()
+	vm.mu.Unlock()
+}
+
+// Stop powers off the VM after a guest sync. A warm VM must be resumed and
+// synced again: writes can land after the pre-PAUSE sync but before PAUSE
+// parks its vCPUs. Even if this final sync fails, the VM is powered off.
 func (e *Engine) Stop(ctx context.Context, id string) error {
 	vm, err := e.getVM(id)
 	if err != nil {
@@ -1124,25 +1153,45 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 		vm.mu.Unlock()
 		return nil
 	}
-	ag := vm.Agent
+	warm := vm.Thermal == "warm"
 	vm.mu.Unlock()
-	if ag != nil {
-		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		// Best effort: a guest that can't sync still gets powered off; ext4's
-		// journal keeps the filesystem consistent, only unflushed writes are lost.
-		if _, err := ag.Exec(sctx, []string{"sync"}, nil, ""); err != nil {
-			slog.Warn("krucible stop: guest sync failed", "id", id, "error", err)
+
+	var syncErr error
+	if warm {
+		// Resume directly while launchMu is held: calling e.Resume would
+		// reacquire it and deadlock. Failure still powers off the VM.
+		resumeCtx, resumeCancel := context.WithTimeout(ctx, 3*time.Second)
+		_, resumeErr := controlCmd(resumeCtx, vm.CtlSockUDS, "RESUME")
+		resumeCancel()
+		if resumeErr != nil {
+			syncErr = fmt.Errorf("resume for guest sync: %w", resumeErr)
+		} else {
+			vm.mu.Lock()
+			vm.Thermal = "hot"
+			vm.persistLocked()
+			ag, unasked := vm.Agent, errors.Is(vm.AgentInfoErr, errAgentInfoPaused)
+			vm.mu.Unlock()
+			if unasked {
+				// The guest could not answer INFO while adopted paused;
+				// refresh its capabilities now that its vCPUs can run.
+				info, infoErr := queryAgentInfo(ctx, ag)
+				vm.mu.Lock()
+				vm.AgentInfo, vm.AgentInfoErr = info, infoErr
+				vm.mu.Unlock()
+			}
 		}
+	}
+	if syncErr == nil {
+		syncCtx, cancel := context.WithTimeout(ctx, guestSyncTimeout)
+		syncErr = vm.syncGuest(syncCtx)
 		cancel()
 	}
-	vm.kill()
-	vm.mu.Lock()
-	vm.Status = "stopped"
-	vm.Thermal = "cold"
-	vm.Agent = nil
-	vm.mu.Unlock()
-	vm.persist()
+	vm.powerOffLocked()
 	slog.Info("krucible sandbox stopped (powered off)", "id", id)
+	if syncErr != nil {
+		slog.Warn("krucible stop: guest sync failed; VM powered off", "id", id, "error", syncErr)
+		return &UncleanStopError{Reason: syncErr}
+	}
 	return nil
 }
 

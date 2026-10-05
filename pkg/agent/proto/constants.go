@@ -39,6 +39,13 @@ const (
 	// Exec
 	EXEC_REQ byte = 0x10 // host → guest: JSON-encoded ExecRequest
 
+	// Volume quiescence: host → guest JSON {"mount":"<absolute mountpoint>"}.
+	// Guest → host: matching empty ACK, or ERROR on failure.
+	FREEZE_REQ byte = 0x18
+	THAW_REQ   byte = 0x19
+	FREEZE_ACK byte = 0x1a
+	THAW_ACK   byte = 0x1b
+
 	// Auth
 	AUTH byte = 0x11 // host → guest: token bytes (first frame after connect)
 

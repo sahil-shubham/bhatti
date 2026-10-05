@@ -33,13 +33,14 @@ type PersistentVolume struct {
 
 // VolumeBackup records a backup of a persistent volume to S3.
 type VolumeBackup struct {
-	ID         string    `json:"id"`
-	VolumeName string    `json:"volume_name"`
-	UserID     string    `json:"user_id"`
-	S3Key      string    `json:"s3_key"`
-	SizeBytes  int64     `json:"size_bytes"`
-	SHA256     string    `json:"sha256"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	VolumeName      string    `json:"volume_name"`
+	UserID          string    `json:"user_id"`
+	S3Key           string    `json:"s3_key"`
+	SizeBytes       int64     `json:"size_bytes"`
+	SHA256          string    `json:"sha256"`
+	ConsistencyMode string    `json:"consistency_mode"` // "frozen", "sync_only", "detached", or "unverified" for historical backups
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // VolumeAttachment records a volume attached to a sandbox.
@@ -259,8 +260,39 @@ func (s *Store) DeletePersistentVolume(userID, name string) error {
 	return tx.Commit()
 }
 
+// LockPersistentVolumeAttachments prevents a new guest from attaching while
+// the caller reads attachment rows and clones the volume. It is per volume,
+// not a SQLite write transaction held over a potentially long file copy.
+func (s *Store) LockPersistentVolumeAttachments(userID, name string) func() {
+	key := userID + "\x00" + name
+	s.volumeGateMu.Lock()
+	if s.volumeGates == nil {
+		s.volumeGates = make(map[string]*volumeAttachmentGate)
+	}
+	gate := s.volumeGates[key]
+	if gate == nil {
+		gate = &volumeAttachmentGate{}
+		s.volumeGates[key] = gate
+	}
+	gate.refs++
+	s.volumeGateMu.Unlock()
+
+	gate.mu.Lock()
+	return func() {
+		gate.mu.Unlock()
+		s.volumeGateMu.Lock()
+		gate.refs--
+		if gate.refs == 0 {
+			delete(s.volumeGates, key)
+		}
+		s.volumeGateMu.Unlock()
+	}
+}
+
 // AttachPersistentVolume attaches a persistent volume to a sandbox with concurrency checks.
 func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, readOnly bool) error {
+	unlock := s.LockPersistentVolumeAttachments(userID, name)
+	defer unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -432,17 +464,20 @@ func (s *Store) UserVolumeStorageUsed(userID string) (int, error) {
 // ==========================================================================
 
 func (s *Store) CreateVolumeBackup(b VolumeBackup) error {
+	if b.ConsistencyMode == "" {
+		b.ConsistencyMode = "unverified"
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO volume_backups (id, volume_name, user_id, s3_key, size_bytes, sha256, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		b.ID, b.VolumeName, b.UserID, b.S3Key, b.SizeBytes, b.SHA256, b.CreatedAt)
+		`INSERT INTO volume_backups (id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		b.ID, b.VolumeName, b.UserID, b.S3Key, b.SizeBytes, b.SHA256, b.ConsistencyMode, b.CreatedAt)
 	return err
 }
 
 // ListVolumeBackups returns backups for a volume, newest first.
 func (s *Store) ListVolumeBackups(userID, volumeName string) ([]VolumeBackup, error) {
 	rows, err := s.db.Query(
-		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, created_at
+		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
 		 FROM volume_backups WHERE user_id = ? AND volume_name = ?
 		 ORDER BY created_at DESC`, userID, volumeName)
 	if err != nil {
@@ -452,7 +487,7 @@ func (s *Store) ListVolumeBackups(userID, volumeName string) ([]VolumeBackup, er
 	var out []VolumeBackup
 	for rows.Next() {
 		var b VolumeBackup
-		if err := rows.Scan(&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.ConsistencyMode, &b.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -464,9 +499,9 @@ func (s *Store) ListVolumeBackups(userID, volumeName string) ([]VolumeBackup, er
 func (s *Store) GetVolumeBackup(userID, backupID string) (*VolumeBackup, error) {
 	var b VolumeBackup
 	err := s.db.QueryRow(
-		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, created_at
+		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
 		 FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID).Scan(
-		&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.CreatedAt)
+		&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.ConsistencyMode, &b.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +517,7 @@ func (s *Store) DeleteVolumeBackup(userID, backupID string) error {
 // OldestVolumeBackups returns the oldest backups beyond the retention count.
 func (s *Store) OldestVolumeBackups(userID, volumeName string, keepCount int) ([]VolumeBackup, error) {
 	rows, err := s.db.Query(
-		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, created_at
+		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
 		 FROM volume_backups WHERE user_id = ? AND volume_name = ?
 		 ORDER BY created_at DESC LIMIT -1 OFFSET ?`, userID, volumeName, keepCount)
 	if err != nil {
@@ -492,7 +527,7 @@ func (s *Store) OldestVolumeBackups(userID, volumeName string, keepCount int) ([
 	var out []VolumeBackup
 	for rows.Next() {
 		var b VolumeBackup
-		if err := rows.Scan(&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.ConsistencyMode, &b.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)

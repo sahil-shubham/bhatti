@@ -171,6 +171,14 @@ type StreamExecEngine interface {
 	ExecStream(ctx context.Context, id string, cmd []string, onEvent func(StreamEvent)) error
 }
 
+// SyncExecEngine optionally supports an explicit guest-wide sync before the
+// exec's EXIT frame. Implementations must refuse sync on older guest agents
+// instead of silently running without it.
+type SyncExecEngine interface {
+	ExecWithSync(ctx context.Context, id string, cmd []string, sync bool) (ExecResult, error)
+	ExecStreamWithSync(ctx context.Context, id string, cmd []string, sync bool, onEvent func(StreamEvent)) error
+}
+
 // DetachedExecEngine is optionally implemented by engines that support
 // fire-and-forget command execution. The command runs in its own session
 // (setsid) and survives vsock connection close. Returns the PID and the

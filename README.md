@@ -134,10 +134,10 @@ Each tier name (`images/rootfs-<tier>-<arch>.ext4`) is a symlink to an immutable
 | `create` | Create a new sandbox VM |
 | `list` | List sandboxes |
 | `inspect` | Show sandbox details (state, IP, resources) |
-| `exec` | Execute a command in a sandbox |
+| `exec` | Execute a command in a sandbox (`--sync` flushes guest filesystems before returning) |
 | `shell` | Open an interactive shell (Ctrl+\\ to detach) |
 | `ps` | List active sessions in a sandbox |
-| `stop` | Snapshot and stop a sandbox |
+| `stop` | Sync guest filesystems and power off a sandbox (disk retained) |
 | `start` | Resume a stopped sandbox |
 | `destroy` | Destroy a sandbox |
 
@@ -258,7 +258,9 @@ bhatti (host daemon)                        lohar (guest agent, PID 1 in each VM
   └─ Reverse proxy (HTTP + WebSocket)
 ```
 
-Runs on Linux (KVM) and macOS (Apple Silicon, HVF). Idle sandbox → **warm** after 30s (vCPUs paused, ~4ms wake) → **cold** after 30min (snapshotted to disk, memory freed, sub-second wake including page-in on first request). Any API request transparently wakes it.
+Runs on Linux (KVM) and macOS (Apple Silicon, HVF). Idle sandbox → **warm** after 30s (vCPUs paused, ~4ms wake) → **cold** after 30min (powered off, disk retained). Any API request transparently wakes it.
+
+Lohar periodically writes dirty guest pages back to disk; normal `exec` no longer forces a filesystem-wide flush after every command. Use `bhatti exec --sync dev -- command` (or `"sync": true` in an exec API request) when a command must finish with its writes flushed. Going warm syncs before pausing; stopping a warm sandbox resumes it and syncs again before power-off, so writes that race the pause remain durable. A hot stop also syncs before power-off. If the final sync fails, power-off still completes and emits `sandbox.unclean_stop` with a reason. Volume backups quiesce attached running sandboxes while cloning the disk; backups taken with an older guest agent without filesystem freeze support are sync-only, as recorded with the backup.
 
 ## Multi-Tenant Isolation
 

@@ -40,11 +40,14 @@ func execd(t *testing.T, pid int, argv ...string) {
 }
 
 // fakeHelper starts a process that passes for the helper running spec: argv
-// ["bhatti-vmm", spec]. The shell runs spec as its script, which blocks reading
-// a pipe nobody writes. Killed and reaped at cleanup.
+// ["bhatti-vmm", spec]. The script reports when /bin/sh has finished startup
+// and reached its blocking read; seeing argv before that point isn't enough on
+// Darwin, where shell initialization can still change the process arguments.
 func fakeHelper(t *testing.T, spec string) int {
 	t.Helper()
-	if err := os.WriteFile(spec, []byte("read line\n"), 0o644); err != nil {
+	ready := spec + ".ready"
+	script := fmt.Sprintf("printf ready > %q\nread line\n", ready)
+	if err := os.WriteFile(spec, []byte(script), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	pr, pw, err := os.Pipe()
@@ -63,6 +66,14 @@ func fakeHelper(t *testing.T, spec string) int {
 		_, _ = cmd.Process.Wait()
 		pw.Close()
 	})
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fake helper did not reach its blocking read: pid=%d spec=%s", cmd.Process.Pid, spec)
+		}
+	}
 	execd(t, cmd.Process.Pid, "bhatti-vmm", spec)
 	return cmd.Process.Pid
 }
@@ -305,4 +316,3 @@ func TestLaunchRecordsHelperBeforeReady(t *testing.T) {
 		t.Fatalf("failed launch left state.json naming helper %d", rec.HelperPID)
 	}
 }
-

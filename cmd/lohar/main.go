@@ -103,6 +103,18 @@ func runAgent() {
 	mustMount("tmpfs", "/dev/shm", "tmpfs", 0, "")
 	bp("mounts_done")
 
+	// Background writeback bounds guest dirty-page age without forcing a
+	// costly global sync after every exec. Snapshots/backups still sync at
+	// their own durability boundary.
+	for _, setting := range [...]struct{ path, value string }{
+		{"/proc/sys/vm/dirty_expire_centisecs", "500\n"},
+		{"/proc/sys/vm/dirty_writeback_centisecs", "100\n"},
+	} {
+		if err := os.WriteFile(setting.path, []byte(setting.value), 0644); err != nil {
+			logf("set %s: %v", setting.path, err)
+		}
+	}
+
 	if err := growRoot(); err != nil {
 		fmt.Fprintf(os.Stderr, "lohar: grow root filesystem (non-fatal): %v\n", err)
 	}

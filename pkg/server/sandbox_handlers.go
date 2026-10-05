@@ -513,31 +513,33 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				// For read-only attach: ensure the ext4 journal is clean BEFORE
-				// calling AttachPersistentVolume. But we must verify the volume
-				// isn't RW-attached first (e2fsck on a live RW filesystem = corruption).
-				// The store's AttachPersistentVolume checks this atomically, but we need
-				// the e2fsck to happen between "it's safe" and "we've committed the attach".
-				//
-				// Strategy: check attachments first (read-only query), e2fsck if safe,
-				// then do the transactional attach (which re-checks under lock).
-				if vol.ReadOnly && existing.FilePath != "" && len(existing.Attachments) == 0 {
-					// No current attachments — safe to e2fsck.
-					// This handles the common case: volume was RW-attached, VM was destroyed
-					// (unclean unmount → dirty journal), now attaching RO.
-					if !volumeIsClean(existing.FilePath) {
-						slog.Info("cleaning dirty journal before ro attach", "volume", vol.Name)
-						if out, err := exec.Command("e2fsck", "-f", "-y", existing.FilePath).CombinedOutput(); err != nil {
-							slog.Warn("e2fsck before ro attach failed", "volume", vol.Name, "output", string(out), "error", err)
+				// The attachment gate must cover both the fresh attachment read
+				// and any journal repair. A backup clone and new RW attachment
+				// take this same gate; neither may overlap e2fsck.
+				if vol.ReadOnly {
+					unlock := s.store.LockPersistentVolumeAttachments(user.ID, vol.Name)
+					var checkErr error
+					existing, checkErr = s.store.GetPersistentVolume(user.ID, vol.Name)
+					if checkErr == nil && existing.FilePath != "" {
+						switch {
+						case len(existing.Attachments) == 0:
+							// A previously RW-mounted volume may need its journal
+							// replayed before the first RO attachment.
+							if !volumeIsClean(existing.FilePath) {
+								slog.Info("cleaning dirty journal before ro attach", "volume", vol.Name)
+								if out, err := exec.Command("e2fsck", "-f", "-y", existing.FilePath).CombinedOutput(); err != nil {
+									slog.Warn("e2fsck before ro attach failed", "volume", vol.Name, "output", string(out), "error", err)
+								}
+							}
+						case !volumeIsClean(existing.FilePath):
+							// A mounted filesystem must never be repaired in place.
+							checkErr = fmt.Errorf("volume %q has a dirty journal and existing attachments — detach all and retry", vol.Name)
 						}
 					}
-				} else if vol.ReadOnly && existing.FilePath != "" && len(existing.Attachments) > 0 {
-					// Has existing RO attachments. The journal must already be clean
-					// (first RO mount cleaned it). If somehow dirty, reject rather than
-					// risk concurrent e2fsck.
-					if !volumeIsClean(existing.FilePath) {
+					unlock() // AttachPersistentVolume acquires the gate itself.
+					if checkErr != nil {
 						s.store.DetachAllPersistentVolumesForSandbox(sbID)
-						errResp(w, 409, fmt.Sprintf("volume %q has a dirty journal and existing attachments — detach all and retry", vol.Name))
+						errResp(w, 409, checkErr.Error())
 						return
 					}
 				}
@@ -958,11 +960,16 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 	if sb == nil {
 		return
 	}
-	if err := s.engine.Stop(r.Context(), sb.EngineID); err != nil {
-		errRespInternal(w, r, "stop sandbox failed", err)
+	stopErr := s.engine.Stop(r.Context(), sb.EngineID)
+	reason, poweredOffUnclean := uncleanStopReason(stopErr)
+	if stopErr != nil && !poweredOffUnclean {
+		errRespInternal(w, r, "stop sandbox failed", stopErr)
 		return
 	}
 	s.store.StopSandbox(sb.ID)
+	if poweredOffUnclean {
+		s.recordUncleanStop(*sb, reason)
+	}
 	user := UserFromContext(r.Context())
 	s.RecordEvent(store.Event{
 		Type: "sandbox.stopped", UserID: user.ID, SandboxID: sb.ID,
