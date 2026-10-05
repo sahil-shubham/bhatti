@@ -13,9 +13,7 @@ import (
 // socket (PAUSE/RESUME/STATUS), the warm tier. Stop powers off the cold tier.
 //
 // Memory model: libkrun maps guest RAM MAP_PRIVATE|MAP_ANONYMOUS (lazy commit),
-// so a paused VM's host RSS already only counts touched pages — we don't need
-// the FC balloon-inflate trick for the warm tier. BalloonSet is therefore a
-// no-op on krucible; it stays on the interface for FC compatibility.
+// so a paused VM's host RSS only counts touched pages. No balloon is needed.
 
 // Pause: hot → warm. Idempotent on warm.
 func (e *Engine) Pause(ctx context.Context, id string) error {
@@ -128,23 +126,4 @@ func (e *Engine) Activity(ctx context.Context, id string) (*proto.ActivityInfo, 
 		return nil, err
 	}
 	return ag.Activity(ctx)
-}
-
-// BalloonSet is a no-op on krucible (see file header). Returning nil keeps the
-// server's thermal manager happy without a special-case for the engine kind.
-func (e *Engine) BalloonSet(ctx context.Context, id string, amountMiB int64) error {
-	return nil
-}
-
-// MemSizeMib returns the boot-configured RAM size, which is also the ceiling.
-// Used by the thermal manager when sizing the balloon target on FC; here it's
-// for parity / reporting.
-func (e *Engine) MemSizeMib(id string) int64 {
-	vm, err := e.getVM(id)
-	if err != nil {
-		return 0
-	}
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	return int64(vm.MemMiB)
 }

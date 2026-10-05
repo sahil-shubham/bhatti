@@ -370,64 +370,6 @@ func (s *Store) ClearShellToken(sandboxID string) error {
 	return err
 }
 
-type FirecrackerState struct {
-	RootfsPath      string
-	SnapMemPath     string
-	SnapVMPath      string
-	VsockCID        int
-	TapDevice       string
-	GuestIP         string
-	GuestMAC        string
-	VcpuCount       float64
-	MemSizeMib      int
-	SocketPath      string
-	VsockPath       string
-	AgentToken      string
-	HasBaseSnapshot bool
-	FCPathOrigin    string
-}
-
-// SaveFirecrackerState persists Firecracker-specific VM state.
-func (s *Store) SaveFirecrackerState(id string, st FirecrackerState) error {
-	hasSnap := 0
-	if st.HasBaseSnapshot {
-		hasSnap = 1
-	}
-	_, err := s.db.Exec(`UPDATE sandboxes SET
-		rootfs_path = ?, snap_mem_path = ?, snap_vm_path = ?,
-		vsock_cid = ?, tap_device = ?, guest_ip = ?, guest_mac = ?,
-		vcpu_count = ?, mem_size_mib = ?, socket_path = ?, vsock_path = ?,
-		agent_token = ?, has_base_snapshot = ?, fc_path_origin = ?
-		WHERE id = ?`,
-		st.RootfsPath, st.SnapMemPath, st.SnapVMPath,
-		st.VsockCID, st.TapDevice, st.GuestIP, st.GuestMAC,
-		st.VcpuCount, st.MemSizeMib, st.SocketPath, st.VsockPath,
-		st.AgentToken, hasSnap, st.FCPathOrigin,
-		id)
-	return err
-}
-
-// LoadFirecrackerState loads Firecracker-specific VM state.
-func (s *Store) LoadFirecrackerState(id string) (*FirecrackerState, error) {
-	var st FirecrackerState
-	var hasSnap int
-	err := s.db.QueryRow(`SELECT
-		COALESCE(rootfs_path,''), COALESCE(snap_mem_path,''), COALESCE(snap_vm_path,''),
-		COALESCE(vsock_cid,0), COALESCE(tap_device,''), COALESCE(guest_ip,''), COALESCE(guest_mac,''),
-		COALESCE(vcpu_count,1), COALESCE(mem_size_mib,512), COALESCE(socket_path,''), COALESCE(vsock_path,''),
-		COALESCE(agent_token,''), COALESCE(has_base_snapshot,0), COALESCE(fc_path_origin,'')
-		FROM sandboxes WHERE id = ?`, id).Scan(
-		&st.RootfsPath, &st.SnapMemPath, &st.SnapVMPath,
-		&st.VsockCID, &st.TapDevice, &st.GuestIP, &st.GuestMAC,
-		&st.VcpuCount, &st.MemSizeMib, &st.SocketPath, &st.VsockPath,
-		&st.AgentToken, &hasSnap, &st.FCPathOrigin)
-	if err != nil {
-		return nil, err
-	}
-	st.HasBaseSnapshot = hasSnap != 0
-	return &st, nil
-}
-
 // ==========================================================================
 // v0.3 Persistent Volumes
 // ==========================================================================

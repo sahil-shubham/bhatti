@@ -240,7 +240,7 @@ func TestStopNotSupportedIs501(t *testing.T) {
 // /sandboxes/<name>/start has the name in the URL. Before this fix,
 // handleSandboxStart and handleSandbox GET passed that URL parameter to
 // store methods that key on the primary key (UpdateSandboxStatus,
-// UpdateSandboxEngine, GetSandboxByID, saveVMState). With a name as the
+// UpdateSandboxEngine, GetSandboxByID). With a name as the
 // key, the UPDATE matches zero rows, returns no error, and silently leaves
 // the store out of sync with the engine — surfacing as `bhatti list`
 // showing a running VM as stopped.

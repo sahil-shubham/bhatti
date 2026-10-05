@@ -58,7 +58,6 @@ func TestConfigServerRoundTrip(t *testing.T) {
 		Hostname:  "dev",
 		Token:     "tok_secret_123",
 		Env:       map[string]string{"FOO": "bar", "OPENAI_API_KEY": "sk-xyz"},
-		DNS:       []string{"1.1.1.1"},
 	}
 	uds := serveConfig(t, want)
 

@@ -102,8 +102,8 @@ func runDaemon() {
 	var eng engine.Engine
 	switch cfg.Engine {
 	case "krucible", "":
-		// Before recovery reads any sandbox's disk: an older data dir names
-		// tier images by path, which the next image update would overwrite.
+		// Before krucible adopts helpers: older data dirs name tier images by
+		// path, which the next image update would overwrite.
 		migrateImages(cfg.DataDir)
 		eng, err = newKrucibleEngine(cfg)
 	case "firecracker":
@@ -128,8 +128,8 @@ func runDaemon() {
 	// stopped; srv.RecoverSandboxes below brings the store in line. There are no
 	// host TAP devices to reclaim (netd is userspace).
 
-	// v0.3: Detach volumes orphaned by crashed sandboxes.
-	// MUST run after recoverVMs (which marks dead-process sandboxes as stopped/unknown).
+	// Detach volumes orphaned by crashed sandboxes after krucible has
+	// reconciled its helpers in New.
 	if n, err := st.DetachOrphanedPersistentVolumes(); err != nil {
 		slog.Warn("orphan volume detach failed", "error", err)
 	} else if n > 0 {
@@ -160,7 +160,7 @@ func runDaemon() {
 		}
 	}
 
-	// After recovery and the temp-dir cleanup above, before serving: nothing
+	// After adoption and the temp-dir cleanup above, before serving: nothing
 	// can be naming a base it is about to remove.
 	gcImages(cfg)
 
@@ -220,10 +220,13 @@ func runDaemon() {
 	srv.StartCredentialBroker()
 
 	// Start thermal manager to transition idle VMs: hot → warm → cold
-	srv.StartThermalManager(server.ThermalConfig{
+	if err := srv.StartThermalManager(server.ThermalConfig{
 		WarmTimeout: 30 * time.Second, // hot → warm after 30s idle
 		ColdTimeout: 30 * time.Minute, // warm → cold after 30min idle
-	})
+	}); err != nil {
+		slog.Error("start thermal manager", "error", err)
+		os.Exit(1)
+	}
 
 	// Start metrics snapshots after thermal manager and public proxy are
 	// wired up (so the snapshot goroutine can read proxy counters).
@@ -501,110 +504,6 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 	return servers
 }
 
-// recoverVMs restores Firecracker VMs from the SQLite store on startup.
-func recoverVMs(st *store.Store, provider engine.VMStateProvider) {
-	sandboxes, err := st.ListAllSandboxes()
-	if err != nil {
-		slog.Warn("recovery: list sandboxes", "error", err)
-		return
-	}
-
-	recovered := 0
-	for _, sb := range sandboxes {
-		if sb.Status == "destroyed" {
-			continue
-		}
-
-		fcState, err := st.LoadFirecrackerState(sb.ID)
-		if err != nil {
-			continue // Not a Firecracker sandbox (no FC state row)
-		}
-		if fcState.RootfsPath == "" {
-			// Has an FC state row but no rootfs — corrupted or partially created.
-			// Mark as unknown so the user can see something went wrong.
-			if sb.Status == "running" || sb.Status == "stopped" {
-				st.UpdateSandboxStatus(sb.ID, "unknown")
-				slog.Warn("sandbox has no rootfs path", "name", sb.Name, "id", sb.ID)
-			}
-			continue
-		}
-
-		// Look up user's subnet index for network recovery
-		var subnetIndex int
-		if sb.CreatedBy != "" {
-			if user, err := st.GetUser(sb.CreatedBy); err == nil {
-				subnetIndex = user.SubnetIndex
-			}
-		}
-
-		// Rebuild volume attachments from the store so resume can
-		// hard-link volume files into the jail chroot.
-		var volumes []map[string]interface{}
-		if attached, err := st.AttachedPersistentVolumesForSandbox(sb.ID); err == nil {
-			for i, v := range attached {
-				volumes = append(volumes, map[string]interface{}{
-					"drive_id":  fmt.Sprintf("vol%d", i),
-					"name":      v.VolumeName,
-					"file_path": v.FilePath,
-					"mount":     v.Mount,
-					"read_only": v.ReadOnly,
-				})
-			}
-		}
-
-		state := map[string]interface{}{
-			"rootfs_path":       fcState.RootfsPath,
-			"snap_mem_path":     fcState.SnapMemPath,
-			"snap_vm_path":      fcState.SnapVMPath,
-			"vsock_cid":         fcState.VsockCID,
-			"tap_device":        fcState.TapDevice,
-			"guest_ip":          fcState.GuestIP,
-			"guest_mac":         fcState.GuestMAC,
-			"vcpu_count":        fcState.VcpuCount,
-			"mem_size_mib":      fcState.MemSizeMib,
-			"socket_path":       fcState.SocketPath,
-			"vsock_path":        fcState.VsockPath,
-			"user_id":           sb.CreatedBy,
-			"subnet_index":      subnetIndex,
-			"agent_token":       fcState.AgentToken,
-			"has_base_snapshot": fcState.HasBaseSnapshot,
-			"fc_path_origin":    fcState.FCPathOrigin,
-			"volumes":           volumes,
-		}
-
-		// Verify all critical snapshot files exist and are non-empty.
-		// Checking only SnapMemPath misses corrupt/truncated vm.snap or rootfs.
-		snapshotOK := fcState.SnapMemPath != "" && fcState.SnapVMPath != "" &&
-			fileExistsAndNonEmpty(fcState.SnapMemPath) &&
-			fileExistsAndNonEmpty(fcState.SnapVMPath) &&
-			fileExistsAndNonEmpty(fcState.RootfsPath)
-
-		if sb.Status == "stopped" && snapshotOK {
-			provider.RestoreVM(sb.EngineID, sb.Name, "stopped", state)
-			recovered++
-			slog.Info("recovered sandbox", "name", sb.Name, "id", sb.ID, "status", "stopped")
-		} else if sb.Status == "stopped" {
-			st.UpdateSandboxStatus(sb.ID, "unknown")
-			slog.Warn("snapshot files missing or corrupt", "name", sb.Name, "id", sb.ID,
-				"mem", fcState.SnapMemPath, "vm", fcState.SnapVMPath, "rootfs", fcState.RootfsPath)
-		} else if sb.Status == "running" {
-			if snapshotOK {
-				st.UpdateSandboxStatus(sb.ID, "stopped")
-				provider.RestoreVM(sb.EngineID, sb.Name, "stopped", state)
-				recovered++
-				slog.Info("recovered sandbox", "name", sb.Name, "id", sb.ID, "status", "stopped (was running)")
-			} else {
-				st.UpdateSandboxStatus(sb.ID, "unknown")
-				slog.Warn("sandbox was running with no valid snapshot", "name", sb.Name, "id", sb.ID)
-			}
-		}
-	}
-
-	if recovered > 0 {
-		slog.Info("recovery complete", "count", recovered)
-	}
-}
-
 // reconcileOrphanedVolumeFiles walks the volumes directory and removes
 // .ext4 files that have no matching store record. This handles the crash
 // window between store.DeletePersistentVolume and os.Remove.
@@ -726,16 +625,6 @@ func gcImages(cfg *pkg.Config) {
 	if err != nil {
 		slog.Error("images.gc", "error", err)
 	}
-}
-
-// fileExistsAndNonEmpty returns true if the path exists and has size > 0.
-// Used by recovery to detect truncated/corrupt snapshot files.
-func fileExistsAndNonEmpty(path string) bool {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	return fi.Size() > 0
 }
 
 // getLanIP returns the first non-loopback IPv4 address, or "" if none found.

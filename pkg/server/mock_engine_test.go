@@ -252,14 +252,6 @@ func (m *mockEngine) Activity(_ context.Context, id string) (*proto.ActivityInfo
 	}, nil
 }
 
-func (m *mockEngine) BalloonSet(_ context.Context, _ string, _ int64) error {
-	return nil
-}
-
-func (m *mockEngine) MemSizeMib(_ string) int64 {
-	return 2048
-}
-
 func (m *mockEngine) RequireGuestAgentFeature(_ context.Context, _ string, _ proto.AgentFeature) error {
 	return m.GuestFeatureErr
 }

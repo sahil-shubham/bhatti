@@ -693,8 +693,6 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			s.store.AttachVolume(sbID, v.Name, v.Target, v.ReadOnly)
 		}
 
-		// Persist Firecracker VM state
-		s.saveVMState(sbID, info.EngineID)
 		handlerPhase("db_store_done")
 
 		slog.Info("sandbox.created",
@@ -965,7 +963,6 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	s.store.StopSandbox(sb.ID)
-	s.saveVMState(sb.ID, sb.EngineID) // persist snapshot paths
 	user := UserFromContext(r.Context())
 	s.RecordEvent(store.Event{
 		Type: "sandbox.stopped", UserID: user.ID, SandboxID: sb.ID,
@@ -994,27 +991,8 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	// B7: read optional force param
-	var startReq struct {
-		Force bool `json:"force"`
-	}
-	readJSON(r, &startReq) // ignore error — body may be empty
-
-	var startErr error
-	type forceStarter interface {
-		StartForce(ctx context.Context, id string) error
-	}
-	if startReq.Force {
-		if fs, ok := s.engine.(forceStarter); ok {
-			startErr = fs.StartForce(r.Context(), sb.EngineID)
-		} else {
-			startErr = s.engine.Start(r.Context(), sb.EngineID)
-		}
-	} else {
-		startErr = s.engine.Start(r.Context(), sb.EngineID)
-	}
-	if startErr != nil {
-		errRespInternal(w, r, "start sandbox failed", startErr)
+	if err := s.engine.Start(r.Context(), sb.EngineID); err != nil {
+		errRespInternal(w, r, "start sandbox failed", err)
 		return
 	}
 	// Refresh from engine — IP may have changed after restart. Use
@@ -1030,7 +1008,6 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 	} else {
 		s.store.UpdateSandboxStatus(sb.ID, "running")
 	}
-	s.saveVMState(sb.ID, sb.EngineID) // persist updated state
 	user := UserFromContext(r.Context())
 	s.RecordEvent(store.Event{
 		Type: "sandbox.started", UserID: user.ID, SandboxID: sb.ID,

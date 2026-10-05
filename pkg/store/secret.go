@@ -101,7 +101,3 @@ func (s *Store) DeleteSecret(userID, name string) error {
 	}
 	return nil
 }
-
-// --- Firecracker-specific state persistence ---
-
-// FirecrackerState holds the VM state needed to reconnect or resume.

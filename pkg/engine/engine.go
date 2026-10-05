@@ -158,12 +158,6 @@ type TerminalConn interface {
 	Resize(rows, cols int) error
 }
 
-// VMStateProvider is optionally implemented by engines that persist VM state.
-type VMStateProvider interface {
-	VMState(id string) map[string]interface{}
-	RestoreVM(id, name, status string, state map[string]interface{})
-}
-
 // StreamEvent is emitted during streaming exec.
 type StreamEvent struct {
 	Type     string `json:"type"`                // "stdout", "stderr", "exit", "error"

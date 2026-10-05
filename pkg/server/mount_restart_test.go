@@ -35,7 +35,7 @@ func (e *mountRecoveryEngine) Mounts(id string) ([]engine.FsMount, bool) {
 }
 
 func TestMountPolicyRefusesManualRestartAndColdWake(t *testing.T) {
-	for _, action := range []string{"start", "force", "wake"} {
+	for _, action := range []string{"start", "wake"} {
 		t.Run(action, func(t *testing.T) {
 			srv, ts := setup(t)
 			eng := &mountRecoveryEngine{mockEngine: srv.engine.(*mockEngine), mounts: make(map[string][]engine.FsMount)}
@@ -66,12 +66,8 @@ func TestMountPolicyRefusesManualRestartAndColdWake(t *testing.T) {
 			}
 			srv.mountRoots = []string{revoked}
 			switch action {
-			case "start", "force":
-				var body any
-				if action == "force" {
-					body = map[string]bool{"force": true}
-				}
-				resp := doReq(t, ts, http.MethodPost, "/sandboxes/"+sb.ID+"/start", body)
+			case "start":
+				resp := doReq(t, ts, http.MethodPost, "/sandboxes/"+sb.ID+"/start", nil)
 				defer resp.Body.Close()
 				b, _ := io.ReadAll(resp.Body)
 				if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(b), "mount_roots") {

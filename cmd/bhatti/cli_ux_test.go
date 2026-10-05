@@ -303,7 +303,6 @@ func TestCLIInspectImageNonDefault(t *testing.T) {
 	}
 }
 
-
 // startTestListener opens a TCP listener inside the sandbox and waits for it
 // to be up. The minimal tier ships no python3/nc/socat and its /bin/sh is dash
 // (the previous `&>` was a bashism dash parses as a background token plus an
@@ -405,27 +404,6 @@ func TestCLIListWideMode(t *testing.T) {
 		}
 	}
 	t.Errorf("sandbox %q not found in wide list:\n%s", name, stdout)
-}
-
-func TestCLIForceStart(t *testing.T) {
-	c := setupCLITest(t)
-
-	name := fmt.Sprintf("cli-force-%d", time.Now().UnixNano()%100000)
-	c.run("create", "--name", name)
-	t.Cleanup(func() { c.run("destroy", name, "-y") })
-
-	c.run("stop", name)
-
-	// --force should be accepted and start should succeed
-	_, _, code := c.run("start", "--force", name)
-	if code != 0 {
-		t.Fatalf("start --force exit %d", code)
-	}
-
-	stdout, _, code := c.run("exec", name, "--", "echo", "force-ok")
-	if code != 0 || !strings.Contains(stdout, "force-ok") {
-		t.Fatalf("exec after force start: exit=%d out=%q", code, stdout)
-	}
 }
 
 // --- Tier 2: Important polish ---

@@ -1,5 +1,5 @@
 // Package configdrive defines the bhatti sandbox config schema: the JSON
-// (hostname, auth token, env, files, volumes, DNS, init, net) lohar fetches over
+// (hostname, auth token, env, files, volumes, init, net) lohar fetches over
 // the guest→host config vsock at boot (DESIGN-bhatti-v2-secrets-and-trust §3.4),
 // before the agent starts listening. It replaced the on-disk ext4 "config drive"
 // (retired along with mke2fs); the package name is kept for continuity. These
@@ -10,17 +10,15 @@ package configdrive
 // SandboxConfig is the JSON lohar fetches over the config vsock at boot. Field
 // names are the wire contract with cmd/lohar/main.go.
 type SandboxConfig struct {
-	SandboxID   string                `json:"sandbox_id"`
-	Hostname    string                `json:"hostname"`
-	Token       string                `json:"token"`
-	Env         map[string]string     `json:"env"`
-	Files       map[string]ConfigFile `json:"files"`
-	Volumes     []VolumeMountConfig   `json:"volumes"`
-	Mounts      []FsMountConfig       `json:"mounts,omitempty"` // virtio-fs binds: tag → guest mount path
-	Init        string                `json:"init,omitempty"`
-	DNS         []string              `json:"dns"`
-	DNSInternal string                `json:"dns_internal,omitempty"`
-	User        string                `json:"user"`
+	SandboxID string                `json:"sandbox_id"`
+	Hostname  string                `json:"hostname"`
+	Token     string                `json:"token"`
+	Env       map[string]string     `json:"env"`
+	Files     map[string]ConfigFile `json:"files"`
+	Volumes   []VolumeMountConfig   `json:"volumes"`
+	Mounts    []FsMountConfig       `json:"mounts,omitempty"` // virtio-fs binds: tag → guest mount path
+	Init      string                `json:"init,omitempty"`
+	User      string                `json:"user"`
 	// Net, if set, tells lohar to configure eth0 (virtio-net gateway path) from
 	// the config drive via netlink — no `ip` binary / kernel IP autoconfig needed.
 	Net *NetConfig `json:"net,omitempty"`

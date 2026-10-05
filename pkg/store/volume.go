@@ -376,7 +376,6 @@ func (s *Store) AttachedPersistentVolumesForSandbox(sandboxID string) ([]struct 
 }
 
 // DetachOrphanedPersistentVolumes removes attachments for destroyed/missing sandboxes.
-// Must be called AFTER recoverVMs updates sandbox statuses.
 func (s *Store) DetachOrphanedPersistentVolumes() (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM volume_attachments
 		WHERE sandbox_id IN (

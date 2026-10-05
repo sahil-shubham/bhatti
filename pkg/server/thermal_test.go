@@ -12,6 +12,19 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
+type engineWithoutThermal struct{ engine.Engine }
+
+func TestThermalManagerRejectsEngineWithoutThermal(t *testing.T) {
+	srv, _ := setup(t)
+	srv.engine = engineWithoutThermal{Engine: srv.engine}
+	if err := srv.StartThermalManager(ThermalConfig{}); err == nil {
+		t.Fatal("engine without thermal methods must fail startup")
+	}
+	if srv.stopThermal != nil || srv.thermalDone != nil {
+		t.Fatal("thermal manager started despite missing engine capability")
+	}
+}
+
 // createRunningBox is a helper that creates a sandbox in the store and
 // mock engine, returning the engine ID. The sandbox starts as "hot".
 func createRunningBox(t *testing.T, srv *Server, eng *mockEngine, name string) string {

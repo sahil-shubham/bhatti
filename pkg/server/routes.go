@@ -10,80 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
-
-// saveVMState persists Firecracker VM state to the store if the engine supports it.
-func (s *Server) saveVMState(sandboxID, engineID string) {
-	provider, ok := s.engine.(engine.VMStateProvider)
-	if !ok {
-		return
-	}
-	state := provider.VMState(engineID)
-	if state == nil {
-		return
-	}
-	s.store.SaveFirecrackerState(sandboxID, store.FirecrackerState{
-		RootfsPath:      strOrEmpty(state, "rootfs_path"),
-		SnapMemPath:     strOrEmpty(state, "snap_mem_path"),
-		SnapVMPath:      strOrEmpty(state, "snap_vm_path"),
-		VsockCID:        intOrZero(state, "vsock_cid"),
-		TapDevice:       strOrEmpty(state, "tap_device"),
-		GuestIP:         strOrEmpty(state, "guest_ip"),
-		GuestMAC:        strOrEmpty(state, "guest_mac"),
-		VcpuCount:       floatOrZero(state, "vcpu_count"),
-		MemSizeMib:      intOrZero(state, "mem_size_mib"),
-		SocketPath:      strOrEmpty(state, "socket_path"),
-		VsockPath:       strOrEmpty(state, "vsock_path"),
-		AgentToken:      strOrEmpty(state, "agent_token"),
-		HasBaseSnapshot: boolOrFalse(state, "has_base_snapshot"),
-		FCPathOrigin:    strOrEmpty(state, "fc_path_origin"),
-	})
-}
-
-func strOrEmpty(m map[string]interface{}, k string) string {
-	if v, ok := m[k].(string); ok {
-		return v
-	}
-	return ""
-}
-
-func intOrZero(m map[string]interface{}, k string) int {
-	switch v := m[k].(type) {
-	case int:
-		return v
-	case int64:
-		return int(v)
-	case uint32:
-		return int(v)
-	case float64:
-		return int(v)
-	}
-	return 0
-}
-
-func floatOrZero(m map[string]interface{}, k string) float64 {
-	switch v := m[k].(type) {
-	case float64:
-		return v
-	case int64:
-		return float64(v)
-	}
-	return 0
-}
-
-func boolOrFalse(m map[string]interface{}, k string) bool {
-	switch v := m[k].(type) {
-	case bool:
-		return v
-	case int:
-		return v != 0
-	case float64:
-		return v != 0
-	}
-	return false
-}
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)

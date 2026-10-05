@@ -393,8 +393,6 @@ func init() {
 	editCmd.Flags().StringSlice("label-delete", nil, "Remove label by key (repeatable)")
 
 	listCmd.Flags().StringSlice("label", nil, "Filter by label key=value (AND across multiple, repeatable)")
-
-	startCmd.Flags().Bool("force", false, "Force start (retry after failed restore)")
 }
 
 // --- edit ---
@@ -525,12 +523,10 @@ keep a sandbox's memory, take a snapshot ('bhatti snapshot create').`,
 // --- start ---
 
 var startCmd = &cobra.Command{
-	Use:   "start <sandbox>",
-	Short: "Boot a stopped sandbox",
-	Long: `Boot a stopped sandbox from its disk; its --init command runs again.
-Use --force to retry after a failed start.`,
-	Example: `  bhatti start dev
-  bhatti start dev --force`,
+	Use:               "start <sandbox>",
+	Short:             "Boot a stopped sandbox",
+	Long:              `Boot a stopped sandbox from its disk; its --init command runs again.`,
+	Example:           `  bhatti start dev`,
 	Args:              exactArgs(1),
 	ValidArgsFunction: completeSandboxNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -540,13 +536,8 @@ Use --force to retry after a failed start.`,
 		if err != nil {
 			return err
 		}
-		force, _ := cmd.Flags().GetBool("force")
-		var body map[string]any
-		if force {
-			body = map[string]any{"force": true}
-		}
 		var sb map[string]any
-		if err := apiJSON("POST", "/sandboxes/"+id+"/start", body, &sb); err != nil {
+		if err := apiJSON("POST", "/sandboxes/"+id+"/start", nil, &sb); err != nil {
 			return err
 		}
 		if isJSON(cmd) {

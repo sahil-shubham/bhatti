@@ -470,7 +470,6 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	s.saveVMState(sb.ID, sb.EngineID) // persist updated state
 	slog.Info("snapshot.created", "name", req.Name, "sandbox", sb.ID,
 		"user", user.Name, "size_mb", sizeMB)
 	s.RecordEvent(store.Event{
@@ -609,7 +608,6 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	}
 
 	// Create volume_attachments for volumes in the snapshot manifest.
-	// Without this, recoverVMs can't find volumes after daemon restart (Bug #1).
 	for _, d := range m.Drives {
 		if d.Role != "volume" || d.Name == "" {
 			continue
@@ -633,7 +631,6 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		_ = vol // used for store lookup
 	}
 
-	s.saveVMState(sbID, info.EngineID)
 	slog.Info("snapshot.resumed", "snapshot", snapName, "sandbox_id", sbID,
 		"name", sandboxName, "user", user.Name)
 	s.RecordEvent(store.Event{

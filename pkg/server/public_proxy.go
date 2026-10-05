@@ -30,13 +30,13 @@ type PublicProxyHandler struct {
 	store       *store.Store
 	limiter     *publicRateLimiter
 	resumeSem   chan struct{}
-	resumeGroup singleflight.Group // coalesces concurrent resumes per sandbox
-	routeCache  *routeCache        // in-memory alias → route mapping
-	onActivity  func(engineID string) // called on every request to signal thermal manager
+	resumeGroup singleflight.Group                               // coalesces concurrent resumes per sandbox
+	routeCache  *routeCache                                      // in-memory alias → route mapping
+	onActivity  func(engineID string)                            // called on every request to signal thermal manager
 	onEnsureHot func(ctx context.Context, engineID string) error // canonical wake logic (delegates to Server.ensureHot)
 
 	// Observability
-	onRecordEvent func(store.Event) // optional callback to record events
+	onRecordEvent   func(store.Event) // optional callback to record events
 	requestsTotal   atomic.Int64
 	requestsError   atomic.Int64
 	coldWakes       atomic.Int64
@@ -179,12 +179,12 @@ func (rc *routeCache) InvalidateSandbox(sandboxID string) {
 // limiter mutex held throughout, every excess Allow() spent O(N) on a
 // hot HTTP path. Tranche 0a #4 of PLAN-bhatti-v2.md.
 type publicRateLimiter struct {
-	mu          sync.Mutex
-	perIP       map[string]*list.Element // ip → element in perIPOrder
-	perIPOrder  *list.List               // front = MRU, back = LRU
-	perAlias    map[string]*list.Element
+	mu            sync.Mutex
+	perIP         map[string]*list.Element // ip → element in perIPOrder
+	perIPOrder    *list.List               // front = MRU, back = LRU
+	perAlias      map[string]*list.Element
 	perAliasOrder *list.List
-	global      *tokenBucket
+	global        *tokenBucket
 }
 
 type publicBucketNode struct {
@@ -415,9 +415,8 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 }
 
 // ensureHotBounded wraps the canonical ensureHot callback with singleflight
-// coalescing and semaphore-based concurrency limiting. The actual wake logic
-// (touchActivity, store update, saveVMState) lives in Server.ensureHot —
-// we only add public-proxy-specific concerns here.
+// coalescing and semaphore-based concurrency limiting. Wake bookkeeping
+// remains in Server.ensureHot.
 func (h *PublicProxyHandler) ensureHotBounded(ctx context.Context, te ThermalEngine, engineID string) error {
 	thermal := te.ThermalState(engineID)
 	if thermal == "hot" {
@@ -452,12 +451,12 @@ func (h *PublicProxyHandler) logRequest(alias, method, path string, status int, 
 // Metrics returns a snapshot of public proxy metrics.
 func (h *PublicProxyHandler) Metrics() map[string]interface{} {
 	return map[string]interface{}{
-		"requests_total":    h.requestsTotal.Load(),
-		"requests_error":    h.requestsError.Load(),
-		"cold_wakes":        h.coldWakes.Load(),
-		"rate_limited":      h.rateLimited.Load(),
-		"busy":              h.busy.Load(),
-		"websocket_active":  h.webSocketActive.Load(),
+		"requests_total":   h.requestsTotal.Load(),
+		"requests_error":   h.requestsError.Load(),
+		"cold_wakes":       h.coldWakes.Load(),
+		"rate_limited":     h.rateLimited.Load(),
+		"busy":             h.busy.Load(),
+		"websocket_active": h.webSocketActive.Load(),
 	}
 }
 

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,48 +16,14 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
-// AgentClient communicates with the guest agent running inside a microVM.
-//
-// Three transport modes:
-//   - Vsock: connects through Firecracker's vsock UDS with CONNECT handshake
-//   - TCP: connects directly to the guest's IP over the TAP network
-//   - Test: connects to plain Unix sockets (no handshake)
+// AgentClient communicates with lohar over the libkrun-bridged Unix sockets.
 type AgentClient struct {
-	controlSock string // vsock UDS path or Unix socket path
+	controlSock string
 	forwardSock string
-	isVsock     bool
-	tcpAddr     string // guest IP for TCP mode (e.g. "192.168.137.2")
 	token       string // auth token, empty = no auth
 }
 
-// NewVsockClient creates a client that connects through a Firecracker vsock UDS.
-func NewVsockClient(vsockPath string) *AgentClient {
-	return &AgentClient{
-		controlSock: vsockPath,
-		forwardSock: vsockPath,
-		isVsock:     true,
-	}
-}
-
-// NewTCPClient creates a client that connects to the agent via TCP over the
-// TAP network. Used after snapshot/resume since virtio-net survives but
-// vsock does not.
-func NewTCPClient(guestIP string) *AgentClient {
-	return &AgentClient{
-		tcpAddr: guestIP,
-	}
-}
-
-// NewTCPClientWithAuth creates a TCP client with an auth token.
-func NewTCPClientWithAuth(guestIP, token string) *AgentClient {
-	return &AgentClient{
-		tcpAddr: guestIP,
-		token:   token,
-	}
-}
-
-// NewTestClient creates a client that connects to the agent's test-mode
-// Unix sockets directly (no vsock handshake).
+// NewTestClient connects to the agent's test-mode Unix sockets.
 func NewTestClient(controlSock, forwardSock string) *AgentClient {
 	return &AgentClient{
 		controlSock: controlSock,
@@ -84,15 +48,7 @@ func NewKrucibleClient(controlSock, forwardSock, token string) *AgentClient {
 // The context controls connection timeout and cancellation.
 func (c *AgentClient) DialControl(ctx context.Context) (net.Conn, error) {
 	var d net.Dialer
-	var conn net.Conn
-	var err error
-	if c.tcpAddr != "" {
-		conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(c.tcpAddr, fmt.Sprint(proto.VsockPortControl)))
-	} else if c.isVsock {
-		conn, err = c.dialVsockPort(ctx, c.controlSock, proto.VsockPortControl)
-	} else {
-		conn, err = d.DialContext(ctx, "unix", c.controlSock)
-	}
+	conn, err := d.DialContext(ctx, "unix", c.controlSock)
 	if err != nil {
 		return nil, err
 	}
@@ -106,15 +62,7 @@ func (c *AgentClient) DialControl(ctx context.Context) (net.Conn, error) {
 // dialForward opens a connection to the forward channel (port 1025).
 func (c *AgentClient) dialForward(ctx context.Context) (net.Conn, error) {
 	var d net.Dialer
-	var conn net.Conn
-	var err error
-	if c.tcpAddr != "" {
-		conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(c.tcpAddr, fmt.Sprint(proto.VsockPortForward)))
-	} else if c.isVsock {
-		conn, err = c.dialVsockPort(ctx, c.forwardSock, proto.VsockPortForward)
-	} else {
-		conn, err = d.DialContext(ctx, "unix", c.forwardSock)
-	}
+	conn, err := d.DialContext(ctx, "unix", c.forwardSock)
 	if err != nil {
 		return nil, err
 	}
@@ -173,35 +121,6 @@ func (c *AgentClient) Info(ctx context.Context) (proto.AgentInfo, error) {
 
 func unexpectedFrame(payload []byte, msgType byte) bool {
 	return string(payload) == fmt.Sprintf("unexpected frame type 0x%02x", msgType)
-}
-
-// dialVsockPort performs the Firecracker vsock CONNECT handshake.
-// See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md
-func (c *AgentClient) dialVsockPort(ctx context.Context, udsPath string, port uint32) (net.Conn, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", udsPath)
-	if err != nil {
-		return nil, fmt.Errorf("vsock dial %s: %w", udsPath, err)
-	}
-
-	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("vsock CONNECT write: %w", err)
-	}
-
-	// Use a small reader to avoid buffering beyond the handshake line.
-	reader := bufio.NewReaderSize(conn, 64)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("vsock CONNECT read: %w", err)
-	}
-	if !strings.HasPrefix(line, "OK ") {
-		conn.Close()
-		return nil, fmt.Errorf("vsock handshake failed: %q", strings.TrimSpace(line))
-	}
-
-	return conn, nil
 }
 
 // Exec runs a command non-interactively and returns after it exits.
@@ -401,14 +320,8 @@ func (c *AgentClient) Forward(ctx context.Context, port uint16) (io.ReadWriteClo
 // WaitReady polls the agent until it responds or the context expires.
 // Used during VM boot to wait for the agent to start listening.
 //
-// The per-attempt timeout starts short (100ms) and escalates. This avoids
-// the 1-second ARP retransmit penalty: the first probe triggers an ARP
-// request for the guest IP, but the guest can't reply yet (kernel still
-// booting). Linux's default retrans_time_ms is 1000ms, so the host waits
-// a full second before re-probing. By timing out at 100ms, closing the
-// socket, and opening a fresh one, we send a new SYN that lands after the
-// guest is ready — typically within 2-3 attempts (~150ms total) instead
-// of one long ARP wait (~1005ms).
+// Short connection timeouts on early attempts avoid waiting through a full
+// boot timeout when the guest's control socket is not accepting yet.
 func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -445,7 +358,7 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 				"attempt", attempt,
 				"attempt_ms", time.Since(attemptStart).Milliseconds(),
 				"total_ms", time.Since(start).Milliseconds(),
-				"addr", c.tcpAddr)
+				"addr", c.controlSock)
 			return nil
 		}
 
@@ -454,7 +367,7 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 			"attempt_ms", time.Since(attemptStart).Milliseconds(),
 			"total_ms", time.Since(start).Milliseconds(),
 			"error", err,
-			"addr", c.tcpAddr)
+			"addr", c.controlSock)
 
 		// Brief pause before retry. The dial timeout provides the main
 		// pacing — this just prevents a tight spin when the guest sends

@@ -151,7 +151,7 @@ func runAgent() {
 		}
 		applyHostname(hostname)
 		// virtio-net gateway path: bring eth0 up from the config drive (netlink,
-		// no `ip` binary / IP autoconfig). Before DNS so egress is ready.
+		// no `ip` binary / IP autoconfig) before guest networking starts.
 		if cfg.Net != nil && cfg.Net.IP != "" {
 			if err := configureEth0("eth0", cfg.Net.IP, cfg.Net.Gateway); err != nil {
 				fmt.Fprintf(os.Stderr, "lohar: configure eth0: %v\n", err)
@@ -159,11 +159,7 @@ func runAgent() {
 				fmt.Fprintf(os.Stderr, "lohar: eth0 %s gw %s (netlink)\n", cfg.Net.IP, cfg.Net.Gateway)
 			}
 		}
-		if cfg.DNSInternal != "" || len(cfg.DNS) > 0 {
-			applyDNS(cfg.DNSInternal, cfg.DNS)
-		} else {
-			ensureResolvConf()
-		}
+		ensureResolvConf()
 		agentToken = cfg.Token
 		configEnv = cfg.Env
 		writeConfigFiles(cfg.Files)
@@ -508,16 +504,8 @@ type SandboxConfig struct {
 	Volumes []VolumeMountConfig `json:"volumes"`
 	Mounts  []FsMountConfig     `json:"mounts,omitempty"`
 	Init    string              `json:"init,omitempty"`
-	DNS     []string            `json:"dns"`
-	// DNSInternal is the per-user bridge gateway IP hosting the
-	// in-cluster DNS responder. Prepended to /etc/resolv.conf so
-	// sandbox-name lookups resolve locally before the public DNS
-	// fallbacks. Empty string skips the install — backwards-compatible
-	// with hosts running an older bhatti daemon. G1.1 of
-	// PLAN-bhatti-v2.md.
-	DNSInternal string     `json:"dns_internal,omitempty"`
-	User        string     `json:"user"`
-	Net         *NetConfig `json:"net,omitempty"`
+	User    string              `json:"user"`
+	Net     *NetConfig          `json:"net,omitempty"`
 	// Entropy is a fresh seed for the kernel's CRNG, sent per boot by the
 	// host's config server (seedEntropy).
 	Entropy []byte `json:"entropy,omitempty"`
@@ -558,70 +546,6 @@ func fetchConfig() *SandboxConfig {
 	}
 	fmt.Fprintf(os.Stderr, "lohar: fetched config for %s\n", cfg.SandboxID)
 	return &cfg
-}
-
-// applyDNS writes /etc/resolv.conf. Two mutually-exclusive shapes,
-// chosen by the host (engine) based on whether the per-user DNS
-// responder bound successfully:
-//
-//  1. Responder up (the normal case): internal != "", public empty.
-//     We write ONLY the in-cluster responder. It is authoritative for
-//     sibling sandbox names AND forwards everything else upstream
-//     itself (see pkg/dns Server.Upstreams), so it's the only resolver
-//     the sandbox needs.
-//
-//  2. Responder bind failed (degraded): internal == "", public set.
-//     We write the public resolvers directly so the sandbox still has
-//     working name resolution — just without sibling names.
-//
-// IMPORTANT: we do NOT list internal AND public together. An earlier
-// version did, on the assumption that a non-sandbox name would "fall
-// through" to 1.1.1.1 after the responder returned NXDOMAIN. That is
-// false — glibc treats NXDOMAIN as authoritative and never tries the
-// next nameserver (only a TIMEOUT does). Listing public servers
-// alongside the responder would just let glibc round-robin away from
-// our responder and miss sibling names. Forwarding (case 1) is what
-// makes both kinds of name resolve from a single nameserver line.
-// G1.1 of PLAN-bhatti-v2.md.
-func applyDNS(internal string, public []string) {
-	content := buildResolvConf(internal, public)
-	if content == "" {
-		return
-	}
-	os.Remove("/etc/resolv.conf")
-	os.WriteFile("/etc/resolv.conf", []byte(content), 0644)
-}
-
-// buildResolvConf renders the resolv.conf contents. Pure function for
-// testability: the ordering (internal first, public second) is the
-// load-bearing property a future refactor must preserve, and a
-// regression test on the string output catches accidental swaps.
-//
-// Returns "" when both inputs are empty; callers skip writing the
-// file in that case so an existing system-installed resolv.conf isn't
-// clobbered.
-func buildResolvConf(internal string, public []string) string {
-	if internal == "" && len(public) == 0 {
-		return ""
-	}
-	var content string
-	if internal != "" {
-		// Comment line so a human reading the file knows what 10.0.N.1
-		// is. Some tools strip comments; that's fine — the nameserver
-		// line is what actually matters.
-		content += "# bhatti in-cluster DNS (per-user): resolves sibling sandbox\n"
-		content += "# names (<sandbox>, <sandbox>.sb) and forwards everything else\n"
-		content += "# upstream, so it's the only resolver the sandbox needs.\n"
-		content += "nameserver " + internal + "\n"
-		// timeout:2 attempts:1 — if the responder is unreachable, fail
-		// fast (2s) rather than stalling on glibc's default 5s × 2
-		// attempts = 10s before the sandbox gives up on DNS entirely.
-		content += "options timeout:2 attempts:1\n"
-	}
-	for _, s := range public {
-		content += "nameserver " + s + "\n"
-	}
-	return content
 }
 
 func writeConfigFiles(files map[string]struct {

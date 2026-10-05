@@ -35,8 +35,6 @@ type ThermalEngine interface {
 	ThermalState(id string) string
 	Pause(ctx context.Context, id string) error
 	Activity(ctx context.Context, id string) (*proto.ActivityInfo, error)
-	BalloonSet(ctx context.Context, id string, amountMiB int64) error
-	MemSizeMib(id string) int64
 }
 
 // ThermalSupport is implemented by engines whose thermal support depends on
@@ -564,10 +562,15 @@ func cronMatch(expr string, t time.Time) bool {
 
 // StartThermalManager starts the background goroutine that transitions idle
 // sandboxes through thermal states: hot → warm → cold.
-func (s *Server) StartThermalManager(cfg ThermalConfig) {
-	te, ok := thermalOf(s.engine)
+// A missing thermal implementation is a startup error, not a disabled manager.
+func (s *Server) StartThermalManager(cfg ThermalConfig) error {
+	te, ok := s.engine.(ThermalEngine)
 	if !ok {
-		return // engine doesn't support thermal management
+		return fmt.Errorf("engine %T does not implement thermal management", s.engine)
+	}
+	if !thermalUsable(s.engine) {
+		slog.Warn("thermal management unavailable for this VMM build")
+		return nil
 	}
 	if cfg.WarmTimeout == 0 {
 		cfg.WarmTimeout = 30 * time.Second
@@ -593,6 +596,7 @@ func (s *Server) StartThermalManager(cfg ThermalConfig) {
 			}
 		}
 	}()
+	return nil
 }
 
 func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
@@ -665,7 +669,6 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 				// Success — clear failure counter
 				s.resetSnapshotFailures(sb.EngineID)
 				s.store.StopSandbox(sb.ID)
-				s.saveVMState(sb.ID, sb.EngineID)
 				slog.Info("thermal transition", "sandbox", sb.Name,
 					"from", "warm", "to", "cold", "idle", idle.Round(time.Second))
 				s.RecordEvent(store.Event{
@@ -705,16 +708,10 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			if count >= maxThermalFailures {
 				slog.Error("thermal force-pause: agent unresponsive",
 					"sandbox", sb.Name, "failures", count)
-				// Pause is a Firecracker API call — doesn't need the agent
+				// Pausing the VMM doesn't require the guest agent.
 				if err := te.Pause(context.Background(), sb.EngineID); err != nil {
 					slog.Warn("thermal force-pause failed", "sandbox", sb.Name, "error", err)
 				} else {
-					// Inflate balloon on force-paused VMs too
-					if memMiB := te.MemSizeMib(sb.EngineID); memMiB > 0 {
-						bCtx, bCancel := context.WithTimeout(context.Background(), 5*time.Second)
-						te.BalloonSet(bCtx, sb.EngineID, memMiB/2)
-						bCancel()
-					}
 					s.lastActivity.Store(sb.EngineID, time.Now())
 					slog.Info("thermal transition", "sandbox", sb.Name,
 						"from", "hot", "to", "warm", "reason", "force-pause")
@@ -735,15 +732,6 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			if err := te.Pause(context.Background(), sb.EngineID); err != nil {
 				slog.Warn("thermal pause failed", "sandbox", sb.Name, "error", err)
 				continue
-			}
-			// Inflate balloon to reclaim ~50% of guest memory while paused.
-			// deflate_on_oom ensures the guest reclaims it when resumed.
-			if memMiB := te.MemSizeMib(sb.EngineID); memMiB > 0 {
-				balloonCtx, balloonCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := te.BalloonSet(balloonCtx, sb.EngineID, memMiB/2); err != nil {
-					slog.Debug("balloon inflate failed", "sandbox", sb.Name, "error", err)
-				}
-				balloonCancel()
 			}
 			// Record pause time so warm→cold timer starts from now,
 			// not from the last user interaction.
@@ -800,7 +788,6 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 			slog.Info("sandbox recovered",
 				"sandbox", sb.Name, "from_status", sb.Status)
 			s.store.UpdateSandboxStatus(sb.ID, "running")
-			s.saveVMState(sb.ID, engineID)
 		}
 		s.RecordEvent(store.Event{
 			Type: "thermal.wake", SandboxID: sb.ID,

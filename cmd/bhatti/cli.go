@@ -246,8 +246,6 @@ func errorHint(msg string) string {
 		return "  Check sandbox name:\n    bhatti ls"
 	case strings.Contains(lower, "already exists"):
 		return "  Use a different name or destroy the existing one:\n    bhatti destroy <sandbox>"
-	case strings.Contains(lower, "use 'bhatti start --force'"):
-		return "  Retry with force:\n    bhatti start --force <sandbox>"
 	case strings.Contains(lower, "limit") || strings.Contains(lower, "max sandbox"):
 		return "  Destroy unused sandboxes to free capacity:\n    bhatti ls\n    bhatti destroy <sandbox>"
 	}
