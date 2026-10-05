@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
 // TestEngineCapabilities boots one VM and probes the agent surface
@@ -50,7 +51,9 @@ func TestEngineCapabilities(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "probe", CPUs: 1, MemoryMB: 512})
+	// Egress is one of the capabilities probed; a sandbox has no network unless asked.
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "probe", CPUs: 1, MemoryMB: 512,
+		NetPolicy: &gateway.NetPolicyWire{Default: "public"}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
