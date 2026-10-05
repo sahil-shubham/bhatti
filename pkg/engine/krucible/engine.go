@@ -832,16 +832,16 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		}
 	}
 
-	// Fork/restore reconcile: a memory restore brings the guest back with the
-	// SOURCE's IP still configured in eth0 (lohar configured it once, at the
-	// boot the snapshot froze). The host allocated a FRESH identity above
-	// (cdNet), so re-point the restored guest's eth0 to it — otherwise every
-	// fork of one source collides on the source's IP on the shared netd. Only
-	// on the restore path; a normal create's guest already configured itself
-	// correctly from the config drive at boot.
+	// Fork/restore reconcile: a memory restore brings back the source's eth0 IP
+	// and MAC in RAM. netd authenticates both against this fork's fresh identity,
+	// so re-point the guest NIC before returning it. Normal boot already gets
+	// the new identity from the VMM and config drive.
 	if opts.snapshotDir != "" && cdNet != nil {
+		if err = vm.requireFeature(proto.FeatureNetConfigMAC); err != nil {
+			return info, fmt.Errorf("fork: reconcile guest network identity: %w", err)
+		}
 		nctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = vm.Agent.NetConfig(nctx, cdNet.IP, cdNet.Gateway)
+		err = vm.Agent.NetConfig(nctx, cdNet.IP, cdNet.Gateway, baseSpec.NetMAC)
 		cancel()
 		if err != nil {
 			return info, fmt.Errorf("fork: reconcile guest network identity: %w", err)

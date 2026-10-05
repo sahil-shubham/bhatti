@@ -19,7 +19,7 @@ import (
 
 func TestForkRefusesOldLoharBeforeCheckpoint(t *testing.T) {
 	dataDir := t.TempDir()
-	vm := &VM{ID: "old", Status: "running", Thermal: "hot", AgentInfo: proto.AgentInfo{Legacy: true}}
+	vm := &VM{ID: "old", Status: "running", Thermal: "hot", netIP: "100.64.0.2", netdKey: "u:owner", AgentInfo: proto.AgentInfo{Legacy: true}}
 	e := &Engine{cfg: Config{DataDir: dataDir}, caps: VMMCapabilities{Checkpoint: true}, vms: map[string]*VM{"old": vm}}
 	_, err := e.Fork(context.Background(), "old", "copy")
 	if !errors.Is(err, engine.ErrGuestAgentOutdated) || !strings.Contains(err.Error(), "net_config") {
@@ -30,12 +30,19 @@ func TestForkRefusesOldLoharBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("fork touched snapshot directory before refusing: %v, %v", entries, err)
 	}
 
-	vm.AgentInfo = proto.AgentInfo{Version: "v2.4.0", Features: []proto.AgentFeature{proto.FeatureNetConfig}}
-	if err := e.RequireGuestAgentFeature(context.Background(), "old", proto.FeatureNetConfig); err != nil {
-		t.Fatalf("new agent rejected: %v", err)
+	// A guest that understands the old IP-only protocol must not claim success
+	// after silently ignoring the fork's new MAC.
+	vm.AgentInfo = proto.AgentInfo{Version: "v2.4.0", Features: []proto.AgentFeature{"net_config"}}
+	_, err = e.Fork(context.Background(), "old", "copy")
+	if !errors.Is(err, engine.ErrGuestAgentOutdated) || !strings.Contains(err.Error(), "net_config_mac") {
+		t.Fatalf("fork IP-only lohar = %v; want MAC capability conflict", err)
+	}
+	vm.AgentInfo = proto.AgentInfo{Version: "v2.5.0", Features: []proto.AgentFeature{proto.FeatureNetConfigMAC}}
+	if err := e.RequireGuestAgentFeature(context.Background(), "old", proto.FeatureNetConfigMAC); err != nil {
+		t.Fatalf("MAC-capable agent rejected: %v", err)
 	}
 	vm.AgentInfoErr = errors.New("info timed out")
-	if err := e.RequireGuestAgentFeature(context.Background(), "old", proto.FeatureNetConfig); err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
+	if err := e.RequireGuestAgentFeature(context.Background(), "old", proto.FeatureNetConfigMAC); err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
 		t.Fatalf("unknown capability mislabeled old: %v", err)
 	}
 }

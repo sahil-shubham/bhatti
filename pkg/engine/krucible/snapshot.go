@@ -289,6 +289,7 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 	}
 	vm.mu.Lock()
 	hasMount := len(vm.baseSpec.Mounts) > 0
+	networked := vm.netIP != ""
 	vm.mu.Unlock()
 	// The fork belongs to the source's owner and must join the same shared netd
 	// (netdKey is "u:<userID>" on the net backend; "" or "s:<id>" otherwise).
@@ -300,10 +301,12 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 		return engine.SandboxInfo{}, fmt.Errorf("cannot fork a sandbox with a virtio-fs --mount (the device cannot be memory-restored); use a filesystem snapshot (snapshot create --type filesystem) then create --snapshot")
 	}
 
-	// Refuse before CHECKPOINT freezes the source; its baked-in lohar may
-	// predate network reconciliation even though the daemon supports fork.
-	if err := e.RequireGuestAgentFeature(ctx, sandboxID, proto.FeatureNetConfig); err != nil {
-		return engine.SandboxInfo{}, fmt.Errorf("fork: %w", err)
+	// A networked fork must reconcile the cloned NIC's MAC/IP. Refuse old
+	// guests before checkpointing; no-network forks do not need this feature.
+	if networked {
+		if err := e.RequireGuestAgentFeature(ctx, sandboxID, proto.FeatureNetConfigMAC); err != nil {
+			return engine.SandboxInfo{}, fmt.Errorf("fork: %w", err)
+		}
 	}
 
 	tmp, err := os.MkdirTemp(e.cfg.DataDir, "fork-")

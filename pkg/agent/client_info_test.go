@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -83,15 +84,15 @@ func TestAgentInfoReportsVersionAndFeatures(t *testing.T) {
 		if typ != proto.INFO_REQ {
 			return oldAgentReply(typ, nil)
 		}
-		return proto.INFO_RESP, []byte(`{"version":"v2.4.0","features":["net_config","sandbox_ca","root_growth","piped_stderr"]}`)
+		return proto.INFO_RESP, []byte(`{"version":"v2.5.0","features":["net_config_mac","sandbox_ca","root_growth","piped_stderr"]}`)
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	info, err := guest.Info(ctx)
-	if err != nil || info.Legacy || info.Version != "v2.4.0" {
+	if err != nil || info.Legacy || info.Version != "v2.5.0" {
 		t.Fatalf("info = %+v, %v", info, err)
 	}
-	for _, feature := range []proto.AgentFeature{proto.FeatureNetConfig, proto.FeatureSandboxCA, proto.FeatureRootGrowth, proto.FeaturePipedStderr} {
+	for _, feature := range []proto.AgentFeature{proto.FeatureNetConfigMAC, proto.FeatureSandboxCA, proto.FeatureRootGrowth, proto.FeaturePipedStderr} {
 		if !info.Has(feature) {
 			t.Fatalf("agent info missing %s: %+v", feature, info)
 		}
@@ -102,14 +103,41 @@ func TestOldAgentNetConfigMapsOnlyUnknownFrameToOutdated(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	old := fakeAgent(t, oldAgentReply)
-	if err := old.NetConfig(ctx, "100.64.1.2/24", "100.64.1.1"); !errors.Is(err, engine.ErrGuestAgentOutdated) || !strings.Contains(err.Error(), "recreate it") {
+	if err := old.NetConfig(ctx, "100.64.1.2/24", "100.64.1.1", "52:54:00:00:00:02"); !errors.Is(err, engine.ErrGuestAgentOutdated) || !strings.Contains(err.Error(), "recreate it") {
 		t.Fatalf("old NET_CONFIG error = %v; want actionable outdated conflict", err)
 	}
 	broken := fakeAgent(t, func(byte, []byte) (byte, []byte) {
 		return proto.ERROR, []byte("reconfigure eth0: permission denied")
 	})
-	if err := broken.NetConfig(ctx, "100.64.1.2/24", "100.64.1.1"); err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
+	if err := broken.NetConfig(ctx, "100.64.1.2/24", "100.64.1.1", "52:54:00:00:00:02"); err == nil || errors.Is(err, engine.ErrGuestAgentOutdated) {
 		t.Fatalf("real network failure mislabeled outdated: %v", err)
+	}
+}
+
+func TestNetConfigSendsFreshMACWithIP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	received := make(chan []byte, 1)
+	guest := fakeAgent(t, func(typ byte, payload []byte) (byte, []byte) {
+		if typ != proto.NET_CONFIG {
+			return proto.ERROR, []byte("unexpected frame")
+		}
+		received <- bytes.Clone(payload)
+		return proto.NET_CONFIG, nil
+	})
+	if err := guest.NetConfig(ctx, "100.64.1.3/24", "100.64.1.1", "52:54:00:00:00:03"); err != nil {
+		t.Fatal(err)
+	}
+	var req struct {
+		IPCIDR  string `json:"ip_cidr"`
+		Gateway string `json:"gateway"`
+		MAC     string `json:"mac"`
+	}
+	if err := json.Unmarshal(<-received, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.IPCIDR != "100.64.1.3/24" || req.Gateway != "100.64.1.1" || req.MAC != "52:54:00:00:00:03" {
+		t.Fatalf("fork net config = %+v, missing allocated MAC", req)
 	}
 }
 

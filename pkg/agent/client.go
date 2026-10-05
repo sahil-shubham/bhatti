@@ -530,12 +530,10 @@ func (c *AgentClient) Activity(ctx context.Context) (*proto.ActivityInfo, error)
 	return &info, nil
 }
 
-// NetConfig reconciles the guest's eth0 to a fresh point-to-point identity
-// (ip_cidr + gateway) after a memory-restore fork. The restored guest holds the
-// source's IP in RAM; this re-points it so the fork is network-distinct from its
-// source. Ack is a NET_CONFIG frame with nil payload; an ERROR frame surfaces
-// the guest-side failure.
-func (c *AgentClient) NetConfig(ctx context.Context, ipCIDR, gateway string) error {
+// NetConfig reconciles the guest's eth0 to a fresh IP/MAC identity after a
+// memory-restore fork. The restored guest holds both source identities in RAM.
+// Ack is a NET_CONFIG frame with nil payload; ERROR surfaces guest failure.
+func (c *AgentClient) NetConfig(ctx context.Context, ipCIDR, gateway, mac string) error {
 	conn, err := c.DialControl(ctx)
 	if err != nil {
 		return fmt.Errorf("agent connect: %w", err)
@@ -549,7 +547,8 @@ func (c *AgentClient) NetConfig(ctx context.Context, ipCIDR, gateway string) err
 	req := struct {
 		IPCIDR  string `json:"ip_cidr"`
 		Gateway string `json:"gateway"`
-	}{IPCIDR: ipCIDR, Gateway: gateway}
+		MAC     string `json:"mac"`
+	}{IPCIDR: ipCIDR, Gateway: gateway, MAC: mac}
 	if err := proto.SendJSON(conn, proto.NET_CONFIG, req); err != nil {
 		return fmt.Errorf("agent send net config: %w", err)
 	}

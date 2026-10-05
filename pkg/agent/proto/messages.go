@@ -5,11 +5,11 @@ package proto
 type AgentFeature string
 
 const (
-	FeatureNetConfig   AgentFeature = "net_config"
-	FeatureSandboxCA   AgentFeature = "sandbox_ca"
-	FeatureRootGrowth  AgentFeature = "root_growth"
-	FeaturePipedStderr AgentFeature = "piped_stderr"
-	FeatureReseedCRNG  AgentFeature = "reseed_crng"
+	FeatureNetConfigMAC AgentFeature = "net_config_mac"
+	FeatureSandboxCA    AgentFeature = "sandbox_ca"
+	FeatureRootGrowth   AgentFeature = "root_growth"
+	FeaturePipedStderr  AgentFeature = "piped_stderr"
+	FeatureReseedCRNG   AgentFeature = "reseed_crng"
 )
 
 // AgentInfo is returned by INFO_RESP. Legacy is host-only: an old lohar

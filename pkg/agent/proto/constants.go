@@ -20,11 +20,10 @@ const (
 	ERROR  byte = 0x06 // either direction: UTF-8 error message (variable length)
 	KILL   byte = 0x07 // host → guest: empty payload, agent sends SIGTERM to child
 
-	// NET_CONFIG reconciles the guest's eth0 to a fresh point-to-point identity
-	// after a memory-restore fork: the restored guest holds the SOURCE's IP in
-	// RAM, so the host sends the freshly-allocated {ip_cidr, gateway} and lohar
-	// re-points eth0 (flush old addrs, add the new /32). Ack = NET_CONFIG frame
-	// with nil payload; failure = ERROR. Host → guest.
+	// NET_CONFIG reconciles a memory-restored guest's eth0 to a fresh IP and
+	// MAC. The restored guest holds both SOURCE identities in RAM; the host
+	// sends {ip_cidr, gateway, mac}, and lohar replaces the address and NIC MAC.
+	// Ack = NET_CONFIG frame with nil payload; failure = ERROR. Host → guest.
 	NET_CONFIG byte = 0x14
 
 	// A memory restore clones the kernel CRNG state. Host entropy must be

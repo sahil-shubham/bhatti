@@ -73,20 +73,12 @@ func configureEth0(name, ipCIDR, gateway string) error {
 	return nil
 }
 
-// reconfigureEth0 re-points eth0 to a fresh point-to-point identity after a
-// memory-restore fork. The restored guest still holds the SOURCE's /32 address
-// in RAM (lohar configures eth0 only at first boot, which the snapshot froze),
-// so a plain add would leave two addresses fighting on one link. Flush every
-// IPv4 address first, then add the fresh one. For a same-owner fork the gateway
-// is unchanged (same shared netd), so the on-link + default routes already
-// exist and survive an address flush; re-establish them anyway, tolerating
-// EEXIST, so a future cross-subnet fork stays correct. IPv6 link-local is left
-// untouched — netd is IPv4-only.
-//
-// The MAC is deliberately not changed: the guest link is point-to-point to
-// netd, which keys routing on IP and learns the MAC per-link from the guest's
-// frames, so the IP is the only identity that must be reconciled.
-func reconfigureEth0(name, ipCIDR, gateway string) error {
+// reconfigureEth0 replaces BOTH identities cloned from a source VM's RAM:
+// /32 IPv4 address and virtio-net MAC. netd binds every guest connection to
+// its allocated IP/MAC; changing only the IP leaves every fork packet dropped
+// as a spoof. Take the link down before setting its MAC, then restore the
+// on-link gateway and default routes (tolerating EEXIST).
+func reconfigureEth0(name, ipCIDR, gateway, macText string) error {
 	ip, _, err := net.ParseCIDR(ipCIDR)
 	if err != nil {
 		return fmt.Errorf("parse %q: %w", ipCIDR, err)
@@ -94,6 +86,10 @@ func reconfigureEth0(name, ipCIDR, gateway string) error {
 	ip4 := ip.To4()
 	if ip4 == nil {
 		return fmt.Errorf("only IPv4 supported for now: %q", ipCIDR)
+	}
+	mac, err := net.ParseMAC(macText)
+	if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
+		return fmt.Errorf("invalid guest MAC %q", macText)
 	}
 
 	iface, err := net.InterfaceByName(name)
@@ -111,11 +107,17 @@ func reconfigureEth0(name, ipCIDR, gateway string) error {
 		return fmt.Errorf("netlink bind: %w", err)
 	}
 
-	if err := linkUp(fd, idx); err != nil {
-		return fmt.Errorf("link up: %w", err)
+	if err := linkDown(fd, idx); err != nil {
+		return fmt.Errorf("link down: %w", err)
 	}
 	if err := flushAddrs(fd, name); err != nil {
 		return fmt.Errorf("flush addrs: %w", err)
+	}
+	if err := linkSetMAC(fd, idx, mac); err != nil {
+		return fmt.Errorf("set MAC: %w", err)
+	}
+	if err := linkUp(fd, idx); err != nil {
+		return fmt.Errorf("link up: %w", err)
 	}
 	if err := addAddr(fd, idx, ip4, 32); err != nil {
 		return fmt.Errorf("add addr: %w", err)
@@ -230,6 +232,29 @@ func linkUp(fd, idx int) error {
 	msg := unix.IfInfomsg{Family: unix.AF_UNSPEC, Index: int32(idx), Flags: unix.IFF_UP, Change: unix.IFF_UP}
 	payload := (*(*[unix.SizeofIfInfomsg]byte)(unsafe.Pointer(&msg)))[:]
 	return nlRequest(fd, unix.RTM_NEWLINK, 0, payload)
+}
+
+func linkDown(fd, idx int) error {
+	msg := unix.IfInfomsg{Family: unix.AF_UNSPEC, Index: int32(idx), Change: unix.IFF_UP}
+	payload := (*(*[unix.SizeofIfInfomsg]byte)(unsafe.Pointer(&msg)))[:]
+	return nlRequest(fd, unix.RTM_NEWLINK, 0, payload)
+}
+
+func linkSetMAC(fd, idx int, mac net.HardwareAddr) error {
+	payload := macLinkPayload(idx, mac)
+	return nlRequest(fd, unix.RTM_NEWLINK, 0, payload[:])
+}
+
+// macLinkPayload is an RTM_NEWLINK/IFLA_ADDRESS request for a six-byte MAC.
+func macLinkPayload(idx int, mac net.HardwareAddr) [unix.SizeofIfInfomsg + 12]byte {
+	msg := unix.IfInfomsg{Family: unix.AF_UNSPEC, Index: int32(idx)}
+	var payload [unix.SizeofIfInfomsg + 12]byte // rtattr(4) + MAC(6) + pad(2)
+	copy(payload[:], (*(*[unix.SizeofIfInfomsg]byte)(unsafe.Pointer(&msg)))[:])
+	a := payload[unix.SizeofIfInfomsg:]
+	*(*uint16)(unsafe.Pointer(&a[0])) = uint16(unix.SizeofRtAttr + len(mac))
+	*(*uint16)(unsafe.Pointer(&a[2])) = unix.IFLA_ADDRESS
+	copy(a[unix.SizeofRtAttr:], mac)
+	return payload
 }
 
 func addAddr(fd, idx int, ip4 net.IP, prefix int) error {

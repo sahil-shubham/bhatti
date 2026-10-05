@@ -65,7 +65,7 @@ func TestClientInfoFromLohar(t *testing.T) {
 	if expected := os.Getenv("LOHAR_EXPECT_VERSION"); expected != "" && info.Version != expected {
 		t.Fatalf("lohar reports %q, want ldflag-stamped %q", info.Version, expected)
 	}
-	for _, feature := range []proto.AgentFeature{proto.FeatureNetConfig, proto.FeatureSandboxCA, proto.FeatureRootGrowth, proto.FeaturePipedStderr} {
+	for _, feature := range []proto.AgentFeature{proto.FeatureNetConfigMAC, proto.FeatureSandboxCA, proto.FeatureRootGrowth, proto.FeaturePipedStderr} {
 		if !info.Has(feature) {
 			t.Fatalf("lohar does not advertise %q", feature)
 		}

@@ -530,6 +530,13 @@ func main() {
 			}
 		}
 		os.Exit(1)
+	case "localmac":
+		iface, err := net.InterfaceByName("eth0")
+		if err != nil || len(iface.HardwareAddr) != 6 {
+			fmt.Println("ERR eth0 hardware address", err)
+			os.Exit(1)
+		}
+		fmt.Println(iface.HardwareAddr.String())
 	}
 }
 `

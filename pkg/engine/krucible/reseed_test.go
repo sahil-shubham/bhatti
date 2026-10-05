@@ -109,9 +109,9 @@ func TestFakeReseedVMMProcess(t *testing.T) {
 				case mode == "unknown" && spec.SnapshotDir != "":
 					proto.WriteFrame(conn, proto.ERROR, []byte("capabilities unavailable"))
 				case mode == "old":
-					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.4.0", Features: []proto.AgentFeature{proto.FeatureNetConfig}})
+					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.4.0", Features: []proto.AgentFeature{}})
 				default:
-					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.5.0", Features: []proto.AgentFeature{proto.FeatureNetConfig, proto.FeatureReseedCRNG}})
+					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.5.0", Features: []proto.AgentFeature{proto.FeatureReseedCRNG}})
 				}
 			case proto.EXEC_REQ:
 				exit := proto.ExitPayload(0)
