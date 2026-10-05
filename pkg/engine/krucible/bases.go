@@ -252,6 +252,13 @@ func qcow2BackingPath(path string) (string, error) {
 // (link=true) under dataDir, except under bases/: a base is only ever
 // reached through what names it. A file it can't read goes to fn as an
 // image, whose header fn then fails to read: it might be one.
+//
+// Files directly in dataDir are never images, and are never opened: they
+// are the daemon's own state, state.db and its WAL and shm among them. A
+// process's POSIX record locks on a file all go when it closes any fd to that
+// file, so sniffing state.db-shm here would silently release the daemon's
+// SQLite locks, and the next process to open the database (any `bhatti user`
+// command) would take itself for the only one and delete the live WAL.
 func walkImages(dataDir string, fn func(path string, link bool) error) error {
 	skip := basesDir(dataDir)
 	return filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
@@ -263,6 +270,8 @@ func walkImages(dataDir string, fn func(path string, link bool) error) error {
 			if path == skip {
 				return filepath.SkipDir
 			}
+			return nil
+		case filepath.Dir(path) == filepath.Clean(dataDir):
 			return nil
 		case d.Type()&fs.ModeSymlink != 0:
 			return fn(path, true)
