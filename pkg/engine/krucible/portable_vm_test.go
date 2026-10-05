@@ -212,7 +212,13 @@ func TestKrucibleSnapshotImportRefusesAnotherCPU(t *testing.T) {
 			if err := a.ExportSnapshot(ctx, &archive, copyDir, checkpointJSON(t, m), engine.SnapshotExport{Name: "cpu"}); err != nil {
 				t.Fatal(err)
 			}
-			dest := filepath.Join(t.TempDir(), "imported")
+			// The API stages imports beneath DataDir/snapshots. A root daemon
+			// may make only directories it owns searchable by the probe's
+			// private UID; an unrelated t.TempDir() is deliberately refused.
+			dest := filepath.Join(a.cfg.DataDir, "snapshots", "cpu-"+tc.name, "imported")
+			if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			_, err = a.ImportSnapshot(ctx, &archive, dest)
 			if !errors.Is(err, engine.ErrSnapshotIncompatible) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("import: %v; want %q", err, tc.want)

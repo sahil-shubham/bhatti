@@ -558,6 +558,35 @@ func TestConfineLaunchMarksVirtioFSMounts(t *testing.T) {
 	}
 }
 
+func TestCheckCheckpointHostRejectsExternalPrivateDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("root-only Linux helper confinement")
+	}
+	e := portableEngine(t, "", "echo PROBE >&2; exit 0")
+	e.confineVMM, e.dropVMM = true, true
+	e.vmmIDs = make(map[uint32]string)
+	external := t.TempDir() // 0700, owned by root, outside the engine's DataDir
+	checkpoint := filepath.Join(external, checkpointFile)
+	writeFile(t, checkpoint, []byte("checkpoint"))
+	before, err := os.Stat(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.checkCheckpointHost(context.Background(), external)
+	if err == nil || !strings.Contains(err.Error(), "check-checkpoint confinement:") ||
+		!strings.Contains(err.Error(), "can't reach") || errors.Is(err, engine.ErrSnapshotIncompatible) {
+		t.Fatalf("outside root-private directory was opened for a helper: %v", err)
+	}
+	after, err := os.Stat(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode() != after.Mode() || before.Sys().(*syscall.Stat_t).Gid != after.Sys().(*syscall.Stat_t).Gid ||
+		len(e.vmmIDs) != 0 || checkLog(e) != "" {
+		t.Fatal("rejected probe changed checkpoint permissions, reserved an ID, or launched the helper")
+	}
+}
+
 // A checkpoint probe has no VM to supply a policy; it must still be confined
 // to the one checkpoint, /dev/kvm, and no network.
 func TestCheckCheckpointHostConfined(t *testing.T) {
