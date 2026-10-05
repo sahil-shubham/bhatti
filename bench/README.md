@@ -1,5 +1,12 @@
 # Bench
 
+For the current v2 daemon and concurrent agent workloads, use the Go harness
+in [`load/README.md`](load/README.md). It measures persistent-client API
+latencies, concurrency ramps, throughput, public proxy fan-in, network egress,
+and hot/warm VM density, recording raw samples and host metrics with provenance.
+The `run.sh` results below are historical v1-era CLI-per-operation measurements;
+do not use them as v2 capacity numbers.
+
 `run.sh` measures end-to-end latency against a live bhatti daemon. Run it on
 the same host as the daemon (loopback) so results don't include geographic
 network latency.
