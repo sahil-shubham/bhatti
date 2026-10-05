@@ -60,7 +60,7 @@ jobs:
         # bring-up builds libkrun with --features blk,net (krun_add_net_unixstream).
         run: |
           export PATH=/usr/local/go/bin:$PATH
-          go build -ldflags="-s -w" -o bhatti-netd ./cmd/bhatti-netd/
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o bhatti-netd ./cmd/bhatti-netd/   # confine's AllThreadsSyscall refuses cgo binaries
 
       - name: Setup /dev/kvm + TMPDIR
         run: |

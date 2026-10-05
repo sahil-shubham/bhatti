@@ -76,7 +76,7 @@ cat <<EOF
     libkrucible: $LIBDIR (libkrun.so)
     helper:      $REPO/bhatti-vmm
 
-Run the krucible suite (also needs: go build -o bhatti-netd ./cmd/bhatti-netd):
+Run the krucible suite (also needs: CGO_ENABLED=0 go build -o bhatti-netd ./cmd/bhatti-netd):
   export PKG_CONFIG_PATH=$KPREFIX/lib/pkgconfig
   go test -tags krucible ./pkg/engine/krucible/ -v
 EOF

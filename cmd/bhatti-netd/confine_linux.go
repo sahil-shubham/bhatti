@@ -40,6 +40,9 @@ func confine(uid, gid int) error {
 		}
 	}
 	if _, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
+		if errno == syscall.ENOTSUP {
+			return fmt.Errorf("no_new_privs: %w (AllThreadsSyscall needs a cgo-free binary: build with CGO_ENABLED=0)", errno)
+		}
 		return fmt.Errorf("no_new_privs: %w", errno)
 	}
 	if err := landlockReadOnly("/etc", restrictAllThreads); err != nil {
