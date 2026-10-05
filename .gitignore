@@ -15,3 +15,4 @@ docs/internal/
 /krucible-mkimage
 bench/results-krucible-mac/
 /cmd/bhatti-netd/bhatti-netd
+/cmd/lohar/system.slice/
