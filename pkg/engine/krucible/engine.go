@@ -269,15 +269,12 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start bhatti-netd: %w", err)
 	}
+	logPath := filepath.Join(inst.dir, "netd.log")
 	if werr := waitForSocket(inst.sock, 5*time.Second); werr != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		return fmt.Errorf("bhatti-netd not listening: %w", werr)
+		return netdStartFailed(cmd, logPath, fmt.Errorf("bhatti-netd not listening: %w", werr))
 	}
 	if werr := waitForSocket(inst.ctlSock, 5*time.Second); werr != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		return fmt.Errorf("bhatti-netd control socket not listening: %w", werr)
+		return netdStartFailed(cmd, logPath, fmt.Errorf("bhatti-netd control socket not listening: %w", werr))
 	}
 	// The socket path appears before netd finishes confinement and starts its
 	// accept loop. Give this newly spawned process time to answer, but never
@@ -289,9 +286,7 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 			break
 		}
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-			return fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr)
+			return netdStartFailed(cmd, logPath, fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr))
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -1475,6 +1470,23 @@ func tailFile(path string, n int64) string {
 		return ""
 	}
 	return string(buf)
+}
+
+// netdStartFailed reaps a netd that didn't come up and says why: whether it
+// exited on its own (netd binds its sockets before it confines itself, so a
+// confinement failure looks like an unanswered socket) and its last log lines.
+func netdStartFailed(cmd *exec.Cmd, logPath string, cause error) error {
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	// Killing a process that already exited changes nothing, so anything but
+	// our SIGKILL in the wait status is netd's own exit.
+	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && !(ws.Signaled() && ws.Signal() == syscall.SIGKILL) {
+		cause = fmt.Errorf("%w (bhatti-netd exited at startup: %s)", cause, cmd.ProcessState)
+	}
+	if tail := strings.TrimSpace(tailFile(logPath, 1024)); tail != "" {
+		cause = fmt.Errorf("%w; netd log: %s", cause, tail)
+	}
+	return cause
 }
 
 // LoharPath is the guest agent shipped beside bhatti-vmm in the runtime
