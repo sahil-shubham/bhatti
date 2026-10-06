@@ -22,6 +22,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -173,7 +174,10 @@ func loadConfig(cmd *cobra.Command) error {
 	} else {
 		// Even when the socket is absent, dial it rather than silently
 		// sending an API request (and its token) to localhost:8080.
-		unixSocketPath = cfg.APISocketPath()
+		unixSocketPath, err = cliSocketPath(cfg, "/var/lib/bhatti/api.sock")
+		if err != nil {
+			return err
+		}
 		apiURL = "http://unix"
 	}
 
@@ -186,6 +190,37 @@ func loadConfig(cmd *cobra.Command) error {
 		apiToken = cfg.AuthToken
 	}
 	return nil
+}
+
+// cliSocketPath distinguishes a configured data_dir from LoadConfig's default.
+// The daemon's config defaults are unchanged; only endpoint selection differs.
+func cliSocketPath(cfg *pkg.Config, systemSocket string) (string, error) {
+	if cfg.APISocket != "" {
+		return cfg.APISocket, nil
+	}
+	if cfg.ConfigPath != "" {
+		data, err := os.ReadFile(cfg.ConfigPath)
+		if err != nil {
+			return "", fmt.Errorf("read config %s: %w", cfg.ConfigPath, err)
+		}
+		var explicit struct {
+			APISocket string `yaml:"api_socket"`
+			DataDir   string `yaml:"data_dir"`
+		}
+		if err := yaml.Unmarshal(data, &explicit); err != nil {
+			return "", fmt.Errorf("parse config %s: %w", cfg.ConfigPath, err)
+		}
+		if explicit.APISocket != "" {
+			return explicit.APISocket, nil
+		}
+		if explicit.DataDir != "" {
+			return filepath.Join(explicit.DataDir, "api.sock"), nil
+		}
+	}
+	if _, err := os.Stat(systemSocket); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return systemSocket, nil
+	}
+	return filepath.Join(pkg.DefaultDataDir(), "api.sock"), nil
 }
 
 // --- HTTP helpers ---

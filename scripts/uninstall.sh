@@ -34,6 +34,28 @@ remove_api_group() {
     fi
 }
 
+# The installer writes only a token-only config for the invoking user.
+# Other files (and remote configs) may belong to unrelated servers.
+purge_invoking_user_cli_config() {
+    [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] || return 0
+    local user_home user_dir config
+    user_home=$(eval echo "~$SUDO_USER")
+    user_dir="$user_home/.bhatti"
+    [ -d "$user_dir" ] || return 0
+    config="$user_dir/config.yaml"
+    if [ -L "$config" ]; then
+        echo "==> Keeping $config (symlink was not written by the installer)"
+    elif [ -f "$config" ]; then
+        if grep -q 'api_url' "$config"; then
+            echo "==> Keeping $config (api_url may point to another server)"
+        else
+            echo "==> Removing $config (local CLI credentials)"
+            rm -f -- "$config"
+        fi
+    fi
+    echo "==> Keeping $user_dir (other files may contain credentials for other servers)"
+}
+
 # Tests source the group helper without running the privileged teardown.
 if [ "${BHATTI_TEST:-}" != "1" ]; then
 
@@ -42,7 +64,7 @@ for arg in "$@"; do
         --purge) PURGE=true ;;
         --help|-h)
             echo "Usage: sudo $0 [--purge]"
-            echo "  --purge   remove all data (sandboxes, images, volumes, secrets, config) and API group"
+            echo "  --purge   remove server data and API group; keep other users' CLI credentials"
             echo "  (default) remove binaries + service only; preserve data and API group"
             exit 0
             ;;
@@ -56,7 +78,7 @@ fi
 
 echo "==> Uninstalling bhatti"
 if [[ "$PURGE" == "true" ]]; then
-    echo "    mode: PURGE (all data will be deleted)"
+    echo "    mode: PURGE (server data removed; unrelated user CLI files preserved)"
 else
     echo "    mode: soft (data in $DATA_DIR preserved)"
 fi
@@ -188,14 +210,9 @@ if [[ "$PURGE" == "true" ]]; then
         rm -rf "$ROOT_HOME/.bhatti"
     fi
 
-    # Try to find the sudo user's config too
-    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-        USER_CFG="$(eval echo "~$SUDO_USER")/.bhatti"
-        if [[ -d "$USER_CFG" ]]; then
-            echo "==> Removing $USER_CFG"
-            rm -rf "$USER_CFG"
-        fi
-    fi
+    # Never delete the invoking user's entire ~/.bhatti: it may hold credentials
+    # for other servers. Only the installer's local CLI config is disposable.
+    purge_invoking_user_cli_config
 
     remove_api_group
 else
@@ -211,7 +228,7 @@ echo "============================================"
 echo "  bhatti uninstalled"
 echo ""
 if [[ "$PURGE" == "true" ]]; then
-    echo "  All data removed."
+    echo "  Server data removed; unrelated user CLI files preserved."
 else
     echo "  Binaries + runtime + service removed."
     echo "  Data preserved: $DATA_DIR"

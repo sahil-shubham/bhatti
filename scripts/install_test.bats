@@ -852,6 +852,19 @@ _security_fixture() {
     [ "$(grep -c '^usermod$' "$SECURITY_TMP/calls")" -eq 1 ]
 }
 
+@test "ensure_api_group Linux tells new members to start a new login session" {
+    _security_fixture
+    SUDO_USER=operator
+    linux_api_group_gid() { printf '3131\n'; }
+    id() { printf 'staff\n'; }
+    usermod() { :; }
+
+    run ensure_api_group
+    [ "$status" -eq 0 ]
+    output_contains "log out and back in"
+}
+
+
 @test "ensure_api_group on macOS creates group and sudo membership only once" {
     _security_fixture
     OS=darwin
@@ -880,6 +893,59 @@ _security_fixture() {
     [ "$(grep -c '^create$' "$SECURITY_TMP/calls")" -eq 1 ]
     [ "$(grep -c '^edit$' "$SECURITY_TMP/calls")" -eq 1 ]
 }
+
+@test "ensure_api_group macOS does not tell new members to log out" {
+    _security_fixture
+    OS=darwin
+    SUDO_USER=operator
+    dscl() { printf 'PrimaryGroupID: 4040\n'; }
+    id() { printf 'staff\n'; }
+    dseditgroup() { :; }
+
+    run ensure_api_group
+    [ "$status" -eq 0 ]
+    output_contains "added to bhatti group"
+    if echo "$output" | grep -qF "log out"; then
+        echo "macOS group instructions incorrectly require a new login: $output" >&2
+        return 1
+    fi
+}
+
+@test "purge removes only a token-only invoking user CLI config" {
+    _security_fixture
+    export HOME="$SECURITY_TMP/user"
+    mkdir -p "$HOME/.bhatti"
+    printf 'auth_token: local-key\n' > "$HOME/.bhatti/config.yaml"
+    printf 'remote credential\n' > "$HOME/.bhatti/other-server"
+    SUDO_USER=operator
+    source scripts/uninstall.sh
+    eval() { printf '%s\n' "$HOME"; }
+
+    run purge_invoking_user_cli_config
+    [ "$status" -eq 0 ]
+    [ ! -e "$HOME/.bhatti/config.yaml" ]
+    [ "$(cat "$HOME/.bhatti/other-server")" = "remote credential" ]
+    output_contains "Keeping $HOME/.bhatti"
+}
+
+@test "purge preserves invoking user remote CLI config and other files" {
+    _security_fixture
+    export HOME="$SECURITY_TMP/user"
+    mkdir -p "$HOME/.bhatti"
+    printf 'api_url: https://other.example.test\nauth_token: remote-key\n' > "$HOME/.bhatti/config.yaml"
+    printf 'remote credential\n' > "$HOME/.bhatti/other-server"
+    SUDO_USER=operator
+    source scripts/uninstall.sh
+    eval() { printf '%s\n' "$HOME"; }
+
+    run purge_invoking_user_cli_config
+    [ "$status" -eq 0 ]
+    grep -qx 'api_url: https://other.example.test' "$HOME/.bhatti/config.yaml"
+    [ "$(cat "$HOME/.bhatti/other-server")" = "remote credential" ]
+    output_contains "Keeping $HOME/.bhatti/config.yaml"
+    output_contains "api_url"
+}
+
 
 @test "update_api_security appends gid once and warns about untouched plaintext listen" {
     _security_fixture

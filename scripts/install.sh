@@ -961,7 +961,11 @@ ensure_api_group() {
                     || die "could not add $SUDO_USER to bhatti API group"
             fi
             API_GROUP_USER_ADDED=true
-            info "$SUDO_USER added to bhatti group; log out and back in before using the socket without sudo."
+            if [ "$OS" = "darwin" ]; then
+                info "$SUDO_USER added to bhatti group; new processes can use the socket without sudo immediately."
+            else
+                info "$SUDO_USER added to bhatti group; log out and back in (or use newgrp bhatti) before using the socket without sudo."
+            fi
         fi
     fi
 }
@@ -1034,9 +1038,9 @@ migrate_local_cli_configs() {
     if [ -n "$root_home" ]; then
         remove_legacy_cli_url "$root_home/.bhatti/config.yaml"
     fi
-    # The invoking user only reaches the socket after logging in again with the
-    # new group, so keep their localhost URL while the server still listens on
-    # TCP: dropping it would break a working CLI. Without a listener it was dead.
+    # On Linux the invoking user only reaches the socket after logging in again
+    # with the new group. Keep a working localhost URL while TCP is enabled;
+    # without a listener it was already unusable.
     if [ -n "$(server_listen)" ]; then
         return 0
     fi
@@ -1381,8 +1385,8 @@ do_server_install() {
     echo "  tier: ${tier}"
     echo "  Local API: $DATA_DIR/api.sock (Unix socket; no TCP listener)"
     echo "  Socket group: bhatti; API requests still require a bearer token."
-    if [ "${API_GROUP_USER_ADDED:-false}" = true ]; then
-        echo "  Log out and back in to activate your new bhatti group membership."
+    if [ "${API_GROUP_USER_ADDED:-false}" = true ] && [ "$OS" = "linux" ]; then
+        echo "  Log out and back in (or use newgrp bhatti) to activate your new bhatti group membership."
     fi
     echo "  Remote access: configure a TLS domain, or forward the socket over SSH:"
     echo "    ssh -N -L 127.0.0.1:8080:$DATA_DIR/api.sock user@<server>"

@@ -39,6 +39,91 @@ func cliSocketDir(t *testing.T) string {
 	return dir
 }
 
+func TestCLILocalSocketPrecedence(t *testing.T) {
+	t.Setenv("HOME", cliSocketDir(t)) // short: <home>/.bhatti/api.sock must fit sun_path (104 bytes on macOS)
+	t.Setenv("SUDO_USER", "")
+	systemSocket := filepath.Join(t.TempDir(), "system.sock")
+	explicitDir := cliSocketDir(t)
+	explicitSocket := filepath.Join(cliSocketDir(t), "chosen.sock")
+	defaultSocket := filepath.Join(pkg.DefaultDataDir(), "api.sock")
+
+	tests := []struct {
+		name   string
+		config string
+		system bool
+		want   string
+	}{
+		{"token only, system socket present", "auth_token: local-key\n", true, systemSocket},
+		{"token only, system socket absent", "auth_token: local-key\n", false, defaultSocket},
+		{"explicit socket wins over system", fmt.Sprintf("api_socket: %q\n", explicitSocket), true, explicitSocket},
+		{"explicit directory wins over system", fmt.Sprintf("data_dir: %q\n", explicitDir), true, filepath.Join(explicitDir, "api.sock")},
+		{"explicit directory used when absent", fmt.Sprintf("data_dir: %q\n", explicitDir), false, filepath.Join(explicitDir, "api.sock")},
+		{"explicit default directory wins over system", fmt.Sprintf("data_dir: %q\n", pkg.DefaultDataDir()), true, defaultSocket},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cliEndpointFixture(t, tt.config)
+			if tt.system {
+				ln, err := net.Listen("unix", systemSocket)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ln.(*net.UnixListener).SetUnlinkOnClose(false)
+				if err := ln.Close(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { os.Remove(systemSocket) })
+			}
+			cfg, err := pkg.LoadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := cliSocketPath(cfg, systemSocket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("socket path = %q, want %q", got, tt.want)
+			}
+			_, err = dialUnixSocket(t.Context(), got)
+			if want := "no bhatti daemon at " + tt.want; err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("socket error = %v, want path %q", err, want)
+			}
+		})
+	}
+}
+
+func TestCLIUserConfigExplicitSocketAndDataDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUDO_USER", "")
+	dir := cliSocketDir(t)
+	socket := filepath.Join(cliSocketDir(t), "custom.sock")
+	systemSocket := filepath.Join(t.TempDir(), "system.sock")
+	if err := os.WriteFile(systemSocket, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Layered user files only supply auth to pkg.LoadConfig. Endpoint selection
+	// must still honor their explicit socket and directory settings.
+	for _, tt := range []struct {
+		name, config, want string
+	}{
+		{"directory", fmt.Sprintf("data_dir: %q\n", dir), filepath.Join(dir, "api.sock")},
+		{"socket", fmt.Sprintf("api_socket: %q\n", socket), socket},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := cliEndpointFixture(t, tt.config)
+			cfg := &pkg.Config{ConfigPath: path, DataDir: pkg.DefaultDataDir()}
+			got, err := cliSocketPath(cfg, systemSocket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("user config socket = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCLIAbsentSocketRemainsLocal(t *testing.T) {
 	dataDir := cliSocketDir(t)
 	cliEndpointFixture(t, fmt.Sprintf("data_dir: %q\nauth_token: local-key\n", dataDir))
