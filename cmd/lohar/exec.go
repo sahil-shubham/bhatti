@@ -52,7 +52,8 @@ func handleDetachedExec(conn net.Conn, req proto.ExecRequest) {
 	cmd.Stdout = f
 	cmd.Stderr = f
 
-	if err := cmd.Start(); err != nil {
+	done, err := startTracked(cmd)
+	if err != nil {
 		f.Close()
 		proto.WriteFrame(conn, proto.ERROR,
 			[]byte(fmt.Sprintf("start: %v", err)))
@@ -62,11 +63,11 @@ func handleDetachedExec(conn net.Conn, req proto.ExecRequest) {
 	pid := cmd.Process.Pid
 	logf("detached exec: pid=%d cmd=%v output=%s", pid, req.Argv, outputFile)
 
-	// Reap in background — don't leak zombies.
+	// Reap in background — don't leak process handles or zombies.
 	go func() {
-		cmd.Wait()
+		exit := waitTracked(cmd, done)
 		f.Close()
-		logf("detached exec done: pid=%d", pid)
+		logf("detached exec done: pid=%d exit=%d", pid, exit.code())
 	}()
 
 	// Return PID and output file path as STDOUT JSON + EXIT(0).
@@ -98,16 +99,23 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		stdinPipe.Close()
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("stdout pipe: %v", err)))
 		return
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
+		stdinPipe.Close()
+		stdoutPipe.Close()
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("stderr pipe: %v", err)))
 		return
 	}
 
-	if err := cmd.Start(); err != nil {
+	done, err := startTracked(cmd)
+	if err != nil {
+		stdinPipe.Close()
+		stdoutPipe.Close()
+		stderrPipe.Close()
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("start: %v", err)))
 		return
 	}
@@ -128,6 +136,7 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 	ioWg.Add(2)
 	go func() {
 		defer ioWg.Done()
+		defer stdoutPipe.Close()
 		buf := make([]byte, 8192)
 		for {
 			n, err := stdoutPipe.Read(buf)
@@ -145,6 +154,7 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 	// stderr → STDERR frames
 	go func() {
 		defer ioWg.Done()
+		defer stderrPipe.Close()
 		buf := make([]byte, 8192)
 		for {
 			n, err := stderrPipe.Read(buf)
@@ -182,9 +192,9 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 		}
 	}()
 
-	// Wait for stdout/stderr to drain, then wait for child.
+	// Drain stdout/stderr before reporting the reaper's exit status.
 	ioWg.Wait()
-	exitCode := exitCodeFromErr(cmd.Wait())
+	exitCode := waitTracked(cmd, done).code()
 
 	if req.Sync != nil && *req.Sync {
 		execSync()
@@ -193,20 +203,6 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 	tx <- frameMsg{proto.EXIT, exit[:]}
 	close(tx)
 	writerWg.Wait()
-}
-
-func exitCodeFromErr(err error) int {
-	if err == nil {
-		return 0
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		status := exitErr.Sys().(syscall.WaitStatus)
-		if status.Signaled() {
-			return 128 + int(status.Signal())
-		}
-		return status.ExitStatus()
-	}
-	return 1
 }
 
 func buildEnv(env map[string]string) []string {

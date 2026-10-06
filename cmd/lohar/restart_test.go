@@ -36,28 +36,30 @@ func TestShouldRestart(t *testing.T) {
 	// Maps Restart= directive + exit code to a yes/no decision. Mirrors
 	// systemd's policy table.
 	cases := []struct {
-		policy  string
-		exit    int
-		wantRun bool
+		policy   string
+		exit     int
+		signaled bool
+		wantRun  bool
 	}{
-		{"no", 0, false},
-		{"no", 1, false},
-		{"", 0, false}, // unset = explicit opt-in
-		{"", 1, false},
-		{"always", 0, true},
-		{"always", 1, true},
-		{"on-success", 0, true},
-		{"on-success", 1, false},
-		{"on-failure", 0, false},
-		{"on-failure", 1, true},
-		{"on-abnormal", 1, false},     // not signal-killed
-		{"on-abnormal", 130, true},    // exit > 128 -> killed by signal
-		{"on-abnormal", 137, true},    // SIGKILL = 128+9
+		{"no", 0, false, false},
+		{"no", 1, false, false},
+		{"", 0, false, false}, // unset = explicit opt-in
+		{"", 1, false, false},
+		{"always", 0, false, true},
+		{"always", 1, false, true},
+		{"on-success", 0, false, true},
+		{"on-success", 1, false, false},
+		{"on-failure", 0, false, false},
+		{"on-failure", 1, false, true},
+		{"on-failure", 137, true, true},
+		{"on-abnormal", 1, false, false},
+		{"on-abnormal", 137, false, false}, // exit(137) is not SIGKILL
+		{"on-abnormal", 137, true, true},
 	}
 	for _, c := range cases {
-		got := shouldRestart(c.policy, c.exit)
+		got := shouldRestart(c.policy, c.exit, c.signaled)
 		if got != c.wantRun {
-			t.Errorf("shouldRestart(%q, exit=%d) = %v, want %v", c.policy, c.exit, got, c.wantRun)
+			t.Errorf("shouldRestart(%q, exit=%d, signaled=%v) = %v, want %v", c.policy, c.exit, c.signaled, got, c.wantRun)
 		}
 	}
 }

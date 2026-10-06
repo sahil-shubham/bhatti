@@ -27,7 +27,7 @@ func runCACertUpdate(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runTracked(cmd)
 }
 
 func setSandboxCAEnv(env map[string]string, bundle string) {

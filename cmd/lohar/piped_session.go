@@ -73,7 +73,8 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
 	}
 
-	if err := cmd.Start(); err != nil {
+	done, err := startTracked(cmd)
+	if err != nil {
 		stdinR.Close()
 		stdinW.Close()
 		stdoutR.Close()
@@ -160,7 +161,7 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 			if err != nil {
 				// Pipe closed — process exited.
 				stderrDone.Wait()
-				exitCode := exitCodeFromErr(cmd.Wait())
+				exitCode := waitTracked(cmd, done).code()
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
 				if sess.Attached != nil {
@@ -216,7 +217,7 @@ func readPipedHostInput(conn net.Conn, sess *Session) {
 			}
 			sess.mu.Unlock()
 			return
-		// RESIZE: ignored for piped sessions (no PTY)
+			// RESIZE: ignored for piped sessions (no PTY)
 		}
 	}
 }

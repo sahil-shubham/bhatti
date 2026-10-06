@@ -305,7 +305,7 @@ func netmaskToCIDR(mask string) int {
 
 // run executes a command and returns an error if it fails.
 func run(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	out, err := combinedOutputTracked(exec.Command(name, args...))
 	if err != nil {
 		return fmt.Errorf("%s %v: %s: %w", name, args, strings.TrimSpace(string(out)), err)
 	}

@@ -3,7 +3,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -76,6 +76,7 @@ func runAgent() {
 			os.Getpid())
 		os.Exit(2)
 	}
+	startChildReaper()
 
 	bootStart := time.Now()
 	var bootLog strings.Builder
@@ -206,10 +207,9 @@ func runAgent() {
 	setupNetworking()
 	bp("network_done")
 
-	// --- Signal handlers + zombie reaping + syslog ---
+	// --- Signal handlers + syslog ---
 
 	installSignalHandlers()
-	go reapZombies()
 
 	// Build the long-lived Unit registry shared by the syslog receiver,
 	// service activation, and the IPC handler. Bound to ProductionConfig()
@@ -321,19 +321,27 @@ func runAgent() {
 	// --- Boot profile ---
 
 	if _, err := os.Stat("/etc/bhatti/init.sh"); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cmd := exec.CommandContext(ctx, "/bin/sh", "/etc/bhatti/init.sh")
+		cmd := exec.Command("/bin/sh", "/etc/bhatti/init.sh")
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		cmd.Env = buildEnv(map[string]string{"HOME": "/root"})
-		if err := cmd.Run(); err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
+		done, err := startTracked(cmd)
+		if err == nil {
+			var timedOut atomic.Bool
+			timer := time.AfterFunc(30*time.Second, func() {
+				timedOut.Store(true)
+				cmd.Process.Kill()
+			})
+			err = waitTracked(cmd, done).err()
+			timer.Stop()
+			if timedOut.Load() {
 				fmt.Fprintf(os.Stderr, "lohar: boot profile timed out after 30s\n")
-			} else {
+			} else if err != nil {
 				fmt.Fprintf(os.Stderr, "lohar: boot profile failed: %v\n", err)
 			}
+		} else {
+			fmt.Fprintf(os.Stderr, "lohar: boot profile failed: %v\n", err)
 		}
-		cancel()
 	}
 
 	// --- Supplementary env ---
@@ -392,22 +400,6 @@ func installSignalHandlers() {
 		syscall.Sync()
 		syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
 	}()
-}
-
-// reapZombies reaps orphaned child processes. As PID 1, lohar is
-// responsible for waiting on all orphans to prevent zombie accumulation.
-// Go's runtime handles SIGCHLD for processes started via exec.Command,
-// but grandchild processes (e.g. services started by the systemctl shim,
-// daemons that double-fork) need explicit reaping.
-func reapZombies() {
-	for {
-		var status syscall.WaitStatus
-		pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-		if err != nil || pid <= 0 {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-	}
 }
 
 // startSyslogReceiver creates the syslog socket and routes datagrams to

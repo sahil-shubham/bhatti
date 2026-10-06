@@ -555,7 +555,7 @@ func svcStart(u *Unit) error {
 		os.MkdirAll(dir, mode)
 		os.Chmod(dir, mode)
 		if user := svc.get("Service", "User"); user != "" {
-			exec.Command("chown", user, dir).Run()
+			runTracked(exec.Command("chown", user, dir))
 		}
 	}
 
@@ -753,7 +753,8 @@ func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 		cmd.Stderr = logFile
 	}
 
-	if err := cmd.Start(); err != nil {
+	done, err := startTracked(cmd)
+	if err != nil {
 		if logFile != nil {
 			logFile.Close()
 		}
@@ -773,12 +774,9 @@ func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 	u.WritePID(cmd.Process.Pid)
 	u.ClearFailed() // a new run starts with a clean slate
 
-	// Spawn a watcher goroutine that observes the daemon's exit and
-	// applies the Restart= policy. cmd.Process.Release() is NOT called
-	// before this — the watcher needs the cmd handle for cmd.Wait().
-	//
-	// Tracked via the Registry's watcherWG so tests can wait for
-	// completion before tearing down. Production code never reads it.
+	// The watcher receives the reaper's status; it never waits on cmd itself.
+	// Tracked via the Registry's watcherWG so tests can wait for completion
+	// before tearing down. Production code never reads it.
 	//
 	// Snapshot/restore caveat: this goroutine is bound to *os.Process,
 	// which doesn't survive a process restart. In a Firecracker microVM
@@ -788,13 +786,12 @@ func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 	u.reg.watcherWG.Add(1)
 	go func() {
 		defer u.reg.watcherWG.Done()
-		watchAndMaybeRestart(u, cmd)
+		watchAndMaybeRestart(u, cmd, done)
 	}()
 	return nil
 }
 
-// watchAndMaybeRestart is the per-daemon supervisor goroutine. It blocks
-// on cmd.Wait() (which also reaps the zombie), then:
+// watchAndMaybeRestart observes the reaper's status and then:
 //
 //   - Updates the failed-state marker based on the exit code.
 //   - Removes the pidfile.
@@ -803,16 +800,9 @@ func startDaemon(u *Unit, execStart string, svc serviceFile) error {
 //
 // If an admin called systemctl stop (markStopRequested), the restart is
 // suppressed and the stop-marker cleared.
-func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd) {
-	err := cmd.Wait()
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
+func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd, done <-chan childExit) {
+	exit := waitTracked(cmd, done)
+	exitCode := exit.code()
 
 	u.RemovePID()
 	if exitCode == 0 {
@@ -827,7 +817,7 @@ func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd) {
 	}
 
 	policy := u.Sections.get("Service", "Restart")
-	if !shouldRestart(policy, exitCode) {
+	if !shouldRestart(policy, exitCode, exit.status.Signaled()) {
 		return
 	}
 	if !u.reg.restartBurstAllowed(u) {
@@ -843,16 +833,9 @@ func watchAndMaybeRestart(u *Unit, cmd *exec.Cmd) {
 	}
 }
 
-// shouldRestart maps the Restart= directive to a yes/no for the given
-// exit code. Mirrors systemd's policy:
-//
-//	no            never
-//	always        always (also after clean exits)
-//	on-success    only after exit 0
-//	on-failure    after non-zero exit (the common case)
-//	on-abnormal   after signals (exit > 128, by convention)
-//	"" (unset)    treated as no — services explicitly opt in
-func shouldRestart(policy string, exitCode int) bool {
+// shouldRestart maps Restart= to the actual wait status. A process that calls
+// exit(137) failed, but was not signaled and must not trigger on-abnormal.
+func shouldRestart(policy string, exitCode int, signaled bool) bool {
 	failed := exitCode != 0
 	switch policy {
 	case "always":
@@ -862,7 +845,7 @@ func shouldRestart(policy string, exitCode int) bool {
 	case "on-failure":
 		return failed
 	case "on-abnormal":
-		return exitCode > 128
+		return signaled
 	case "no", "":
 		return false
 	}
@@ -934,7 +917,7 @@ func startForking(u *Unit, execStart string, svc serviceFile) error {
 	cmd.Env = buildServiceEnv(svc)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-	if err := cmd.Run(); err != nil {
+	if err := runTracked(cmd); err != nil {
 		return fmt.Errorf("start %s: %w", execStart, err)
 	}
 
@@ -1581,7 +1564,7 @@ func runServiceCommand(cmdLine string, svc serviceFile) error {
 	cmd.Env = buildServiceEnv(svc)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runTracked(cmd)
 }
 
 func buildServiceEnv(svc serviceFile) []string {

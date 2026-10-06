@@ -78,7 +78,8 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
 	}
 
-	if err := cmd.Start(); err != nil {
+	done, err := startTracked(cmd)
+	if err != nil {
 		slave.Close()
 		master.Close()
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("start: %v", err)))
@@ -125,7 +126,7 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 				// to retrieve scrollback. The session is removed when:
 				//   1. A client attaches and we send the exit frame (handleSessionAttach)
 				//   2. The reap timer fires (30s after exit, no reattach)
-				exitCode := exitCodeFromErr(cmd.Wait())
+				exitCode := waitTracked(cmd, done).code()
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
 				if sess.Attached != nil {
@@ -358,7 +359,8 @@ func runInitSession(script, user string) {
 		},
 	}
 	cmd.Dir = "/workspace"
-	if err := cmd.Start(); err != nil {
+	done, err := startTracked(cmd)
+	if err != nil {
 		slave.Close()
 		master.Close()
 		logf("init session start: %v", err)
@@ -386,7 +388,7 @@ func runInitSession(script, user string) {
 				sess.mu.Unlock()
 			}
 			if err != nil {
-				exitCode := exitCodeFromErr(cmd.Wait())
+				exitCode := waitTracked(cmd, done).code()
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
 				if sess.Attached != nil {
