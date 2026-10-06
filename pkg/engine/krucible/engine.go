@@ -89,18 +89,23 @@ func netGuestIPFor(subnetIdx, guestIdx int) string {
 // detached (survives a daemon restart) and identified by pid so recovery can
 // re-adopt it instead of respawning onto a socket it still holds.
 type netdInstance struct {
-	owner     string
-	sock      string
-	ctlSock   string
-	dir       string
-	subnetIdx int
-	mu        sync.Mutex // guards cmd/pid (spawn-once)
-	cmd       *exec.Cmd  // set when WE spawned it (nil when adopted across a restart)
-	pid       int        // the running netd's pid (source of truth for alive/kill)
-	nextGuest int
-	refs      int
-	brokerLn  net.Listener // credential broker socket served to this netd (broker.go); guarded by mu
-	vmmGID    uint32       // group of the owner's confined helpers, the only one sock opens to (vmmuser.go); 0 = none
+	owner          string
+	sock           string
+	ctlSock        string
+	dir            string
+	subnetIdx      int
+	mu             sync.Mutex // guards process handles, pid, broker, and guest counter
+	cmd            *exec.Cmd
+	waitDone       <-chan error  // one cmd.Wait goroutine, drained by watchNetd
+	exitDone       chan struct{} // closed as soon as cmd.Wait returns, before cleanup
+	stopping       bool          // deliberate replacement / last-sandbox removal
+	pid            int
+	watchedPID     int  // only one adopted death monitor per incarnation
+	lostAtRecovery bool // persisted pid was gone before startup adoption
+	nextGuest      int
+	refs           int
+	brokerLn       net.Listener
+	vmmGID         uint32
 }
 
 // netdDir is the deterministic per-owner directory (so recovery finds the same
@@ -175,15 +180,18 @@ func (e *Engine) releaseNetd(ownerKey string) {
 		return
 	}
 	inst.mu.Lock()
+	inst.stopping = true
 	switch {
 	case inst.cmd != nil && inst.cmd.Process != nil:
 		_ = inst.cmd.Process.Kill()
-		_, _ = inst.cmd.Process.Wait() // reap our child
+		if inst.exitDone != nil {
+			<-inst.exitDone
+		} else if inst.waitDone != nil {
+			<-inst.waitDone
+		}
 	case inst.pid > 0 && isNetd(inst.pid, inst.sock):
-		// Adopted across a restart, and still that netd (by now its pid could be
-		// anyone's). Reap it if it's our child (same-process recovery / tests); a
-		// no-op (ECHILD) in production where init re-parented it.
 		_ = syscall.Kill(inst.pid, syscall.SIGKILL)
+		// Adopted gateways are not our children, except in same-process tests.
 		var ws syscall.WaitStatus
 		_, _ = syscall.Wait4(inst.pid, &ws, 0, nil)
 	}
@@ -198,7 +206,7 @@ func (e *Engine) releaseNetd(ownerKey string) {
 
 // ensureNetd spawns the owner's bhatti-netd (LISTENING on inst.sock) if it is
 // not already running. Idempotent: siblings and cold Start reuse a live gateway.
-func (e *Engine) ensureNetd(ownerKey string) error {
+func (e *Engine) ensureNetd(ownerKey string) (retErr error) {
 	e.netdMu.Lock()
 	inst := e.netds[ownerKey]
 	broker := e.broker
@@ -207,7 +215,13 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		return fmt.Errorf("netd instance %q not found", ownerKey)
 	}
 	inst.mu.Lock()
-	defer inst.mu.Unlock()
+	var lostReason string
+	defer func() {
+		inst.mu.Unlock()
+		if lostReason != "" {
+			e.emitNetworkLost(ownerKey, lostReason)
+		}
+	}()
 	// libkrun's Unixstream holds its connected fd for the VM's lifetime
 	// (no reconnect after EOF). Replacing an incompatible netd therefore
 	// disconnects existing guests permanently until they are restarted. Kill it
@@ -221,6 +235,9 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 			versionErr = gateway.ProbeVersion(inst.ctlSock)
 			if versionErr == nil {
 				serveBrokerLocked(inst, broker)
+				if inst.cmd == nil {
+					e.watchAdoptedNetdLocked(inst)
+				}
 				return e.shareNetdSocket(inst)
 			}
 		} else {
@@ -229,9 +246,12 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 		if err := e.replaceNetdLocked(inst, versionErr); err != nil {
 			return err // fail closed: never unlink sockets while old netd lives
 		}
+		lostReason = "bhatti-netd replaced after incompatible control protocol: " + versionErr.Error()
+	} else if inst.pid > 0 {
+		lostReason = "bhatti-netd exited or its pid was reused"
+		e.netdExitedLocked(inst)
 	} else {
-		inst.pid = 0 // dead process / reused pid, never signal an unrelated pid
-		inst.cmd = nil
+		inst.cmd, inst.waitDone, inst.exitDone = nil, nil, nil
 	}
 
 	if err := os.MkdirAll(inst.dir, 0700); err != nil {
@@ -270,12 +290,14 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start bhatti-netd: %w", err)
 	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
 	logPath := filepath.Join(inst.dir, "netd.log")
 	if werr := waitForSocket(inst.sock, 5*time.Second); werr != nil {
-		return netdStartFailed(cmd, logPath, fmt.Errorf("bhatti-netd not listening: %w", werr))
+		return netdStartFailed(cmd, waitDone, logPath, fmt.Errorf("bhatti-netd not listening: %w", werr))
 	}
 	if werr := waitForSocket(inst.ctlSock, 5*time.Second); werr != nil {
-		return netdStartFailed(cmd, logPath, fmt.Errorf("bhatti-netd control socket not listening: %w", werr))
+		return netdStartFailed(cmd, waitDone, logPath, fmt.Errorf("bhatti-netd control socket not listening: %w", werr))
 	}
 	// The socket path appears before netd finishes confinement and starts its
 	// accept loop. Give this newly spawned process time to answer, but never
@@ -287,29 +309,40 @@ func (e *Engine) ensureNetd(ownerKey string) error {
 			break
 		}
 		if time.Now().After(deadline) {
-			return netdStartFailed(cmd, logPath, fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr))
+			return netdStartFailed(cmd, waitDone, logPath, fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr))
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	inst.cmd = cmd
 	inst.pid = cmd.Process.Pid
+	inst.waitDone = waitDone
+	inst.exitDone = make(chan struct{})
+	inst.stopping = false
+	inst.watchedPID = inst.pid
 	writeNetdRecord(inst) // persist pid+sock so recovery can re-adopt this netd
+	e.watchNetd(inst, cmd, waitDone, inst.exitDone)
 	serveBrokerLocked(inst, broker)
 	return e.shareNetdSocket(inst)
 }
 
 // replaceNetdLocked stops a verified old netd before its sockets are reused.
-// It is called with inst.mu held and records the unavoidable disconnection of
-// helpers still using the old, non-reconnecting Unixstream fd.
+// Caller holds inst.mu. Emission happens after releasing it in ensureNetd.
 func (e *Engine) replaceNetdLocked(inst *netdInstance, reason error) error {
 	slog.Error("krucible.netd_incompatible", "owner", inst.owner, "pid", inst.pid, "error", reason)
+	inst.stopping = true
 	if inst.cmd != nil && inst.cmd.Process != nil {
 		if err := inst.cmd.Process.Kill(); err != nil && err != os.ErrProcessDone {
+			inst.stopping = false
 			return fmt.Errorf("stop incompatible netd: %w", err)
 		}
-		_, _ = inst.cmd.Process.Wait()
+		if inst.exitDone != nil {
+			<-inst.exitDone
+		} else if inst.waitDone != nil {
+			<-inst.waitDone
+		}
 	} else {
 		if err := syscall.Kill(inst.pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			inst.stopping = false
 			return fmt.Errorf("stop incompatible netd %d: %w", inst.pid, err)
 		}
 		deadline := time.Now().Add(3 * time.Second)
@@ -325,15 +358,7 @@ func (e *Engine) replaceNetdLocked(inst *netdInstance, reason error) error {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	inst.cmd, inst.pid = nil, 0
-	writeNetdRecord(inst)
-	e.mu.RLock()
-	for _, vm := range e.vms {
-		if vm.netdKey == inst.owner && vm.Status == "running" {
-			e.emitNetdEvent(vm.UserID, vm.brokerRef(), reason.Error())
-		}
-	}
-	e.mu.RUnlock()
+	e.netdExitedLocked(inst)
 	return nil
 }
 
@@ -385,13 +410,11 @@ func (e *Engine) delSandboxPolicy(vm *VM) {
 // stop it and the agent client to drive lohar.
 type VM struct {
 	mu sync.Mutex
-	// launchMu serializes lifecycle transitions (Create's launch / Start / Stop /
-	// Pause / Resume / Destroy) for this VM. Held for the whole transition so a
-	// burst of concurrent wake-on-request calls (the public proxy + exec handlers
-	// all call ensureHot uncoalesced) can't double-spawn the helper, racing on the
-	// same vsock UDS paths and orphaning processes. Ordering rule: acquire
-	// launchMu BEFORE mu, never the reverse (mu guards field reads/writes and is
-	// also taken by read-only Status/List, which must not block on a transition).
+	// Lock order: launchMu before mu for VM transitions; never hold mu for
+	// sockets, process waits or state.json I/O. e.mu/netdMu only protect maps,
+	// and must not be held while taking launchMu or calling event handlers.
+	// A death watcher publishes the reaped process before taking launchMu,
+	// so a concurrent Stop cannot deadlock waiting on its exit.
 	launchMu     sync.Mutex
 	ID           string
 	Name         string
@@ -412,7 +435,9 @@ type VM struct {
 	logPath      string
 	HelperPID    int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
 	cmd          *exec.Cmd
-	waitDone     <-chan error // cmd.Wait is owned by one goroutine, including during kill
+	waitDone     <-chan error  // cmd.Wait's result, owned by the death watcher
+	exitDone     chan struct{} // watcher closes on reap before taking launchMu
+	stopping     bool          // explicit kill owns this exit, not the watcher
 	cancel       context.CancelFunc
 	configSrv    *configServer          // host-side boot config server (§3.4); launchMu-guarded
 	netdKey      string                 // owner key of the shared bhatti-netd (net backend); "" on TSI
@@ -442,17 +467,20 @@ func (vm *VM) specPath() string { return filepath.Join(vm.SandboxDir, "vmspec.js
 
 // Engine implements engine.Engine on libkrun via the per-VM bhatti-vmm helper.
 type Engine struct {
-	mu                sync.RWMutex
-	vms               map[string]*VM
-	cfg               Config
-	baseImgMu         sync.Mutex               // guards the one-time base-image build
-	netdMu            sync.Mutex               // guards netds and broker
-	netds             map[string]*netdInstance // owner key → shared bhatti-netd gateway
-	broker            engine.CredentialBroker  // served to every netd (broker.go); nil = no credential substitution
-	netdEventMu       sync.Mutex
-	onNetdEvent       func(userID, sandboxID, reason string)
-	pendingNetdEvents []netdEvent
-	caps              VMMCapabilities // what the bhatti-vmm build supports (probed in New)
+	mu               sync.RWMutex
+	vms              map[string]*VM
+	cfg              Config
+	baseImgMu        sync.Mutex               // guards the one-time base-image build
+	netdMu           sync.Mutex               // guards netds and broker
+	netds            map[string]*netdInstance // owner key → shared bhatti-netd gateway
+	broker           engine.CredentialBroker  // served to every netd (broker.go); nil = no credential substitution
+	eventMu          sync.Mutex
+	onLifecycleEvent func(engine.LifecycleEvent)
+	pendingEvents    []engine.LifecycleEvent
+	monitorMu        sync.Mutex
+	monitorStop      chan struct{} // closes on Shutdown; detached helpers keep running
+	monitorStopped   bool
+	caps             VMMCapabilities // what the bhatti-vmm build supports (probed in New)
 	// Confined helpers (vmmuser.go): confineVMM on Linux; dropVMM when the
 	// daemon is root, which gives each helper its own uid from vmmIDs (mu).
 	confineVMM, dropVMM bool
@@ -815,6 +843,11 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		sandboxRef: spec.SandboxID,
 	}
 
+	// An exit racing Create's final checks and registration must wait until
+	// the VM is visible to observers before its watcher publishes the death.
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
+
 	if opts.snapshotDir != "" && !e.caps.Checkpoint {
 		return info, errNoCheckpoint
 	}
@@ -941,6 +974,8 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 	cmd := exec.CommandContext(vmCtx, e.cfg.VMMBinary, specPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	// Its own process group, out of the daemon's: the helper outlives every
 	// daemon restart, and the next daemon adopts it (recover). (darwin + linux.)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -965,14 +1000,14 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 	// mid-launch leaves a helper the next one has to find, to kill (recover).
 	vm.mu.Lock()
 	vm.HelperPID = cmd.Process.Pid
-	vm.persistLocked()
 	vm.mu.Unlock()
+	vm.persist()
 	defer func() {
 		if err != nil {
 			vm.mu.Lock()
 			vm.HelperPID = 0
-			vm.persistLocked()
 			vm.mu.Unlock()
+			vm.persist()
 		}
 	}()
 
@@ -1028,10 +1063,13 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 			return fmt.Errorf("restore: %w: %w", engine.ErrGuestReseedFailed, err)
 		}
 	}
+	reaped := make(chan struct{})
 	vm.mu.Lock()
 	vm.cmd = cmd
 	vm.cancel = vmCancel
 	vm.waitDone = waitDone
+	vm.exitDone = reaped
+	vm.stopping = false
 	vm.HelperPID = cmd.Process.Pid
 	vm.Agent = ag
 	vm.AgentInfo = agentInfo
@@ -1041,30 +1079,35 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 	vm.Thermal = "hot"
 	vm.mu.Unlock()
 	vm.persist()
+	e.watchVM(vm, cmd, waitDone, reaped)
 	return nil
 }
 
-// kill terminates the helper and waits until it's gone: through the Cmd handle
-// when we spawned it, else by the persisted pid of a helper adopted across a
-// daemon restart — signalled only while it still runs this sandbox's spec.
+// kill terminates a helper that this daemon owns or adopted. The watcher owns
+// cmd.Wait; signal under the short state lock, then wait without holding it.
 func (vm *VM) kill() {
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	if vm.cmd != nil && vm.cmd.Process != nil {
-		_ = vm.cmd.Process.Kill()
-		<-vm.waitDone
-	} else if vm.HelperPID > 0 {
-		killHelper(vm.HelperPID, vm.specPath())
+	cmd, waitDone, reaped := vm.cmd, vm.waitDone, vm.exitDone
+	pid, cancel := vm.HelperPID, vm.cancel
+	vm.stopping = true
+	vm.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		if reaped != nil {
+			<-reaped
+		} else if waitDone != nil { // fixtures with a manually owned Cmd.Wait
+			<-waitDone
+		}
+	} else if pid > 0 {
+		killHelper(pid, vm.specPath())
 	}
-	// The bhatti-netd gateway is shared per owner and outlives a single VM; it is
-	// torn down by releaseNetd on Destroy of the owner's last sandbox.
-	if vm.cancel != nil {
-		vm.cancel()
+	if cancel != nil {
+		cancel()
 	}
-	vm.cmd = nil
-	vm.cancel = nil
-	vm.waitDone = nil
+	vm.mu.Lock()
+	vm.cmd, vm.cancel, vm.waitDone, vm.exitDone = nil, nil, nil, nil
 	vm.HelperPID = 0
+	vm.mu.Unlock()
 	vm.closeConfigSrv()
 }
 
@@ -1125,17 +1168,18 @@ func (e *UncleanStopError) Error() string {
 func (e *UncleanStopError) Unwrap() error             { return e.Reason }
 func (e *UncleanStopError) UncleanStopReason() string { return e.Reason.Error() }
 
-// powerOffLocked kills a VM even when guest cooperation is unavailable. The
-// caller owns launchMu, so thaw failure can share Stop's final state transition
-// without reacquiring the lock held for the volume backup lease.
-func (vm *VM) powerOffLocked() {
+// powerOffLocked handles an explicit, possibly unclean stop. The caller owns
+// launchMu; neither killing the process nor persisting the record holds vm.mu.
+func (e *Engine) powerOffLocked(vm *VM) {
 	vm.kill()
 	vm.mu.Lock()
 	vm.Status = "stopped"
 	vm.Thermal = "cold"
 	vm.Agent = nil
-	vm.persistLocked()
 	vm.mu.Unlock()
+	e.delSandboxPolicy(vm)
+	vm.removeSockets()
+	vm.persist()
 }
 
 // Stop powers off the VM after a guest sync. A warm VM must be resumed and
@@ -1168,9 +1212,9 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 		} else {
 			vm.mu.Lock()
 			vm.Thermal = "hot"
-			vm.persistLocked()
 			ag, unasked := vm.Agent, errors.Is(vm.AgentInfoErr, errAgentInfoPaused)
 			vm.mu.Unlock()
+			vm.persist()
 			if unasked {
 				// The guest could not answer INFO while adopted paused;
 				// refresh its capabilities now that its vCPUs can run.
@@ -1186,7 +1230,7 @@ func (e *Engine) Stop(ctx context.Context, id string) error {
 		syncErr = vm.syncGuest(syncCtx)
 		cancel()
 	}
-	vm.powerOffLocked()
+	e.powerOffLocked(vm)
 	slog.Info("krucible sandbox stopped (powered off)", "id", id)
 	if syncErr != nil {
 		slog.Warn("krucible stop: guest sync failed; VM powered off", "id", id, "error", syncErr)
@@ -1421,6 +1465,7 @@ func (e *Engine) List(ctx context.Context) ([]engine.SandboxInfo, error) {
 // lifecycle transitions, which persist what they did, and closes what the
 // daemon serves the sandboxes: boot config and credential broker sockets.
 func (e *Engine) Shutdown() {
+	e.stopMonitors()
 	e.mu.RLock()
 	vms := make([]*VM, 0, len(e.vms))
 	for _, vm := range e.vms {
@@ -1524,13 +1569,16 @@ func tailFile(path string, n int64) string {
 // netdStartFailed reaps a netd that didn't come up and says why: whether it
 // exited on its own (netd binds its sockets before it confines itself, so a
 // confinement failure looks like an unanswered socket) and its last log lines.
-func netdStartFailed(cmd *exec.Cmd, logPath string, cause error) error {
+func netdStartFailed(cmd *exec.Cmd, done <-chan error, logPath string, cause error) error {
 	_ = cmd.Process.Kill()
-	// Killing a process that already exited changes nothing, so anything but
-	// our SIGKILL in the wait status is netd's own exit.
-	if state, err := cmd.Process.Wait(); err == nil {
-		if ws, ok := state.Sys().(syscall.WaitStatus); ok && !(ws.Signaled() && ws.Signal() == syscall.SIGKILL) {
-			cause = fmt.Errorf("%w (bhatti-netd exited at startup: %s)", cause, state)
+	// The single cmd.Wait goroutine owns the process even on failed startup.
+	// A completed wait before our SIGKILL preserves the actual startup error.
+	if err := <-done; err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			if ws, ok := exit.Sys().(syscall.WaitStatus); ok && !(ws.Signaled() && ws.Signal() == syscall.SIGKILL) {
+				cause = fmt.Errorf("%w (bhatti-netd exited at startup: %s)", cause, exit)
+			}
 		}
 	}
 	if tail := strings.TrimSpace(tailFile(logPath, 1024)); tail != "" {

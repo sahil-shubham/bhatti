@@ -57,14 +57,15 @@ func (e *Engine) pause(ctx context.Context, id string, syncGuest bool) error {
 			slog.Warn("krucible pause: guest sync failed; final stop will retry", "id", id, "error", err)
 		}
 	}
-	// Keep the VMM's acknowledged thermal state durable for daemon adoption.
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	// launchMu keeps the transition serialized while vm.mu stays available
+	// to Status/List throughout a slow or wedged control-socket round-trip.
 	if _, err := controlCmd(ctx, vm.CtlSockUDS, "PAUSE"); err != nil {
 		return fmt.Errorf("pause: %w", err)
 	}
+	vm.mu.Lock()
 	vm.Thermal = "warm"
-	vm.persistLocked()
+	vm.mu.Unlock()
+	vm.persist()
 	return nil
 }
 
@@ -82,14 +83,15 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 		vm.mu.Unlock()
 		return nil
 	}
+	vm.mu.Unlock()
 	if _, err := controlCmd(ctx, vm.CtlSockUDS, "RESUME"); err != nil {
-		vm.mu.Unlock()
 		return fmt.Errorf("resume: %w", err)
 	}
+	vm.mu.Lock()
 	vm.Thermal = "hot"
-	vm.persistLocked()
 	ag, unasked := vm.Agent, errors.Is(vm.AgentInfoErr, errAgentInfoPaused)
 	vm.mu.Unlock()
+	vm.persist()
 	if unasked { // adopted paused: its guest couldn't answer until now
 		info, err := queryAgentInfo(ctx, ag)
 		if err != nil {

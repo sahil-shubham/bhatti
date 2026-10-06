@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -15,10 +14,7 @@ import (
 // a metrics snapshot every 60 seconds. Counter fields are deltas since
 // the previous snapshot. Gauge fields are point-in-time values.
 func (s *Server) StartMetricsSnapshots() {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.stopMetrics = cancel
-
-	go func() {
+	s.startBackground("metrics snapshots", func() {
 		// Initialize previous counter values to current (which are 0 on
 		// fresh start). First snapshot will have correct deltas.
 		prevAPI := s.requestTotal.Load()
@@ -44,7 +40,7 @@ func (s *Server) StartMetricsSnapshots() {
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
 				snap := s.collectSnapshot(
@@ -57,7 +53,7 @@ func (s *Server) StartMetricsSnapshots() {
 				}
 			}
 		}
-	}()
+	})
 }
 
 func (s *Server) collectSnapshot(
@@ -171,15 +167,12 @@ func (s *Server) collectSnapshot(
 // StartRetention starts a background goroutine that purges old events
 // and metrics snapshots hourly.
 func (s *Server) StartRetention() {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.stopRetention = cancel
-
-	go func() {
+	s.startBackground("event retention", func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
 				if n, err := s.store.PurgeOldEvents(90 * 24 * time.Hour); err != nil {
@@ -194,5 +187,5 @@ func (s *Server) StartRetention() {
 				}
 			}
 		}
-	}()
+	})
 }

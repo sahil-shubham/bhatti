@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent"
+	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
@@ -99,18 +100,14 @@ func (vm *VM) toRecordLocked() vmRecord {
 	}
 }
 
-// persist writes the VM's durable state. persistLocked is the same for callers
-// already holding vm.mu (e.g. thermal transitions). Atomic (temp + rename) so a
-// crash mid-write never leaves a half-written record.
+// persist snapshots under vm.mu, then writes after releasing it. Lifecycle
+// transitions own launchMu, so the snapshots cannot be reordered by a peer.
 func (vm *VM) persist() {
 	vm.mu.Lock()
 	rec := vm.toRecordLocked()
 	vm.mu.Unlock()
 	writeRecord(rec)
 }
-
-func (vm *VM) persistLocked() { writeRecord(vm.toRecordLocked()) }
-
 func writeRecord(rec vmRecord) {
 	if rec.SandboxDir == "" {
 		return
@@ -167,6 +164,8 @@ func (e *Engine) readoptNetd(vm *VM) {
 			inst.nextGuest = rec.NextGuest
 			if rec.Pid > 0 && pidAlive(rec.Pid) && isNetd(rec.Pid, inst.sock) {
 				inst.pid = rec.Pid // adopt the live gateway
+			} else if rec.Pid > 0 {
+				inst.lostAtRecovery = true
 			}
 			if e.dropVMM {
 				inst.vmmGID = rec.VMMGID
@@ -273,6 +272,13 @@ func (e *Engine) recover() {
 			continue
 		}
 		checked[vm.netdKey] = true
+		e.netdMu.Lock()
+		inst := e.netds[vm.netdKey]
+		e.netdMu.Unlock()
+		if inst.lostAtRecovery {
+			inst.lostAtRecovery = false
+			e.emitNetworkLost(vm.netdKey, "bhatti-netd exited before daemon recovery")
+		}
 		if err := e.ensureNetd(vm.netdKey); err != nil {
 			slog.Error("krucible.netd_recovery_failed", "owner", vm.netdKey, "error", err)
 			if e.netdRunning(vm.netdKey) {
@@ -288,7 +294,9 @@ func (e *Engine) recover() {
 			// VMM alive would leave its unverified egress policy in effect.
 			slog.Error("krucible.netd_quarantine", "sandbox_id", vm.ID, "error", reason)
 			killHelper(vm.HelperPID, vm.specPath())
-			e.emitNetdEvent(vm.UserID, vm.brokerRef(), "gateway recovery failed: "+reason.Error())
+			e.emitLifecycle(engine.LifecycleEvent{Kind: engine.NetworkLost, EngineID: vm.ID,
+				SandboxID: vm.sandboxRef, UserID: vm.UserID,
+				Reason: "gateway recovery failed: " + reason.Error() + "; existing guests cannot reattach their Unixstream NIC until restarted"})
 		} else {
 			helper = e.adoptHelper(vm, recStatus)
 		}
@@ -317,6 +325,11 @@ func (e *Engine) recover() {
 			if err := e.pushSandboxPolicy(vm); err != nil {
 				slog.Warn("krucible.netd_policy_replay_failed", "sandbox_id", vm.ID, "error", err)
 			}
+		}
+	}
+	for _, vm := range recovered {
+		if vm.Status == "running" {
+			e.watchAdoptedVM(vm)
 		}
 	}
 }
@@ -368,8 +381,8 @@ func (e *Engine) helperState(vm *VM) (string, error) {
 	return reply, nil
 }
 
-// netdRunning reports whether the owner's netd is a live process (adopted or
-// spawned), so there is something to push to.
+// netdRunning checks identity as well as the pid: a crashed owned netd can
+// still be a zombie until its wait goroutine has updated the instance.
 func (e *Engine) netdRunning(ownerKey string) bool {
 	e.netdMu.Lock()
 	inst := e.netds[ownerKey]
@@ -378,8 +391,9 @@ func (e *Engine) netdRunning(ownerKey string) bool {
 		return false
 	}
 	inst.mu.Lock()
-	defer inst.mu.Unlock()
-	return inst.pid > 0
+	pid, sock := inst.pid, inst.sock
+	inst.mu.Unlock()
+	return pid > 0 && pidAlive(pid) && isNetd(pid, sock)
 }
 
 const stateFile = "state.json"

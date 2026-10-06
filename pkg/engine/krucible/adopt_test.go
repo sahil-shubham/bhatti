@@ -201,6 +201,7 @@ func TestRecoverAdoptsLiveHelpers(t *testing.T) {
 	}
 	recordSandbox(e, "dead", "running", gone.Process.Pid)
 
+	t.Cleanup(e.Shutdown) // stop adopted monitors before fakeHelper cleanup
 	e.recover()
 
 	want := map[string]struct {
@@ -220,18 +221,21 @@ func TestRecoverAdoptsLiveHelpers(t *testing.T) {
 			t.Errorf("%s: not recovered", id)
 			continue
 		}
-		if vm.Status != w.status || vm.Thermal != w.thermal || vm.HelperPID != w.pid {
-			t.Errorf("%s: recovered %s/%s pid %d, want %s/%s pid %d", id, vm.Status, vm.Thermal, vm.HelperPID, w.status, w.thermal, w.pid)
+		vm.mu.Lock()
+		status, thermal, pid, ag, agentInfoErr := vm.Status, vm.Thermal, vm.HelperPID, vm.Agent, vm.AgentInfoErr
+		vm.mu.Unlock()
+		if status != w.status || thermal != w.thermal || pid != w.pid {
+			t.Errorf("%s: recovered %s/%s pid %d, want %s/%s pid %d", id, status, thermal, pid, w.status, w.thermal, w.pid)
 		}
-		if (vm.Agent != nil) != (w.status == "running") {
-			t.Errorf("%s: agent client %v with status %s", id, vm.Agent, vm.Status)
+		if (ag != nil) != (w.status == "running") {
+			t.Errorf("%s: agent client %v with status %s", id, ag, status)
+		}
+		if id == "paused" && !errors.Is(agentInfoErr, errAgentInfoPaused) {
+			t.Errorf("paused: agent info error %v, want it left for Resume", agentInfoErr)
 		}
 		if rec := readRecord(t, vm.SandboxDir); rec.Status != w.status || rec.Thermal != w.thermal || rec.HelperPID != w.pid {
 			t.Errorf("%s: state.json says %s/%s pid %d, want %s/%s pid %d", id, rec.Status, rec.Thermal, rec.HelperPID, w.status, w.thermal, w.pid)
 		}
-	}
-	if err := e.vms["paused"].AgentInfoErr; !errors.Is(err, errAgentInfoPaused) {
-		t.Errorf("paused: agent info error %v, want it left for Resume", err)
 	}
 	for id, pid := range map[string]int{"running": runningPID, "paused": pausedPID} {
 		if !running(pid, "bhatti-vmm", e.vms[id].specPath()) {

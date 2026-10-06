@@ -215,6 +215,8 @@ func runDaemon() {
 	srv.StartEventRecorder()
 	// Before the thermal manager's first cycle, and after the recorder.
 	srv.RecoverSandboxes(context.Background())
+	// Register after recovery so queued engine exits cannot race store sync.
+	srv.StartLifecycleEvents()
 	srv.StartRetention()
 	// After the recorder: the broker audits every credential use and refusal.
 	srv.StartCredentialBroker()
@@ -265,32 +267,9 @@ func runDaemon() {
 		},
 	})
 
-	// Auto-wake keep_hot sandboxes after recovery. These sandboxes maintain
-	// persistent external connections that die on pause. One that outlived the
-	// previous daemon is hot already (a no-op here); one whose VM died while no
-	// daemon was running, or that was stopped, boots now.
-	go func() {
-		hotSandboxes, err := st.ListAllSandboxes()
-		if err != nil {
-			slog.Warn("auto-wake: list sandboxes", "error", err)
-			return
-		}
-		for _, sb := range hotSandboxes {
-			if !sb.KeepHot || sb.Status == "destroyed" {
-				continue
-			}
-			wakeCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			if err := srv.EnsureHot(wakeCtx, sb.EngineID); err != nil {
-				slog.Error("auto-wake failed",
-					"sandbox", sb.Name, "id", sb.ID, "error", err)
-			} else {
-				st.UpdateSandboxStatus(sb.ID, "running")
-				slog.Info("auto-wake: sandbox started",
-					"sandbox", sb.Name, "id", sb.ID)
-			}
-			cancel()
-		}
-	}()
+	// Recover keep_hot guests in a server-owned loop, cancelled and joined on
+	// shutdown rather than racing a detached startup wake against engine exit.
+	srv.StartKeepHotRecovery()
 
 	// Wait for SIGTERM/SIGINT
 	sigCh := make(chan os.Signal, 1)

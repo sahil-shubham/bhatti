@@ -345,7 +345,7 @@ func wsRelay(conn *websocket.Conn, term engine.TerminalConn) {
 	})
 
 	// Ping ticker — keeps the connection alive through proxies.
-	go func() {
+	goSafe("terminal websocket ping", func() {
 		ticker := time.NewTicker(wsPingInterval)
 		defer ticker.Stop()
 		for {
@@ -359,10 +359,10 @@ func wsRelay(conn *websocket.Conn, term engine.TerminalConn) {
 				return
 			}
 		}
-	}()
+	})
 
 	// Terminal → WebSocket
-	go func() {
+	goSafe("terminal to websocket", func() {
 		defer closeDone()
 		buf := make([]byte, 4096)
 		for {
@@ -376,10 +376,10 @@ func wsRelay(conn *websocket.Conn, term engine.TerminalConn) {
 				return
 			}
 		}
-	}()
+	})
 
 	// WebSocket → Terminal
-	go func() {
+	goSafe("websocket to terminal", func() {
 		defer closeDone()
 		for {
 			msgType, msg, err := conn.ReadMessage()
@@ -404,7 +404,7 @@ func wsRelay(conn *websocket.Conn, term engine.TerminalConn) {
 				return
 			}
 		}
-	}()
+	})
 
 	<-done
 }
@@ -606,7 +606,7 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn, streams *streamSet)
 		conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
 		return nil
 	})
-	go func() {
+	goSafe("piped websocket ping", func() {
 		ticker := time.NewTicker(wsPingInterval)
 		defer ticker.Stop()
 		for {
@@ -620,10 +620,10 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn, streams *streamSet)
 				return
 			}
 		}
-	}()
+	})
 
 	// Piped session → WebSocket (STDOUT/EXIT frames)
-	go func() {
+	goSafe("piped session to websocket", func() {
 		defer closeDone()
 		var out utf8Framer
 		for {
@@ -671,10 +671,10 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn, streams *streamSet)
 				return
 			}
 		}
-	}()
+	})
 
 	// WebSocket → piped session (text messages → STDIN frames)
-	go func() {
+	goSafe("websocket to piped session", func() {
 		defer closeDone()
 		for {
 			_, msg, err := conn.ReadMessage()
@@ -685,7 +685,7 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn, streams *streamSet)
 				return
 			}
 		}
-	}()
+	})
 
 	<-done
 }

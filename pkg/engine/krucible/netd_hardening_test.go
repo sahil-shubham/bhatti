@@ -121,9 +121,11 @@ func TestIncompatibleNetdIsKilledBeforeReuseAndEventsAreQueued(t *testing.T) {
 	if inst.pid != 0 {
 		t.Fatalf("incompatible pid %d retained", inst.pid)
 	}
-	var events []netdEvent
-	e.SetNetdEventRecorder(func(user, sandbox, reason string) { events = append(events, netdEvent{user, sandbox, reason}) })
-	if len(events) != 1 || events[0].userID != "owner" || events[0].sandboxID != "sb-server" || !strings.Contains(events[0].reason, "hello") {
+	var events []engine.LifecycleEvent
+	e.SetLifecycleHandler(func(event engine.LifecycleEvent) { events = append(events, event) })
+	if len(events) != 1 || events[0].Kind != engine.NetworkLost || events[0].EngineID != "sb" ||
+		events[0].UserID != "owner" || events[0].SandboxID != "sb-server" ||
+		!strings.Contains(events[0].Reason, "hello") || !strings.Contains(events[0].Reason, "cannot reattach") {
 		t.Fatalf("missing per-sandbox network-loss event: %+v", events)
 	}
 }

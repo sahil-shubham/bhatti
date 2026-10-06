@@ -67,18 +67,22 @@ type subscriber struct {
 // subscribers (whose per-subscriber buffer would block) are
 // disconnected, not blocked.
 type EventRecorder struct {
-	store   *store.Store
-	ch      chan store.Event
-	done    chan struct{}
-	Dropped atomic.Int64
+	store     *store.Store
+	ch        chan store.Event
+	done      chan struct{}
+	Dropped   atomic.Int64
+	mu        sync.Mutex // coordinates Record's send with Close's channel close
+	closed    bool
+	closeOnce sync.Once
 
 	// Subscriber state. subsMu serialises fan-out, Subscribe, and
 	// disconnect/Cancel — channel close is performed under the lock
 	// so a concurrent fan-out can't observe a closed channel and
 	// panic on send.
-	subsMu sync.Mutex
-	subs   map[int64]*subscriber
-	nextID atomic.Int64
+	subsMu     sync.Mutex
+	subs       map[int64]*subscriber
+	subsClosed bool
+	nextID     atomic.Int64
 }
 
 // NewEventRecorder creates and starts an EventRecorder.
@@ -90,7 +94,7 @@ func NewEventRecorder(st *store.Store) *EventRecorder {
 		done:  make(chan struct{}),
 		subs:  make(map[int64]*subscriber),
 	}
-	go r.loop()
+	goSafe("event recorder", r.loop)
 	return r
 }
 
@@ -100,11 +104,17 @@ func NewEventRecorder(st *store.Store) *EventRecorder {
 // non-blocking per subscriber; subscribers whose buffer is full are
 // disconnected.
 func (r *EventRecorder) Record(e store.Event) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
 	select {
 	case r.ch <- e:
 	default:
 		r.Dropped.Add(1)
 	}
+	r.mu.Unlock()
 	r.fanOut(e)
 }
 
@@ -119,6 +129,11 @@ func (r *EventRecorder) Subscribe(f SubscriptionFilter) *Subscription {
 		ch:     make(chan store.Event, subscriberBuffer),
 	}
 	r.subsMu.Lock()
+	if r.subsClosed {
+		close(sub.ch)
+		r.subsMu.Unlock()
+		return &Subscription{C: sub.ch, Cancel: func() {}}
+	}
 	r.subs[id] = sub
 	r.subsMu.Unlock()
 	return &Subscription{
@@ -177,31 +192,32 @@ func (r *EventRecorder) fanOut(e store.Event) {
 // closes every active subscription's channel so consumers ranging
 // over Subscription.C exit cleanly.
 func (r *EventRecorder) Close() {
-	r.subsMu.Lock()
-	for id, sub := range r.subs {
-		if sub.closed.CompareAndSwap(false, true) {
-			close(sub.ch)
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		close(r.ch)
+		r.mu.Unlock()
+		<-r.done
+		r.subsMu.Lock()
+		r.subsClosed = true
+		for id, sub := range r.subs {
+			if sub.closed.CompareAndSwap(false, true) {
+				close(sub.ch)
+			}
+			delete(r.subs, id)
 		}
-		delete(r.subs, id)
-	}
-	r.subsMu.Unlock()
-	close(r.ch)
-	<-r.done
+		r.subsMu.Unlock()
+	})
 }
 
 // StartEventRecorder creates and attaches an EventRecorder to the server.
 func (s *Server) StartEventRecorder() {
-	s.events = NewEventRecorder(s.store)
-	if e, ok := s.engine.(interface {
-		SetNetdEventRecorder(func(userID, sandboxID, reason string))
-	}); ok {
-		e.SetNetdEventRecorder(func(userID, sandboxID, reason string) {
-			s.RecordEvent(store.Event{
-				Type: "sandbox.network_disconnected", UserID: userID, SandboxID: sandboxID,
-				Meta: map[string]any{"reason": "gateway disconnected", "detail": reason},
-			})
-		})
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.closed || s.events != nil {
+		return
 	}
+	s.events = NewEventRecorder(s.store)
 }
 
 // RecordEvent is a convenience method that records an event if the recorder exists.

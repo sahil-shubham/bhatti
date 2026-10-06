@@ -180,10 +180,10 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID
 	defer term.Close()
 
 	// 10. Bidirectional relay. Exits when either side closes OR on revoke.
-	go func() {
+	goSafe("shell revoke watcher", func() {
 		<-revoked
 		conn.Close()
-	}()
+	})
 	wsRelay(conn, term)
 }
 

@@ -307,17 +307,17 @@ func relayBidirectional(a, b io.ReadWriteCloser, idle time.Duration) {
 	done := make(chan struct{})
 
 	// Direction 1 (background goroutine): a → b.
-	go func() {
+	goSafe("bidirectional proxy relay", func() {
+		// Closing b wakes the foreground Read before signaling completion,
+		// including if goSafe recovers a panic.
+		defer close(done)
+		defer b.Close()
 		if dc, ok := a.(deadlineConn); ok {
 			idleCopyWithDeadline(b, dc, idle)
 		} else {
 			io.Copy(b, a)
 		}
-		// a's read ended — wake the other direction by closing b
-		// so its Read on b returns.
-		b.Close()
-		close(done)
-	}()
+	})
 
 	// Direction 2 (foreground): b → a.
 	if dc, ok := b.(deadlineConn); ok {
@@ -378,7 +378,7 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, eng engine.Engine, e
 	if onActivity != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		stopActivity = cancel
-		go func() {
+		goSafe("websocket proxy activity", func() {
 			tick := time.NewTicker(10 * time.Second)
 			defer tick.Stop()
 			for {
@@ -389,7 +389,7 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, eng engine.Engine, e
 					onActivity()
 				}
 			}
-		}()
+		})
 	}
 
 	// Bidirectional relay with idle timeout and leak-free teardown.

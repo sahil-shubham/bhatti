@@ -171,8 +171,9 @@ func TestLiveBackupDoesNotStartGuestStoppedAfterServerStatusCheck(t *testing.T) 
 
 func TestVolumeBackupLifecycleLeaseAndUnconfirmedThawContainment(t *testing.T) {
 	vm := &VM{ID: "vm", Status: "running", Thermal: "hot"}
+	e := &Engine{}
 	vm.launchMu.Lock()
-	if err := vm.finishVolumeBackup(nil, context.Background()); err != nil {
+	if err := e.finishVolumeBackup(vm, nil, context.Background()); err != nil {
 		t.Fatalf("sync-only backup must release its lifecycle lease: %v", err)
 	}
 	if !vm.launchMu.TryLock() {
@@ -184,7 +185,7 @@ func TestVolumeBackupLifecycleLeaseAndUnconfirmedThawContainment(t *testing.T) {
 	}
 
 	vm.launchMu.Lock()
-	err := vm.finishVolumeBackup(func(ctx context.Context) error {
+	err := e.finishVolumeBackup(vm, func(ctx context.Context) error {
 		if ctx.Err() != nil {
 			t.Fatal("thaw ran under canceled context")
 		}

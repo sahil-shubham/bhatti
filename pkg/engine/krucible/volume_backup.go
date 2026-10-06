@@ -56,7 +56,7 @@ func (e *Engine) BeginVolumeBackup(ctx context.Context, id, mount string) (func(
 		if err != nil {
 			var uncertain *unconfirmedVolumeThaw
 			if errors.As(err, &uncertain) {
-				vm.powerOffLocked()
+				e.powerOffLocked(vm)
 				err = &UncleanStopError{Reason: fmt.Errorf("volume backup freeze cleanup could not confirm thaw: %w", err)}
 			}
 			vm.launchMu.Unlock()
@@ -69,7 +69,7 @@ func (e *Engine) BeginVolumeBackup(ctx context.Context, id, mount string) (func(
 		var once sync.Once
 		var thawErr error
 		return func(cleanupCtx context.Context) error {
-			once.Do(func() { thawErr = vm.finishVolumeBackup(thaw, cleanupCtx) })
+			once.Do(func() { thawErr = e.finishVolumeBackup(vm, thaw, cleanupCtx) })
 			return thawErr
 		}, mode, nil
 	}
@@ -79,13 +79,13 @@ func (e *Engine) BeginVolumeBackup(ctx context.Context, id, mount string) (func(
 // finishVolumeBackup owns launchMu. A failed THAW ACK means the filesystem's
 // state is unknown, even if closing the agent connection may thaw it later.
 // Power off before allowing any other lifecycle transition.
-func (vm *VM) finishVolumeBackup(thaw func(context.Context) error, cleanupCtx context.Context) error {
+func (e *Engine) finishVolumeBackup(vm *VM, thaw func(context.Context) error, cleanupCtx context.Context) error {
 	defer vm.launchMu.Unlock()
 	if thaw == nil { // sync-only still needs the lifecycle lease until after clone
 		return nil
 	}
 	if err := thaw(cleanupCtx); err != nil {
-		vm.powerOffLocked()
+		e.powerOffLocked(vm)
 		return &UncleanStopError{Reason: fmt.Errorf("volume backup thaw unconfirmed: %w", err)}
 	}
 	return nil

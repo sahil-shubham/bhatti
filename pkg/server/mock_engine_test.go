@@ -30,6 +30,11 @@ type mockEngine struct {
 	ActivityResult  *proto.ActivityInfo
 	ActivityErr     error
 	GuestFeatureErr error
+	StartErr        error
+	StartCalls      int
+	StartHook       func(string) // runs outside m.mu after a successful start
+	onLifecycle     func(engine.LifecycleEvent)
+	pendingEvents   []engine.LifecycleEvent
 
 	// LastCreateSpec is the spec from the most recent successful Create call,
 	// for tests that want to verify what got passed downstream.
@@ -120,13 +125,58 @@ func (m *mockEngine) Shutdown() {
 
 func (m *mockEngine) Start(_ context.Context, id string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.StartCalls++
+	if m.StartErr != nil {
+		err := m.StartErr
+		m.mu.Unlock()
+		return err
+	}
 	sb, ok := m.sandboxes[id]
 	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("sandbox %q not found", id)
 	}
 	sb.Status = "running"
+	m.thermal[id] = "hot"
+	hook := m.StartHook
+	m.mu.Unlock()
+	if hook != nil {
+		hook(id)
+	}
 	return nil
+}
+
+func (m *mockEngine) SetLifecycleHandler(handler func(engine.LifecycleEvent)) {
+	m.mu.Lock()
+	m.onLifecycle = handler
+	pending := m.pendingEvents
+	m.pendingEvents = nil
+	m.mu.Unlock()
+	if handler != nil {
+		for _, e := range pending {
+			handler(e)
+		}
+	}
+}
+
+// emitLifecycle simulates the engine having already persisted an exit before
+// delivering its notification, including events from recovery before wiring.
+func (m *mockEngine) emitLifecycle(e engine.LifecycleEvent) {
+	m.mu.Lock()
+	if e.Kind == engine.VMExited {
+		if sb := m.sandboxes[e.EngineID]; sb != nil {
+			sb.Status = "stopped"
+			m.thermal[e.EngineID] = "cold"
+		}
+	}
+	handler := m.onLifecycle
+	if handler == nil {
+		m.pendingEvents = append(m.pendingEvents, e)
+	}
+	m.mu.Unlock()
+	if handler != nil {
+		handler(e)
+	}
 }
 
 func (m *mockEngine) Status(_ context.Context, id string) (engine.SandboxInfo, error) {
@@ -234,13 +284,21 @@ func (m *mockEngine) Pause(_ context.Context, id string) error {
 	return nil
 }
 
-func (m *mockEngine) EnsureHot(_ context.Context, id string) error {
+func (m *mockEngine) EnsureHot(ctx context.Context, id string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.sandboxes[id]; !ok {
+	sb, ok := m.sandboxes[id]
+	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("sandbox %q not found", id)
 	}
-	m.thermal[id] = "hot"
+	stopped := sb.Status == "stopped"
+	if !stopped {
+		m.thermal[id] = "hot"
+	}
+	m.mu.Unlock()
+	if stopped {
+		return m.Start(ctx, id)
+	}
 	return nil
 }
 

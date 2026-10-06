@@ -97,17 +97,22 @@ type ThermalConfig struct {
 
 // Server is the HTTP API server.
 type Server struct {
-	engine           engine.Engine
-	store            *store.Store
-	dataDir          string   // path to data directory (for age.key)
-	mountRoots       []string // configured roots for live host-directory binds; nil disables mounts
-	configPath       string   // primary loaded server config, for diagnostics
-	configPaths      []string // all files read by the daemon, protected from live mounts
-	mux              *http.ServeMux
-	limiter          *rateLimiter
-	stopThermal      context.CancelFunc
-	thermalDone      chan struct{} // closed when thermal goroutine exits
-	stopTaskCleanup  context.CancelFunc
+	engine      engine.Engine
+	store       *store.Store
+	dataDir     string   // path to data directory (for age.key)
+	mountRoots  []string // configured roots for live host-directory binds; nil disables mounts
+	configPath  string   // primary loaded server config, for diagnostics
+	configPaths []string // all files read by the daemon, protected from live mounts
+	mux         *http.ServeMux
+	limiter     *rateLimiter
+	// bgMu serializes worker registration with Close, so bg.Add never races Wait.
+	bgMu             sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	bg               sync.WaitGroup
+	closed           bool
+	lifecycle        *serverLifecycle
+	onWorkerExit     func(string) // optional shutdown test hook, under bgMu
 	startTime        time.Time
 	lastActivity     sync.Map // engineID → time.Time — host-side activity cache
 	snapshotFailures sync.Map // engineID → *atomic.Int64 — consecutive snapshot failure count
@@ -130,9 +135,7 @@ type Server struct {
 	rateLimited   atomic.Int64
 
 	// Observability
-	events        *EventRecorder
-	stopMetrics   context.CancelFunc
-	stopRetention context.CancelFunc
+	events *EventRecorder
 
 	// Public proxy (set via options)
 	proxyZone       string              // e.g. "bhatti.sh"
@@ -145,7 +148,6 @@ type Server struct {
 
 	// Backup
 	backupBackend backup.Backend // nil if backup not configured
-	stopBackup    context.CancelFunc
 
 	// Web shell
 	shellSessions *shellSessionTracker
@@ -348,8 +350,12 @@ func WithBackupBackend(b backup.Backend) ServerOption {
 // New creates a new API server. dataDir is the path to the data directory
 // containing age.key for secret encryption.
 func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOption) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
+		ctx:               ctx,
+		cancel:            cancel,
 		engine:            eng,
+		lifecycle:         newServerLifecycle(),
 		store:             st,
 		dataDir:           dataDir,
 		mux:               http.NewServeMux(),
@@ -411,17 +417,14 @@ func stripPort(host string) string {
 	return host
 }
 
-// startTaskCleanup runs a background goroutine that deletes completed/failed
-// tasks older than 24 hours. Never deletes running tasks.
+// startTaskCleanup deletes completed/failed tasks older than 24 hours.
 func (s *Server) startTaskCleanup() {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.stopTaskCleanup = cancel
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
+	s.startBackground("task cleanup", func() {
+		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
 				if n, err := s.store.CleanupOldTasks(24 * time.Hour); err != nil {
@@ -431,32 +434,41 @@ func (s *Server) startTaskCleanup() {
 				}
 			}
 		}
-	}()
+	})
 }
 
-// Close stops background goroutines (thermal manager, task cleanup, ...). It
-// waits for the thermal manager to finish its current cycle, so a transition
-// it started (a pause, a cold stop) completes and is recorded before the
-// daemon exits.
+// startBackground serializes registration with shutdown: Add cannot race Wait.
+func (s *Server) startBackground(name string, fn func()) bool {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.bg.Add(1)
+	goSafe(name, func() {
+		defer s.bg.Done()
+		defer func() {
+			s.bgMu.Lock()
+			hook := s.onWorkerExit
+			s.bgMu.Unlock()
+			if hook != nil {
+				hook(name)
+			}
+		}()
+		fn()
+	})
+	return true
+}
+
+// Close cancels and joins every server-owned loop before flushing events.
+// Request-owned WebSockets and proxy relays may outlive the server; late
+// RecordEvent calls are safe no-ops.
 func (s *Server) Close() {
-	if s.stopThermal != nil {
-		s.stopThermal()
-		if s.thermalDone != nil {
-			<-s.thermalDone
-		}
-	}
-	if s.stopTaskCleanup != nil {
-		s.stopTaskCleanup()
-	}
-	if s.stopBackup != nil {
-		s.stopBackup()
-	}
-	if s.stopMetrics != nil {
-		s.stopMetrics()
-	}
-	if s.stopRetention != nil {
-		s.stopRetention()
-	}
+	s.bgMu.Lock()
+	s.closed = true
+	s.cancel()
+	s.bgMu.Unlock()
+	s.bg.Wait()
 	if s.events != nil {
 		s.events.Close()
 	}
@@ -537,26 +549,23 @@ func (s *Server) StartBackupScheduler(schedules []pkg.BackupSchedule) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s.stopBackup = cancel
-
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
+	s.startBackground("backup scheduler", func() {
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return
 			case now := <-ticker.C:
 				for _, sched := range schedules {
 					if !cronMatch(sched.Cron, now) {
 						continue
 					}
-					s.runScheduledBackup(ctx, sched)
+					s.runScheduledBackup(s.ctx, sched)
 				}
 			}
 		}
-	}()
+	})
 
 	slog.Info("backup scheduler started", "schedules", len(schedules))
 }
@@ -650,23 +659,18 @@ func (s *Server) StartThermalManager(cfg ThermalConfig) error {
 		cfg.ColdTimeout = 30 * time.Minute
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s.stopThermal = cancel
-	s.thermalDone = make(chan struct{})
-
-	go func() {
-		defer close(s.thermalDone)
+	s.startBackground("thermal manager", func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
 				s.runThermalCycle(te, cfg)
 			}
 		}
-	}()
+	})
 	return nil
 }
 
@@ -826,12 +830,12 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 	var workers sync.WaitGroup
 	for range min(8, len(coldStops)) {
 		workers.Add(1)
-		go func() {
+		goSafe("thermal cold stop", func() {
 			defer workers.Done()
 			for candidate := range jobs {
 				s.stopColdSandbox(candidate.sandbox, candidate.idle)
 			}
-		}()
+		})
 	}
 	for _, candidate := range coldStops {
 		jobs <- candidate

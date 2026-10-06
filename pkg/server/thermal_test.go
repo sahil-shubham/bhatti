@@ -16,11 +16,16 @@ type engineWithoutThermal struct{ engine.Engine }
 
 func TestThermalManagerRejectsEngineWithoutThermal(t *testing.T) {
 	srv, _ := setup(t)
+	exited := make(chan string, 2)
+	srv.bgMu.Lock()
+	srv.onWorkerExit = func(name string) { exited <- name }
+	srv.bgMu.Unlock()
 	srv.engine = engineWithoutThermal{Engine: srv.engine}
 	if err := srv.StartThermalManager(ThermalConfig{}); err == nil {
 		t.Fatal("engine without thermal methods must fail startup")
 	}
-	if srv.stopThermal != nil || srv.thermalDone != nil {
+	srv.Close()
+	if len(exited) != 1 || <-exited != "task cleanup" {
 		t.Fatal("thermal manager started despite missing engine capability")
 	}
 }

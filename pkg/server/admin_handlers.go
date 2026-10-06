@@ -709,7 +709,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 	outputPath := filepath.Join(outputDir, req.Name+".ext4")
 
 	// Run in background goroutine
-	go func() {
+	goSafe("image pull", func() {
 		defer cancel()
 		defer func() {
 			s.pullCancelMu.Lock()
@@ -768,7 +768,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 			Type: "image.pulled", UserID: user.ID,
 			Meta: map[string]any{"ref": req.Ref, "name": req.Name, "size_mb": sizeMB, "digest": config.Digest},
 		})
-	}()
+	})
 
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"task_id": taskID, "status": "running"})
