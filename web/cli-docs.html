@@ -161,6 +161,7 @@
       <a class="sub" href="#bhatti-file-ls">ls</a>
       <a class="sub" href="#bhatti-file-read">read</a>
       <a class="sub" href="#bhatti-file-write">write</a>
+      <a href="#bhatti-forward" >bhatti forward</a>
       <a href="#bhatti-image" style="margin-top: 8px;">bhatti image</a>
       <a class="sub" href="#bhatti-image-delete">delete</a>
       <a class="sub" href="#bhatti-image-import">import</a>
@@ -207,7 +208,7 @@
     </nav>
     <main class="content">
       <h1>bhatti <small>CLI Reference</small></h1>
-      <p class="subtitle">Auto-generated from command definitions. Always up to date.</p>
+      <p class="subtitle">Command syntax and flags for the bhatti CLI.</p>
       <section class="command" id="bhatti">
         <h2><a href="#bhatti">bhatti</a></h2>
         <p>Firecracker microVM orchestrator</p>
@@ -388,6 +389,37 @@ Sleeping sandboxes wake automatically.</div>
       <section class="command" id="bhatti-file-write">
         <h2><a href="#bhatti-file-write">bhatti file write</a></h2>
         <p>Write a file to a sandbox (reads from stdin)</p>
+      </section>
+      <section class="command" id="bhatti-forward">
+        <h2><a href="#bhatti-forward">bhatti forward</a></h2>
+        <p>Forward guest TCP ports to listeners on the CLI machine</p>
+        <div class="description">Usage: bhatti forward &lt;sandbox&gt; &lt;port-spec&gt;... [--address 127.0.0.1]
+
+PORT binds local PORT and connects to the same guest port. LOCAL:GUEST binds
+a different local port; 0:GUEST picks an available local port. Multiple port
+specifications run together. The default bind address is 127.0.0.1.
+
+For each local TCP connection, the CLI opens an authenticated WebSocket to
+GET /sandboxes/{id}/tunnel?port=N and relays bytes to the guest. Remote
+HTTPS/WSS and the daemon's local unix-socket API both work. Ctrl-C stops only
+this CLI process and its listeners. --json prints bound addresses as JSON
+and continues forwarding until interrupted.</div>
+        <pre>  bhatti forward spc-dev 5174 3000:3000
+  bhatti forward spc-dev 0:3000
+  bhatti forward spc-dev 8080:3000 --address 127.0.0.1</pre>
+        <table>
+          <tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+          <tr>
+            <td>--address</td>
+            <td><span class="default-val">127.0.0.1</span></td>
+            <td>Local address on the CLI machine to bind each port</td>
+          </tr>
+          <tr>
+            <td>--json</td>
+            <td><span class="default-val">false</span></td>
+            <td>Print bound addresses as JSON, then continue serving</td>
+          </tr>
+        </table>
       </section>
       <section class="command" id="bhatti-image">
         <h2><a href="#bhatti-image">bhatti image</a></h2>

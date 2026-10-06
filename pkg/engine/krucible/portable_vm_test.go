@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
-	"github.com/sahil-shubham/bhatti/pkg/forward"
 )
 
 // secondHost is another engine on its own data dir and sockets, as on another
@@ -44,20 +43,15 @@ func secondHost(t *testing.T, a *Engine, base string) *Engine {
 	return b
 }
 
-// guestServes checks the netcheck server started as pid still runs in sandbox
-// id and answers through a forwarded port.
+// guestServes checks that the netcheck server started as pid still runs in
+// sandbox id and answers through a fresh guest-port tunnel.
 func guestServes(t *testing.T, e *Engine, ctx context.Context, id string, pid int) {
 	t.Helper()
 	var cmdline bytes.Buffer
 	if _, _, err := e.FileRead(ctx, id, "/proc/"+strconv.Itoa(pid)+"/cmdline", &cmdline); err != nil || !strings.Contains(cmdline.String(), "netcheck") {
 		t.Fatalf("process %d: %q, %v", pid, cmdline.String(), err)
 	}
-	ln, err := forward.Serve(e, id, guestPort, "127.0.0.1:0", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	httpGetRetry(t, "http://"+ln.Addr().String()+"/", "hello-from-guest", 15*time.Second)
+	guestHTTPRetry(t, e, ctx, id, guestPort, "hello-from-guest", 15*time.Second)
 }
 
 const guestPort = 18081

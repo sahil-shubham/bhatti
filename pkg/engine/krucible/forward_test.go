@@ -3,6 +3,7 @@
 package krucible
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -12,12 +13,10 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
-	"github.com/sahil-shubham/bhatti/pkg/forward"
 )
 
-// TestKrucibleForward proves the host↔guest forward end to end with no mocking:
-// a real guest HTTP server (netcheck serve) is reached from the host through a
-// forward.Serve listener that bridges over the vsock Tunnel primitive.
+// TestKrucibleForward proves a real guest HTTP server can be reached via the
+// engine's raw guest-port tunnel, without a server-local listening port.
 func TestKrucibleForward(t *testing.T) {
 	eng := newBlockRootEngine(t) // skips if libkrun/vmm/mke2fs unavailable
 
@@ -35,56 +34,49 @@ func TestKrucibleForward(t *testing.T) {
 	// guest listen can't bind a port the host already uses (e.g. 8080 on a
 	// dev/CI box). Pick one the host is unlikely to occupy.
 	const guestPort = 18080
-	// Start a real HTTP server inside the guest (detached, keeps running).
-	// (The toy rootfs has no `ss`, so we can't poll ListeningPorts; instead we
-	// retry the forwarded GET, which fails fast until the guest server is up.)
 	de := eng.(engine.DetachedExecEngine)
 	if _, _, err := de.ExecDetached(ctx, id, []string{"/bin/netcheck", "serve", fmt.Sprintf("%d", guestPort)}, "/tmp/serve.log"); err != nil {
 		t.Fatalf("ExecDetached netcheck serve: %v", err)
 	}
 
-	// Bridge a host port to the guest port over the vsock tunnel.
-	ln, err := forward.Serve(eng, id, guestPort, "127.0.0.1:0", nil)
-	if err != nil {
-		t.Fatalf("forward.Serve: %v", err)
-	}
-	defer ln.Close()
-
-	// Hit the host port — the response must come from inside the guest. Retry
-	// until the guest's server answers: TSI shares the host's network stack, so a
-	// guest connect to :8080 before netcheck has bound it can transiently fall
-	// through to a host process on the same port — wait for the real guest body.
-	url := "http://" + ln.Addr().String() + "/"
-	body := httpGetRetry(t, url, "hello-from-guest", 25*time.Second)
+	body := guestHTTPRetry(t, eng, ctx, id, guestPort, "hello-from-guest", 25*time.Second)
 	if !strings.Contains(body, "hello-from-guest") {
-		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
+		t.Fatalf("tunnel response = %q, want hello-from-guest", body)
 	}
 }
 
-// httpGetRetry GETs url until the response body contains want (or it times
-// out). Retrying until the EXPECTED body — not just any non-empty body — makes
-// the forward tests robust to the TSI host-stack fall-through described above
-// and to the guest server still coming up.
-func httpGetRetry(t *testing.T, url, want string, within time.Duration) string {
+// guestHTTPRetry connects through the same engine Tunnel used by the WebSocket
+// handler and waits for the detached guest server to become available.
+func guestHTTPRetry(t *testing.T, eng engine.Engine, ctx context.Context, id string, port int, want string, within time.Duration) string {
 	t.Helper()
-	client := &http.Client{Timeout: 3 * time.Second}
 	deadline := time.Now().Add(within)
 	var last string
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(url)
+		tun, err := eng.Tunnel(ctx, id, port)
+		if err == nil {
+			if conn, ok := tun.(interface{ SetDeadline(time.Time) error }); ok {
+				conn.SetDeadline(time.Now().Add(3 * time.Second))
+			}
+			_, err = io.WriteString(tun, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+			if err == nil {
+				var resp *http.Response
+				resp, err = http.ReadResponse(bufio.NewReader(tun), &http.Request{Method: http.MethodGet})
+				if err == nil {
+					data, readErr := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					last = string(data)
+					err = readErr
+				}
+			}
+			tun.Close()
+		}
 		if err != nil {
 			last = err.Error()
-			time.Sleep(300 * time.Millisecond)
-			continue
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		last = string(b)
-		if strings.Contains(last, want) {
+		} else if strings.Contains(last, want) {
 			return last
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatalf("GET %s never returned %q (last: %q)", url, want, last)
+	t.Fatalf("guest tunnel %s:%d never returned %q (last: %q)", id, port, want, last)
 	return ""
 }

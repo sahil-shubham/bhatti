@@ -3,11 +3,13 @@
 package krucible
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/server"
 	"github.com/sahil-shubham/bhatti/pkg/store"
@@ -25,7 +28,7 @@ import (
 // against a powered-off sandbox auto-boots from disk through the server's
 // ensureHot -> EnsureHot -> Start path.
 func TestKrucibleServerIntegration(t *testing.T) {
-	_, do := krucibleServer(t, newBlockRootEngine) // skips without VM prerequisites
+	_, do, _ := krucibleServer(t, newBlockRootEngine) // skips without VM prerequisites
 
 	// --- create over HTTP ---
 	resp := do("POST", "/sandboxes", map[string]any{"name": "srv-it", "memory_mb": 512})
@@ -72,7 +75,7 @@ func TestKrucibleServerIntegration(t *testing.T) {
 // power-off, including the final guest sync after RESUME.
 func TestKrucibleServerThermalDurability(t *testing.T) {
 	var eng *Engine
-	srv, do := krucibleServer(t, func(t *testing.T) engine.Engine {
+	srv, do, _ := krucibleServer(t, func(t *testing.T) engine.Engine {
 		eng = newPauseEngine(t).(*Engine)
 		return eng
 	})
@@ -167,7 +170,7 @@ func TestKrucibleServerThermalDurability(t *testing.T) {
 // The HTTP manual stop also resumes and syncs a warm VM before powering it off.
 func TestKrucibleServerManualWarmStop(t *testing.T) {
 	var eng *Engine
-	_, do := krucibleServer(t, func(t *testing.T) engine.Engine {
+	_, do, _ := krucibleServer(t, func(t *testing.T) engine.Engine {
 		eng = newPauseEngine(t).(*Engine)
 		return eng
 	})
@@ -230,9 +233,9 @@ func TestKrucibleServerManualWarmStop(t *testing.T) {
 type doFunc func(method, path string, body any) *http.Response
 
 // krucibleServer stands up the HTTP API and store over a real krucible
-// block-root engine. Callers may start its thermal manager explicitly.
-// Skips if libkrun/vmm/mke2fs are unavailable.
-func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*server.Server, doFunc) {
+// block-root engine. It returns the base URL for WebSocket upgrades; callers
+// may start its thermal manager explicitly. Skips without VM prerequisites.
+func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*server.Server, doFunc, string) {
 	t.Helper()
 	eng := newEngine(t)
 	dir := t.TempDir()
@@ -272,16 +275,14 @@ func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*se
 		}
 		return resp
 	}
-	return srv, do
+	return srv, do, ts.URL
 }
 
-// TestKrucibleServerForward drives `bhatti forward` end to end through the full
-// daemon over a real VM (no mock): create -> start a guest HTTP server
-// (detached exec) -> POST /forward -> the daemon binds a host port and bridges
-// it to the guest over the vsock tunnel -> a GET to that host port returns the
-// guest's response.
+// TestKrucibleServerForward drives the authenticated WebSocket tunnel through
+// the full daemon and a real VM: detached guest HTTP server -> GET /tunnel
+// upgrade -> binary HTTP request/response over the guest connection.
 func TestKrucibleServerForward(t *testing.T) {
-	_, do := krucibleServer(t, newBlockRootEngine)
+	_, do, serverURL := krucibleServer(t, newBlockRootEngine)
 
 	resp := do("POST", "/sandboxes", map[string]any{"name": "fwd-srv"})
 	if resp.StatusCode != 201 {
@@ -291,10 +292,10 @@ func TestKrucibleServerForward(t *testing.T) {
 	var sb store.Sandbox
 	json.NewDecoder(resp.Body).Decode(&sb)
 	resp.Body.Close()
-	t.Cleanup(func() { do("DELETE", "/sandboxes/"+sb.ID, nil) })
+	t.Cleanup(func() { do("DELETE", "/sandboxes/"+sb.ID, nil).Body.Close() })
 
-	// Start a real HTTP server inside the guest (detached). High port: under TSI
-	// the guest shares the host's port namespace, so avoid host-occupied ports.
+	// High port: under TSI the guest shares the host's port namespace, so
+	// avoid host-occupied ports. Detached exec may finish before serve listens.
 	resp = do("POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
 		"cmd": []string{"/bin/netcheck", "serve", "18080"}, "detach": true, "output_file": "/tmp/serve.log",
 	})
@@ -304,32 +305,73 @@ func TestKrucibleServerForward(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Ask the daemon to forward a host port to guest :8080.
-	resp = do("POST", "/sandboxes/"+sb.ID+"/forward", map[string]any{"guest_port": 18080})
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("forward: want 200, got %d: %s", resp.StatusCode, b)
-	}
-	var fwd struct {
-		HostAddr string `json:"host_addr"`
-	}
-	json.NewDecoder(resp.Body).Decode(&fwd)
-	resp.Body.Close()
-	if fwd.HostAddr == "" {
-		t.Fatal("forward returned no host_addr")
+	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/sandboxes/" + sb.ID + "/tunnel?port=18080"
+	dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+	header := http.Header{"Authorization": {"Bearer test-token"}}
+	fetch := func() (string, error) {
+		ws, upgrade, err := dialer.Dial(wsURL, header)
+		if err != nil {
+			if upgrade != nil {
+				upgrade.Body.Close()
+			}
+			return "", err
+		}
+		defer ws.Close()
+		if err := ws.WriteMessage(websocket.BinaryMessage, []byte("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")); err != nil {
+			return "", err
+		}
+		ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var raw bytes.Buffer
+		for {
+			kind, chunk, err := ws.ReadMessage()
+			if err != nil {
+				if raw.Len() == 0 {
+					return "", fmt.Errorf("read tunnel: %w", err)
+				}
+				break
+			}
+			if kind != websocket.BinaryMessage {
+				return "", fmt.Errorf("unexpected tunnel frame %d", kind)
+			}
+			raw.Write(chunk)
+		}
+		reply, err := http.ReadResponse(bufio.NewReader(&raw), &http.Request{Method: http.MethodGet})
+		if err != nil {
+			return "", err
+		}
+		defer reply.Body.Close()
+		body, err := io.ReadAll(reply.Body)
+		if err != nil {
+			return "", err
+		}
+		if reply.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("guest HTTP status %d: %s", reply.StatusCode, body)
+		}
+		return string(body), nil
 	}
 
-	body := httpGetRetry(t, "http://"+fwd.HostAddr+"/", "hello-from-guest", 25*time.Second)
-	if !strings.Contains(body, "hello-from-guest") {
-		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
+	deadline := time.Now().Add(25 * time.Second)
+	var last string
+	for time.Now().Before(deadline) {
+		body, err := fetch()
+		if err == nil && strings.Contains(body, "hello-from-guest") {
+			return
+		}
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = body
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
+	t.Fatalf("WebSocket tunnel never returned hello-from-guest (last: %q)", last)
 }
 
 // TestKrucibleServerFork exercises `create --from` end-to-end (Phase 2 #4):
 // POST /sandboxes with {from} forks a running sandbox via the engine's Fork
 // capability; the fork is a distinct, working, independent VM.
 func TestKrucibleServerFork(t *testing.T) {
-	_, do := krucibleServer(t, newCheckpointEngine) // skips if libkrun/vmm/mke2fs unavailable
+	_, do, _ := krucibleServer(t, newCheckpointEngine) // skips if libkrun/vmm/mke2fs unavailable
 
 	resp := do("POST", "/sandboxes", map[string]any{"name": "fork-src", "memory_mb": 512})
 	if resp.StatusCode != 201 {

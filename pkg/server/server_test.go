@@ -1211,6 +1211,8 @@ func TestClassifyRequest(t *testing.T) {
 		{"POST", "/sandboxes/abc/exec", "exec"},
 		{"PUT", "/sandboxes/abc/files?path=/test", "exec"},
 		{"GET", "/sandboxes/abc/ws", "exec"},
+		{"GET", "/sandboxes/abc/tunnel?port=8080", "read"},
+		{"GET", "/sandboxes/ws/tunnel?port=8080", "read"},
 		{"GET", "/sandboxes", "read"},
 		{"GET", "/sandboxes/abc", "read"},
 		{"GET", "/sandboxes/abc/ports", "read"},

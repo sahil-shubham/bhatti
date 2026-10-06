@@ -65,6 +65,29 @@ address in the server config and does not provide TLS; do not expose it to
 untrusted networks. The CLI-only install needs a reachable remote API endpoint
 and an API key (`bhatti setup --url ... --token ...`); it does not open one.
 
+### Forward local ports into a sandbox
+
+`bhatti forward <sandbox> <port-spec>... [--address 127.0.0.1]` binds TCP
+listeners on the **CLI machine**, not on the bhatti server. A `PORT` maps
+local `PORT` to the same guest port; `LOCAL:GUEST` maps different ports, and
+`0:GUEST` asks the OS to choose an available local port. Multiple mappings
+can run in one process:
+
+```bash
+# Vite on guest :5174, plus an app on guest :3000.
+bhatti forward spc-dev 5174 3000:3000
+bhatti forward spc-dev 0:3000            # print the chosen local port
+```
+
+The default bind address is `127.0.0.1`; use `--address` to change it.
+For each incoming connection the CLI opens an authenticated WebSocket to
+`GET /sandboxes/{id}/tunnel?port=N` (Bearer token in the Authorization
+header), relaying TCP bytes to the guest. This works from a remote CLI over
+HTTPS/WSS and from the local CLI over the daemon's unix socket. Ctrl-C stops
+only this CLI process and its local listeners. With `--json`, the command
+prints the bound addresses as JSON and **keeps forwarding** until stopped.
+
+
 **v1 (Firecracker) — Linux + KVM · frozen.** To install the old engine instead, pin
 it (a bare `bhatti.sh/install` now installs v2):
 
@@ -181,6 +204,7 @@ Each tier name (`images/rootfs-<tier>-<arch>.ext4`) is a symlink to an immutable
 | Command | Description |
 |---------|-------------|
 | `publish` | Publish a sandbox port with a public URL |
+| `forward` | Forward one or more guest TCP ports to listeners on the CLI machine |
 | `unpublish` | Remove a published port |
 | `share` | Generate a shareable web shell URL |
 

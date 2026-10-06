@@ -43,6 +43,9 @@ type mockEngine struct {
 	Inits map[string]bool
 	// TunnelRefusals makes the next N Tunnel calls fail as "nothing listening".
 	TunnelRefusals int
+	// TunnelPeer receives the guest end of each successful tunnel. Tests set
+	// a buffered channel when they need to exchange bytes with the client.
+	TunnelPeer chan net.Conn
 
 	// Stops and Shutdowns count Stop and Shutdown calls.
 	Stops, Shutdowns int
@@ -204,7 +207,12 @@ func (m *mockEngine) Tunnel(_ context.Context, id string, port int) (io.ReadWrit
 	if refuse {
 		return nil, fmt.Errorf("forward to port %d: %w: connection refused", port, agent.ErrPortRefused)
 	}
-	_, client := net.Pipe()
+	guest, client := net.Pipe()
+	if peer := m.TunnelPeer; peer != nil {
+		peer <- guest
+	} else {
+		guest.Close()
+	}
 	return client, nil
 }
 

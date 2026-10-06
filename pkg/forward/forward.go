@@ -1,75 +1,149 @@
-// Package forward bridges a host-side TCP listener to a port inside a guest,
-// over the engine's vsock Tunnel primitive. It is the building block for the
-// `bhatti forward` dev convenience (host↔guest) and the server-brokered
-// inter-sandbox mesh (each sandbox gets a stable host endpoint that other
-// sandboxes reach via the host). Engine-agnostic: anything implementing
-// Tunneler (both krucible and Firecracker do) works.
+// Package forward bridges raw TCP streams and authenticated WebSocket tunnels.
 package forward
 
 import (
-	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// Tunneler is the slice of engine.Engine the forwarder needs: a bidirectional
-// byte stream to localhost:port inside the guest.
-type Tunneler interface {
-	Tunnel(ctx context.Context, id string, port int) (io.ReadWriteCloser, error)
+const (
+	pingInterval = 30 * time.Second
+	pongTimeout  = 90 * time.Second
+	writeTimeout = 10 * time.Second
+)
+
+// WSConn exposes binary WebSocket messages as one continuous byte stream.
+// Exactly one goroutine may call Read; Write, ping and pong all share a writer
+// lock, as required by gorilla/websocket.
+type WSConn struct {
+	conn      *websocket.Conn
+	reader    io.Reader
+	writeMu   sync.Mutex
+	closeOnce sync.Once
+	done      chan struct{}
 }
 
-// Serve binds listenAddr and forwards each accepted TCP connection to guest
-// `port` via eng.Tunnel(id, port). It returns the listener immediately (the
-// accept loop runs in the background); close the listener to stop forwarding.
-// Protocol-agnostic — raw bytes, so any TCP service (HTTP, postgres, redis, …)
-// works, unlike the HTTP-aware public proxy.
-//
-// onConnect, if non-nil, runs before each tunnel is opened — e.g. wake-on-connect
-// via the server's thermal EnsureHot, so connecting to the host port transparently
-// revives a warm/cold sandbox. A non-nil error from onConnect drops the connection.
-func Serve(eng Tunneler, id string, port int, listenAddr string, onConnect func(context.Context) error) (net.Listener, error) {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return nil, err
-	}
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return // listener closed
-			}
-			go bridge(eng, id, port, conn, onConnect)
+// NewWSConn starts keepalives for a tunnel. Both peers use the same adapter,
+// so idle connections survive reverse proxies without relying on TCP traffic.
+func NewWSConn(conn *websocket.Conn) *WSConn {
+	c := &WSConn{conn: conn, done: make(chan struct{})}
+	conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	})
+	conn.SetPingHandler(func(payload string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(pongTimeout)); err != nil {
+			return err
 		}
-	}()
-	return ln, nil
+		return c.writeControl(websocket.PongMessage, []byte(payload))
+	})
+	go c.ping()
+	return c
 }
 
-func bridge(eng Tunneler, id string, port int, conn net.Conn, onConnect func(context.Context) error) {
-	defer conn.Close()
-	ctx := context.Background()
-	if onConnect != nil {
-		if err := onConnect(ctx); err != nil {
+func (c *WSConn) ping() {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
 			return
+		case <-ticker.C:
+			if err := c.writeControl(websocket.PingMessage, nil); err != nil {
+				c.Close()
+				return
+			}
 		}
 	}
-	tun, err := eng.Tunnel(ctx, id, port)
-	if err != nil {
-		return
-	}
-	defer tun.Close()
-	relay(conn, tun)
 }
 
-// relay copies bytes in both directions until either side ends, then closes the
-// other side so its blocked Read unblocks and the goroutine exits (no leak).
-func relay(a, b io.ReadWriteCloser) {
-	done := make(chan struct{})
+func (c *WSConn) writeControl(messageType int, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteControl(messageType, payload, time.Now().Add(writeTimeout))
+}
+
+func (c *WSConn) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for {
+		if c.reader == nil {
+			messageType, reader, err := c.conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			if messageType != websocket.BinaryMessage {
+				return 0, fmt.Errorf("unexpected tunnel websocket message type %d", messageType)
+			}
+			c.reader = reader
+		}
+		n, err := c.reader.Read(p)
+		if errors.Is(err, io.EOF) {
+			c.reader = nil
+			if n == 0 {
+				continue
+			}
+			return n, nil
+		}
+		return n, err
+	}
+}
+
+func (c *WSConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return 0, err
+	}
+	if err := c.conn.WriteMessage(websocket.BinaryMessage, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *WSConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		// A normal close keeps ordinary TCP EOFs from surfacing as noisy
+		// "websocket: close 1006" errors in the client.
+		c.writeControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	})
+	return c.conn.Close()
+}
+
+// Abort immediately interrupts active reads and writes (e.g. on Ctrl-C).
+// Closing the socket before waiting for a concurrent graceful Close also
+// unblocks a writer stalled on a slow peer.
+func (c *WSConn) Abort() error {
+	err := c.conn.Close()
+	c.closeOnce.Do(func() { close(c.done) })
+	return err
+}
+
+// Relay copies raw bytes in both directions until either side ends, then
+// closes both streams so the other copy goroutine cannot remain blocked.
+func Relay(a, b io.ReadWriteCloser) error {
+	done := make(chan error, 1)
 	go func() {
-		io.Copy(b, a)
+		_, err := io.Copy(b, a)
 		b.Close()
-		close(done)
+		done <- err
 	}()
-	io.Copy(a, b)
+	_, errBA := io.Copy(a, b)
 	a.Close()
-	<-done
+	errAB := <-done
+	if errBA != nil && !errors.Is(errBA, net.ErrClosed) {
+		return errBA
+	}
+	if errAB != nil && !errors.Is(errAB, net.ErrClosed) {
+		return errAB
+	}
+	return nil
 }

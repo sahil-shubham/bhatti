@@ -18,7 +18,6 @@ import (
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/enginetest"
-	"github.com/sahil-shubham/bhatti/pkg/forward"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
 
@@ -236,11 +235,9 @@ func TestKrucibleNetHostIsolation(t *testing.T) {
 	}
 }
 
-// TestKrucibleNetForward is the inbound port-forward (dev-loop) gate on the
-// virtio-net backend: a real guest HTTP server is reached from the host through
-// forward.Serve over the vsock Tunnel. Under netd the guest has its OWN loopback
-// (unlike TSI's shared host stack), so there is no host-port fall-through — the
-// forwarded response can only come from inside the guest.
+// TestKrucibleNetForward checks guest-port tunneling on the virtio-net backend:
+// a real guest HTTP server answers through Tunnel, with no host-port fall-through
+// (netd gives the guest its own loopback, unlike TSI).
 func TestKrucibleNetForward(t *testing.T) {
 	eng := newNetEngine(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -260,15 +257,9 @@ func TestKrucibleNetForward(t *testing.T) {
 		t.Fatalf("ExecDetached netcheck serve: %v", err)
 	}
 
-	ln, err := forward.Serve(eng, id, guestPort, "127.0.0.1:0", nil)
-	if err != nil {
-		t.Fatalf("forward.Serve: %v", err)
-	}
-	defer ln.Close()
-
-	url := "http://" + ln.Addr().String() + "/"
-	if body := httpGetRetry(t, url, "hello-from-guest", 25*time.Second); !strings.Contains(body, "hello-from-guest") {
-		t.Fatalf("forwarded response = %q, want hello-from-guest", body)
+	body := guestHTTPRetry(t, eng, ctx, id, guestPort, "hello-from-guest", 25*time.Second)
+	if !strings.Contains(body, "hello-from-guest") {
+		t.Fatalf("tunnel response = %q, want hello-from-guest", body)
 	}
 }
 

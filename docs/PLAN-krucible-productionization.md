@@ -199,10 +199,14 @@ is the guest's loopback). krucible sandboxes are currently **outbound-only islan
 
 **Forward path** (build on `Forward`, keep TSI — do *not* switch to a passt/gvproxy L3 backend, which would re-introduce
 the FC-style plumbing we shed):
-1. **Host↔guest forward** — **DONE (2026-06-16):** new engine-agnostic `pkg/forward` (host TCP listener → `Tunnel`
-   bridge, raw bytes, wake-on-connect hook); server `POST/GET/DELETE /sandboxes/:id/forward` (binds 127.0.0.1, torn
-   down on Destroy); CLI `bhatti forward <id> <guestPort> [hostPort]`. Real-VM tests (engine + full-daemon, no mock):
-   a guest HTTP server is reached from the host through the forward. *The mesh building block.*
+1. **Host↔guest forward** — **DONE (2026-06-16):** the engine-agnostic `pkg/forward`
+   originally bridged a host TCP listener to `Tunnel` (raw bytes, wake-on-connect).
+   **Current interface:** `bhatti forward <sandbox> <port-spec>... [--address 127.0.0.1]`
+   binds one or more ports on the CLI machine (`PORT`, `LOCAL:GUEST`, or `0:GUEST`),
+   then uses authenticated WebSocket `GET /sandboxes/{id}/tunnel?port=N` to relay
+   each local connection through the server to the guest. The CLI process owns the
+   listeners; Ctrl-C stops only that process. Real-VM tests originally reached a
+   guest HTTP server through the host↔guest bridge. *The mesh building block.*
 2. **Inter-sandbox connectivity** — the server assigns each sandbox a stable host endpoint (vsock-forwarded to a guest
    port) and brokers **name resolution** (inject `<name>.sb → gateway` — the krucible-native replacement for the FC DNS
    responder), so A reaches B by name, routed A→host→(vsock forward)→B. The multi-agent unlock.

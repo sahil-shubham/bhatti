@@ -22,7 +22,7 @@ type rateLimiter struct {
 const maxRateLimitEntries = 10_000
 
 type userBuckets struct {
-	mu         sync.Mutex  // per-user lock — no global contention
+	mu         sync.Mutex   // per-user lock — no global contention
 	create     *tokenBucket // sandbox creation: 30/min
 	exec       *tokenBucket // exec, file ops: 600/min
 	read       *tokenBucket // list, get, ports: 1200/min
@@ -124,8 +124,14 @@ func (rl *rateLimiter) Allow(userID string, r *http.Request) bool {
 }
 
 // classifyRequest determines the rate limit class for a request.
+// Tunnel upgrades use the read bucket (60 burst, 1200/min). A browser can
+// connect tens of local ports at once without exhausting the smaller exec
+// bucket, while upgrades still count against the user's general request limit.
 func classifyRequest(r *http.Request) string {
 	path := r.URL.Path
+	if r.Method == http.MethodGet && strings.HasPrefix(path, "/sandboxes/") && strings.HasSuffix(path, "/tunnel") {
+		return "read"
+	}
 
 	// Sandbox creation
 	if r.Method == http.MethodPost && path == "/sandboxes" {
