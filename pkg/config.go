@@ -19,9 +19,12 @@ type Config struct {
 	Engine    string `yaml:"engine"`     // "krucible" (default; v2). Firecracker is v1 (firecracker branch).
 	Listen    string `yaml:"listen"`     // TCP control API, e.g. ":8080". Empty disables TCP (unix socket only).
 	APISocket string `yaml:"api_socket"` // unix socket for the local control API (default: <DataDir>/api.sock). Never reachable from a sandbox.
-	APIURL    string `yaml:"api_url"`    // CLI: remote API endpoint (e.g. https://api.bhatti.sh)
-	AuthToken string `yaml:"auth_token"` // CLI: API key for remote requests
-	DataDir   string `yaml:"data_dir"`   // defaults to ~/.bhatti
+	// APISocketGID grants this group access to the socket when positive.
+	// A bearer token is still required for every API request over the socket.
+	APISocketGID int    `yaml:"api_socket_gid,omitempty"`
+	APIURL       string `yaml:"api_url"`    // CLI: remote API endpoint (e.g. https://api.bhatti.sh)
+	AuthToken    string `yaml:"auth_token"` // CLI: API key for remote requests
+	DataDir      string `yaml:"data_dir"`   // defaults to ~/.bhatti
 
 	// MountRoots permits live --mount sources only beneath these host directories.
 	// Empty disables live mounts. Roots must not expose bhatti's data or config directory.
@@ -206,7 +209,6 @@ func LoadConfig() (*Config, error) {
 	dir := DefaultDataDir()
 	cfg := &Config{
 		Engine:  "krucible",
-		Listen:  ":8080",
 		DataDir: dir,
 	}
 
@@ -257,16 +259,17 @@ func loadLayeredConfig(cfg *Config, systemPath, deprecatedPath, userPath string)
 		// Protect even a malformed credentials file: the daemon opened it.
 		cfg.ConfigPaths = append(cfg.ConfigPaths, userPath)
 		var userCfg Config
-		if err := yaml.Unmarshal(data, &userCfg); err == nil {
-			if cfg.APIURL == "" {
-				cfg.APIURL = userCfg.APIURL
-			}
-			if cfg.AuthToken == "" {
-				cfg.AuthToken = userCfg.AuthToken
-			}
-			if cfg.ConfigPath == "" {
-				cfg.ConfigPath = userPath
-			}
+		if err := yaml.Unmarshal(data, &userCfg); err != nil {
+			return fmt.Errorf("parse config %s: %w", userPath, err)
+		}
+		if cfg.APIURL == "" {
+			cfg.APIURL = userCfg.APIURL
+		}
+		if cfg.AuthToken == "" {
+			cfg.AuthToken = userCfg.AuthToken
+		}
+		if cfg.ConfigPath == "" {
+			cfg.ConfigPath = userPath
 		}
 	}
 	return nil

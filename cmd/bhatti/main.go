@@ -312,6 +312,22 @@ func runDaemon() {
 	slog.Info("shutdown complete")
 }
 
+// setControlSocketPermissions keeps the socket owner-only unless a group was
+// explicitly configured. Socket access never replaces bearer-token auth.
+func setControlSocketPermissions(sock string, gid int, chown func(string, int, int) error) error {
+	mode := os.FileMode(0600)
+	if gid > 0 {
+		if err := chown(sock, 0, gid); err != nil {
+			return fmt.Errorf("chown socket root:%d: %w", gid, err)
+		}
+		mode = 0660
+	}
+	if err := os.Chmod(sock, mode); err != nil {
+		return fmt.Errorf("chmod socket %04o: %w", mode, err)
+	}
+	return nil
+}
+
 // serveControlSocket serves the full control mux on a unix socket — the local
 // CLI channel, never reachable from a sandbox (unlike a loopback TCP port, which
 // TSI proxies through). Returned so the caller can add it to the shutdown set.
@@ -324,7 +340,12 @@ func serveControlSocket(cfg *pkg.Config, srv *server.Server) *http.Server {
 		slog.Error("control socket listen", "path", sock, "error", err)
 		os.Exit(1)
 	}
-	_ = os.Chmod(sock, 0600) // owner-only
+	if err := setControlSocketPermissions(sock, cfg.APISocketGID, os.Chown); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(sock)
+		slog.Error("control socket permissions", "path", sock, "gid", cfg.APISocketGID, "error", err)
+		os.Exit(1)
+	}
 	s := &http.Server{Handler: srv}
 	go func() {
 		slog.Info("control API listening", "socket", sock)
@@ -395,7 +416,7 @@ func redirectHTTPS(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, target, http.StatusMovedPermanently)
 }
 
-// startDomainMode starts :443 + :80 (redirect) + 127.0.0.1:8080 (internal).
+// startDomainMode starts :443 + :80 (redirect) + the local control socket.
 func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *server.Server) []*http.Server {
 	dom := cfg.Domain
 	var servers []*http.Server

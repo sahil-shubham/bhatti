@@ -46,6 +46,7 @@ fi
 
 GITHUB_REPO="sahil-shubham/bhatti"
 DATA_DIR="/var/lib/bhatti"
+CONFIG_DIR="/etc/bhatti"  # tests may point this at a temporary directory after sourcing
 # Order matters: drives the order in user-facing hints ("outdated on disk:
 # computer, browser" follows ALL_KNOWN_TIERS order, not insertion order).
 ALL_KNOWN_TIERS="minimal browser docker computer"
@@ -541,7 +542,7 @@ crosses_major() {
 
 # Returns: none | cli | server
 detect_install_type() {
-    if [ -f "/etc/bhatti/config.yaml" ]; then
+    if [ -f "$CONFIG_DIR/config.yaml" ]; then
         echo "server"
     elif [ -d "$DATA_DIR" ] && [ -f "$DATA_DIR/config.yaml" ]; then
         # Pre-v1.6 installs kept config in the data dir
@@ -570,7 +571,7 @@ detect_tier() {
     # Primary: parse firecracker_rootfs from config.yaml
     local config_file="${1:-}"
     if [ -z "$config_file" ]; then
-        config_file="/etc/bhatti/config.yaml"
+        config_file="$CONFIG_DIR/config.yaml"
         [ -f "$config_file" ] || config_file="$DATA_DIR/config.yaml"  # pre-v1.6 fallback
     fi
     if [ -f "$config_file" ]; then
@@ -619,7 +620,7 @@ installed_bhatti_version() {
 # Used to hard-block an in-place v1→v2 crossing (a different VMM; not upgradeable).
 is_firecracker_install() {
     command -v firecracker >/dev/null 2>&1 && return 0
-    local cfg="/etc/bhatti/config.yaml"
+    local cfg="$CONFIG_DIR/config.yaml"
     [ -f "$cfg" ] || cfg="$DATA_DIR/config.yaml"
     [ -f "$cfg" ] || return 1
     grep -q '^engine:[[:space:]]*krucible' "$cfg" && return 1
@@ -916,6 +917,158 @@ install_rootfs() {
     success "rootfs ${tier} ($(du -h "$bases_dir/$base_name" | cut -f1), $(step_elapsed))"
 }
 
+# Keep the control socket group separate from the Unix accounts created by
+# `bhatti user create`. Membership permits connecting to the socket; every API
+# request still needs its own bearer token.
+linux_api_group_gid() {
+    if command -v getent >/dev/null 2>&1; then
+        getent group bhatti 2>/dev/null | cut -d: -f3 || true
+    elif [ -r /etc/group ]; then
+        awk -F: '$1 == "bhatti" {print $3; exit}' /etc/group
+    fi
+}
+
+ensure_api_group() {
+    case "$OS" in
+        linux)
+            API_GROUP_GID=$(linux_api_group_gid)
+            if [ -z "$API_GROUP_GID" ]; then
+                groupadd --system bhatti || die "could not create bhatti API group"
+                API_GROUP_GID=$(linux_api_group_gid)
+            fi
+            ;;
+        darwin)
+            if ! dscl . -read /Groups/bhatti PrimaryGroupID >/dev/null 2>&1; then
+                dseditgroup -o create bhatti || die "could not create bhatti API group"
+            fi
+            API_GROUP_GID=$(dscl . -read /Groups/bhatti PrimaryGroupID | awk '{print $NF}')
+            ;;
+        *) die "unsupported OS for API group: $OS" ;;
+    esac
+    case "$API_GROUP_GID" in
+        ''|*[!0-9]*) die "could not resolve numeric gid of bhatti API group" ;;
+    esac
+    [ "$API_GROUP_GID" -gt 0 ] || die "bhatti API group cannot use root gid"
+
+    API_GROUP_USER_ADDED=false
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        if ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx bhatti; then
+            if [ "$OS" = "darwin" ]; then
+                dseditgroup -o edit -a "$SUDO_USER" -t user bhatti \
+                    || die "could not add $SUDO_USER to bhatti API group"
+            else
+                usermod -aG bhatti "$SUDO_USER" \
+                    || die "could not add $SUDO_USER to bhatti API group"
+            fi
+            API_GROUP_USER_ADDED=true
+            info "$SUDO_USER added to bhatti group; log out and back in before using the socket without sudo."
+        fi
+    fi
+}
+
+# server_listen prints the server config's TCP listen address, normalised;
+# empty when the API is socket-only.
+server_listen() {
+    local cfg="$CONFIG_DIR/config.yaml" listen
+    [ -f "$cfg" ] || cfg="$DATA_DIR/config.yaml" # pre-v1.6 location
+    [ -f "$cfg" ] || return 0
+    listen=$(sed -nE 's/^[[:space:]]*listen[[:space:]]*:[[:space:]]*([^#]*).*/\1/p' "$cfg" \
+        | head -1 | tr -d "\"'[:space:]" | tr '[:upper:]' '[:lower:]') || true
+    case "$listen" in '~'|null) listen="" ;; esac
+    printf '%s' "$listen"
+}
+
+# Updates preserve all operator settings, including a legacy TCP listener.
+# Add only the missing group gid; never silently disable an existing listen.
+update_api_security() {
+    local cfg="$CONFIG_DIR/config.yaml"
+    [ -f "$cfg" ] || cfg="$DATA_DIR/config.yaml" # pre-v1.6 location
+    [ -f "$cfg" ] || return 0
+
+    if ! grep -qE '^[[:space:]]*api_socket_gid[[:space:]]*:' "$cfg"; then
+        if [ -s "$cfg" ] && [ -n "$(tail -c 1 "$cfg")" ]; then
+            printf '\n' >> "$cfg"
+        fi
+        printf 'api_socket_gid: %s\n' "$API_GROUP_GID" >> "$cfg"
+    fi
+
+    local listen
+    listen=$(server_listen)
+    if [ -n "$listen" ]; then
+        case "$listen" in
+            localhost:*|'[::1]:'*|::1:*) return 0 ;;
+        esac
+        if [[ "$listen" =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+$ ]]; then
+            return 0
+        fi
+        printf '  %s⚠  Existing listen: %s exposes a plaintext API; configuration left unchanged.%s\n' \
+            "$RED" "$listen" "$RESET" >&2
+        printf '     Remove listen for socket-only access, or configure a TLS domain for remote access.\n' >&2
+        printf '     Remove api_url: http://localhost:8080 from ~/.bhatti/config.yaml on other local accounts to use the socket.\n' >&2
+    fi
+}
+
+# Prior installers pinned CLI credentials to localhost:8080. Drop only that
+# legacy endpoint so the CLI selects the server's socket; leave remote URLs,
+# the bearer token, and all other settings untouched.
+remove_legacy_cli_url() {
+    local cfg="$1" tmp
+    [ -f "$cfg" ] && [ ! -L "$cfg" ] || return 0
+    grep -qxF 'api_url: http://localhost:8080' "$cfg" || return 0
+    tmp=$(mktemp "${cfg}.tmp.XXXXXX") || die "could not stage CLI config migration"
+    if ! awk '$0 != "api_url: http://localhost:8080"' "$cfg" > "$tmp"; then
+        rm -f "$tmp"
+        die "could not read CLI config for socket migration: $cfg"
+    fi
+    if ! cat "$tmp" > "$cfg"; then
+        rm -f "$tmp"
+        die "could not update CLI config for socket migration: $cfg"
+    fi
+    rm -f "$tmp"
+    info "Removed stale localhost API URL from $cfg"
+}
+
+migrate_local_cli_configs() {
+    local root_home user_home
+    root_home=$(eval echo ~root 2>/dev/null) || root_home=""
+    if [ -n "$root_home" ]; then
+        remove_legacy_cli_url "$root_home/.bhatti/config.yaml"
+    fi
+    # The invoking user only reaches the socket after logging in again with the
+    # new group, so keep their localhost URL while the server still listens on
+    # TCP: dropping it would break a working CLI. Without a listener it was dead.
+    if [ -n "$(server_listen)" ]; then
+        return 0
+    fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        user_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6) || true
+        if [ -z "$user_home" ]; then
+            user_home=$(eval echo "~$SUDO_USER" 2>/dev/null) || true
+        fi
+        if [ -n "$user_home" ]; then
+            remove_legacy_cli_url "$user_home/.bhatti/config.yaml"
+        fi
+    fi
+}
+
+# An existing data directory may be deliberately private (0700). Never relax
+# it on an update: it also contains the database, age.key, and sandbox data.
+warn_if_socket_dir_private() {
+    local mode owner_gid group_digit other_digit
+    if [ "$OS" = "darwin" ]; then
+        read -r mode owner_gid < <(stat -f '%Lp %g' "$DATA_DIR")
+    else
+        read -r mode owner_gid < <(stat -c '%a %g' "$DATA_DIR")
+    fi
+    group_digit="${mode: -2:1}"
+    other_digit="${mode: -1}"
+    if (( (other_digit & 1) == 0 && (owner_gid != API_GROUP_GID || (group_digit & 1) == 0) )); then
+        printf '  %s⚠  %s is not traversable by the bhatti group; socket access may require sudo.%s\n' \
+            "$RED" "$DATA_DIR" "$RESET" >&2
+        printf '     Review directory/file permissions before granting group traversal (secrets live here).\n' >&2
+    fi
+}
+
 generate_config() {
     local tier="$1"
     local rt="${RUNTIME_DIR:-$DATA_DIR/runtime}"
@@ -923,17 +1076,18 @@ generate_config() {
     # on x86_64). block-root + external lean kernel is the v2 boot path.
     local kernel
     kernel=$(find "$rt/kernel" -maxdepth 1 -type f \( -name 'Image-lean-*' -o -name 'vmlinux-lean-*' \) 2>/dev/null | head -1)
-    mkdir -p /etc/bhatti
-    cat > /etc/bhatti/config.yaml << EOF
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_DIR/config.yaml" << EOF
 engine: krucible
-listen: :8080
 data_dir: ${DATA_DIR}
+api_socket: ${DATA_DIR}/api.sock
+api_socket_gid: ${API_GROUP_GID}
 # Live --mount is disabled unless mount_roots names absolute, existing directories.
 # Roots and selected sources cannot be / or overlap data_dir (including age.key)
 # or the directory containing this config. Symlinks are resolved before checking.
 # mount_roots: [/srv/bhatti-shared]
-# Guests are networked only through the per-owner bhatti-netd gateway: isolated
-# from the host, egress policed, same-owner siblings reachable.
+# Guests use a per-owner bhatti-netd gateway. Same-owner sibling traffic is
+# denied by default and requires an explicit network-policy opt-in.
 krucible_vmm: ${rt}/bin/bhatti-vmm
 krucible_netd: ${rt}/bin/bhatti-netd
 krucible_libdir: ${rt}/lib
@@ -944,7 +1098,7 @@ EOF
     # Clean up pre-v1.6 config location
     if [ -f "$DATA_DIR/config.yaml" ]; then
         rm -f "$DATA_DIR/config.yaml"
-        info "Migrated config to /etc/bhatti/config.yaml"
+        info "Migrated config to $CONFIG_DIR/config.yaml"
     fi
 }
 
@@ -970,8 +1124,10 @@ create_admin_user() {
 
             if [ -n "$user_home" ] && [ -d "$user_home" ]; then
                 mkdir -p "$user_home/.bhatti"
+                # Set mode before writing the token; chmod afterward would
+                # briefly expose a newly created file under a 022 umask.
+                install -m 0600 /dev/null "$user_home/.bhatti/config.yaml"
                 cat > "$user_home/.bhatti/config.yaml" << EOF
-api_url: http://localhost:8080
 auth_token: ${ADMIN_KEY}
 EOF
                 chown -R "$SUDO_USER:$user_group" "$user_home/.bhatti"
@@ -984,8 +1140,8 @@ EOF
         local root_home
         root_home=$(eval echo ~root 2>/dev/null) || root_home=""
         if [ -n "$root_home" ] && [ -d "$root_home" ] && mkdir -p "$root_home/.bhatti" 2>/dev/null; then
+            install -m 0600 /dev/null "$root_home/.bhatti/config.yaml"
             cat > "$root_home/.bhatti/config.yaml" << EOF
-api_url: http://localhost:8080
 auth_token: ${ADMIN_KEY}
 EOF
         fi
@@ -1063,7 +1219,7 @@ start_service() {
     fi
     local healthy=false
     for _ in 1 2 3 4 5; do
-        if curl -sf http://localhost:8080/health >/dev/null 2>&1; then healthy=true; break; fi
+        if curl --unix-socket "$DATA_DIR/api.sock" -sf http://localhost/health >/dev/null 2>&1; then healthy=true; break; fi
         sleep 1
     done
     [ "$healthy" = true ]
@@ -1186,7 +1342,14 @@ do_server_install() {
 
     heading "Installing bhatti ${VERSION} (server, ${tier} tier) on $(hostname) (${HOST_ARCH})"
 
+    # Only establish the standard traversable mode on a newly created data
+    # directory. Never loosen an existing directory containing secrets.
+    if [ ! -d "$DATA_DIR" ]; then
+        mkdir -p -m 0755 "$DATA_DIR"
+    fi
     mkdir -p "$DATA_DIR"/{images,sandboxes,volumes,snapshots}
+    ensure_api_group
+    warn_if_socket_dir_private
 
     # v2 (krucible): one self-contained bundle brings the CLI + the whole runtime
     # (bhatti-vmm, bhatti-netd, libkrun, lean kernel). No Firecracker.
@@ -1215,6 +1378,14 @@ do_server_install() {
     echo "============================================"
     echo "  bhatti ${VERSION} installed (${elapsed}s)"
     echo "  tier: ${tier}"
+    echo "  Local API: $DATA_DIR/api.sock (Unix socket; no TCP listener)"
+    echo "  Socket group: bhatti; API requests still require a bearer token."
+    if [ "${API_GROUP_USER_ADDED:-false}" = true ]; then
+        echo "  Log out and back in to activate your new bhatti group membership."
+    fi
+    echo "  Remote access: configure a TLS domain, or forward the socket over SSH:"
+    echo "    ssh -N -L 127.0.0.1:8080:$DATA_DIR/api.sock user@<server>"
+    echo "  Local health: curl --unix-socket $DATA_DIR/api.sock http://localhost/health"
     echo ""
     echo "  Manage users:"
     echo "    sudo bhatti user create --name alice"
@@ -1249,7 +1420,7 @@ do_server_install() {
     if start_service; then
         success "bhatti service started and healthy"
     else
-        printf '  %s⚠  Service not responding on :8080 yet%s\n' "$RED" "$RESET"
+        printf '  %s⚠  Service not responding on %s/api.sock yet%s\n' "$RED" "$DATA_DIR" "$RESET"
         if [ "$OS" = "darwin" ]; then
             echo "  Check logs:"
             echo "    tail -n 40 ${DATA_DIR}/bhatti.log"
@@ -1318,7 +1489,7 @@ do_server_update() {
     # firecracker/lohar/vmlinux — never matched on v2, so update never short-circuited.)
     local rt="$DATA_DIR/runtime"
     local all_present=true
-    [ -f "/usr/local/bin/bhatti" ]              || all_present=false
+    [ -f "${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}" ] || all_present=false
     [ -f "$rt/bin/bhatti-vmm" ]                 || all_present=false
     [ -f "$rt/bin/bhatti-netd" ]                || all_present=false
     ls "$rt"/lib/libkrun.* >/dev/null 2>&1      || all_present=false
@@ -1328,13 +1499,6 @@ do_server_update() {
     # shellcheck disable=SC2086
     # intentional word-splitting: $tiers_to_install is space-separated tokens
     all_rootfs_up_to_date $tiers_to_install || rootfs_fresh=false
-
-    if [ -n "$current" ] && [ "v${current#v}" = "${VERSION}" ] \
-       && [ "$all_present" = true ] && [ "$rootfs_fresh" = true ]; then
-        success "bhatti ${VERSION} (server, ${tier} tier) is already up to date"
-        return 0
-    fi
-
     # Hard stop: a v1 (Firecracker) server cannot upgrade in place to v2
     # (krucible) — a different VMM, non-portable snapshots, a different on-disk
     # layout. This is a deliberate cutover, not an update.
@@ -1379,6 +1543,16 @@ do_server_update() {
             esac
         fi
     fi
+    ensure_api_group
+    update_api_security
+    migrate_local_cli_configs
+    warn_if_socket_dir_private
+
+    if [ -n "$current" ] && [ "v${current#v}" = "${VERSION}" ] \
+       && [ "$all_present" = true ] && [ "$rootfs_fresh" = true ]; then
+        success "bhatti ${VERSION} (server, ${tier} tier) is already up to date"
+        return 0
+    fi
 
     heading "Updating bhatti server (${tier} tier)"
     if [ -n "$current" ]; then
@@ -1415,15 +1589,13 @@ do_server_update() {
     fi
 
     # Migrate config from old location if needed (pre-v1.6, Linux only)
-    if [ "$OS" != "darwin" ] && [ -f "$DATA_DIR/config.yaml" ] && [ ! -f "/etc/bhatti/config.yaml" ]; then
-        mkdir -p /etc/bhatti
-        mv "$DATA_DIR/config.yaml" /etc/bhatti/config.yaml
-        info "Migrated config to /etc/bhatti/config.yaml"
+    if [ "$OS" != "darwin" ] && [ -f "$DATA_DIR/config.yaml" ] && [ ! -f "$CONFIG_DIR/config.yaml" ]; then
+        mkdir -p "$CONFIG_DIR"
+        mv "$DATA_DIR/config.yaml" "$CONFIG_DIR/config.yaml"
+        info "Migrated config to $CONFIG_DIR/config.yaml"
     fi
-    # INVARIANT: do_server_update NEVER overwrites /etc/bhatti/config.yaml.
-    # The operator's config is preserved across updates. Only
-    # do_server_install generates a fresh config. If the config schema
-    # changes, handle it via migration logic, not regeneration.
+    # Preserve all other operator settings across updates, including listen.
+    # Only the missing socket gid is appended by update_api_security above.
     # admin user is PRESERVED
 
     # Always refresh the service definition + ensure it's enabled (OS-aware).

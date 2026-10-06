@@ -57,6 +57,14 @@ manual grab? Take the per-platform tarball
 (`bhatti-<ver>-{darwin-arm64,linux-amd64,linux-arm64}.tar.zst`) from the
 [latest release](https://github.com/sahil-shubham/bhatti/releases).
 
+The v2 control API listens on a local, owner-only unix socket by default
+(`<data_dir>/api.sock`); installation does not expose port 8080. The local CLI
+uses that socket. For remote access, configure a domain for HTTPS/TLS or use
+SSH to run the CLI on the server. Plain TCP requires an explicit `listen`
+address in the server config and does not provide TLS; do not expose it to
+untrusted networks. The CLI-only install needs a reachable remote API endpoint
+and an API key (`bhatti setup --url ... --token ...`); it does not open one.
+
 **v1 (Firecracker) — Linux + KVM · frozen.** To install the old engine instead, pin
 it (a bare `bhatti.sh/install` now installs v2):
 
@@ -244,7 +252,7 @@ in `bench/README.md`.
 
 ```
 bhatti (host daemon)                        lohar (guest agent, PID 1 in each VM)
-  ├─ Control API (unix socket + :8080)       ├─ vsock: exec, files, sessions
+  ├─ Control API (unix socket default)       ├─ vsock: exec, files, sessions
   ├─ Per-user auth (API keys, SHA-256)        ├─ port forwarding
   ├─ krucible engine (libkrun fork)           ├─ PTY sessions + 64KB scrollback
   │  └─ per-VM bhatti-vmm helper + control      ├─ Atomic file writes

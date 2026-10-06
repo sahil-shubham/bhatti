@@ -86,7 +86,11 @@ var userCreateCmd = &cobra.Command{
 		fmt.Println()
 		fmt.Println("This key will not be shown again. Save it now.")
 		fmt.Printf("\nQuick start:\n")
-		fmt.Printf("  export BHATTI_URL=%s\n", apiURL)
+		if unixSocketPath != "" {
+			fmt.Printf("  # Local API via unix socket: %s\n", unixSocketPath)
+		} else {
+			fmt.Printf("  export BHATTI_URL=%s\n", apiURL)
+		}
 		fmt.Printf("  export BHATTI_TOKEN=%s\n", apiKey)
 		fmt.Printf("  bhatti create --name my-sandbox\n")
 		return nil

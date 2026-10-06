@@ -1,23 +1,49 @@
 #!/bin/bash
-# scripts/uninstall.sh — Remove bhatti from a Linux host.
+# scripts/uninstall.sh — Remove bhatti from a Linux or macOS host.
 #
 # Usage:
-#   sudo ./scripts/uninstall.sh           # remove binaries + service, keep data
-#   sudo ./scripts/uninstall.sh --purge   # remove everything including data
+#   sudo ./scripts/uninstall.sh           # remove binaries + service, keep data and API group
+#   sudo ./scripts/uninstall.sh --purge   # remove everything including data and API group
 #
 # Safe to run multiple times.
-set -euo pipefail
+if [ "${BHATTI_TEST:-}" != "1" ]; then
+    set -euo pipefail
+fi
 
 DATA_DIR="/var/lib/bhatti"
 PURGE=false
+
+linux_api_group_exists() {
+    if command -v getent >/dev/null 2>&1; then
+        getent group bhatti >/dev/null 2>&1
+    elif [ -r /etc/group ]; then
+        grep -q '^bhatti:' /etc/group
+    fi
+}
+
+remove_api_group() {
+    [ "$PURGE" = "true" ] || return 0
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if dscl . -read /Groups/bhatti PrimaryGroupID >/dev/null 2>&1; then
+            echo "==> Removing bhatti API group"
+            dseditgroup -o delete bhatti
+        fi
+    elif linux_api_group_exists; then
+        echo "==> Removing bhatti API group"
+        groupdel bhatti
+    fi
+}
+
+# Tests source the group helper without running the privileged teardown.
+if [ "${BHATTI_TEST:-}" != "1" ]; then
 
 for arg in "$@"; do
     case "$arg" in
         --purge) PURGE=true ;;
         --help|-h)
             echo "Usage: sudo $0 [--purge]"
-            echo "  --purge   remove all data (sandboxes, images, volumes, secrets, config)"
-            echo "  (default) remove binaries + service only, keep data for reinstall"
+            echo "  --purge   remove all data (sandboxes, images, volumes, secrets, config) and API group"
+            echo "  (default) remove binaries + service only; preserve data and API group"
             exit 0
             ;;
     esac
@@ -38,20 +64,30 @@ echo ""
 
 # --- 1. Stop service ---
 
-if systemctl is-active bhatti &>/dev/null; then
-    echo "==> Stopping bhatti service..."
-    systemctl stop bhatti
-fi
+if [[ $(uname -s) == Darwin ]]; then
+    PLIST=/Library/LaunchDaemons/sh.bhatti.plist
+    if [[ -f "$PLIST" ]]; then
+        echo "==> Stopping bhatti service..."
+        launchctl bootout system "$PLIST" 2>/dev/null || true
+        echo "==> Removing launchd unit..."
+        rm -f "$PLIST"
+    fi
+else
+    if systemctl is-active bhatti &>/dev/null; then
+        echo "==> Stopping bhatti service..."
+        systemctl stop bhatti
+    fi
 
-if systemctl is-enabled bhatti &>/dev/null; then
-    echo "==> Disabling bhatti service..."
-    systemctl disable bhatti
-fi
+    if systemctl is-enabled bhatti &>/dev/null; then
+        echo "==> Disabling bhatti service..."
+        systemctl disable bhatti
+    fi
 
-if [[ -f /etc/systemd/system/bhatti.service ]]; then
-    echo "==> Removing systemd unit..."
-    rm -f /etc/systemd/system/bhatti.service
-    systemctl daemon-reload
+    if [[ -f /etc/systemd/system/bhatti.service ]]; then
+        echo "==> Removing systemd unit..."
+        rm -f /etc/systemd/system/bhatti.service
+        systemctl daemon-reload
+    fi
 fi
 
 # --- 2. Kill any running sandbox VMs / gateways (v2 = krucible) ---
@@ -79,8 +115,8 @@ fi
 # host tap/bridge/iptables state to reap. This block only runs on a leftover v1
 # host (per-sandbox TAP + per-user brbhatti bridge + FORWARD rules).
 
-if command -v firecracker >/dev/null 2>&1 \
-   || ip -o link show type bridge 2>/dev/null | grep -q "brbhatti"; then
+if [[ $(uname -s) == Linux ]] && { command -v firecracker >/dev/null 2>&1 \
+   || ip -o link show type bridge 2>/dev/null | grep -q "brbhatti"; }; then
     echo "==> Firecracker (v1) artifacts detected — cleaning up host network state"
 
     for pid in $(pgrep -f "firecracker --api-sock" 2>/dev/null || true); do
@@ -127,11 +163,13 @@ fi
 # --- 5. Purge data (only with --purge) ---
 
 if [[ "$PURGE" == "true" ]]; then
-    # Unmount any leftover loop mounts from sandboxes
-    for mnt in $(mount | grep "$DATA_DIR" | awk '{print $3}'); do
-        echo "  unmounting: $mnt"
-        umount -l "$mnt" 2>/dev/null || true
-    done
+    # Unmount any leftover loop mounts from sandboxes (Linux only).
+    if [[ $(uname -s) == Linux ]]; then
+        for mnt in $(mount | grep "$DATA_DIR" | awk '{print $3}'); do
+            echo "  unmounting: $mnt"
+            umount -l "$mnt" 2>/dev/null || true
+        done
+    fi
 
     if [[ -d "$DATA_DIR" ]]; then
         echo "==> Removing $DATA_DIR"
@@ -144,12 +182,11 @@ if [[ "$PURGE" == "true" ]]; then
     fi
 
     # Remove CLI configs
-    for cfg in /root/.bhatti; do
-        if [[ -d "$cfg" ]]; then
-            echo "==> Removing $cfg"
-            rm -rf "$cfg"
-        fi
-    done
+    ROOT_HOME=$(eval echo ~root)
+    if [[ -d "$ROOT_HOME/.bhatti" ]]; then
+        echo "==> Removing $ROOT_HOME/.bhatti"
+        rm -rf "$ROOT_HOME/.bhatti"
+    fi
 
     # Try to find the sudo user's config too
     if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
@@ -159,6 +196,8 @@ if [[ "$PURGE" == "true" ]]; then
             rm -rf "$USER_CFG"
         fi
     fi
+
+    remove_api_group
 else
     echo ""
     echo "  Data preserved in $DATA_DIR"
@@ -177,10 +216,11 @@ else
     echo "  Binaries + runtime + service removed."
     echo "  Data preserved: $DATA_DIR"
     echo "    (rootfs images, volumes, secrets, sandboxes)"
-    echo "  Config preserved: /etc/bhatti/config.yaml"
+    echo "  Config preserved: /etc/bhatti/config.yaml; bhatti API group preserved."
     echo "    (the krucible runtime under $DATA_DIR/runtime is re-installed on update)"
     echo ""
     echo "  To reinstall:"
     echo "    curl -fsSL bhatti.sh/install | sudo bash"
 fi
 echo "============================================"
+fi

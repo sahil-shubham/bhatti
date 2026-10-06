@@ -5,12 +5,18 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("engine: krucible\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BHATTI_CONFIG", cfgPath)
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -18,19 +24,32 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Engine != "krucible" {
 		t.Fatalf("expected krucible, got %s", cfg.Engine)
 	}
-	if cfg.Listen != ":8080" {
-		t.Fatalf("expected :8080, got %s", cfg.Listen)
+	if cfg.Listen != "" {
+		t.Fatalf("default listen = %q, want empty (socket-only)", cfg.Listen)
+	}
+	if cfg.APISocketGID != 0 {
+		t.Fatalf("default api_socket_gid = %d, want 0 (owner-only)", cfg.APISocketGID)
 	}
 }
 
 func TestConfigYAMLParsing(t *testing.T) {
-	content := []byte("engine: krucible\nlisten: :9090\nauth_token: secret123\n")
+	content := []byte("engine: krucible\nlisten: :9090\napi_socket_gid: 123\nauth_token: secret123\n")
 	cfg := &Config{}
 	if err := yaml.Unmarshal(content, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Engine != "krucible" || cfg.Listen != ":9090" || cfg.AuthToken != "secret123" {
+	if cfg.Engine != "krucible" || cfg.Listen != ":9090" || cfg.APISocketGID != 123 || cfg.AuthToken != "secret123" {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestConfigYAMLOmitsUnsetSocketGID(t *testing.T) {
+	data, err := yaml.Marshal(&Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "api_socket_gid:") {
+		t.Fatalf("unset api_socket_gid should be omitted: %s", data)
 	}
 }
 
@@ -187,6 +206,23 @@ func TestLoadConfigTracksEveryReadFile(t *testing.T) {
 		cfg.ConfigPaths[0] != systemPath || cfg.ConfigPaths[1] != userPath ||
 		cfg.AuthToken != "secret" {
 		t.Fatalf("loaded paths and credentials = %+v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsMalformedUserConfig(t *testing.T) {
+	base := t.TempDir()
+	systemPath := filepath.Join(base, "server.yaml")
+	userPath := filepath.Join(base, "user.yaml")
+	if err := os.WriteFile(systemPath, []byte("listen: :9090\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte("api_url: [invalid\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	err := loadLayeredConfig(cfg, systemPath, filepath.Join(base, "missing.yaml"), userPath)
+	if err == nil || !strings.Contains(err.Error(), userPath) {
+		t.Fatalf("malformed user config error = %v, want path-specific parse error", err)
 	}
 }
 

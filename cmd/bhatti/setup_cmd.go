@@ -47,11 +47,15 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 			if setupURL != "" {
 				endpoint = setupURL
 			} else {
-				fmt.Printf("API endpoint [%s]: ", apiURL)
+				defaultEndpoint := apiURL
+				if unixSocketPath != "" {
+					defaultEndpoint = "unix://" + unixSocketPath
+				}
+				fmt.Printf("API endpoint [%s]: ", defaultEndpoint)
 				var in string
 				fmt.Scanln(&in)
 				if in == "" {
-					endpoint = apiURL
+					endpoint = defaultEndpoint
 				} else {
 					endpoint = in
 				}
@@ -78,6 +82,13 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 		if key == "" {
 			return fmt.Errorf("API key is required (pass --token or enter at the prompt)")
 		}
+		if strings.HasPrefix(endpoint, "unix://") {
+			if strings.TrimPrefix(endpoint, "unix://") != unixSocketPath || unixSocketPath == "" {
+				return fmt.Errorf("custom unix socket endpoint %q cannot be saved by setup; configure api_socket in the daemon config", endpoint)
+			}
+		} else if !strings.HasPrefix(endpoint, "https://") && !strings.HasPrefix(endpoint, "http://") {
+			return fmt.Errorf("API endpoint must be an http(s) URL or the local unix socket (%s)", "unix://"+unixSocketPath)
+		}
 
 		// Write config to the *invoking* user's home, even if we're running
 		// under sudo. pkg.DefaultDataDir() honors SUDO_USER, so this resolves
@@ -89,14 +100,13 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 		cfgPath := filepath.Join(cfgDir, "config.yaml")
 
 		var cfgContent string
-		if strings.HasPrefix(endpoint, "https://") || strings.HasPrefix(endpoint, "http://") {
-			// Remote endpoint — save URL and token
-			cfgContent = fmt.Sprintf("api_url: %s\nauth_token: %s\n", endpoint, key)
+		if strings.HasPrefix(endpoint, "unix://") {
+			// The socket path comes from the daemon config (or its default);
+			// the user config only supplies credentials.
+			cfgContent = fmt.Sprintf("auth_token: %s\n", key)
 		} else {
-			// Local — save listen address and token
-			cfgContent = fmt.Sprintf("listen: %s\nauth_token: %s\n", endpoint, key)
+			cfgContent = fmt.Sprintf("api_url: %s\nauth_token: %s\n", endpoint, key)
 		}
-
 		if err := os.WriteFile(cfgPath, []byte(cfgContent), 0600); err != nil {
 			return fmt.Errorf("write config: %w", err)
 		}
@@ -120,7 +130,11 @@ CI scripts, and provisioning tools that can't answer prompts.`,
 		fmt.Print("Testing connection... ")
 		apiURL = endpoint
 		apiToken = key
-		unixSocketPath = "" // A local daemon socket must not override the newly selected endpoint.
+		unixSocketPath = ""
+		if strings.HasPrefix(endpoint, "unix://") {
+			unixSocketPath = strings.TrimPrefix(endpoint, "unix://")
+			apiURL = "http://unix"
+		}
 		var sandboxes []any
 		if err := apiJSON("GET", "/sandboxes", nil, &sandboxes); err != nil {
 			fmt.Printf("✗ %v\n", err)

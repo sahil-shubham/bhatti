@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -23,7 +25,7 @@ import (
 )
 
 var (
-	apiURL   = "http://localhost:8080"
+	apiURL   = ""
 	apiToken = ""
 	// unixSocketPath, when set, routes the CLI's HTTP + websocket traffic over the
 	// daemon's local control socket instead of TCP (apiURL becomes http://unix).
@@ -46,8 +48,8 @@ Quick start:
   bhatti shell dev                     # interactive shell (Ctrl+\ to detach)
   bhatti destroy dev                   # clean up`,
 	SilenceUsage: true,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		loadConfig(cmd)
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return loadConfig(cmd)
 	},
 }
 
@@ -140,43 +142,50 @@ func runCLI() {
 
 // loadConfig sets apiURL and apiToken with precedence:
 //
-//	flag → env var → config file → local socket → default
+//	flag → env var → config file → local socket
 //
 // Env vars override the config file (12-factor convention, matching
 // docker/kubectl): an agent or CI job can point an already-configured CLI at
 // another daemon with BHATTI_URL/BHATTI_TOKEN without editing
 // ~/.bhatti/config.yaml. `bhatti setup` still just works when no env
 // overrides are set.
-func loadConfig(cmd *cobra.Command) {
-	cfg, _ := pkg.LoadConfig()
-
-	// URL: flag wins, then env, then config, then the local unix socket
-	if v, _ := cmd.Flags().GetString("url"); v != "" {
-		apiURL = v
-	} else if v := os.Getenv("BHATTI_URL"); v != "" {
-		apiURL = v
-	} else if cfg != nil && cfg.APIURL != "" {
-		apiURL = cfg.APIURL
-	} else if cfg != nil {
-		// No explicit remote endpoint: prefer the daemon's local unix control
-		// socket (not reachable from a sandbox). Fall back to the default TCP URL if
-		// the socket isn't there (no daemon / older daemon).
-		if sock := cfg.APISocketPath(); sock != "" {
-			if _, err := os.Stat(sock); err == nil {
-				unixSocketPath = sock
-				apiURL = "http://unix"
-			}
-		}
+func loadConfig(cmd *cobra.Command) error {
+	cfg, err := pkg.LoadConfig()
+	if err != nil {
+		return err
 	}
 
-	// Token: same order
+	// Reset per-command state so a prior local command cannot redirect an
+	// explicitly remote URL through the socket.
+	unixSocketPath = ""
+	flagURL := ""
+	if cmd != setupCmd {
+		// setup's --url is the endpoint to save, not an override of the
+		// currently configured socket used to validate that choice.
+		flagURL, _ = cmd.Flags().GetString("url")
+	}
+	if flagURL != "" {
+		apiURL = flagURL
+	} else if v := os.Getenv("BHATTI_URL"); v != "" {
+		apiURL = v
+	} else if cfg.APIURL != "" {
+		apiURL = cfg.APIURL
+	} else {
+		// Even when the socket is absent, dial it rather than silently
+		// sending an API request (and its token) to localhost:8080.
+		unixSocketPath = cfg.APISocketPath()
+		apiURL = "http://unix"
+	}
+
+	apiToken = ""
 	if v, _ := cmd.Flags().GetString("token"); v != "" {
 		apiToken = v
 	} else if v := os.Getenv("BHATTI_TOKEN"); v != "" {
 		apiToken = v
-	} else if cfg != nil && cfg.AuthToken != "" {
+	} else {
 		apiToken = cfg.AuthToken
 	}
+	return nil
 }
 
 // --- HTTP helpers ---
@@ -461,12 +470,33 @@ func (t *timingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // currentTiming is set per-command when --timing is active.
 var currentTiming *requestTiming
 
+// socketDialError supplies a recovery hint without changing remote URL errors.
+func socketDialError(sock string, err error) error {
+	switch {
+	case errors.Is(err, syscall.ENOENT), errors.Is(err, syscall.ECONNREFUSED):
+		return fmt.Errorf("no bhatti daemon at %s: is it running? To use a remote server: bhatti setup", sock)
+	case errors.Is(err, syscall.EACCES):
+		return fmt.Errorf("permission denied on %s: add yourself to the bhatti group (then log in again) or use sudo", sock)
+	default:
+		return err
+	}
+}
+
+func dialUnixSocket(ctx context.Context, sock string) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	if err != nil {
+		return nil, socketDialError(sock, err)
+	}
+	return conn, nil
+}
+
 // baseTransport dials the unix control socket when configured, else default TCP.
 func baseTransport() http.RoundTripper {
 	if unixSocketPath != "" {
+		sock := unixSocketPath
 		return &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", unixSocketPath)
+				return dialUnixSocket(ctx, sock)
 			},
 		}
 	}
@@ -484,9 +514,10 @@ func httpClient() *http.Client {
 // wsDialer returns a websocket dialer that honors the unix control socket.
 func wsDialer() *websocket.Dialer {
 	if unixSocketPath != "" {
+		sock := unixSocketPath
 		return &websocket.Dialer{
 			NetDialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", unixSocketPath)
+				return dialUnixSocket(ctx, sock)
 			},
 		}
 	}

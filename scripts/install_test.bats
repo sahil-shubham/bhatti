@@ -2,7 +2,7 @@
 # scripts/install_test.bats — Unit tests for scripts/install.sh
 #
 # Pairs with scripts/install_smoke.bats. The contract:
-#   install_test.bats  — pure helpers, sub-second, no network/disk
+#   install_test.bats  — isolated helpers + temp paths, no network/system changes
 #   install_smoke.bats — end-to-end against a fake release tree
 # Together they're the suite that has to be green for "if CI passes,
 # install + update works modulo GitHub being down".
@@ -25,6 +25,9 @@ setup() {
 teardown() {
     if [ "${INSTALL_ROOTFS_FIXTURE:-}" = 1 ]; then
         rm -rf "$DATA_DIR"
+    fi
+    if [ -n "${SECURITY_TMP:-}" ]; then
+        rm -rf "$SECURITY_TMP"
     fi
 }
 
@@ -758,4 +761,288 @@ _release_rootfs() {
     run parse_flags --help
     [ "$status" -eq 0 ]
     output_contains "Usage:"
+}
+
+# ── Local API security ────────────────────────────────────────────
+# Source the script and exercise its real config/update helpers with temporary
+# paths. Never run the full installer or mutate system groups/service files.
+_security_fixture() {
+    SECURITY_TMP=$(mktemp -d)
+    CONFIG_DIR="$SECURITY_TMP/etc"
+    DATA_DIR="$SECURITY_TMP/data"
+    RUNTIME_DIR="$DATA_DIR/runtime"
+    mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR/kernel"
+    chmod 0755 "$DATA_DIR"
+    : > "$RUNTIME_DIR/kernel/Image-lean-test"
+    API_GROUP_GID=4242
+    OS=linux
+    ARCH=arm64
+    SUDO_USER=""
+}
+
+@test "generate_config uses a group-owned Unix API socket, no TCP listen, and accurate sibling policy" {
+    _security_fixture
+    generate_config minimal
+    local cfg="$CONFIG_DIR/config.yaml"
+    grep -qx "data_dir: $DATA_DIR" "$cfg"
+    grep -qx "api_socket: $DATA_DIR/api.sock" "$cfg"
+    grep -qx "api_socket_gid: 4242" "$cfg"
+    grep -q "denied by default and requires an explicit network-policy opt-in" "$cfg"
+    run grep -qE '^[[:space:]]*listen:' "$cfg"
+    [ "$status" -ne 0 ]
+}
+
+@test "create_admin_user writes token-only, private CLI configs for sudo user and root" {
+    _security_fixture
+    mkdir -p "$SECURITY_TMP/user" "$SECURITY_TMP/root"
+    SUDO_USER=operator
+    bhatti() { echo "API key: bht_test_secret"; }
+    getent() { [ "$1" = passwd ] && printf 'operator:x:1000:1000:Operator:%s/user:/bin/bash\n' "$SECURITY_TMP"; }
+    id() { [ "$1" = -gn ] && echo staff; }
+    eval() { printf '%s\n' "$SECURITY_TMP/root"; }
+    chown() { :; }
+
+    create_admin_user
+    [ "$(cat "$SECURITY_TMP/user/.bhatti/config.yaml")" = 'auth_token: bht_test_secret' ]
+    [ "$(cat "$SECURITY_TMP/root/.bhatti/config.yaml")" = 'auth_token: bht_test_secret' ]
+    [ "$(stat -c %a "$SECURITY_TMP/user/.bhatti/config.yaml" 2>/dev/null || stat -f %Lp "$SECURITY_TMP/user/.bhatti/config.yaml")" = 600 ]
+    [ "$(stat -c %a "$SECURITY_TMP/root/.bhatti/config.yaml" 2>/dev/null || stat -f %Lp "$SECURITY_TMP/root/.bhatti/config.yaml")" = 600 ]
+}
+
+@test "start_service probes the local socket even when domain mode has no TCP listener" {
+    _security_fixture
+    systemctl() { [ "$*" = "enable --now bhatti" ]; }
+    curl() {
+        printf '%s\n' "$*" > "$SECURITY_TMP/curl-args"
+        [ "$*" = "--unix-socket $DATA_DIR/api.sock -sf http://localhost/health" ]
+    }
+
+    start_service
+    [ "$(cat "$SECURITY_TMP/curl-args")" = "--unix-socket $DATA_DIR/api.sock -sf http://localhost/health" ]
+}
+
+@test "ensure_api_group on Linux creates group and sudo membership only once" {
+    _security_fixture
+    SUDO_USER=operator
+    getent() {
+        [ "$1" = group ] && [ "$2" = bhatti ] && [ -f "$SECURITY_TMP/group" ] &&
+            echo 'bhatti:x:3131:'
+    }
+    groupadd() {
+        [ "$*" = "--system bhatti" ] || return 1
+        echo groupadd >> "$SECURITY_TMP/calls"
+        : > "$SECURITY_TMP/group"
+    }
+    id() {
+        [ "$1" = -nG ] || return 1
+        if [ -f "$SECURITY_TMP/member" ]; then echo 'staff bhatti'; else echo staff; fi
+    }
+    usermod() {
+        [ "$*" = "-aG bhatti operator" ] || return 1
+        echo usermod >> "$SECURITY_TMP/calls"
+        : > "$SECURITY_TMP/member"
+    }
+
+    ensure_api_group
+    [ "$API_GROUP_GID" = 3131 ]
+    [ "$API_GROUP_USER_ADDED" = true ]
+    ensure_api_group
+    [ "$API_GROUP_USER_ADDED" = false ]
+    [ "$(grep -c '^groupadd$' "$SECURITY_TMP/calls")" -eq 1 ]
+    [ "$(grep -c '^usermod$' "$SECURITY_TMP/calls")" -eq 1 ]
+}
+
+@test "ensure_api_group on macOS creates group and sudo membership only once" {
+    _security_fixture
+    OS=darwin
+    SUDO_USER=operator
+    dscl() {
+        [ "$*" = ". -read /Groups/bhatti PrimaryGroupID" ] || return 1
+        [ -f "$SECURITY_TMP/group" ] && echo 'PrimaryGroupID: 4040'
+    }
+    dseditgroup() {
+        case "$*" in
+            "-o create bhatti") echo create >> "$SECURITY_TMP/calls"; : > "$SECURITY_TMP/group" ;;
+            "-o edit -a operator -t user bhatti") echo edit >> "$SECURITY_TMP/calls"; : > "$SECURITY_TMP/member" ;;
+            *) return 1 ;;
+        esac
+    }
+    id() {
+        [ "$1" = -nG ] || return 1
+        if [ -f "$SECURITY_TMP/member" ]; then echo 'staff bhatti'; else echo staff; fi
+    }
+
+    ensure_api_group
+    [ "$API_GROUP_GID" = 4040 ]
+    [ "$API_GROUP_USER_ADDED" = true ]
+    ensure_api_group
+    [ "$API_GROUP_USER_ADDED" = false ]
+    [ "$(grep -c '^create$' "$SECURITY_TMP/calls")" -eq 1 ]
+    [ "$(grep -c '^edit$' "$SECURITY_TMP/calls")" -eq 1 ]
+}
+
+@test "update_api_security appends gid once and warns about untouched plaintext listen" {
+    _security_fixture
+    printf 'engine: krucible\nlisten: :8080\n# api_socket_gid: 5' > "$CONFIG_DIR/config.yaml"
+
+    run update_api_security
+    [ "$status" -eq 0 ]
+    output_contains "Existing listen: :8080 exposes a plaintext API; configuration left unchanged."
+    [ "$(grep -c '^api_socket_gid:' "$CONFIG_DIR/config.yaml")" -eq 1 ]
+    grep -qx 'listen: :8080' "$CONFIG_DIR/config.yaml"
+    grep -qx '# api_socket_gid: 5' "$CONFIG_DIR/config.yaml"
+    grep -qx 'api_socket_gid: 4242' "$CONFIG_DIR/config.yaml"
+    run update_api_security
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^api_socket_gid:' "$CONFIG_DIR/config.yaml")" -eq 1 ]
+}
+
+@test "update_api_security preserves existing gid and ignores commented or empty listen" {
+    _security_fixture
+    printf 'api_socket_gid: 999\n# listen: :8080\nlisten: ""\n' > "$CONFIG_DIR/config.yaml"
+
+    run update_api_security
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ "$(grep -c '^api_socket_gid:' "$CONFIG_DIR/config.yaml")" -eq 1 ]
+    grep -qx 'api_socket_gid: 999' "$CONFIG_DIR/config.yaml"
+}
+
+@test "update_api_security appends to deprecated data-dir config without replacing it" {
+    _security_fixture
+    printf 'engine: krucible\nlisten: ":8080" # retained\n' > "$DATA_DIR/config.yaml"
+
+    run update_api_security
+    [ "$status" -eq 0 ]
+    output_contains "Existing listen: :8080 exposes a plaintext API"
+    [ ! -f "$CONFIG_DIR/config.yaml" ]
+    grep -qx 'listen: ":8080" # retained' "$DATA_DIR/config.yaml"
+    grep -qx 'api_socket_gid: 4242' "$DATA_DIR/config.yaml"
+}
+
+@test "update_api_security preserves loopback listeners without warning" {
+    _security_fixture
+    local listen
+    for listen in 'localhost:8080' '127.42.0.1:8080' "'[::1]:8080'" '"::1:8080"'; do
+        printf 'listen: %s\n' "$listen" > "$CONFIG_DIR/config.yaml"
+        run update_api_security
+        [ "$status" -eq 0 ]
+        [ -z "$output" ]
+        grep -qxF "listen: $listen" "$CONFIG_DIR/config.yaml"
+        grep -qx 'api_socket_gid: 4242' "$CONFIG_DIR/config.yaml"
+    done
+}
+
+@test "migrate_local_cli_configs removes legacy URL but preserves tokens and remote URLs" {
+    _security_fixture
+    mkdir -p "$SECURITY_TMP/root/.bhatti" "$SECURITY_TMP/user/.bhatti"
+    SUDO_USER=operator
+    eval() { printf '%s\n' "$SECURITY_TMP/root"; }
+    getent() { [ "$1" = passwd ] && printf 'operator:x:1000:1000:Operator:%s/user:/bin/bash\n' "$SECURITY_TMP"; }
+    printf 'api_url: https://api.example.test\nauth_token: root-token\n' > "$SECURITY_TMP/root/.bhatti/config.yaml"
+    printf 'api_url: http://localhost:8080\nauth_token: user-token\n' > "$SECURITY_TMP/user/.bhatti/config.yaml"
+
+    migrate_local_cli_configs
+    [ "$(cat "$SECURITY_TMP/root/.bhatti/config.yaml")" = $'api_url: https://api.example.test\nauth_token: root-token' ]
+    [ "$(cat "$SECURITY_TMP/user/.bhatti/config.yaml")" = 'auth_token: user-token' ]
+}
+
+@test "migrate_local_cli_configs keeps the invoking user's localhost URL while the server listens on TCP" {
+    _security_fixture
+    mkdir -p "$SECURITY_TMP/root/.bhatti" "$SECURITY_TMP/user/.bhatti"
+    SUDO_USER=operator
+    eval() { printf '%s\n' "$SECURITY_TMP/root"; }
+    getent() { [ "$1" = passwd ] && printf 'operator:x:1000:1000:Operator:%s/user:/bin/bash\n' "$SECURITY_TMP"; }
+    printf 'engine: krucible\nlisten: :8080\n' > "$CONFIG_DIR/config.yaml"
+    printf 'api_url: http://localhost:8080\nauth_token: root-token\n' > "$SECURITY_TMP/root/.bhatti/config.yaml"
+    printf 'api_url: http://localhost:8080\nauth_token: user-token\n' > "$SECURITY_TMP/user/.bhatti/config.yaml"
+
+    migrate_local_cli_configs
+    # root reaches the socket regardless; the user would need a fresh login first.
+    [ "$(cat "$SECURITY_TMP/root/.bhatti/config.yaml")" = 'auth_token: root-token' ]
+    [ "$(cat "$SECURITY_TMP/user/.bhatti/config.yaml")" = $'api_url: http://localhost:8080\nauth_token: user-token' ]
+}
+
+@test "same-version server update adds gid and keeps loopback config without full install" {
+    _security_fixture
+    cat > "$CONFIG_DIR/config.yaml" <<EOF
+engine: krucible
+listen: 127.0.0.1:8080
+krucible_base_image: $DATA_DIR/images/rootfs-minimal-arm64.ext4
+EOF
+    mkdir -p "$SECURITY_TMP/root/.bhatti"
+    printf 'api_url: http://localhost:8080\nauth_token: local-token\n' > "$SECURITY_TMP/root/.bhatti/config.yaml"
+    eval() { printf '%s\n' "$SECURITY_TMP/root"; }
+    mkdir -p "$RUNTIME_DIR/bin" "$RUNTIME_DIR/lib" "$DATA_DIR/images"
+    : > "$RUNTIME_DIR/bin/bhatti-vmm"
+    : > "$RUNTIME_DIR/bin/bhatti-netd"
+    : > "$RUNTIME_DIR/lib/libkrun.so"
+    : > "$DATA_DIR/images/rootfs-minimal-arm64.ext4"
+    printf 'expected\n' > "$DATA_DIR/images/.rootfs-minimal-arm64.sha256"
+    CHECKSUMS='expected  rootfs-minimal-arm64.ext4.zst'
+    BHATTI_TEST_BIN_DEST="$SECURITY_TMP/bhatti"
+    : > "$BHATTI_TEST_BIN_DEST"
+    VERSION=v2.0.0
+    unset BHATTI_TIERS
+    id() { [ "$1" = -u ] && echo 0; }
+    installed_bhatti_version() { echo v2.0.0; }
+    is_firecracker_install() { return 1; }
+    ensure_api_group() { API_GROUP_GID=4242; }
+    install_bundle() { echo "unexpected install_bundle" >&2; return 1; }
+    systemctl() { echo "unexpected systemctl" >&2; return 1; }
+
+    run do_server_update
+    [ "$status" -eq 0 ] || { echo "$output" >&2; return 1; }
+    output_contains "is already up to date"
+    grep -qx 'api_socket_gid: 4242' "$CONFIG_DIR/config.yaml"
+    grep -qx 'listen: 127.0.0.1:8080' "$CONFIG_DIR/config.yaml"
+    [ "$(cat "$SECURITY_TMP/root/.bhatti/config.yaml")" = 'auth_token: local-token' ]
+    if echo "$output" | grep -qF "Existing listen:"; then
+        echo "loopback listener was incorrectly treated as network-bound: $output" >&2
+        return 1
+    fi
+}
+
+@test "private existing data dir warns instead of changing permissions" {
+    _security_fixture
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    chmod 0700 "$DATA_DIR"
+    run warn_if_socket_dir_private
+    [ "$status" -eq 0 ]
+    output_contains "not traversable by the bhatti group"
+    [ "$(stat -c %a "$DATA_DIR" 2>/dev/null || stat -f %Lp "$DATA_DIR")" = 700 ]
+    chmod 0755 "$DATA_DIR"
+    run warn_if_socket_dir_private
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "purge group helper removes Linux API group idempotently" {
+    _security_fixture
+    source scripts/uninstall.sh
+    uname() { echo Linux; }
+    getent() { [ "$*" = "group bhatti" ] && [ -f "$SECURITY_TMP/group" ]; }
+    groupdel() { [ "$*" = bhatti ] && rm -f "$SECURITY_TMP/group" && echo groupdel >> "$SECURITY_TMP/calls"; }
+    : > "$SECURITY_TMP/group"
+    remove_api_group
+    [ -f "$SECURITY_TMP/group" ]
+    PURGE=true
+    remove_api_group
+    remove_api_group
+    [ "$(grep -c '^groupdel$' "$SECURITY_TMP/calls")" -eq 1 ]
+}
+
+@test "purge group helper removes macOS API group idempotently" {
+    _security_fixture
+    source scripts/uninstall.sh
+    uname() { echo Darwin; }
+    dscl() { [ "$*" = ". -read /Groups/bhatti PrimaryGroupID" ] && [ -f "$SECURITY_TMP/group" ]; }
+    dseditgroup() { [ "$*" = "-o delete bhatti" ] && rm -f "$SECURITY_TMP/group" && echo delete >> "$SECURITY_TMP/calls"; }
+    : > "$SECURITY_TMP/group"
+    remove_api_group
+    [ -f "$SECURITY_TMP/group" ]
+    PURGE=true
+    remove_api_group
+    remove_api_group
+    [ "$(grep -c '^delete$' "$SECURITY_TMP/calls")" -eq 1 ]
 }

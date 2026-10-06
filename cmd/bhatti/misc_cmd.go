@@ -160,6 +160,10 @@ var versionCmd = &cobra.Command{
 	Example: `  bhatti version
   bhatti version --json`,
 	Run: func(cmd *cobra.Command, args []string) {
+		endpoint := apiURL
+		if unixSocketPath != "" {
+			endpoint = "unix://" + unixSocketPath
+		}
 		serverVer := ""
 		// Quick probe to get server version from header
 		if resp, err := apiRequest("GET", "/sandboxes", nil); err == nil {
@@ -176,7 +180,7 @@ var versionCmd = &cobra.Command{
 		if isJSON(cmd) {
 			out := map[string]string{
 				"version": version,
-				"api":     apiURL,
+				"api":     endpoint,
 			}
 			if serverVer != "" {
 				out["server_version"] = serverVer
@@ -187,7 +191,7 @@ var versionCmd = &cobra.Command{
 			outputJSON(out)
 		} else {
 			fmt.Printf("bhatti %s\n", version)
-			fmt.Printf("api: %s\n", apiURL)
+			fmt.Printf("api: %s\n", endpoint)
 			if serverVer != "" && serverVer != "dev" {
 				fmt.Printf("server: %s\n", serverVer)
 			}
@@ -219,8 +223,8 @@ var versionCmd = &cobra.Command{
 // --- publish / unpublish ---
 
 var publishCmd = &cobra.Command{
-	Use:               "publish <sandbox> -p <port> [-a <alias>]",
-	Short:             "Publish a sandbox port with a public URL",
+	Use:   "publish <sandbox> -p <port> [-a <alias>]",
+	Short: "Publish a sandbox port with a public URL",
 	Example: `  bhatti publish dev -p 3000
   bhatti publish dev -p 3000 -a my-app`,
 	Args:              exactArgs(1),
@@ -279,7 +283,7 @@ var publishCmd = &cobra.Command{
 var unpublishCmd = &cobra.Command{
 	Use:               "unpublish <sandbox> -p <port>",
 	Short:             "Unpublish a sandbox port",
-	Example: `  bhatti unpublish dev -p 3000`,
+	Example:           `  bhatti unpublish dev -p 3000`,
 	Args:              exactArgs(1),
 	ValidArgsFunction: completeSandboxNames,
 	Run: func(cmd *cobra.Command, args []string) {

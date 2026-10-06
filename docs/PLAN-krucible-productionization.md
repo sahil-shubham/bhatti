@@ -46,9 +46,11 @@ for *why the server earns its keep*, not as a plan to split it.
 
 ## 2b. (rationale, retained) The CLI / daemon / HTTPS topology for a library VMM
 
-Today: `bhatti` CLI → HTTP (`localhost:8080`) → **daemon** (`pkg/server`) which owns the engine, the store (registry),
-the thermal manager, and the public proxy; the daemon spawns one `bhatti-vmm` helper per sandbox (only the helper links
-libkrun). This client/server shape is inherited from Firecracker (out-of-process VMM + HTTP API + jailer + TAP network).
+Originally, `bhatti` CLI → HTTP (`localhost:8080`) → **daemon** (`pkg/server`) which owns the engine, the store (registry),
+the thermal manager, and the public proxy. Current v2 defaults to a local unix socket
+for the control API; TCP requires explicit `listen`, while domain mode exposes HTTPS/TLS.
+The daemon spawns one `bhatti-vmm` helper per sandbox (only the helper links libkrun).
+The single-writer client/server shape is inherited from Firecracker (out-of-process VMM + HTTP API + jailer + TAP network).
 
 libkrun being an **in-process library** doesn't remove the daemon — but it changes *what the daemon is for* and shrinks it.
 
