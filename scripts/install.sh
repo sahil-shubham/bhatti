@@ -1345,7 +1345,8 @@ do_server_install() {
     # Only establish the standard traversable mode on a newly created data
     # directory. Never loosen an existing directory containing secrets.
     if [ ! -d "$DATA_DIR" ]; then
-        mkdir -p -m 0755 "$DATA_DIR"
+        mkdir -p "$(dirname "$DATA_DIR")"
+        mkdir -m 0755 "$DATA_DIR"
     fi
     mkdir -p "$DATA_DIR"/{images,sandboxes,volumes,snapshots}
     ensure_api_group
