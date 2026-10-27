@@ -28,12 +28,13 @@ if [[ ! -f "$AGENT" ]]; then
     exit 1
 fi
 
-# Tier-specific defaults
+# Tier-specific defaults. Leave headroom over the finished size: apt's download
+# cache sits inside the image until each tier's `apt-get clean`.
 case "$TIER" in
     minimal)  SIZE_MB="${SIZE_MB:-1024}" ;;
-    browser)  SIZE_MB="${SIZE_MB:-2048}" ;;
+    browser)  SIZE_MB="${SIZE_MB:-3072}" ;;
     docker)   SIZE_MB="${SIZE_MB:-2048}" ;;
-    computer) SIZE_MB="${SIZE_MB:-4096}" ;;
+    computer) SIZE_MB="${SIZE_MB:-5120}" ;;
     *) echo "unknown tier: $TIER" >&2; exit 1 ;;
 esac
 
