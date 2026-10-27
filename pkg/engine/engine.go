@@ -29,6 +29,10 @@ func GuestAgentOutdated(feature string) error {
 // CRNG state could not be made independent of its source.
 var ErrGuestReseedFailed = errors.New("guest CRNG reseed failed")
 
+// ErrNetworkFull means the owner's sandboxes already hold every guest address
+// on its gateway subnet. The API returns 409: destroying sandboxes frees them.
+var ErrNetworkFull = errors.New("owner's sandbox network is full")
+
 // GuestAgentCapabilities is optional. Engines without guest capability
 // discovery do not claim support for credential-substitution grants.
 type GuestAgentCapabilities interface {

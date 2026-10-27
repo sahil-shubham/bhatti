@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -82,6 +83,28 @@ func TestControlChannelPerGuestPolicy(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("guest still registered after DelSandbox")
+}
+
+// A guest can't be registered on the subnet's network or broadcast address: a
+// guest given .255 looks like it works and breaks everything broadcast.
+func TestSetSandboxRefusesNetworkAndBroadcastAddresses(t *testing.T) {
+	gw, err := NewGateway(tcpip.AddrFrom4([4]byte{100, 64, 0, 1}), 24, testGwMAC, hostProtection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range []struct {
+		ip string
+		ok bool
+	}{
+		{"100.64.0.0", false}, {"100.64.0.1", false}, {"100.64.0.255", false}, {"100.64.0.256", false}, {"100.64.1.2", false},
+		{"100.64.0.2", true}, {"100.64.0.254", true},
+	} {
+		token := fmt.Sprintf("%064x", i+1) // a secret binds one attachment
+		err := gw.SetSandbox(tc.ip, fmt.Sprintf("sb%d", i), nil, fmt.Sprintf("52:54:00:00:00:%02x", 2+i), token)
+		if (err == nil) != tc.ok {
+			t.Errorf("SetSandbox(%s) = %v, want accepted=%v", tc.ip, err, tc.ok)
+		}
+	}
 }
 
 func TestMalformedControlPolicyRevokesPreviousGrant(t *testing.T) {

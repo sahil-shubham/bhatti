@@ -1189,6 +1189,22 @@ func TestErrorSanitization(t *testing.T) {
 	mockEng.CreateErr = nil
 }
 
+// A full owner network is the caller's to fix (destroy sandboxes), not an
+// internal error: create, fork and resume all say so with a 409.
+func TestNetworkFullIsAConflict(t *testing.T) {
+	srv, ts := setup(t)
+	mockEng := srv.engine.(*mockEngine)
+	mockEng.CreateErr = fmt.Errorf("%w: this owner's sandboxes already hold all 253 addresses", engine.ErrNetworkFull)
+	defer func() { mockEng.CreateErr = nil }()
+
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{"name": uniqueName(t, "full"), "net_policy": map[string]any{"default": "public"}})
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "253 addresses") {
+		t.Fatalf("create on a full network: %d %s, want 409 naming the limit", resp.StatusCode, body)
+	}
+}
+
 func TestRequestHasID(t *testing.T) {
 	_, ts := setup(t)
 

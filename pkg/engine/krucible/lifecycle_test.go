@@ -252,7 +252,7 @@ func TestGatewayDeathFromSpawnAndAdoption(t *testing.T) {
 				}}
 			t.Cleanup(func() {
 				for range 3 {
-					e.releaseNetd(owner)
+					e.releaseNetd(owner, -1)
 				}
 				e.Shutdown()
 			})

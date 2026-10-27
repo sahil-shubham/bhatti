@@ -144,38 +144,41 @@ func vmFromRecord(rec vmRecord) *VM {
 // readoptNetd re-registers a recovered VM with its owner's shared bhatti-netd:
 // it rebuilds the per-owner instance from the persisted netd record, re-adopts
 // the still-running gateway (so ensureNetd reuses it instead of respawning onto a
-// socket it holds), and reference-counts it so Destroy of the owner's last
-// sandbox still tears it down.
+// socket it holds), reference-counts it so Destroy of the owner's last sandbox
+// still tears it down, and marks the VM's address slot as taken.
 func (e *Engine) readoptNetd(vm *VM) {
 	if vm.netdKey == "" {
 		return
 	}
 	e.netdMu.Lock()
-	defer e.netdMu.Unlock()
-	if inst := e.netds[vm.netdKey]; inst != nil {
+	inst := e.netds[vm.netdKey]
+	if inst != nil {
 		inst.refs++
-		return
-	}
-	dir := e.netdDir(vm.netdKey)
-	inst := &netdInstance{owner: vm.netdKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: vm.subnetIdx, refs: 1}
-	if data, err := os.ReadFile(netdStatePath(dir)); err == nil {
-		var rec netdRecord
-		if json.Unmarshal(data, &rec) == nil {
-			inst.nextGuest = rec.NextGuest
-			if rec.Pid > 0 && pidAlive(rec.Pid) && isNetd(rec.Pid, inst.sock) {
-				inst.pid = rec.Pid // adopt the live gateway
-			} else if rec.Pid > 0 {
-				inst.lostAtRecovery = true
-			}
-			if e.dropVMM {
-				inst.vmmGID = rec.VMMGID
+	} else {
+		dir := e.netdDir(vm.netdKey)
+		inst = &netdInstance{owner: vm.netdKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: vm.subnetIdx, refs: 1,
+			guests: map[int]bool{}}
+		if data, err := os.ReadFile(netdStatePath(dir)); err == nil {
+			var rec netdRecord
+			if json.Unmarshal(data, &rec) == nil {
+				inst.nextGuest = rec.NextGuest
+				if rec.Pid > 0 && pidAlive(rec.Pid) && isNetd(rec.Pid, inst.sock) {
+					inst.pid = rec.Pid // adopt the live gateway
+				} else if rec.Pid > 0 {
+					inst.lostAtRecovery = true
+				}
+				if e.dropVMM {
+					inst.vmmGID = rec.VMMGID
+				}
 			}
 		}
+		if e.dropVMM && inst.vmmGID == 0 {
+			inst.vmmGID = e.netdGIDLocked(vm.netdKey)
+		}
+		e.netds[vm.netdKey] = inst
 	}
-	if e.dropVMM && inst.vmmGID == 0 {
-		inst.vmmGID = e.netdGIDLocked(vm.netdKey)
-	}
-	e.netds[vm.netdKey] = inst
+	e.netdMu.Unlock()
+	inst.holdGuest(vm.netIP) // it keeps its address: the slot must not be handed out again
 }
 
 // pidAlive reports whether a process exists. signal 0 probes without delivering:

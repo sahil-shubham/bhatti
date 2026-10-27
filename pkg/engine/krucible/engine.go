@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,6 +86,22 @@ func netGuestIPFor(subnetIdx, guestIdx int) string {
 	return fmt.Sprintf("100.64.%d.%d", subnetIdx, 2+guestIdx)
 }
 
+// netGuestSlots is how many guests share one owner's /24: .2 through .254
+// (.0 is the network, .1 the gateway, .255 broadcast). A slot also fixes the
+// guest's MAC, so slot 252 (MAC :fe) is the last one either can express.
+const netGuestSlots = 253
+
+// netGuestIndexFor recovers the slot a guest address was handed out from; false
+// for no address, or one outside the slots.
+func netGuestIndexFor(ip string) (int, bool) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is4() {
+		return 0, false
+	}
+	idx := int(addr.As4()[3]) - 2
+	return idx, idx >= 0 && idx < netGuestSlots
+}
+
 // netdInstance is one owner's shared bhatti-netd gateway process. It is spawned
 // detached (survives a daemon restart) and identified by pid so recovery can
 // re-adopt it instead of respawning onto a socket it still holds.
@@ -100,9 +117,10 @@ type netdInstance struct {
 	exitDone       chan struct{} // closed as soon as cmd.Wait returns, before cleanup
 	stopping       bool          // deliberate replacement / last-sandbox removal
 	pid            int
-	watchedPID     int  // only one adopted death monitor per incarnation
-	lostAtRecovery bool // persisted pid was gone before startup adoption
-	nextGuest      int
+	watchedPID     int          // only one adopted death monitor per incarnation
+	lostAtRecovery bool         // persisted pid was gone before startup adoption
+	nextGuest      int          // where the next slot search starts (persisted)
+	guests         map[int]bool // slots held by the owner's sandboxes, running or stopped
 	refs           int
 	brokerLn       net.Listener
 	vmmGID         uint32
@@ -139,31 +157,72 @@ func netdKeyFor(spec engine.SandboxSpec, id string) string {
 }
 
 // acquireNetd returns (creating if needed) the owner's shared netd instance and
-// reserves a guest slot on it, returning the instance and this guest's index.
-// Release with releaseNetd on Destroy.
-func (e *Engine) acquireNetd(ownerKey string, subnetIdx int) (*netdInstance, int) {
+// reserves a free guest slot on it. A sandbox holds its slot from create until
+// Destroy (a stopped one keeps its address), so an owner can have at most
+// netGuestSlots sandboxes with a network at once. Release with releaseNetd.
+func (e *Engine) acquireNetd(ownerKey string, subnetIdx int) (*netdInstance, int, error) {
 	e.netdMu.Lock()
 	inst := e.netds[ownerKey]
 	if inst == nil {
 		dir := e.netdDir(ownerKey)
 		inst = &netdInstance{owner: ownerKey, sock: filepath.Join(dir, "n.sock"), ctlSock: filepath.Join(dir, "ctl.sock"), dir: dir, subnetIdx: subnetIdx,
-			vmmGID: e.netdGIDLocked(ownerKey)}
+			vmmGID: e.netdGIDLocked(ownerKey), guests: map[int]bool{}}
 		e.netds[ownerKey] = inst
 	}
 	inst.refs++
 	e.netdMu.Unlock()
 
 	inst.mu.Lock()
-	idx := inst.nextGuest
-	inst.nextGuest++
-	writeNetdRecord(inst) // persist address counter so recovery doesn't reissue a taken IP
+	idx, ok := inst.claimGuestLocked()
+	if ok {
+		writeNetdRecord(inst) // persist the search position; held slots are rebuilt from VM records
+	}
+	subnet := inst.subnetIdx
 	inst.mu.Unlock()
-	return inst, idx
+	if !ok {
+		e.releaseNetd(ownerKey, -1)
+		return nil, 0, fmt.Errorf("%w: this owner's sandboxes already hold all %d addresses on 100.64.%d.0/24 (stopped ones keep theirs); destroy sandboxes you no longer need",
+			engine.ErrNetworkFull, netGuestSlots, subnet)
+	}
+	return inst, idx, nil
 }
 
-// releaseNetd drops one reference to the owner's netd, tearing the process down
-// when the last sandbox of the owner is gone.
-func (e *Engine) releaseNetd(ownerKey string) {
+// claimGuestLocked reserves the first free slot at or after nextGuest, wrapping
+// around. Starting after the last slot handed out keeps a just-freed address
+// from being the next one reused. Caller holds inst.mu.
+func (inst *netdInstance) claimGuestLocked() (int, bool) {
+	if inst.guests == nil {
+		inst.guests = map[int]bool{}
+	}
+	for i := range netGuestSlots {
+		idx := (inst.nextGuest + i) % netGuestSlots
+		if !inst.guests[idx] {
+			inst.guests[idx] = true
+			inst.nextGuest = idx + 1
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+// holdGuest marks a recovered sandbox's slot as taken.
+func (inst *netdInstance) holdGuest(ip string) {
+	idx, ok := netGuestIndexFor(ip)
+	if !ok {
+		return
+	}
+	inst.mu.Lock()
+	if inst.guests == nil {
+		inst.guests = map[int]bool{}
+	}
+	inst.guests[idx] = true
+	inst.mu.Unlock()
+}
+
+// releaseNetd frees a guest slot (guestIdx < 0: none held) and drops one
+// reference to the owner's netd, tearing the process down when the last
+// sandbox of the owner is gone.
+func (e *Engine) releaseNetd(ownerKey string, guestIdx int) {
 	e.netdMu.Lock()
 	inst := e.netds[ownerKey]
 	if inst == nil {
@@ -177,6 +236,11 @@ func (e *Engine) releaseNetd(ownerKey string) {
 	}
 	e.netdMu.Unlock()
 	if !done {
+		if guestIdx >= 0 {
+			inst.mu.Lock()
+			delete(inst.guests, guestIdx)
+			inst.mu.Unlock()
+		}
 		return
 	}
 	inst.mu.Lock()
@@ -653,6 +717,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 
 	var vm *VM
 	var netdKey string // owner's shared-netd key; released on error / Destroy
+	netGuestIdx := -1  // the guest slot reserved on it
 	defer func() {
 		if err != nil {
 			if vm != nil {
@@ -663,7 +728,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 				if vm != nil {
 					e.delSandboxPolicy(vm) // also covers failed pushes with a lost ACK
 				}
-				e.releaseNetd(netdKey)
+				e.releaseNetd(netdKey, netGuestIdx)
 			}
 			os.RemoveAll(sandboxDir)
 			os.RemoveAll(sockDir)
@@ -691,11 +756,13 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// A sandbox with egress "none" gets no NIC and no netd: everything the
 	// platform does with it (exec, files, shell, published ports) goes over vsock.
 	var netInst *netdInstance
-	var netGuestIdx int
 	netUDS := ""
 	if !spec.NetPolicy.NoNetwork() {
-		netdKey = netdKeyFor(spec, id)
-		netInst, netGuestIdx = e.acquireNetd(netdKey, spec.SubnetIndex)
+		key := netdKeyFor(spec, id)
+		if netInst, netGuestIdx, err = e.acquireNetd(key, spec.SubnetIndex); err != nil {
+			return info, err
+		}
+		netdKey = key
 		netUDS = netInst.sock
 	}
 	if err = os.MkdirAll(sockDir, 0700); err != nil {
@@ -1147,7 +1214,11 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 
 	if vm.netdKey != "" {
 		e.delSandboxPolicy(vm)
-		e.releaseNetd(vm.netdKey)
+		slot, ok := netGuestIndexFor(vm.netIP)
+		if !ok {
+			slot = -1
+		}
+		e.releaseNetd(vm.netdKey, slot)
 	}
 
 	os.RemoveAll(dir)

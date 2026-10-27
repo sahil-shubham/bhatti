@@ -187,10 +187,12 @@ func NewGateway(gwIP tcpip.Address, prefixLen int, mac tcpip.LinkAddress, host h
 }
 
 // SetSandbox atomically binds the per-VM attachment secret to its assigned IP,
-// MAC and policy. A missing/malformed identity is never allowed to register.
+// MAC and policy. A missing/malformed identity is never allowed to register,
+// and neither is the subnet's network or broadcast address.
 func (g *Gateway) SetSandbox(guestIP, sandboxID string, pol *gateway.EgressPolicy, mac, token string) error {
 	ip, err := netip.ParseAddr(guestIP)
-	if err != nil || !ip.Is4() || !g.siblingSubnet.Contains(ip) || tcpip.AddrFrom4(ip.As4()) == g.gwIP {
+	if err != nil || !ip.Is4() || !g.siblingSubnet.Contains(ip) || tcpip.AddrFrom4(ip.As4()) == g.gwIP ||
+		ip == g.siblingSubnet.Addr() || ip == lastAddr(g.siblingSubnet) {
 		return fmt.Errorf("invalid guest IP")
 	}
 	guestAddr := tcpip.AddrFrom4(ip.As4())
@@ -458,4 +460,12 @@ func isBroadcastOrMulticast(mac tcpip.LinkAddress) bool {
 		return true
 	}
 	return mac[0]&0x01 != 0 // multicast/broadcast group bit
+}
+
+// lastAddr is an IPv4 prefix's broadcast address.
+func lastAddr(p netip.Prefix) netip.Addr {
+	b := p.Masked().Addr().As4()
+	host := uint32(1)<<(32-p.Bits()) - 1
+	v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]) | host
+	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
 }
