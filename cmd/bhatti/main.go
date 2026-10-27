@@ -267,8 +267,10 @@ func runDaemon() {
 		},
 	})
 
-	// Recover keep_hot guests in a server-owned loop, cancelled and joined on
-	// shutdown rather than racing a detached startup wake against engine exit.
+	// Restart keep_hot guests that went down on their own (crash, daemon or
+	// host restart) through the crash-restart scheduler: retried with backoff,
+	// cancelled and joined on shutdown. The stored restart_pending marker picks
+	// them; explicitly stopped ones stay stopped.
 	srv.StartKeepHotRecovery()
 
 	// Wait for SIGTERM/SIGINT

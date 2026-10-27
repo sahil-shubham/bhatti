@@ -973,6 +973,7 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 	if sb == nil {
 		return
 	}
+	s.lifecycle.abortRestart(sb.EngineID) // a backing-off keep_hot restart must not undo this stop
 	stopErr := s.engine.Stop(r.Context(), sb.EngineID)
 	reason, poweredOffUnclean := uncleanStopReason(stopErr)
 	if stopErr != nil && !poweredOffUnclean {

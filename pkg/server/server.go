@@ -495,6 +495,10 @@ func (s *Server) Shutdown(sig string) {
 // and its idle clock starts now: the thermal manager skips a warm sandbox it
 // has no activity time for, which would leave it warm for good. One whose VM
 // died while no daemon was watching is stopped, to boot fresh on next use.
+//
+// A keep_hot sandbox in that last group is marked restart_pending, which is
+// what StartKeepHotRecovery boots. One already stored stopped was stopped on
+// purpose (or before this restart) and stays that way.
 func (s *Server) RecoverSandboxes(ctx context.Context) {
 	initOf, _ := s.engine.(interface{ HasInit(id string) (bool, bool) })
 	sandboxes, err := s.store.ListAllSandboxes()
@@ -534,7 +538,7 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 			}
 		case sb.Status == "running":
 			slog.Info("sandbox stopped while the daemon was down", "sandbox", sb.Name, "id", sb.ID)
-			s.store.StopSandbox(sb.ID)
+			s.store.StopSandboxUnexpected(sb.ID) // marks keep_hot for the startup wake
 			s.RecordEvent(store.Event{
 				Type: "sandbox.stopped", SandboxID: sb.ID,
 				Meta: map[string]any{"name": sb.Name, "reason": "lost"},

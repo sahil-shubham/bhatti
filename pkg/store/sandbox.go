@@ -190,8 +190,10 @@ func (s *Store) CountUserSandboxes(userID string) (int, error) {
 	return count, err
 }
 
+// UpdateSandboxStatus also drops a pending keep_hot restart unless the new
+// status is "stopped": a sandbox that is running again (or gone) needs none.
 func (s *Store) UpdateSandboxStatus(id, status string) error {
-	_, err := s.db.Exec(`UPDATE sandboxes SET status = ? WHERE id = ?`, status, id)
+	_, err := s.db.Exec(`UPDATE sandboxes SET status = ?, restart_pending = CASE WHEN ? = 'stopped' THEN restart_pending ELSE 0 END WHERE id = ?`, status, status, id)
 	return err
 }
 
@@ -221,7 +223,6 @@ func (s *Store) RenameSandbox(userID, id, newName string) error {
 	return nil
 }
 
-// UpdateSandboxKeepHot sets or clears the keep_hot flag for a sandbox.
 // UpdateSandboxHasInit records whether the sandbox runs an --init command at
 // boot (the engine's boot config is the source of truth).
 func (s *Store) UpdateSandboxHasInit(id string, hasInit bool) error {
@@ -233,12 +234,14 @@ func (s *Store) UpdateSandboxHasInit(id string, hasInit bool) error {
 	return err
 }
 
+// UpdateSandboxKeepHot also drops a pending restart when keep_hot turns off:
+// the owner no longer wants it kept up.
 func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
 	v := 0
 	if keepHot {
 		v = 1
 	}
-	_, err := s.db.Exec(`UPDATE sandboxes SET keep_hot = ? WHERE id = ?`, v, id)
+	_, err := s.db.Exec(`UPDATE sandboxes SET keep_hot = ?, restart_pending = restart_pending * ? WHERE id = ?`, v, v, id)
 	return err
 }
 
@@ -296,10 +299,47 @@ func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, re
 	return tx.Commit()
 }
 
+// StopSandbox records a stop the owner asked for (or one already confirmed
+// as deliberate): it also drops any pending keep_hot restart.
 func (s *Store) StopSandbox(id string) error {
 	now := time.Now()
-	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'stopped', stopped_at = ? WHERE id = ?`, now, id)
+	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'stopped', stopped_at = ?, restart_pending = 0 WHERE id = ?`, now, id)
 	return err
+}
+
+// StopSandboxUnexpected records a stop nobody asked for — the VM crashed, or
+// went down with the daemon or host. A keep_hot sandbox is marked
+// restart_pending so the next daemon start boots it even if this daemon
+// exits before its restart ran.
+func (s *Store) StopSandboxUnexpected(id string) error {
+	now := time.Now()
+	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'stopped', stopped_at = ?, restart_pending = keep_hot WHERE id = ?`, now, id)
+	return err
+}
+
+// ClearRestartPending drops the marker: the restart ran, or was given up on.
+func (s *Store) ClearRestartPending(id string) error {
+	_, err := s.db.Exec(`UPDATE sandboxes SET restart_pending = 0 WHERE id = ?`, id)
+	return err
+}
+
+// ListRestartPending returns the stopped keep_hot sandboxes that went down
+// without being asked and have not been restarted since.
+func (s *Store) ListRestartPending() ([]Sandbox, error) {
+	rows, err := s.db.Query(`SELECT ` + sandboxCols + ` FROM sandboxes WHERE restart_pending = 1 AND keep_hot = 1 AND status = 'stopped' ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Sandbox
+	for rows.Next() {
+		sb, err := scanSandbox(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *sb)
+	}
+	return out, rows.Err()
 }
 
 // DeleteSandbox removes a sandbox scoped to a user.

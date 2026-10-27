@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -294,8 +295,10 @@ func TestKeepHotStartupRecoveryIsJoinedByClose(t *testing.T) {
 	if err := eng.Stop(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.StopSandbox(sb.ID); err != nil {
-		t.Fatal(err)
+	// The VM went down with the daemon: the store still says running.
+	srv.RecoverSandboxes(context.Background())
+	if pending, err := srv.store.ListRestartPending(); err != nil || len(pending) != 1 || pending[0].ID != sb.ID {
+		t.Fatalf("restart-pending set = %+v (%v), want just %s", pending, err, sb.ID)
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -337,6 +340,471 @@ func TestKeepHotStartupRecoveryIsJoinedByClose(t *testing.T) {
 	eng.mu.Unlock()
 	if starts != 1 {
 		t.Fatalf("startup auto-wake started sandbox %d times, want once", starts)
+	}
+}
+
+// runStartupRecovery runs the startup sequence — recover, then wake — against
+// whatever state the engine and store were left in, joins it with Close, and
+// returns the sandboxes it was due to wake and what it logged.
+func runStartupRecovery(t *testing.T, srv *Server) (due []store.Sandbox, logs string) {
+	t.Helper()
+	w := &syncLogWriter{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
+	defer slog.SetDefault(old)
+	srv.RecoverSandboxes(context.Background())
+	due, err := srv.store.ListRestartPending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.StartKeepHotRecovery()
+	// Close cancels the wake: let it finish its boots before joining.
+	deadline := time.Now().Add(3 * time.Second)
+	for strings.Count(w.String(), "msg=sandbox.restarted") < len(due) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d keep_hot sandbox(es) due, not all woken: %s", len(due), w.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	srv.Close()
+	return due, w.String()
+}
+
+// A restart boots the keep_hot guests that went down with the daemon or host,
+// and only those. One its owner stopped stays stopped (a stopped 8 GB golden
+// VM was booted on every restart), and one the engine adopted still running
+// is not announced as a fresh boot.
+func TestKeepHotStartupWakesOnlyWhatWentDown(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		keepHot    bool
+		storedDown bool // the store says stopped: stopped on purpose
+		vmGone     bool // the engine has no running VM
+		wantStarts int
+		wantStatus string
+	}{
+		{"stopped by owner", true, true, true, 0, "stopped"},
+		{"went down with the daemon", true, false, true, 1, "running"},
+		{"adopted running", true, false, false, 0, "running"},
+		{"went down but not keep_hot", false, false, true, 0, "stopped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := setup(t)
+			eng := srv.engine.(*mockEngine)
+			id := createRunningBox(t, srv, eng, "golden")
+			sb, err := srv.store.GetSandboxByEngineID(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.store.UpdateSandboxKeepHot(sb.ID, tc.keepHot); err != nil {
+				t.Fatal(err)
+			}
+			if tc.vmGone {
+				eng.mu.Lock()
+				eng.sandboxes[id].Status = "stopped"
+				eng.thermal[id] = "cold"
+				eng.mu.Unlock()
+			}
+			if tc.storedDown {
+				if err := srv.store.StopSandbox(sb.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			_, logs := runStartupRecovery(t, srv)
+
+			eng.mu.Lock()
+			starts := eng.StartCalls
+			eng.mu.Unlock()
+			if starts != tc.wantStarts {
+				t.Errorf("engine started %d times, want %d", starts, tc.wantStarts)
+			}
+			if got, _ := srv.store.GetSandboxByID(sb.ID); got == nil || got.Status != tc.wantStatus {
+				t.Errorf("store status %+v, want %s", got, tc.wantStatus)
+			}
+			if n := strings.Count(logs, "msg=sandbox.restarted"); n != tc.wantStarts {
+				t.Errorf("logged %d boots, want %d:\n%s", n, tc.wantStarts, logs)
+			}
+		})
+	}
+}
+
+// An explicit stop of a keep_hot sandbox survives a daemon restart.
+func TestExplicitStopOfKeepHotSurvivesRestart(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	sb := createSandbox(t, ts, uniqueName(t, "golden"))
+	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/stop", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("stop: %d", resp.StatusCode)
+	}
+	eng.mu.Lock()
+	eng.StartCalls = 0
+	eng.mu.Unlock()
+
+	lost, logs := runStartupRecovery(t, srv)
+
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(sb.ID)
+	if err != nil || got.Status != "stopped" || starts != 0 || len(lost) != 0 {
+		t.Fatalf("restart after explicit stop: status=%v (%v) starts=%d lost=%d logs=%s", got, err, starts, len(lost), logs)
+	}
+}
+
+// A crashed keep_hot sandbox is stored stopped while its restart backs off, so
+// the owner's stop changes nothing in the store. It must still cancel the
+// pending restart, or the VM the owner just stopped boots anyway.
+func TestExplicitStopCancelsBackingOffKeepHotRestart(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	sb := createSandbox(t, ts, uniqueName(t, "crashy"))
+	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv.lifecycle.wait = func(ctx context.Context, _ time.Duration) bool {
+		once.Do(func() { close(waiting) })
+		select {
+		case <-release:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	srv.StartEventRecorder()
+	srv.StartLifecycleEvents()
+	eng.mu.Lock()
+	eng.StartCalls = 0
+	eng.mu.Unlock()
+	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: sb.EngineID, ExitCode: -1})
+	select {
+	case <-waiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("restart did not back off")
+	}
+
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/stop", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("stop: %d", resp.StatusCode)
+	}
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for srv.lifecycle.isRestarting(sb.EngineID) {
+		if time.Now().After(deadline) {
+			t.Fatal("restart worker never finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(sb.ID)
+	if err != nil || got.Status != "stopped" || starts != 0 {
+		t.Fatalf("backing-off restart ran after explicit stop: status=%v (%v) starts=%d", got, err, starts)
+	}
+}
+
+// restarted builds the daemon that comes up after srv exits: same store, same
+// engine (its VMs outlive the daemon), none of the old in-process state.
+func restarted(t *testing.T, srv *Server) *Server {
+	t.Helper()
+	srv2 := New(srv.engine, srv.store, t.TempDir())
+	t.Cleanup(srv2.Close)
+	return srv2
+}
+
+// crashedIntoBackoff crashes a keep_hot sandbox and leaves its restart waiting
+// out the backoff, as when a daemon restart lands inside the 30s/2m delay.
+func crashedIntoBackoff(t *testing.T, srv *Server, ts *httptest.Server) store.Sandbox {
+	t.Helper()
+	eng := srv.engine.(*mockEngine)
+	sb := createSandbox(t, ts, uniqueName(t, "crashy"))
+	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{})
+	var once sync.Once
+	srv.lifecycle.wait = func(ctx context.Context, _ time.Duration) bool {
+		once.Do(func() { close(waiting) })
+		<-ctx.Done()
+		return false
+	}
+	srv.StartEventRecorder()
+	srv.StartLifecycleEvents()
+	eng.mu.Lock()
+	eng.StartCalls = 0
+	eng.mu.Unlock()
+	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: sb.EngineID, ExitCode: -1})
+	select {
+	case <-waiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("restart did not back off")
+	}
+	if pending, err := srv.store.ListRestartPending(); err != nil || len(pending) != 1 || pending[0].ID != sb.ID {
+		t.Fatalf("crashed keep_hot sandbox not marked for restart: %+v (%v)", pending, err)
+	}
+	return sb
+}
+
+// A daemon restart inside a crashed keep_hot sandbox's backoff must not lose
+// the restart: the sandbox is stored stopped, and only the stored intent tells
+// the next daemon it went down unasked.
+func TestKeepHotCrashRestartSurvivesDaemonRestart(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	sb := crashedIntoBackoff(t, srv, ts)
+	srv.Close()
+
+	due, logs := runStartupRecovery(t, restarted(t, srv))
+
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(sb.ID)
+	if len(due) != 1 || starts != 1 || err != nil || got.Status != "running" {
+		t.Fatalf("crashed sandbox not revived: due=%d starts=%d status=%v (%v) logs=%s", len(due), starts, got, err, logs)
+	}
+	if pending, _ := srv.store.ListRestartPending(); len(pending) != 0 {
+		t.Fatalf("marker left after the boot: %+v", pending)
+	}
+}
+
+// loseKeepHot leaves a keep_hot sandbox as a host reboot does: stored running,
+// its VM gone.
+func loseKeepHot(t *testing.T, srv *Server, eng *mockEngine, name string) string {
+	t.Helper()
+	id := createRunningBox(t, srv, eng, name)
+	if err := srv.store.UpdateSandboxKeepHot(id, true); err != nil {
+		t.Fatal(err)
+	}
+	eng.mu.Lock()
+	eng.sandboxes[id].Status = "stopped"
+	eng.thermal[id] = "cold"
+	eng.mu.Unlock()
+	return id
+}
+
+// failStartFor fails the boot of one sandbox, counting it as a start.
+type failStartFor struct {
+	*mockEngine
+	id  string
+	err error
+}
+
+func (e *failStartFor) Start(ctx context.Context, id string) error {
+	if id != e.id {
+		return e.mockEngine.Start(ctx, id)
+	}
+	e.mockEngine.mu.Lock()
+	e.mockEngine.StartCalls++
+	e.mockEngine.mu.Unlock()
+	return e.err
+}
+
+// After a host reboot the first boot can fail for a moment (gateway not up
+// yet, disk busy). Startup retries on the crash-restart schedule instead of
+// giving the guest up after one attempt.
+func TestKeepHotStartupBootRetriesAfterTransientFailure(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	id := loseKeepHot(t, srv, eng, "reboot-victim")
+	eng.StartErr = errors.New("gateway not up yet")
+	delays := make(chan time.Duration, 4)
+	srv.lifecycle.wait = func(ctx context.Context, d time.Duration) bool {
+		delays <- d
+		if d > 0 { // the transient condition clears while it backs off
+			eng.mu.Lock()
+			eng.StartErr = nil
+			eng.mu.Unlock()
+		}
+		return ctx.Err() == nil
+	}
+
+	due, logs := runStartupRecovery(t, srv)
+
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(id)
+	if len(due) != 1 || starts != 2 || err != nil || got.Status != "running" {
+		t.Fatalf("boot did not recover from a transient failure: due=%d starts=%d status=%v (%v)\n%s", len(due), starts, got, err, logs)
+	}
+	if first, second := <-delays, <-delays; first != 0 || second != restartBackoff[1] {
+		t.Fatalf("retry delays %v, %v; want 0, %v", first, second, restartBackoff[1])
+	}
+	if pending, _ := srv.store.ListRestartPending(); len(pending) != 0 {
+		t.Fatalf("marker left after the boot: %+v", pending)
+	}
+}
+
+// One guest boots, another fails and is backing off when the daemon exits
+// again. The marker stays set while it backs off, so the next start retries
+// that one and only that one.
+func TestKeepHotStartupBackoffSurvivesDaemonRestart(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	good := loseKeepHot(t, srv, eng, "boots")
+	bad := loseKeepHot(t, srv, eng, "disk-busy")
+	srv.engine = &failStartFor{mockEngine: eng, id: bad, err: errors.New("disk busy")}
+	backingOff := make(chan struct{})
+	var once sync.Once
+	srv.lifecycle.wait = func(ctx context.Context, d time.Duration) bool {
+		if d == 0 {
+			return ctx.Err() == nil
+		}
+		once.Do(func() { close(backingOff) })
+		<-ctx.Done()
+		return false
+	}
+	srv.RecoverSandboxes(context.Background())
+	srv.StartKeepHotRecovery()
+	select {
+	case <-backingOff:
+	case <-time.After(3 * time.Second):
+		t.Fatal("failed boot did not back off")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if sb, err := srv.store.GetSandboxByID(good); err == nil && sb.Status == "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("healthy sandbox did not boot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	srv.Close()
+	eng.mu.Lock()
+	before := eng.StartCalls
+	eng.mu.Unlock()
+
+	due, logs := runStartupRecovery(t, New(eng, srv.store, t.TempDir())) // the disk is free now: the plain engine
+
+	eng.mu.Lock()
+	starts := eng.StartCalls - before
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(bad)
+	if len(due) != 1 || due[0].ID != bad || starts != 1 || err != nil || got.Status != "running" {
+		t.Fatalf("next start due=%+v starts=%d status=%v (%v), want only %s booted:\n%s", due, starts, got, err, bad, logs)
+	}
+}
+
+// A keep_hot sandbox the engine powered off after a failed thaw was not
+// stopped by its owner: it is marked to restart.
+func TestBackupUncleanStopMarksKeepHotForRestart(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	hot := createRunningBox(t, srv, eng, "backup-hot")
+	plain := createRunningBox(t, srv, eng, "backup-plain")
+	if err := srv.store.UpdateSandboxKeepHot(hot, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{hot, plain} {
+		sb, err := srv.store.GetSandboxByID(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.reconcileBackupUncleanStop(sb, &fakeBackupUncleanStop{reason: "guest thaw ACK lost"})
+		if got, _ := srv.store.GetSandboxByID(id); got.Status != "stopped" {
+			t.Fatalf("%s: status %s after unclean stop", id, got.Status)
+		}
+	}
+	list, err := srv.store.ListRestartPending()
+	if err != nil || len(list) != 1 || list[0].ID != hot {
+		t.Fatalf("restart-pending after failed thaw = %+v (%v), want just %s", list, err, hot)
+	}
+}
+
+// An owner's stop while the restart backs off is stored as a plain stop, so
+// the next daemon leaves the sandbox down.
+func TestExplicitStopDuringBackoffSurvivesDaemonRestart(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	sb := crashedIntoBackoff(t, srv, ts)
+	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/stop", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("stop: %d", resp.StatusCode)
+	}
+	srv.Close()
+
+	due, logs := runStartupRecovery(t, restarted(t, srv))
+
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(sb.ID)
+	if len(due) != 0 || starts != 0 || err != nil || got.Status != "stopped" {
+		t.Fatalf("stopped sandbox came back: due=%d starts=%d status=%v (%v) logs=%s", len(due), starts, got, err, logs)
+	}
+}
+
+// `bhatti edit --allow-cold` (keep_hot=false) while a restart is pending
+// drops it, even if keep_hot is turned on again without a wake.
+func TestAllowColdDuringBackoffDropsPendingRestart(t *testing.T) {
+	srv, ts := setup(t)
+	eng := srv.engine.(*mockEngine)
+	sb := crashedIntoBackoff(t, srv, ts)
+	resp := doReq(t, ts, "PATCH", "/sandboxes/"+sb.ID, map[string]any{"keep_hot": false})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("patch: %d", resp.StatusCode)
+	}
+	srv.Close()
+	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	due, logs := runStartupRecovery(t, restarted(t, srv))
+
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	got, err := srv.store.GetSandboxByID(sb.ID)
+	if len(due) != 0 || starts != 0 || err != nil || got.Status != "stopped" {
+		t.Fatalf("--allow-cold sandbox came back: due=%d starts=%d status=%v (%v) logs=%s", len(due), starts, got, err, logs)
+	}
+}
+
+// A restart that gives up must not leave the intent behind: a VM that cannot
+// boot would otherwise be tried again on every daemon restart.
+func TestRestartGiveUpClearsPendingRestart(t *testing.T) {
+	srv, _ := setup(t)
+	eng := srv.engine.(*mockEngine)
+	id := createRunningBox(t, srv, eng, "broken")
+	sb, err := srv.store.GetSandboxByEngineID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	eng.StartErr = errors.New("no memory")
+	srv.lifecycle.wait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
+	srv.StartEventRecorder()
+	srv.StartLifecycleEvents()
+	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
+	defer sub.Cancel()
+	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1})
+	nextLifecycleEvent(t, sub, "sandbox.restart_failed")
+	srv.Close()
+
+	eng.StartErr = nil
+	due, logs := runStartupRecovery(t, restarted(t, srv))
+	eng.mu.Lock()
+	starts := eng.StartCalls
+	eng.mu.Unlock()
+	if len(due) != 0 || starts != 3 {
+		t.Fatalf("given-up sandbox retried at startup: due=%d starts=%d (want only the 3 in-process tries) logs=%s", len(due), starts, logs)
 	}
 }
 

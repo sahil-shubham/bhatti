@@ -335,7 +335,8 @@ func (s *Server) reconcileBackupUncleanStop(sb *store.Sandbox, backupErr error) 
 	if !unclean {
 		return backupErr
 	}
-	if err := s.store.StopSandbox(sb.ID); err != nil {
+	// The owner didn't ask for this power-off: a keep_hot sandbox is marked to restart.
+	if err := s.store.StopSandboxUnexpected(sb.ID); err != nil {
 		backupErr = errors.Join(backupErr, fmt.Errorf("record stopped sandbox %q after thaw failure: %w", sb.ID, err))
 	}
 	s.recordUncleanStop(*sb, reason)

@@ -19,6 +19,7 @@ type restartState struct {
 	attempts []time.Time // recent crashes and failed boots, including the current attempt
 	active   bool
 	pending  bool // another exit arrived while this VM's restart was in flight
+	aborted  bool // the owner stopped the sandbox while a restart was waiting
 }
 
 type serverLifecycle struct {
@@ -76,34 +77,27 @@ func (s *Server) StartLifecycleEvents() {
 	}
 }
 
-// StartKeepHotRecovery wakes previously stopped keep_hot guests after startup.
-// Unlike a detached daemon goroutine, this wake is cancelled and joined by Close.
+// StartKeepHotRecovery restarts the keep_hot sandboxes marked restart_pending:
+// stored stopped because they went down on their own (a crash whose restart
+// had not run yet, or the daemon or host going down), never because their
+// owner stopped them — an owner's stop, a destroy, or keep_hot turning off
+// all clear the marker.
+//
+// Each goes through the same scheduler as a crash restart: try now, then after
+// 30s and 2m, and give up (sandbox.restart_failed) after three failures in ten
+// minutes. A transient failure right after a host reboot (gateway not up yet,
+// disk busy) therefore does not strand the guest. The marker stays set while
+// it backs off, so a daemon that exits mid-backoff leaves the retry to the next
+// start. The restart workers are cancelled and joined by Close.
 func (s *Server) StartKeepHotRecovery() {
-	s.startBackground("keep-hot recovery", func() {
-		sandboxes, err := s.store.ListAllSandboxes()
-		if err != nil {
-			slog.Warn("auto-wake: list sandboxes", "error", err)
-			return
-		}
-		for _, sb := range sandboxes {
-			if s.ctx.Err() != nil {
-				return
-			}
-			if !sb.KeepHot || sb.Status == "destroyed" || s.lifecycle.isRestarting(sb.EngineID) {
-				continue
-			}
-			ctx, cancel := context.WithTimeout(s.ctx, time.Minute)
-			err := s.EnsureHot(ctx, sb.EngineID)
-			cancel()
-			if err != nil {
-				if s.ctx.Err() == nil {
-					slog.Error("auto-wake failed", "sandbox", sb.Name, "id", sb.ID, "error", err)
-				}
-			} else {
-				slog.Info("auto-wake: sandbox started", "sandbox", sb.Name, "id", sb.ID)
-			}
-		}
-	})
+	pending, err := s.store.ListRestartPending()
+	if err != nil {
+		slog.Warn("keep-hot recovery: list pending restarts", "error", err)
+		return
+	}
+	for i := range pending {
+		s.scheduleRestart(&pending[i])
+	}
 }
 
 func (s *Server) enqueueLifecycle(e engine.LifecycleEvent) {
@@ -174,7 +168,7 @@ func (s *Server) handleLifecycle(e engine.LifecycleEvent) {
 		// exit that wins the race must not be overwritten by the Start worker.
 		gate := s.lockTransition(sb.EngineID)
 		defer s.unlockTransition(sb.EngineID, gate)
-		if err := s.store.StopSandbox(sb.ID); err != nil {
+		if err := s.store.StopSandboxUnexpected(sb.ID); err != nil {
 			slog.Error("sandbox exit: persist stopped state", "sandbox_id", sb.ID, "error", err)
 			return
 		}
@@ -242,11 +236,32 @@ func (l *serverLifecycle) isRestarting(engineID string) bool {
 	return state != nil && state.active
 }
 
+// abortRestart cancels a waiting or pending keep-hot restart. A crashed
+// keep_hot sandbox is stored stopped while it backs off, so an explicit stop
+// leaves the store unchanged; without this the restart would boot the VM the
+// owner just stopped.
+func (l *serverLifecycle) abortRestart(engineID string) {
+	l.restartMu.Lock()
+	defer l.restartMu.Unlock()
+	if state := l.restarts[engineID]; state != nil && state.active {
+		state.aborted = true
+		state.pending = false
+	}
+}
+
+func (l *serverLifecycle) restartAborted(engineID string) bool {
+	l.restartMu.Lock()
+	defer l.restartMu.Unlock()
+	state := l.restarts[engineID]
+	return state != nil && state.aborted
+}
+
 func (l *serverLifecycle) finishRestart(engineID string) bool {
 	l.restartMu.Lock()
 	defer l.restartMu.Unlock()
 	state := l.restarts[engineID]
 	state.active = false
+	state.aborted = false
 	pending := state.pending
 	state.pending = false
 	return pending
@@ -287,6 +302,9 @@ func (s *Server) restartKeepHot(sandboxID, engineID string, delay time.Duration)
 		if !s.lifecycle.wait(s.ctx, delay) {
 			return
 		}
+		if s.lifecycle.restartAborted(engineID) {
+			return // the owner stopped it while the restart was backing off
+		}
 		sb, err := s.store.GetSandboxByID(sandboxID)
 		if err != nil || !sb.KeepHot || sb.Status != "stopped" {
 			return // destroyed, disabled, or already woken by a request
@@ -322,6 +340,7 @@ func (s *Server) restartKeepHot(sandboxID, engineID string, delay time.Duration)
 			if statusErr != nil {
 				err = fmt.Errorf("confirm restarted VM: %w", statusErr)
 			} else {
+				slog.Info("sandbox.restarted", "sandbox_id", sb.ID, "name", sb.Name)
 				s.RecordEvent(store.Event{
 					Type: "sandbox.restarted", UserID: sb.CreatedBy, SandboxID: sb.ID,
 					Meta: map[string]any{"name": sb.Name},
@@ -339,8 +358,13 @@ func (s *Server) restartKeepHot(sandboxID, engineID string, delay time.Duration)
 	}
 }
 
+// restartFailed gives up on a keep_hot sandbox: clearing the marker keeps a
+// VM that cannot boot from being retried on every daemon restart.
 func (s *Server) restartFailed(sb *store.Sandbox, reason string) {
 	slog.Error("sandbox.restart_failed", "sandbox_id", sb.ID, "reason", reason)
+	if err := s.store.ClearRestartPending(sb.ID); err != nil {
+		slog.Warn("sandbox.restart_failed: clear restart marker", "sandbox_id", sb.ID, "error", err)
+	}
 	s.RecordEvent(store.Event{
 		Type: "sandbox.restart_failed", UserID: sb.CreatedBy, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": reason},
