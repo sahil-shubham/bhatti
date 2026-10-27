@@ -194,6 +194,39 @@ func (vm *VM) syncGuest(ctx context.Context) error {
 	return nil
 }
 
+// guestClockSyncTimeout bounds each clock push. A wedged agent must not turn
+// a wake into a long stall; the guest then keeps a late clock until the next
+// resume corrects it.
+const guestClockSyncTimeout = 2 * time.Second
+
+// syncGuestClock steps the guest's wall clock to the host's. After a PAUSE,
+// kvmclock is frozen and RESUME restores it, so every pause would otherwise
+// leave CLOCK_REALTIME that much further behind. A restored memory image
+// likewise keeps the wall-clock offset it was saved with, including any lag
+// its source had. Best effort: a guest whose lohar predates clock_sync, or
+// any failure, only logs; the caller proceeds.
+func (vm *VM) syncGuestClock(ctx context.Context) {
+	vm.mu.Lock()
+	ag, info, infoErr := vm.Agent, vm.AgentInfo, vm.AgentInfoErr
+	vm.mu.Unlock()
+	syncGuestClock(ctx, vm.ID, ag, info, infoErr)
+}
+
+func syncGuestClock(ctx context.Context, vmID string, ag *agent.AgentClient, info proto.AgentInfo, infoErr error) {
+	if ag == nil {
+		return
+	}
+	if infoErr != nil || !info.Has(proto.FeatureClockSync) {
+		slog.Debug("krucible.guest_clock_sync_skipped", "id", vmID, "agent_version", info.Version, "info_error", infoErr)
+		return
+	}
+	sctx, cancel := context.WithTimeout(ctx, guestClockSyncTimeout)
+	defer cancel()
+	if err := ag.SyncClock(sctx); err != nil {
+		slog.Warn("krucible.guest_clock_sync_failed", "id", vmID, "error", err)
+	}
+}
+
 // A restored memory image inherits its source's kernel CRNG state. Unlike
 // capabilities that only affect an optional operation, an unknown capability
 // cannot safely permit this restore.

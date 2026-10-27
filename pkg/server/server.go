@@ -814,6 +814,9 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 		} else if activity.AttachedSessions > 0 {
 			slog.Debug("thermal skip: active sessions",
 				"sandbox", sb.Name, "sessions", activity.AttachedSessions)
+		} else if activity.BusyReason != "" {
+			slog.Debug("thermal skip: guest busy",
+				"sandbox", sb.Name, "reason", activity.BusyReason, "idle", idle.Round(time.Second))
 		}
 	}
 	// Cold transitions can each spend a bounded interval on guest sync; do

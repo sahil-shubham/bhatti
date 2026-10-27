@@ -1,5 +1,7 @@
 package proto
 
+import "time"
+
 // AgentFeature names behavior that may be missing from a sandbox's baked-in
 // lohar, even when the host daemon has already been upgraded.
 type AgentFeature string
@@ -12,6 +14,7 @@ const (
 	FeatureReseedCRNG   AgentFeature = "reseed_crng"
 	FeatureExecSync     AgentFeature = "exec_sync"
 	FeatureFSFreeze     AgentFeature = "fs_freeze"
+	FeatureClockSync    AgentFeature = "clock_sync"
 )
 
 // AgentInfo is returned by INFO_RESP. Legacy is host-only: an old lohar
@@ -59,6 +62,25 @@ type ActivityInfo struct {
 	LastActivityUnix int64 `json:"last_activity_unix"`
 	ActiveSessions   int   `json:"active_sessions"`   // running processes
 	AttachedSessions int   `json:"attached_sessions"` // connected clients
+	// NowUnix is the guest's wall clock when it built this reply. A guest paused
+	// warm keeps its clock frozen, so LastActivityUnix lags the host's clock by
+	// the time spent paused: only NowUnix − LastActivityUnix is a real duration.
+	NowUnix int64 `json:"now_unix,omitempty"`
+	// BusyReason is what the guest's own sampling last found it doing ("cpu",
+	// "net", "cpu+net", "conn"); empty when idle. For logs, not for decisions.
+	BusyReason string `json:"busy_reason,omitempty"`
+}
+
+// OnHostClock returns a with LastActivityUnix on the host's clock, so that a
+// host measuring idle time against its own clock is not off by the guest's
+// clock lag. An agent that predates NowUnix, or one never active, is returned
+// unchanged.
+func (a ActivityInfo) OnHostClock(hostNow time.Time) ActivityInfo {
+	if a.NowUnix == 0 || a.LastActivityUnix == 0 {
+		return a
+	}
+	a.LastActivityUnix = hostNow.Unix() - max(a.NowUnix-a.LastActivityUnix, 0)
+	return a
 }
 
 // SessionInfo describes a running or completed session.

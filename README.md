@@ -290,7 +290,7 @@ bhatti (host daemon)                        lohar (guest agent, PID 1 in each VM
   └─ Reverse proxy (HTTP + WebSocket)
 ```
 
-Runs on Linux (KVM) and macOS (Apple Silicon, HVF). Idle sandbox → **warm** after 30s (vCPUs paused, ~4ms wake) → **cold** after 30min (powered off, disk retained). Any API request transparently wakes it.
+Runs on Linux (KVM) and macOS (Apple Silicon, HVF). Idle sandbox → **warm** after 30s (vCPUs paused, ~4ms wake) → **cold** after 30min (powered off, disk retained). Any API request transparently wakes it. Idle means no API requests, no attached shell, and a guest that is not working on its own: lohar samples every 5s and counts CPU above 5% of one vCPU, eth0 traffic above 2 KiB per sample, and open connections to a non-loopback peer (for up to 10 minutes after the last CPU or network work). `--keep-hot` exempts a sandbox.
 
 Lohar periodically writes dirty guest pages back to disk; normal `exec` no longer forces a filesystem-wide flush after every command. Use `bhatti exec --sync dev -- command` (or `"sync": true` in an exec API request) when a command must finish with its writes flushed. Going warm syncs before pausing; stopping a warm sandbox resumes it and syncs again before power-off, so writes that race the pause remain durable. A hot stop also syncs before power-off. If the final sync fails, power-off still completes and emits `sandbox.unclean_stop` with a reason. Volume backups quiesce attached running sandboxes while cloning the disk; backups taken with an older guest agent without filesystem freeze support are sync-only, as recorded with the backup.
 

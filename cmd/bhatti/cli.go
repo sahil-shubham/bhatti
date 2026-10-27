@@ -253,16 +253,22 @@ func apiJSON(method, path string, body any, result any) error {
 	checkServerVersion(resp)
 
 	if resp.StatusCode >= 400 {
-		var errBody struct {
-			Error string `json:"error"`
-		}
-		json.NewDecoder(resp.Body).Decode(&errBody)
-		return &apiError{status: resp.Status, message: errBody.Error}
+		return apiErrorFromResponse(resp)
 	}
 	if result != nil {
 		return json.NewDecoder(resp.Body).Decode(result)
 	}
 	return nil
+}
+
+// apiErrorFromResponse turns an error response ({"error": "..."}) into an
+// *apiError so every command prints the server's message the same way.
+func apiErrorFromResponse(resp *http.Response) error {
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	json.NewDecoder(resp.Body).Decode(&errBody)
+	return &apiError{status: resp.Status, message: errBody.Error}
 }
 
 // apiError wraps server errors with actionable recovery hints (B3).

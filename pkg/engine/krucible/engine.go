@@ -1062,6 +1062,8 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 			vm.closeConfigSrv()
 			return fmt.Errorf("restore: %w: %w", engine.ErrGuestReseedFailed, err)
 		}
+		// The image keeps the wall-clock offset it was saved with.
+		syncGuestClock(ctx, vm.ID, ag, agentInfo, infoErr)
 	}
 	reaped := make(chan struct{})
 	vm.mu.Lock()

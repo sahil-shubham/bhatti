@@ -43,6 +43,8 @@ func getActivity() proto.ActivityInfo {
 		LastActivityUnix: atomic.LoadInt64(&lastActivity),
 		ActiveSessions:   active,
 		AttachedSessions: attached,
+		NowUnix:          time.Now().Unix(),
+		BusyReason:       currentBusyReason(),
 	}
 }
 
@@ -129,6 +131,7 @@ func handleControlConnection(conn net.Conn) {
 				proto.FeatureRootGrowth, proto.FeaturePipedStderr,
 				proto.FeatureReseedCRNG,
 				proto.FeatureExecSync, proto.FeatureFSFreeze,
+				proto.FeatureClockSync,
 			},
 		})
 
@@ -191,6 +194,9 @@ func handleControlConnection(conn net.Conn) {
 			return
 		}
 		proto.WriteFrame(conn, proto.RESEED, nil)
+
+	case proto.SET_TIME:
+		handleSetTime(conn, payload)
 
 	default:
 		proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("unexpected frame type 0x%02x", msgType)))

@@ -101,6 +101,7 @@ func (e *Engine) Resume(ctx context.Context, id string) error {
 		vm.AgentInfo, vm.AgentInfoErr = info, err
 		vm.mu.Unlock()
 	}
+	vm.syncGuestClock(ctx)
 	return nil
 }
 

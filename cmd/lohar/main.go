@@ -265,6 +265,9 @@ func runAgent() {
 	}
 	bp("tcp_listen")
 
+	// A guest working with no host request must not look idle to the thermal manager.
+	startActivitySampler()
+
 	fmt.Fprintln(os.Stderr, "lohar: ready")
 
 	// --- Bridge user --env into unit-file environment ---

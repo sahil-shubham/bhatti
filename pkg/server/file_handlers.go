@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -86,7 +87,16 @@ func (s *Server) handleSandboxFiles(w http.ResponseWriter, r *http.Request, id s
 			mode = "0644"
 		}
 		if err := fe.FileWrite(r.Context(), sb.EngineID, path, mode, size, r.Body); err != nil {
-			errRespInternal(w, r, "write file failed", err)
+			// The agent's message ("no space: need ..., ... available") is
+			// user-facing; anything else stays a logged, generic 500.
+			switch {
+			case errors.Is(err, agent.ErrNoSpace):
+				errResp(w, http.StatusInsufficientStorage, err.Error())
+			case errors.Is(err, agent.ErrFileTooLarge):
+				errResp(w, http.StatusRequestEntityTooLarge, err.Error())
+			default:
+				errRespInternal(w, r, "write file failed", err)
+			}
 			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})

@@ -386,7 +386,7 @@ func buildBaseRootfs(t *testing.T, repo string) string {
 	// splitting on whitespace and dispatching in-process (no real shell needed).
 	// writeuid: writes the caller's uid to a file — lets a test observe that
 	// --init (and exec) ran as uid 1000 without a full userland.
-	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes", "date", "oncpu", "rngready"} {
+	for _, n := range []string{"echo", "errcho", "false", "sleep", "printenv", "cat", "sync", "sh", "writeuid", "fsbytes", "date", "oncpu", "rngready", "spin"} {
 		if err := os.Symlink("true", filepath.Join(root, "bin", n)); err != nil {
 			t.Fatal(err)
 		}
@@ -496,6 +496,14 @@ func dispatch(name string, args []string) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "spin": // spin [SECONDS] -> burn a CPU for SECONDS, or until killed
+		until := time.Now().AddDate(10, 0, 0)
+		if len(args) > 0 {
+			n, _ := strconv.Atoi(args[0])
+			until = time.Now().Add(time.Duration(n) * time.Second)
+		}
+		for time.Now().Before(until) {
+		}
 	default: // true
 	}
 }
@@ -509,6 +517,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -555,6 +564,20 @@ func main() {
 		}
 		c.Close()
 		fmt.Println("OK dial", os.Args[2])
+	case "hold": // hold ADDR SECONDS -> connect, then sit on the connection without sending a byte
+		if len(os.Args) < 4 {
+			fmt.Println("usage: netcheck hold ADDR SECONDS")
+			os.Exit(2)
+		}
+		c, err := net.DialTimeout("tcp", os.Args[2], 5*time.Second)
+		if err != nil {
+			fmt.Println("ERR", err)
+			os.Exit(1)
+		}
+		fmt.Println("OK hold", os.Args[2])
+		secs, _ := strconv.Atoi(os.Args[3])
+		time.Sleep(time.Duration(secs) * time.Second)
+		c.Close()
 	case "serve":
 		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			io.WriteString(w, "hello-from-guest\n")

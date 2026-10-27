@@ -175,6 +175,8 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		if _, resumeErr := controlCmd(rctx, vm.CtlSockUDS, "RESUME"); resumeErr != nil {
 			err = errors.Join(err, fmt.Errorf("checkpoint: resume: %w", resumeErr))
 			manifest = nil
+		} else {
+			vm.syncGuestClock(rctx)
 		}
 	}()
 	if stage != "" {
@@ -396,7 +398,9 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 	defer func() {
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer rcancel()
-		_, _ = controlCmd(rctx, vm.CtlSockUDS, "RESUME")
+		if _, err := controlCmd(rctx, vm.CtlSockUDS, "RESUME"); err == nil {
+			vm.syncGuestClock(rctx)
+		}
 	}()
 
 	// 3. Flush host page cache so the on-disk overlay reflects all writes.

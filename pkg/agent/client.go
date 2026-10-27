@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -491,6 +493,9 @@ func (c *AgentClient) Activity(ctx context.Context) (*proto.ActivityInfo, error)
 	if err := json.Unmarshal(payload, &info); err != nil {
 		return nil, fmt.Errorf("unmarshal activity: %w", err)
 	}
+	// A guest paused warm keeps a frozen clock, so its stamp lags ours by the
+	// time it spent paused; callers measure idle time against our clock.
+	info = info.OnHostClock(time.Now())
 	return &info, nil
 }
 
@@ -557,6 +562,38 @@ func (c *AgentClient) Reseed(ctx context.Context, seed [proto.ReseedBytes]byte) 
 	}
 	if msgType != proto.RESEED || len(payload) != 0 {
 		return fmt.Errorf("expected empty RESEED ack, got 0x%02x (%d bytes)", msgType, len(payload))
+	}
+	return nil
+}
+
+// SyncClock steps the guest's CLOCK_REALTIME to the host's current wall time.
+// The time is read after the connection is open, immediately before the send,
+// so only one one-way hop to lohar (well under a millisecond on the vsock
+// bridge) separates the stamp from the guest's clock_settime. Callers need
+// whole-second accuracy, so the guest adds no latency compensation.
+func (c *AgentClient) SyncClock(ctx context.Context) error {
+	conn, err := c.DialControl(ctx)
+	if err != nil {
+		return fmt.Errorf("agent connect for clock sync: %w", err)
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	var stamp [8]byte
+	binary.BigEndian.PutUint64(stamp[:], uint64(time.Now().UnixNano()))
+	if err := proto.WriteFrame(conn, proto.SET_TIME, stamp[:]); err != nil {
+		return fmt.Errorf("agent send clock sync: %w", err)
+	}
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil {
+		return fmt.Errorf("agent read clock sync ack: %w", err)
+	}
+	if msgType == proto.ERROR {
+		return fmt.Errorf("guest clock sync failed: %s", payload)
+	}
+	if msgType != proto.SET_TIME || len(payload) != 0 {
+		return fmt.Errorf("expected empty SET_TIME ack, got 0x%02x (%d bytes)", msgType, len(payload))
 	}
 	return nil
 }
@@ -1011,6 +1048,41 @@ func (c *AgentClient) FileRead(ctx context.Context, path string, w io.Writer, op
 	}
 }
 
+// ErrNoSpace means the guest filesystem cannot hold the file being written
+// (rejected up front from the declared size, or ENOSPC mid-write).
+var ErrNoSpace = errors.New("guest filesystem out of space")
+
+// ErrFileTooLarge is the 100 MB cap of lohar <= v2.5.4; sandboxes keep the
+// lohar they were created with, so old guests still answer with it.
+var ErrFileTooLarge = errors.New("file too large for this guest agent")
+
+// agentFileError carries the guest's own message (user-facing, surfaced by
+// the API) while matching a sentinel via errors.Is.
+type agentFileError struct {
+	kind error
+	msg  string
+}
+
+func (e *agentFileError) Error() string { return e.msg }
+func (e *agentFileError) Unwrap() error { return e.kind }
+
+// fileWriteAgentError turns an ERROR payload from FILE_WRITE_REQ into an error,
+// typed when the guest used one of the stable prefixes.
+func fileWriteAgentError(payload []byte) error {
+	msg := string(payload)
+	switch {
+	case strings.HasPrefix(msg, proto.ErrPrefixNoSpace):
+		return &agentFileError{kind: ErrNoSpace, msg: msg}
+	case strings.HasPrefix(msg, proto.ErrPrefixFileTooLarge):
+		return &agentFileError{kind: ErrFileTooLarge, msg: msg}
+	}
+	return fmt.Errorf("agent: %s", msg)
+}
+
+// fileWriteReplyWait bounds how long we wait for the guest's explanation after
+// the connection broke mid-upload.
+const fileWriteReplyWait = 2 * time.Second
+
 // FileWrite writes content from r to a file in the guest.
 func (c *AgentClient) FileWrite(ctx context.Context, path, mode string, size int64, r io.Reader) error {
 	conn, err := c.DialControl(ctx)
@@ -1019,7 +1091,8 @@ func (c *AgentClient) FileWrite(ctx context.Context, path, mode string, size int
 	}
 	defer conn.Close()
 
-	if deadline, ok := ctx.Deadline(); ok {
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
 		conn.SetDeadline(deadline)
 	}
 
@@ -1035,6 +1108,11 @@ func (c *AgentClient) FileWrite(ctx context.Context, path, mode string, size int
 		n, err := r.Read(buf)
 		if n > 0 {
 			if werr := proto.WriteFrame(conn, proto.STDIN, buf[:n]); werr != nil {
+				// The guest aborts a write it can't accept by replying ERROR and
+				// closing, which surfaces here as a broken pipe. Its reply says why.
+				if aerr := fileWriteAbortReason(conn, deadline, hasDeadline); aerr != nil {
+					return aerr
+				}
 				return fmt.Errorf("write stdin frame: %w", werr)
 			}
 		}
@@ -1049,9 +1127,24 @@ func (c *AgentClient) FileWrite(ctx context.Context, path, mode string, size int
 		return fmt.Errorf("read write resp: %w", err)
 	}
 	if msgType == proto.ERROR {
-		return fmt.Errorf("agent: %s", payload)
+		return fileWriteAgentError(payload)
 	}
 	return nil
+}
+
+// fileWriteAbortReason reads the guest's ERROR reply after a failed STDIN
+// write. It returns nil when no ERROR frame arrives within fileWriteReplyWait.
+func fileWriteAbortReason(conn net.Conn, ctxDeadline time.Time, hasCtxDeadline bool) error {
+	wait := time.Now().Add(fileWriteReplyWait)
+	if hasCtxDeadline && ctxDeadline.Before(wait) {
+		wait = ctxDeadline
+	}
+	conn.SetReadDeadline(wait)
+	msgType, payload, err := proto.ReadFrame(conn)
+	if err != nil || msgType != proto.ERROR {
+		return nil
+	}
+	return fileWriteAgentError(payload)
 }
 
 // FileStat returns file info for a path in the guest.

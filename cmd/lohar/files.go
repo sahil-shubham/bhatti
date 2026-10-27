@@ -5,11 +5,13 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
@@ -142,21 +144,19 @@ func handleFileWrite(conn net.Conn, payload []byte) {
 		return
 	}
 
-	// Cap file writes at 100MB. The real disk limit is the ext4 image size
-	// (2GB), but this prevents a single API call from filling the filesystem.
-	const maxWriteSize = 100 << 20
-	if req.Size > maxWriteSize {
-		proto.WriteFrame(conn, proto.ERROR,
-			[]byte(fmt.Sprintf("file too large: %d bytes (max %d)", req.Size, maxWriteSize)))
-		return
-	}
-
 	mode, _ := strconv.ParseUint(req.Mode, 8, 32)
 	if mode == 0 {
 		mode = 0644
 	}
 
 	os.MkdirAll(filepath.Dir(req.Path), 0755)
+
+	// Refuse up front, before the host streams the body, so it gets a clear
+	// reply instead of a broken pipe halfway through a multi-GB upload.
+	if err := checkWriteSpace(filepath.Dir(req.Path), req.Size); err != nil {
+		proto.WriteFrame(conn, proto.ERROR, []byte(err.Error()))
+		return
+	}
 
 	// Atomic write: write to a temp file, then rename.
 	// This ensures readers never see partial content.
@@ -179,14 +179,17 @@ func handleFileWrite(conn net.Conn, payload []byte) {
 			n, err := f.Write(data)
 			written += int64(n)
 			if err != nil {
-				writeErr = err
+				writeErr = describeWriteErr(err, written, req.Size)
 				break
 			}
 		}
 	}
 
-	// Fsync before rename to ensure data is on disk
-	f.Sync()
+	// Fsync before rename to ensure data is on disk. Only ENOSPC/EDQUOT is
+	// surfaced: delayed allocation can report them here instead of on Write.
+	if err := f.Sync(); writeErr == nil && isNoSpace(err) {
+		writeErr = describeWriteErr(err, written, req.Size)
+	}
 	f.Close()
 
 	if writeErr != nil {
@@ -207,6 +210,47 @@ func handleFileWrite(conn net.Conn, payload []byte) {
 	os.Chown(req.Path, 1000, 1000)
 
 	proto.SendJSON(conn, proto.FILE_WRITE_RESP, map[string]string{"status": "ok"})
+}
+
+// statfsFn is the free-space probe; tests replace it to simulate a full disk.
+var statfsFn = syscall.Statfs
+
+// writeSpaceReserve is kept free on bulk writes so an upload cannot take the
+// guest filesystem to zero and wedge the sandbox (lohar needs room for logs,
+// temp files and state). Writes no bigger than the reserve are exempt.
+const writeSpaceReserve = 16 << 20
+
+// checkWriteSpace fails with a "no space:" error when size bytes (plus the
+// reserve for bulk writes) do not fit on the filesystem holding dir. A failed
+// probe is not an error: the ENOSPC check during the write still applies.
+func checkWriteSpace(dir string, size int64) error {
+	var st syscall.Statfs_t
+	if err := statfsFn(dir, &st); err != nil {
+		return nil
+	}
+	avail := uint64(st.Bavail) * uint64(st.Bsize)
+	need := uint64(size)
+	if need > writeSpaceReserve {
+		need += writeSpaceReserve
+	}
+	if need > avail {
+		return fmt.Errorf("%s need %d bytes (%s), %d bytes (%s) available", proto.ErrPrefixNoSpace,
+			need, humanBytes(need), avail, humanBytes(avail))
+	}
+	return nil
+}
+
+func isNoSpace(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}
+
+// describeWriteErr tags ENOSPC mid-stream with the stable prefix the host
+// maps to a typed error; other errors pass through unchanged.
+func describeWriteErr(err error, written, size int64) error {
+	if isNoSpace(err) {
+		return fmt.Errorf("%s disk full after %d of %d bytes", proto.ErrPrefixNoSpace, written, size)
+	}
+	return err
 }
 
 func handleFileStat(conn net.Conn, payload []byte) {
@@ -302,4 +346,3 @@ func handleFileList(conn net.Conn, payload []byte) {
 
 	proto.SendJSON(conn, proto.FILE_LS_RESP, files)
 }
-

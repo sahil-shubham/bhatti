@@ -31,6 +31,13 @@ const (
 	// Host → guest: exactly 64 bytes; ack = empty RESEED frame, failure = ERROR.
 	RESEED byte = 0x17
 
+	// Resuming a paused guest restores its frozen kvmclock, so CLOCK_REALTIME
+	// stays behind the host by every second the vCPUs were parked. The host
+	// pushes its current wall time and lohar steps CLOCK_REALTIME to it.
+	// Host → guest: 8 bytes, big-endian int64 Unix nanoseconds; ack = empty
+	// SET_TIME frame, failure = ERROR.
+	SET_TIME byte = 0x1c
+
 	// Agent capability discovery. Older lohar replies with ERROR
 	// "unexpected frame type 0x15"; it does not answer AUTH.
 	INFO_REQ  byte = 0x15 // host → guest: empty payload
@@ -96,6 +103,17 @@ const (
 	VsockPortControl = uint32(1024) // exec, shell
 	VsockPortForward = uint32(1025) // port forwarding
 	VsockPortConfig  = uint32(1026) // boot-time config fetch (guest → host)
+)
+
+// Stable prefixes on ERROR frames answering FILE_WRITE_REQ. The host maps them
+// to typed errors, so the text before the first space is part of the protocol.
+const (
+	// ErrPrefixNoSpace: the guest filesystem cannot hold the file (checked up
+	// front from the declared size, or ENOSPC while writing).
+	ErrPrefixNoSpace = "no space:"
+	// ErrPrefixFileTooLarge: sent only by lohar <= v2.5.4, which capped writes
+	// at 100 MB. Kept so the host can still classify replies from old sandboxes.
+	ErrPrefixFileTooLarge = "file too large:"
 )
 
 // MaxFrameSize is the maximum allowed frame size (1 MB).

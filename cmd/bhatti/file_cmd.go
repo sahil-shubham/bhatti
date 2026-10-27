@@ -39,8 +39,7 @@ var fileReadCmd = &cobra.Command{
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("%s", body)
+			return apiErrorFromResponse(resp)
 		}
 		io.Copy(os.Stdout, resp.Body)
 		return nil
@@ -60,28 +59,59 @@ var fileWriteCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		// Read all stdin to get Content-Length
-		data, _ := io.ReadAll(os.Stdin)
-		req, _ := http.NewRequest("PUT",
-			apiURL+"/sandboxes/"+id+"/files?path="+url.QueryEscape(args[1]),
-			bytes.NewReader(data))
-		req.Header.Set("Content-Type", "application/octet-stream")
-		req.ContentLength = int64(len(data))
-		if apiToken != "" {
-			req.Header.Set("Authorization", "Bearer "+apiToken)
-		}
-		resp, err := httpClient().Do(req)
-		if err != nil {
+		if err := putFile(id, args[1], os.Stdin); err != nil {
 			return err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("%s", body)
 		}
 		fmt.Println("ok")
 		return nil
 	},
+}
+
+// putFile uploads in to guestPath. The API needs a Content-Length, so a
+// regular file (`< huge.img`) is streamed with its remaining size — it may be
+// far larger than RAM or the guest disk — and anything else (a pipe) is
+// buffered first.
+func putFile(id, guestPath string, in *os.File) error {
+	var body io.Reader = http.NoBody
+	var size int64
+	if st, err := in.Stat(); err == nil && st.Mode().IsRegular() {
+		pos, err := in.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if size = st.Size() - pos; size > 0 {
+			// ReadAt, not the shared offset: after an early answer the transport may
+			// still be draining the body, and must not move the caller's file.
+			body = io.NewSectionReader(in, pos, size)
+		}
+	} else {
+		data, err := io.ReadAll(in)
+		if err != nil {
+			return fmt.Errorf("read stdin: %w", err)
+		}
+		if size = int64(len(data)); size > 0 {
+			body = bytes.NewReader(data)
+		}
+	}
+	req, err := http.NewRequest("PUT",
+		apiURL+"/sandboxes/"+id+"/files?path="+url.QueryEscape(guestPath), body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = size
+	if apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+apiToken)
+	}
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return apiErrorFromResponse(resp)
+	}
+	return nil
 }
 
 var fileLSCmd = &cobra.Command{

@@ -111,7 +111,7 @@ func TestFakeReseedVMMProcess(t *testing.T) {
 				case mode == "old":
 					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.4.0", Features: []proto.AgentFeature{}})
 				default:
-					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.5.0", Features: []proto.AgentFeature{proto.FeatureReseedCRNG}})
+					proto.SendJSON(conn, proto.INFO_RESP, proto.AgentInfo{Version: "v2.5.0", Features: []proto.AgentFeature{proto.FeatureReseedCRNG, proto.FeatureClockSync}})
 				}
 			case proto.EXEC_REQ:
 				exit := proto.ExitPayload(0)
@@ -130,6 +130,16 @@ func TestFakeReseedVMMProcess(t *testing.T) {
 					return
 				}
 				proto.WriteFrame(conn, proto.RESEED, nil)
+			case proto.SET_TIME:
+				if os.Getenv("BHATTI_RESEED_MODE") == "clockfail" {
+					proto.WriteFrame(conn, proto.ERROR, []byte("set time: operation not permitted"))
+					return
+				}
+				if err := os.WriteFile(filepath.Join(dir, "clock.bin"), payload, 0o600); err != nil {
+					proto.WriteFrame(conn, proto.ERROR, []byte(err.Error()))
+					return
+				}
+				proto.WriteFrame(conn, proto.SET_TIME, nil)
 			default:
 				proto.WriteFrame(conn, proto.ERROR, []byte(fmt.Sprintf("unexpected frame type 0x%02x", typ)))
 			}
