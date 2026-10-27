@@ -37,7 +37,7 @@ func (s *Server) handleSandboxFiles(w http.ResponseWriter, r *http.Request, id s
 		if r.URL.Query().Get("ls") == "true" {
 			files, err := fe.FileList(r.Context(), sb.EngineID, path)
 			if err != nil {
-				errRespInternal(w, r, "list directory failed", err)
+				fileReadErrResp(w, r, "list directory failed", path, err)
 				return
 			}
 			writeJSON(w, 200, files)
@@ -51,7 +51,7 @@ func (s *Server) handleSandboxFiles(w http.ResponseWriter, r *http.Request, id s
 			// Stat first to detect errors before writing response body.
 			info, err := fe.FileStat(r.Context(), sb.EngineID, path)
 			if err != nil {
-				errRespInternal(w, r, "stat file failed", err)
+				fileReadErrResp(w, r, "stat file failed", path, err)
 				return
 			}
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -103,7 +103,7 @@ func (s *Server) handleSandboxFiles(w http.ResponseWriter, r *http.Request, id s
 	case http.MethodHead:
 		info, err := fe.FileStat(r.Context(), sb.EngineID, path)
 		if err != nil {
-			errResp(w, 404, err.Error())
+			fileReadErrResp(w, r, "stat file failed", path, err)
 			return
 		}
 		w.Header().Set("X-File-Size", fmt.Sprint(info.Size))
@@ -113,4 +113,14 @@ func (s *Server) handleSandboxFiles(w http.ResponseWriter, r *http.Request, id s
 	default:
 		errResp(w, 405, "method not allowed")
 	}
+}
+
+// fileReadErrResp answers a failed read, stat or list: a missing path is the
+// caller's mistake (404 naming it); anything else is a logged, generic 500.
+func fileReadErrResp(w http.ResponseWriter, r *http.Request, logMsg, path string, err error) {
+	if errors.Is(err, agent.ErrFileNotFound) {
+		errResp(w, http.StatusNotFound, "no such file or directory: "+path)
+		return
+	}
+	errRespInternal(w, r, logMsg, err)
 }

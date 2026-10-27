@@ -357,8 +357,12 @@ toggling keep_hot to control thermal management.</div>
       <section class="command" id="bhatti-exec">
         <h2><a href="#bhatti-exec">bhatti exec</a></h2>
         <p>Execute a command in a sandbox</p>
-        <div class="description">Execute a command inside a sandbox. The exit code is forwarded.
-Sleeping sandboxes wake automatically.</div>
+        <div class="description">Execute a command inside a sandbox. Output streams as the command runs, to a
+pipe or file as well as a terminal, with stdout and stderr kept separate. The
+exit code is forwarded. Sleeping sandboxes wake automatically.
+
+A command is stopped after 300 seconds unless --timeout allows longer (up to
+86400). --json waits for the command and prints the whole result at the end.</div>
         <pre>  bhatti exec dev -- echo hello
   bhatti exec dev -- sudo apt-get install -y ripgrep
   bhatti exec dev --timeout 60 -- long-running-script.sh</pre>
@@ -367,7 +371,7 @@ Sleeping sandboxes wake automatically.</div>
           <tr>
             <td>--timeout</td>
             <td><span class="default-val">0</span></td>
-            <td>Exec timeout in seconds (default: 300, max: 3600)</td>
+            <td>Exec timeout in seconds (default: 300, max: 86400)</td>
           </tr>
         </table>
       </section>

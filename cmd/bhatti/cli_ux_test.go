@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -82,9 +81,7 @@ func TestCLIStreamingExecNDJSON(t *testing.T) {
 	}
 	t.Cleanup(func() { c.run("destroy", name, "-y") })
 
-	// BHATTI_FORCE_STREAM=1 bypasses the TTY check in tests
-	stdout, stderr, code := c.runWithEnv(
-		[]string{"BHATTI_FORCE_STREAM=1"},
+	stdout, stderr, code := c.run(
 		"exec", name, "--", "sh", "-c",
 		`echo line1; sleep 0.1; echo line2; sleep 0.1; echo line3`,
 	)
@@ -1043,30 +1040,4 @@ func TestCLIInspectStoppedSandbox(t *testing.T) {
 	if sb["stopped_at"] == nil {
 		t.Error("stopped_at should be set")
 	}
-}
-
-// --- Helpers ---
-
-// runWithEnv extends run() with extra environment variables.
-func (c *cliTest) runWithEnv(extraEnv []string, args ...string) (stdout, stderr string, exitCode int) {
-	c.t.Helper()
-	cmd := exec.Command(c.bhatti, args...)
-	cmd.Env = append(os.Environ(),
-		"BHATTI_URL="+c.baseURL,
-		"BHATTI_TOKEN="+c.token,
-	)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	err := cmd.Run()
-	exitCode = 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			c.t.Fatalf("run %v: %v", args, err)
-		}
-	}
-	return outBuf.String(), errBuf.String(), exitCode
 }

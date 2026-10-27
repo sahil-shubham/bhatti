@@ -315,7 +315,7 @@ sudo bhatti user create --name alice --max-sandboxes 5
 - **Session-aware exec** — TTY sessions survive disconnects, scrollback replayed on reattach
 - **OCI image support** — `bhatti image pull python:3.12` → use as base for sandboxes
 - **Persistent volumes** — survive sandbox destruction, mountable across sandboxes
-- **Streaming exec** — real-time NDJSON output via `Accept: application/x-ndjson`
+- **Streaming exec** — `bhatti exec` prints output as the command runs, even into a pipe or file (stdout and stderr stay separate; `--json` waits for the full result). The API streams NDJSON via `Accept: application/x-ndjson`. Exec stops after 300s by default; raise it with `--timeout` / `timeout_sec` (max 86400)
 - **Guest hardening** — exec as uid 1000, config drive unmounted after boot, connection/session limits
 - **Single binary** — `bhatti serve` = daemon, `bhatti create` = CLI, `bhatti user` = admin
 

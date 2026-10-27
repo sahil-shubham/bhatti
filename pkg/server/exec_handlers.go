@@ -18,6 +18,9 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
+// maxExecTimeoutSec caps timeout_sec on an exec request (24h).
+const maxExecTimeoutSec = 86400
+
 type execReq struct {
 	Cmd        []string `json:"cmd"`
 	TimeoutSec int      `json:"timeout_sec,omitempty"` // default 300, max 86400
@@ -67,7 +70,7 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 
 	// Apply exec timeout (default 300s, max 86400s / 24h)
 	timeout := 300 * time.Second
-	if req.TimeoutSec > 0 && req.TimeoutSec <= 86400 {
+	if req.TimeoutSec > 0 && req.TimeoutSec <= maxExecTimeoutSec {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
 	}
 	execCtx, cancel := context.WithTimeout(r.Context(), timeout)
@@ -108,7 +111,7 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 
 	// Streaming NDJSON when requested via Accept header
 	if r.Header.Get("Accept") == "application/x-ndjson" {
-		s.handleSandboxExecStream(w, r.WithContext(execCtx), sb, req)
+		s.handleSandboxExecStream(w, r, execCtx, timeout, sb, req)
 		return
 	}
 
@@ -121,15 +124,41 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		result, err = s.engine.Exec(execCtx, sb.EngineID, req.Cmd)
 	}
 	if err != nil {
+		if execTimedOut(r.Context(), execCtx) {
+			errResp(w, http.StatusGatewayTimeout, execTimeoutMsg(timeout))
+			return
+		}
 		errRespInternal(w, r, "exec failed", err)
 		return
 	}
 	writeJSON(w, 200, result)
 }
 
+// execTimeoutMsg is what a client sees when the server's exec limit expires. It
+// names the limit and the knob: the raw cause is an agent i/o timeout, which
+// reads like a daemon failure.
+func execTimeoutMsg(timeout time.Duration) string {
+	return fmt.Sprintf("exec timed out after %ds (use --timeout, up to %ds)", int(timeout.Seconds()), maxExecTimeoutSec)
+}
+
+// execTimedOut reports whether an exec failed because its own deadline passed,
+// as opposed to the client going away (the request context is cancelled). The
+// agent connection shares the deadline, so its read fails with an i/o timeout
+// that carries no context error; the clock is what tells them apart.
+func execTimedOut(request, execCtx context.Context) bool {
+	if request.Err() != nil {
+		return false
+	}
+	deadline, ok := execCtx.Deadline()
+	return ok && !time.Now().Before(deadline)
+}
+
 // handleSandboxExecStream streams exec output as NDJSON (one JSON object per line).
 // Each line is flushed immediately so the client sees output in real time.
-func (s *Server) handleSandboxExecStream(w http.ResponseWriter, r *http.Request, sb *store.Sandbox, req execReq) {
+// The 200 goes out before the command runs (output is unbounded and a silent
+// command must not look like a hung request to proxies), so a failure or the
+// exec timeout arrives as a final "error" event rather than a status code.
+func (s *Server) handleSandboxExecStream(w http.ResponseWriter, r *http.Request, execCtx context.Context, timeout time.Duration, sb *store.Sandbox, req execReq) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		errResp(w, 500, "streaming not supported")
@@ -148,47 +177,77 @@ func (s *Server) handleSandboxExecStream(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(200)
 
 	enc := json.NewEncoder(w)
+	write := func(event engine.StreamEvent) {
+		enc.Encode(event)
+		flusher.Flush()
+	}
+	// The guest cuts output at arbitrary byte offsets, and a JSON string can't
+	// carry half a character: without this a multi-byte character straddling two
+	// chunks would reach the client as two U+FFFD.
+	var stdoutFramer, stderrFramer utf8Framer
+	// A stream that ends without an exit or error event leaves the client with no
+	// exit status, so every failed exec must end in one of them.
+	terminated := false
+	emit := func(event engine.StreamEvent) {
+		switch event.Type {
+		case "stdout", "stderr":
+			framer := &stdoutFramer
+			if event.Type == "stderr" {
+				framer = &stderrFramer
+			}
+			data := framer.next([]byte(event.Data))
+			if len(data) == 0 {
+				return
+			}
+			event.Data = string(data)
+		case "exit", "error":
+			terminated = true
+			if tail := stdoutFramer.flush(); tail != nil {
+				write(engine.StreamEvent{Type: "stdout", Data: string(tail)})
+			}
+			if tail := stderrFramer.flush(); tail != nil {
+				write(engine.StreamEvent{Type: "stderr", Data: string(tail)})
+			}
+		}
+		write(event)
+	}
+	finish := func(err error) {
+		if err == nil || terminated {
+			return
+		}
+		if execTimedOut(r.Context(), execCtx) {
+			emit(engine.StreamEvent{Type: "error", Data: execTimeoutMsg(timeout)})
+			return
+		}
+		emit(engine.StreamEvent{Type: "error", Data: err.Error()})
+	}
 
 	// Opt-in sync must use an agent path that waits for the guest's sync
 	// before emitting EXIT, rather than a buffered fallback.
 	if req.Sync {
-		err := s.engine.(engine.SyncExecEngine).ExecStreamWithSync(r.Context(), sb.EngineID, req.Cmd, true, func(event engine.StreamEvent) {
-			enc.Encode(event)
-			flusher.Flush()
-		})
-		if err != nil {
-			enc.Encode(engine.StreamEvent{Type: "error", Data: err.Error()})
-			flusher.Flush()
-		}
+		finish(s.engine.(engine.SyncExecEngine).ExecStreamWithSync(execCtx, sb.EngineID, req.Cmd, true, emit))
 		return
 	}
 	// If engine supports streaming, use it directly
 	if se, ok := s.engine.(engine.StreamExecEngine); ok {
-		se.ExecStream(r.Context(), sb.EngineID, req.Cmd, func(event engine.StreamEvent) {
-			enc.Encode(event)
-			flusher.Flush()
-		})
+		finish(se.ExecStream(execCtx, sb.EngineID, req.Cmd, emit))
 		return
 	}
 
 	// Fallback: buffer then emit as NDJSON events
-	result, err := s.engine.Exec(r.Context(), sb.EngineID, req.Cmd)
+	result, err := s.engine.Exec(execCtx, sb.EngineID, req.Cmd)
 	if err != nil {
-		enc.Encode(engine.StreamEvent{Type: "error", Data: err.Error()})
-		flusher.Flush()
+		finish(err)
 		return
 	}
 	if result.Stdout != "" {
-		enc.Encode(engine.StreamEvent{Type: "stdout", Data: result.Stdout})
-		flusher.Flush()
+		emit(engine.StreamEvent{Type: "stdout", Data: result.Stdout})
 	}
 	if result.Stderr != "" {
-		enc.Encode(engine.StreamEvent{Type: "stderr", Data: result.Stderr})
-		flusher.Flush()
+		emit(engine.StreamEvent{Type: "stderr", Data: result.Stderr})
 	}
 	code := result.ExitCode
-	enc.Encode(engine.StreamEvent{Type: "exit", ExitCode: &code})
-	flusher.Flush()
+	emit(engine.StreamEvent{Type: "exit", ExitCode: &code})
 }
 
 func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id string) {

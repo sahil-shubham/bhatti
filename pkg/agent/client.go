@@ -1016,7 +1016,7 @@ func (c *AgentClient) FileRead(ctx context.Context, path string, w io.Writer, op
 		return 0, "", fmt.Errorf("read file resp: %w", err)
 	}
 	if msgType == proto.ERROR {
-		return 0, "", fmt.Errorf("agent: %s", payload)
+		return 0, "", fileReadAgentError(payload)
 	}
 	if msgType != proto.FILE_READ_RESP {
 		return 0, "", fmt.Errorf("expected FILE_READ_RESP, got 0x%02x", msgType)
@@ -1043,7 +1043,7 @@ func (c *AgentClient) FileRead(ctx context.Context, path string, w io.Writer, op
 		case proto.EXIT:
 			return written, resp.Mode, nil
 		case proto.ERROR:
-			return written, resp.Mode, fmt.Errorf("agent: %s", payload)
+			return written, resp.Mode, fileReadAgentError(payload)
 		}
 	}
 }
@@ -1055,6 +1055,15 @@ var ErrNoSpace = errors.New("guest filesystem out of space")
 // ErrFileTooLarge is the 100 MB cap of lohar <= v2.5.4; sandboxes keep the
 // lohar they were created with, so old guests still answer with it.
 var ErrFileTooLarge = errors.New("file too large for this guest agent")
+
+// ErrFileNotFound means the path a read, stat or list asked for doesn't exist
+// in the guest.
+var ErrFileNotFound = errors.New("no such file or directory")
+
+// guestENOENT is how lohar (every version) ends the message of an os error for
+// a missing path ("stat /x: no such file or directory"). There is no stable
+// prefix to match, and sandboxes keep the lohar they were created with.
+const guestENOENT = "no such file or directory"
 
 // agentFileError carries the guest's own message (user-facing, surfaced by
 // the API) while matching a sentinel via errors.Is.
@@ -1075,6 +1084,16 @@ func fileWriteAgentError(payload []byte) error {
 		return &agentFileError{kind: ErrNoSpace, msg: msg}
 	case strings.HasPrefix(msg, proto.ErrPrefixFileTooLarge):
 		return &agentFileError{kind: ErrFileTooLarge, msg: msg}
+	}
+	return fmt.Errorf("agent: %s", msg)
+}
+
+// fileReadAgentError turns an ERROR payload from a read, stat or list request
+// into an error, typed ErrFileNotFound when the guest reports a missing path.
+func fileReadAgentError(payload []byte) error {
+	msg := string(payload)
+	if strings.HasSuffix(msg, guestENOENT) {
+		return &agentFileError{kind: ErrFileNotFound, msg: "agent: " + msg}
 	}
 	return fmt.Errorf("agent: %s", msg)
 }
@@ -1168,7 +1187,7 @@ func (c *AgentClient) FileStat(ctx context.Context, path string) (*proto.FileInf
 		return nil, fmt.Errorf("read stat resp: %w", err)
 	}
 	if msgType == proto.ERROR {
-		return nil, fmt.Errorf("agent: %s", payload)
+		return nil, fileReadAgentError(payload)
 	}
 	if msgType != proto.FILE_STAT_RESP {
 		return nil, fmt.Errorf("expected FILE_STAT_RESP, got 0x%02x", msgType)
@@ -1201,7 +1220,7 @@ func (c *AgentClient) FileList(ctx context.Context, path string) ([]proto.FileIn
 		return nil, fmt.Errorf("read ls resp: %w", err)
 	}
 	if msgType == proto.ERROR {
-		return nil, fmt.Errorf("agent: %s", payload)
+		return nil, fileReadAgentError(payload)
 	}
 	if msgType != proto.FILE_LS_RESP {
 		return nil, fmt.Errorf("expected FILE_LS_RESP, got 0x%02x", msgType)

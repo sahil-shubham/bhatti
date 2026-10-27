@@ -47,8 +47,12 @@ func init() {
 var execCmd = &cobra.Command{
 	Use:   "exec <id|name> [--] <command...>",
 	Short: "Execute a command in a sandbox",
-	Long: `Execute a command inside a sandbox. The exit code is forwarded.
-Sleeping sandboxes wake automatically.`,
+	Long: `Execute a command inside a sandbox. Output streams as the command runs, to a
+pipe or file as well as a terminal, with stdout and stderr kept separate. The
+exit code is forwarded. Sleeping sandboxes wake automatically.
+
+A command is stopped after 300 seconds unless --timeout allows longer (up to
+86400). --json waits for the command and prints the whole result at the end.`,
 	Example: `  bhatti exec dev -- echo hello
   bhatti exec dev echo hello           # -- is optional
   bhatti exec dev -- sudo apt-get install -y ripgrep
@@ -88,57 +92,20 @@ Sleeping sandboxes wake automatically.`,
 			reqBody["sync"] = true
 		}
 
-		// B2: stream when stdout is a TTY (or BHATTI_FORCE_STREAM=1)
-		stream := (term.IsTerminal(int(os.Stdout.Fd())) || os.Getenv("BHATTI_FORCE_STREAM") == "1") &&
-			!isJSON(cmd) && !detach
-
-		if stream {
-			// Streaming NDJSON path
-			resp, err := apiRequestWithAccept("POST", "/sandboxes/"+id+"/exec", reqBody, "application/x-ndjson")
+		// Stream unless the caller needs the whole result (--json) or only the PID
+		// (--detach). TTY or not: scripts, agents and CI want output as it happens
+		// as much as a person does, and stdout and stderr stay separate either way.
+		if !isJSON(cmd) && !detach {
+			exitCode, err := execStream(id, reqBody, os.Stdout, os.Stderr)
 			if err != nil {
 				return err
-			}
-			defer resp.Body.Close()
-			checkServerVersion(resp)
-			if resp.StatusCode >= 400 {
-				var errBody struct {
-					Error string `json:"error"`
-				}
-				json.NewDecoder(resp.Body).Decode(&errBody)
-				return &apiError{status: resp.Status, message: errBody.Error}
-			}
-
-			exitCode := 0
-			dec := json.NewDecoder(resp.Body)
-			for dec.More() {
-				var event struct {
-					Type     string `json:"type"`
-					Data     string `json:"data"`
-					ExitCode *int   `json:"exit_code"`
-				}
-				if err := dec.Decode(&event); err != nil {
-					break
-				}
-				switch event.Type {
-				case "stdout":
-					os.Stdout.WriteString(event.Data)
-				case "stderr":
-					os.Stderr.WriteString(event.Data)
-				case "exit":
-					if event.ExitCode != nil {
-						exitCode = *event.ExitCode
-					}
-				case "error":
-					fmt.Fprintf(os.Stderr, "exec error: %s\n", event.Data)
-					exitCode = 1
-				}
 			}
 			printTiming()
 			os.Exit(exitCode)
 			return nil
 		}
 
-		// Buffered JSON path (piped, --json, or --detach)
+		// Buffered JSON path (--json or --detach)
 		var result struct {
 			ExitCode   int    `json:"exit_code"`
 			Stdout     string `json:"stdout"`
@@ -165,6 +132,50 @@ Sleeping sandboxes wake automatically.`,
 		os.Exit(result.ExitCode)
 		return nil
 	},
+}
+
+// execStream runs a command over the streaming (NDJSON) exec endpoint, writing
+// its output to stdout/stderr as it arrives, and returns the command's exit code.
+// A failure the server reports mid-stream (timeout, agent error) is printed to
+// stderr and returned as exit code 1. A stream that ends without an exit status
+// is a failure too: the connection dropped, and the command's outcome is unknown.
+func execStream(id string, reqBody map[string]any, stdout, stderr io.Writer) (int, error) {
+	resp, err := apiRequestWithAccept("POST", "/sandboxes/"+id+"/exec", reqBody, "application/x-ndjson")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	checkServerVersion(resp)
+	if resp.StatusCode >= 400 {
+		return 0, apiErrorFromResponse(resp)
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var event struct {
+			Type     string `json:"type"`
+			Data     string `json:"data"`
+			ExitCode *int   `json:"exit_code"`
+		}
+		if err := dec.Decode(&event); err != nil {
+			fmt.Fprintln(stderr, "Error: exec stream ended without an exit status (connection lost?)")
+			return 1, nil
+		}
+		switch event.Type {
+		case "stdout":
+			io.WriteString(stdout, event.Data)
+		case "stderr":
+			io.WriteString(stderr, event.Data)
+		case "exit":
+			if event.ExitCode != nil {
+				return *event.ExitCode, nil
+			}
+			return 0, nil
+		case "error":
+			fmt.Fprintf(stderr, "Error: %s\n", event.Data)
+			return 1, nil
+		}
+	}
 }
 
 func init() {
