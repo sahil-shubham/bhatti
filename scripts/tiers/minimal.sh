@@ -16,8 +16,10 @@ export DEBIAN_FRONTEND=noninteractive
 sed -i "s/ main$/ main universe/" /etc/apt/sources.list
 
 apt-get update -qq
+# git and python3: CI steps (actions/checkout, `git rev-parse`) and most agent
+# and build tooling assume both; without git, checkout falls back to a tarball.
 apt-get install -y --no-install-recommends \
-    iproute2 ca-certificates sudo curl locales fuse3
+    iproute2 ca-certificates sudo curl locales fuse3 git python3
 
 # Locale
 sed -i "/en_US.UTF-8/s/^# //g" /etc/locale.gen
