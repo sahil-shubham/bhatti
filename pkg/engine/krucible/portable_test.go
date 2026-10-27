@@ -397,8 +397,9 @@ func TestSnapshotImportRefusesDamagedArchives(t *testing.T) {
 
 	dir, m := fakeSnapshot(t, base, "memory")
 	real := exportArchive(t, e, dir, m, false)
-	flipped := bytes.Clone(real)
-	flipped[len(flipped)*2/3] ^= 0x40
+	flipped := corruptPayload(t, real)
+	badChecksum := bytes.Clone(real) // the contents are intact; the frame checksum isn't
+	badChecksum[len(badChecksum)-1] ^= 0x40
 	var outOfPlace bytes.Buffer // a tar that doesn't start with the manifest
 	zw, _ := zstd.NewWriter(&outOfPlace)
 	tw := tar.NewWriter(zw)
@@ -407,11 +408,12 @@ func TestSnapshotImportRefusesDamagedArchives(t *testing.T) {
 	tw.Close()
 	zw.Close()
 	cases := map[string][]byte{
-		"empty":              nil,
-		"not zstd":           []byte("this is not a snapshot archive"),
-		"truncated":          real[:len(real)/2],
-		"bit flipped":        flipped,
-		"manifest not first": outOfPlace.Bytes(),
+		"empty":                nil,
+		"not zstd":             []byte("this is not a snapshot archive"),
+		"truncated":            real[:len(real)/2],
+		"bit flipped":          flipped,
+		"frame checksum wrong": badChecksum,
+		"manifest not first":   outOfPlace.Bytes(),
 	}
 	damage := map[string]func(am *archiveManifest, entries []archiveEntry) []archiveEntry{
 		"a listed file is missing": func(_ *archiveManifest, en []archiveEntry) []archiveEntry { return en[:2] },
@@ -452,6 +454,9 @@ func TestSnapshotImportRefusesDamagedArchives(t *testing.T) {
 	for name, archive := range cases {
 		t.Run(name, func(t *testing.T) {
 			dest, _, err := importArchive(e, archive)
+			// Every case imports to the same place: an unexpected success mustn't
+			// leave its staging directory to fail the cases after it.
+			t.Cleanup(func() { os.RemoveAll(dest) })
 			if !errors.Is(err, engine.ErrBadSnapshotArchive) {
 				t.Fatalf("want a bad-archive refusal, got %v", err)
 			}
@@ -460,6 +465,45 @@ func TestSnapshotImportRefusesDamagedArchives(t *testing.T) {
 			mustNotExist(t, filepath.Join(e.cfg.DataDir, "images", "bases"))
 		})
 	}
+}
+
+// decodedSum is the sha256 of everything a zstd stream decodes to, or the
+// decoder's error: a broken block, or contents that don't match the frame's
+// checksum.
+func decodedSum(archive []byte) ([32]byte, error) {
+	var sum [32]byte
+	zr, err := zstd.NewReader(bytes.NewReader(archive), zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return sum, err
+	}
+	defer zr.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, zr); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+// corruptPayload flips one bit, from two thirds into archive, where the flip
+// damages what the stream decodes to. In an archive this repetitive about one
+// flip in six only changes how the same bytes are encoded (a match pointing at
+// another copy of them), which leaves a valid archive the import rightly takes.
+func corruptPayload(t *testing.T, archive []byte) []byte {
+	t.Helper()
+	want, err := decodedSum(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p := len(archive) * 2 / 3; p < len(archive)-4; p++ { // short of the frame checksum
+		f := bytes.Clone(archive)
+		f[p] ^= 0x40
+		if got, err := decodedSum(f); err != nil || got != want {
+			return f
+		}
+	}
+	t.Fatal("no bit flip damages the archive")
+	return nil
 }
 
 // TestSnapshotImportRefusesHostsThatCantRunIt: another architecture or OS, no
