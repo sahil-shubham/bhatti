@@ -196,6 +196,10 @@ func New(dbPath string) (*Store, error) {
 		manifest_json TEXT NOT NULL,
 		size_mb INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		source_image TEXT NOT NULL DEFAULT '',
+		source_disk_size_mb INTEGER NOT NULL DEFAULT 0,
+		source_has_init INTEGER NOT NULL DEFAULT 0,
+		source_recorded_at DATETIME,
 		UNIQUE(user_id, name)
 	)`,
 		`CREATE TABLE IF NOT EXISTS tasks (
@@ -252,11 +256,33 @@ func New(dbPath string) (*Store, error) {
 		!strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
 		return nil, fmt.Errorf("store: migrate volume backup consistency mode: %w", err)
 	}
+	// snapshots predates what a snapshot remembers of its source sandbox.
+	// source_recorded_at is NULL for the rows that were already there: they
+	// recorded nothing, which the other source_* columns' defaults can't say
+	// apart from a snapshot that recorded an empty source.
+	for _, col := range []string{
+		`source_image TEXT NOT NULL DEFAULT ''`,
+		`source_disk_size_mb INTEGER NOT NULL DEFAULT 0`,
+		`source_has_init INTEGER NOT NULL DEFAULT 0`,
+		`source_recorded_at DATETIME`,
+	} {
+		if _, err := db.Exec(`ALTER TABLE snapshots ADD COLUMN ` + col); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
+			return nil, fmt.Errorf("store: migrate snapshots %s: %w", col, err)
+		}
+	}
 
 	// Migrate secrets from v1 (PRIMARY KEY name) to v2 (PRIMARY KEY
 	// (user_id, name)). Idempotent — a no-op once the table is v2.
 	if _, err := migrateSecretsToV2(db); err != nil {
 		return nil, fmt.Errorf("migrate secrets v1→v2: %w", err)
+	}
+
+	// A clone holds its source's placeholder, so secret_grants is unique per
+	// sandbox, not table-wide. Idempotent, and before the CREATE INDEX
+	// statements below: rebuilding the table drops its indexes.
+	if _, err := migrateGrantPlaceholderScope(db); err != nil {
+		return nil, fmt.Errorf("migrate secret grants placeholder scope: %w", err)
 	}
 
 	// Image sharing table — allows sharing images with specific users
@@ -304,19 +330,30 @@ func New(dbPath string) (*Store, error) {
 	)`,
 		`CREATE INDEX IF NOT EXISTS idx_ms_ts ON metrics_snapshots(ts)`,
 
-		`CREATE TABLE IF NOT EXISTS secret_grants (
-		id TEXT PRIMARY KEY,
-		user_id TEXT NOT NULL,
-		secret_name TEXT NOT NULL,
-		sandbox_id TEXT NOT NULL,
-		hosts_json TEXT NOT NULL DEFAULT '[]',
-		placeholder TEXT NOT NULL UNIQUE,
-		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		expires_at DATETIME,
-		revoked_at DATETIME
-	)`,
+		secretGrantsTable,
 		`CREATE INDEX IF NOT EXISTS idx_secret_grants_sandbox ON secret_grants(sandbox_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_secret_grants_user_created ON secret_grants(user_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_secret_grants_placeholder ON secret_grants(placeholder)`,
+
+		// What a snapshot keeps of its source's credential substitution, so a
+		// resume can give its sandbox the same after the source is gone.
+		`CREATE TABLE IF NOT EXISTS snapshot_cas (
+		snapshot_id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		cert_pem TEXT NOT NULL,
+		key_enc BLOB NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`,
+		`CREATE TABLE IF NOT EXISTS snapshot_grants (
+		snapshot_id TEXT NOT NULL,
+		user_id TEXT NOT NULL,
+		secret_name TEXT NOT NULL,
+		hosts_json TEXT NOT NULL DEFAULT '[]',
+		placeholder TEXT NOT NULL,
+		expires_at DATETIME,
+		PRIMARY KEY (snapshot_id, placeholder)
+	)`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_grants_secret ON snapshot_grants(user_id, secret_name)`,
 		`CREATE TABLE IF NOT EXISTS sandbox_cas (
 		sandbox_id TEXT PRIMARY KEY,
 		user_id TEXT NOT NULL,
@@ -383,6 +420,64 @@ func migrateSecretsToV2(db *sql.DB) (bool, error) {
 	}
 	if _, err := db.Exec(`ALTER TABLE secrets_v2 RENAME TO secrets`); err != nil {
 		return false, fmt.Errorf("rename secrets_v2: %w", err)
+	}
+	return true, nil
+}
+
+// secretGrantsTable: a placeholder identifies one grant within a sandbox, not
+// across them. A clone's memory and environment hold its source's placeholder,
+// so the source and each clone are granted the same one, each by a grant of
+// its own (revocable on its own).
+const secretGrantsTable = `CREATE TABLE IF NOT EXISTS secret_grants (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		secret_name TEXT NOT NULL,
+		sandbox_id TEXT NOT NULL,
+		hosts_json TEXT NOT NULL DEFAULT '[]',
+		placeholder TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		expires_at DATETIME,
+		revoked_at DATETIME,
+		UNIQUE (sandbox_id, placeholder)
+	)`
+
+// migrateGrantPlaceholderScope rebuilds a secret_grants table that still has
+// the original table-wide UNIQUE on placeholder, which a clone's grant (the
+// same placeholder as its source's) would violate. SQLite can't drop a
+// constraint in place, so the rows move into a table with the per-sandbox one.
+//
+// Idempotent: a no-op once rebuilt, or while the table doesn't exist yet.
+// Returns true if the rebuild ran on this call. The rebuild drops the old
+// table's indexes; the caller recreates them afterwards.
+func migrateGrantPlaceholderScope(db *sql.DB) (bool, error) {
+	var wide int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_index_list('secret_grants') AS il
+		WHERE il."unique" = 1
+		  AND (SELECT COUNT(*) FROM pragma_index_info(il.name)) = 1
+		  AND (SELECT name FROM pragma_index_info(il.name)) = 'placeholder'`).Scan(&wide); err != nil {
+		return false, fmt.Errorf("inspect secret_grants indexes: %w", err)
+	}
+	if wide == 0 {
+		return false, nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin secret_grants rebuild: %w", err)
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`ALTER TABLE secret_grants RENAME TO secret_grants_wide`,
+		secretGrantsTable,
+		`INSERT INTO secret_grants (id, user_id, secret_name, sandbox_id, hosts_json, placeholder, created_at, expires_at, revoked_at)
+		 SELECT id, user_id, secret_name, sandbox_id, hosts_json, placeholder, created_at, expires_at, revoked_at FROM secret_grants_wide`,
+		`DROP TABLE secret_grants_wide`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return false, fmt.Errorf("rebuild secret_grants: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit secret_grants rebuild: %w", err)
 	}
 	return true, nil
 }

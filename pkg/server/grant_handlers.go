@@ -163,17 +163,104 @@ func (s *Server) mintSandboxCA(userID, sandboxID, name string) (string, error) {
 	return string(certPEM), nil
 }
 
-// inheritSandboxCA gives a fork or memory restore its source's CA: the guest
-// came back with the source's trust store in its memory and on its disk.
-func (s *Server) inheritSandboxCA(userID, fromID, toID string) {
-	ca, err := s.store.GetSandboxCA(fromID)
+// captureSubstitution reads what a copy of sandboxID inherits: the CA its
+// guest trusts and each live grant, whose placeholders sit in its environment.
+// A fork takes it from its live source; a snapshot keeps it, so every resume
+// has it after the source is gone.
+func (s *Server) captureSubstitution(userID, sandboxID string) (store.SnapshotSubstitution, error) {
+	var sub store.SnapshotSubstitution
+	ca, err := s.store.GetSandboxCA(sandboxID)
+	switch {
+	case err == nil && ca.UserID == userID:
+		sub.CA = ca
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return sub, fmt.Errorf("read sandbox CA: %w", err)
+	}
+	grants, err := s.store.ListSandboxSecretGrants(sandboxID)
 	if err != nil {
-		return // the source had none (or is gone): no substitution for the copy either
+		return sub, fmt.Errorf("read sandbox grants: %w", err)
 	}
-	ca.SandboxID, ca.UserID, ca.CreatedAt = toID, userID, time.Now()
-	if err := s.store.PutSandboxCA(*ca); err != nil {
-		slog.Warn("sandbox.ca_inherit", "from", fromID, "to", toID, "error", err)
+	now := time.Now()
+	for _, g := range grants {
+		if g.UserID == userID && g.Live(now) {
+			sub.Grants = append(sub.Grants, store.SnapshotGrant{
+				SecretName: g.SecretName, Hosts: g.Hosts, Placeholder: g.Placeholder, ExpiresAt: g.ExpiresAt,
+			})
+		}
 	}
+	return sub, nil
+}
+
+// inheritSubstitution gives the sandbox to — a fork, or a resume of a
+// snapshot — the substitution state its guest came back with: the CA in its
+// trust store and, for each placeholder in its environment, a grant of its
+// own with the same placeholder (netd can only swap what the guest holds),
+// hosts and expiry. The broker resolves a placeholder per sandbox, so a copy
+// works for to alone, and is revoked alone. A grant whose secret was deleted
+// since is skipped. Failures are logged, not fatal: the clone is already
+// running and without a grant just gets no substitution. Returns the grants
+// it made.
+func (s *Server) inheritSubstitution(userID string, to store.Sandbox, from string, sub store.SnapshotSubstitution) []store.SecretGrant {
+	if sub.CA != nil {
+		ca := *sub.CA
+		ca.SandboxID, ca.UserID, ca.CreatedAt = to.ID, userID, time.Now()
+		if err := s.store.PutSandboxCA(ca); err != nil {
+			slog.Warn("sandbox.ca_inherit", "from", from, "to", to.ID, "error", err)
+		}
+	}
+	now := time.Now().UTC()
+	var made []store.SecretGrant
+	for _, g := range sub.Grants {
+		if _, err := s.store.GetSecret(userID, g.SecretName); err != nil {
+			slog.Info("sandbox.grant_inherit_skipped", "from", from, "to", to.ID, "secret", g.SecretName, "error", err)
+			continue
+		}
+		copied := store.SecretGrant{
+			ID: genID(), UserID: userID, SecretName: g.SecretName, SandboxID: to.ID,
+			Hosts: g.Hosts, Placeholder: g.Placeholder, CreatedAt: now, ExpiresAt: g.ExpiresAt,
+		}
+		if err := s.store.CreateSecretGrant(copied); err != nil {
+			slog.Warn("sandbox.grant_inherit", "from", from, "to", to.ID, "secret", g.SecretName, "error", err)
+			continue
+		}
+		made = append(made, copied)
+	}
+	return made
+}
+
+// inheritFromSandbox is inheritSubstitution from a live source.
+func (s *Server) inheritFromSandbox(userID string, src *store.Sandbox, to store.Sandbox) []store.SecretGrant {
+	sub, err := s.captureSubstitution(userID, src.ID)
+	if err != nil {
+		slog.Warn("sandbox.substitution_inherit", "from", src.ID, "to", to.ID, "error", err)
+		return nil
+	}
+	return s.inheritSubstitution(userID, to, "sandbox:"+src.ID, sub)
+}
+
+// liveSnapshotSource stands in for what a snapshot taken before snapshots
+// recorded their source never kept: the live source, if it still exists, is
+// the best record there is — its image, disk and boot config for the new
+// sandbox's record, the CA its guest trusts and its active grants (the resume
+// uses those for a memory snapshot only). A source destroyed since leaves
+// nothing. Only for snapshots without a record of their own
+// (SourceRecordedAt nil): one that has a record is never mixed with the live
+// source, whatever the source gained since.
+func (s *Server) liveSnapshotSource(userID, sourceID string) (store.SnapshotSource, store.SnapshotSubstitution) {
+	src, err := s.store.GetSandboxByID(sourceID)
+	if err != nil || src.CreatedBy != userID {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			slog.Warn("snapshot.source_lookup", "source", sourceID, "error", err)
+		}
+		return store.SnapshotSource{}, store.SnapshotSubstitution{}
+	}
+	source := store.SnapshotSource{Image: src.Image, DiskSizeMB: src.DiskSizeMB, HasInit: src.HasInit}
+	sub, err := s.captureSubstitution(userID, src.ID)
+	if err != nil {
+		slog.Warn("snapshot.source_substitution", "source", sourceID, "error", err)
+		return source, store.SnapshotSubstitution{}
+	}
+	return source, sub
 }
 
 // discardSubstitution drops a sandbox's grants and CA (destroyed, or its
@@ -215,13 +302,39 @@ func (s *Server) newGrant(userID, secret, sandboxID string, hosts []string, ttl 
 	return g, nil
 }
 
-func (s *Server) recordGrant(g store.SecretGrant, sandboxName string) {
+// recordGrant audits a grant given to a sandbox: minted for it, or (with
+// inheritedFrom set) copied from the clone's source.
+func (s *Server) recordGrant(g store.SecretGrant, sandboxName, inheritedFrom string) {
 	meta := map[string]any{"secret": g.SecretName, "grant": g.ID, "hosts": g.Hosts, "sandbox": g.SandboxID}
 	if g.ExpiresAt != nil {
 		meta["expires_at"] = g.ExpiresAt.Format(time.RFC3339)
 	}
-	slog.Info("secret.granted", "secret", g.SecretName, "grant", g.ID, "sandbox", g.SandboxID, "name", sandboxName, "hosts", g.Hosts)
+	logAttrs := []any{"secret", g.SecretName, "grant", g.ID, "sandbox", g.SandboxID, "name", sandboxName, "hosts", g.Hosts}
+	if inheritedFrom != "" {
+		meta["inherited_from"] = inheritedFrom
+		logAttrs = append(logAttrs, "inherited_from", inheritedFrom)
+	}
+	slog.Info("secret.granted", logAttrs...)
 	s.RecordEvent(store.Event{Type: "secret.granted", UserID: g.UserID, SandboxID: g.SandboxID, Meta: meta})
+}
+
+// createdSandbox is the reply to creating a sandbox, whether by boot, fork or
+// snapshot resume: the sandbox and the secret grants it starts with.
+type createdSandbox struct {
+	store.Sandbox
+	SecretGrants []grantView `json:"secret_grants,omitempty"`
+}
+
+// announceGrants audits grants given to a new sandbox and returns them as the
+// API shows them.
+func (s *Server) announceGrants(grants []store.SecretGrant, sandboxName, inheritedFrom string) []grantView {
+	now := time.Now()
+	views := make([]grantView, 0, len(grants))
+	for _, g := range grants {
+		s.recordGrant(g, sandboxName, inheritedFrom)
+		views = append(views, viewGrant(g, sandboxName, now))
+	}
+	return views
 }
 
 // handleSecretGrantCreate: POST /secrets/{name}/grants
@@ -279,7 +392,7 @@ func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request,
 		errRespInternal(w, r, "create grant failed", err)
 		return
 	}
-	s.recordGrant(g, sb.Name)
+	s.recordGrant(g, sb.Name, "")
 	writeJSON(w, 201, viewGrant(g, sb.Name, time.Now()))
 }
 

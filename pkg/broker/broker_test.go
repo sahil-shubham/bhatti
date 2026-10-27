@@ -352,6 +352,81 @@ func TestReportRecordsDenial(t *testing.T) {
 	}
 }
 
+// copyGrant gives sandbox a grant of its own for the placeholder of grant
+// from, as a fork or a resumed snapshot does (later than the original).
+func (f *fixture) copyGrant(id, sandbox, from string) {
+	f.t.Helper()
+	src, err := f.st.GetSecretGrant("u1", from)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.st.CreateSecretGrant(store.SecretGrant{
+		ID: id, UserID: src.UserID, SecretName: src.SecretName, SandboxID: sandbox, Hosts: src.Hosts,
+		Placeholder: src.Placeholder, CreatedAt: src.CreatedAt.Add(time.Second), ExpiresAt: src.ExpiresAt,
+	}); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// TestClonePlaceholderResolvesForTheClone: a clone holds its source's
+// placeholder under a grant of its own. The value comes back for the source
+// and for the clone, each through its own grant, for no other sandbox; revoking
+// one grant leaves the other; the clone's certificates follow its own grants.
+func TestClonePlaceholderResolvesForTheClone(t *testing.T) {
+	f := newFixture(t)
+	c := f.serve("u1")
+	ph := f.ph["live"]
+	f.copyGrant("clone", "sb2", "live") // sb2 is the clone; eng2 is the engine's name for it
+
+	for _, tc := range []struct{ sandbox, grant, owner string }{
+		{"sb1", "live", "sb1"}, {"eng1", "live", "sb1"},
+		{"sb2", "clone", "sb2"}, {"eng2", "clone", "sb2"},
+	} {
+		resp, err := f.resolve(c, tc.sandbox, ph, "api.github.com")
+		if err != nil || resp.Value != secretValue {
+			t.Fatalf("%s: %+v, %v; want the value", tc.sandbox, resp, err)
+		}
+		if ev := f.events.last(t); ev.Type != "secret.used" || ev.SandboxID != tc.owner || ev.Meta["grant"] != tc.grant {
+			t.Fatalf("%s: event %+v, want %s's grant %s", tc.sandbox, ev, tc.owner, tc.grant)
+		}
+	}
+	if _, err := f.resolve(c, "sb-unrelated", ph, "api.github.com"); refusalReason(err) != "placeholder was granted to another sandbox" {
+		t.Fatalf("an unrelated sandbox: %v", err)
+	}
+
+	// A refusal netd reports is audited against the reporting sandbox's grant.
+	if _, err := c.Do(context.Background(), gateway.BrokerRequest{Op: gateway.BrokerReport, Sandbox: "eng2",
+		Placeholder: ph, Host: "api.github.com", Reason: "placeholder in request body"}); err != nil {
+		t.Fatal(err)
+	}
+	if ev := f.events.last(t); ev.SandboxID != "sb2" || ev.Meta["grant"] != "clone" {
+		t.Fatalf("report from the clone: %+v", ev)
+	}
+
+	cert := func(sandbox string) error {
+		_, err := c.Do(context.Background(), gateway.BrokerRequest{Op: gateway.BrokerCert, Sandbox: sandbox, Host: "api.github.com"})
+		return err
+	}
+	if err := cert("eng2"); err != nil {
+		t.Fatalf("the clone's certificate: %v", err)
+	}
+	if err := f.st.RevokeSecretGrant("u1", "clone", f.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.resolve(c, "sb2", ph, "api.github.com"); refusalReason(err) != "grant revoked" {
+		t.Fatalf("the clone after revoking its grant: %v", err)
+	}
+	if cert("eng2") == nil {
+		t.Fatal("a certificate for the clone after revoking its grant")
+	}
+	if resp, err := f.resolve(c, "sb1", ph, "api.github.com"); err != nil || resp.Value != secretValue {
+		t.Fatalf("the source after the clone's revocation: %+v, %v", resp, err)
+	}
+	if err := cert("eng1"); err != nil {
+		t.Fatalf("the source's certificate: %v", err)
+	}
+}
+
 // TestDenialEventsRateLimited: a guest hammering bad placeholders can't flood
 // the event log; what was dropped is counted on the next event let through.
 func TestDenialEventsRateLimited(t *testing.T) {

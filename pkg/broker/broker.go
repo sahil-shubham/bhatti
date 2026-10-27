@@ -24,7 +24,8 @@ import (
 
 // Store is what the broker reads. *store.Store implements it.
 type Store interface {
-	GetSecretGrantByPlaceholder(placeholder string) (*store.SecretGrant, error)
+	GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder string) (*store.SecretGrant, error)
+	FindSecretGrantByPlaceholder(userID, placeholder string) (*store.SecretGrant, error)
 	ListSandboxSecretGrants(sandboxID string) ([]store.SecretGrant, error)
 	GetSecretValue(userID, name string) ([]byte, error)
 	GetSandboxCA(sandboxID string) (*store.SandboxCA, error)
@@ -131,19 +132,19 @@ func (b *Broker) resolve(userID string, req gateway.BrokerRequest) gateway.Broke
 	if !gateway.IsPlaceholder(req.Placeholder) || host == "" {
 		return b.deny(userID, sandboxID, host, nil, "malformed request")
 	}
-	g, err := b.cfg.Store.GetSecretGrantByPlaceholder(req.Placeholder)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	g, own, err := b.grantFor(userID, sandboxID, req.Placeholder)
+	if err != nil {
 		slog.Error("broker.resolve", "sandbox", sandboxID, "error", err)
 		return refuse("broker error")
 	}
 	// Another owner's placeholder is as unknown as a made-up one: its
 	// existence (and secret name) is that owner's business.
-	if err != nil || g.UserID != userID {
+	if g == nil {
 		return b.deny(userID, sandboxID, host, nil, "unknown placeholder")
 	}
 	now := b.cfg.Now()
 	switch {
-	case g.SandboxID != sandboxID:
+	case !own:
 		return b.deny(userID, sandboxID, host, g, "placeholder was granted to another sandbox")
 	case g.RevokedAt != nil:
 		return b.deny(userID, sandboxID, host, g, "grant revoked")
@@ -168,6 +169,30 @@ func (b *Broker) resolve(userID string, req gateway.BrokerRequest) gateway.Broke
 		ttl = int64((g.ExpiresAt.Sub(now) + time.Second - 1) / time.Second)
 	}
 	return gateway.BrokerResponse{Value: string(value), TTLSeconds: ttl}
+}
+
+// grantFor finds the grant of sandboxID, owned by userID, that carries
+// placeholder. A placeholder is unique within a sandbox, not across them (a
+// clone holds its source's), so only the sandbox's own grant can authorize a
+// use. When it has none, the owner's grant of another sandbox comes back with
+// own=false so the refusal can say so; nil when the owner has no such
+// placeholder at all.
+func (b *Broker) grantFor(userID, sandboxID, placeholder string) (g *store.SecretGrant, own bool, err error) {
+	g, err = b.cfg.Store.GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder)
+	switch {
+	case err == nil && g.UserID == userID:
+		return g, true, nil
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return nil, false, err
+	}
+	g, err = b.cfg.Store.FindSecretGrantByPlaceholder(userID, placeholder)
+	switch {
+	case err == nil:
+		return g, false, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	}
+	return nil, false, err
 }
 
 // cert issues a leaf for host from the sandbox's CA, only while a live grant
@@ -217,7 +242,7 @@ func (b *Broker) report(userID string, req gateway.BrokerRequest) {
 	sandboxID := b.sandboxFor(userID, req.Sandbox)
 	var g *store.SecretGrant
 	if gateway.IsPlaceholder(req.Placeholder) {
-		if got, err := b.cfg.Store.GetSecretGrantByPlaceholder(req.Placeholder); err == nil && got.UserID == userID {
+		if got, _, err := b.grantFor(userID, sandboxID, req.Placeholder); err == nil {
 			g = got
 		}
 	}

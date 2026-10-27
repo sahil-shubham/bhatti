@@ -63,11 +63,27 @@ func (s *Store) GetSecretGrant(userID, id string) (*SecretGrant, error) {
 	return g, nil
 }
 
-// GetSecretGrantByPlaceholder is unscoped; the broker must check ownership.
-func (s *Store) GetSecretGrantByPlaceholder(placeholder string) (*SecretGrant, error) {
-	g, err := scanSecretGrant(s.db.QueryRow(`SELECT `+grantCols+` FROM secret_grants WHERE placeholder = ?`, placeholder))
+// GetSandboxSecretGrantByPlaceholder is the grant of sandboxID that carries
+// placeholder. A placeholder is unique within a sandbox, not across them: a
+// clone's memory and environment hold its source's placeholder, so the source
+// and each clone have a grant of their own for it. The broker resolves
+// through this lookup, so a placeholder works only where it was granted.
+func (s *Store) GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder string) (*SecretGrant, error) {
+	g, err := scanSecretGrant(s.db.QueryRow(`SELECT `+grantCols+` FROM secret_grants WHERE sandbox_id = ? AND placeholder = ?`, sandboxID, placeholder))
 	if err != nil {
 		return nil, fmt.Errorf("get secret grant by placeholder: %w", err)
+	}
+	return g, nil
+}
+
+// FindSecretGrantByPlaceholder is a grant of userID's that carries
+// placeholder, whichever sandbox holds it (the oldest if several do). It
+// names the owner's grant when a refusal is explained and authorizes
+// nothing: use GetSandboxSecretGrantByPlaceholder for that.
+func (s *Store) FindSecretGrantByPlaceholder(userID, placeholder string) (*SecretGrant, error) {
+	g, err := scanSecretGrant(s.db.QueryRow(`SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? AND placeholder = ? ORDER BY created_at, id LIMIT 1`, userID, placeholder))
+	if err != nil {
+		return nil, fmt.Errorf("find secret grant by placeholder: %w", err)
 	}
 	return g, nil
 }
@@ -150,10 +166,19 @@ func (s *Store) DeleteSandboxSecretGrants(sandboxID string) error {
 	return nil
 }
 
+// DeleteSecretGrantsForSecret drops every grant of a secret: the grants
+// sandboxes hold and the ones snapshots keep for their resumes. A secret
+// created later under the same name must not inherit either.
 func (s *Store) DeleteSecretGrantsForSecret(userID, secretName string) error {
-	_, err := s.db.Exec(`DELETE FROM secret_grants WHERE user_id = ? AND secret_name = ?`, userID, secretName)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("delete secret grants: %w", err)
 	}
-	return nil
+	defer tx.Rollback()
+	for _, table := range []string{"secret_grants", "snapshot_grants"} {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE user_id = ? AND secret_name = ?`, userID, secretName); err != nil {
+			return fmt.Errorf("delete secret grants: %w", err)
+		}
+	}
+	return tx.Commit()
 }

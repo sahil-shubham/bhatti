@@ -32,7 +32,7 @@ func TestSecretGrantCreateAndLookup(t *testing.T) {
 	g := grantFixture("g1", "alice", "GH_TOKEN", "sb1", "bhatti_sec_123", when)
 	g.ExpiresAt = &expires
 	putGrant(t, s, g)
-	got, err := s.GetSecretGrantByPlaceholder(g.Placeholder)
+	got, err := s.GetSandboxSecretGrantByPlaceholder(g.SandboxID, g.Placeholder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,8 +42,11 @@ func TestSecretGrantCreateAndLookup(t *testing.T) {
 	if !got.CreatedAt.Equal(when) || got.CreatedAt.Location() != time.UTC || got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) || got.ExpiresAt.Location() != time.UTC || got.RevokedAt != nil {
 		t.Fatalf("times not UTC or nullable: %+v", got)
 	}
-	if _, err := s.GetSecretGrantByPlaceholder("absent"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder(g.SandboxID, "absent"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("absent placeholder: %v", err)
+	}
+	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb2", g.Placeholder); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("another sandbox resolved the placeholder: %v", err)
 	}
 }
 
@@ -63,13 +66,35 @@ func TestSecretGrantOwnership(t *testing.T) {
 	}
 }
 
-func TestSecretGrantUniquePlaceholder(t *testing.T) {
+// TestSecretGrantPlaceholderIsPerSandbox: a clone holds its source's
+// placeholder, so the same one is granted to several sandboxes — one grant
+// each, found only through its own sandbox — while a sandbox can't have a
+// placeholder twice.
+func TestSecretGrantPlaceholderIsPerSandbox(t *testing.T) {
 	s := testStore(t)
-	g := grantFixture("g1", "alice", "GH_TOKEN", "sb1", "placeholder1", time.Now())
-	putGrant(t, s, g)
-	duplicate := grantFixture("g2", "bob", "TOKEN", "sb2", g.Placeholder, time.Now())
-	if err := s.CreateSecretGrant(duplicate); err == nil {
-		t.Fatal("duplicate placeholder accepted")
+	source := grantFixture("g1", "alice", "GH_TOKEN", "sb1", "placeholder1", time.Now())
+	putGrant(t, s, source)
+	clone := grantFixture("g2", "alice", "GH_TOKEN", "sb2", source.Placeholder, time.Now())
+	putGrant(t, s, clone)
+	if err := s.CreateSecretGrant(grantFixture("g3", "alice", "GH_TOKEN", "sb1", source.Placeholder, time.Now())); err == nil {
+		t.Fatal("a sandbox was granted the same placeholder twice")
+	}
+	for sandbox, id := range map[string]string{"sb1": "g1", "sb2": "g2"} {
+		got, err := s.GetSandboxSecretGrantByPlaceholder(sandbox, source.Placeholder)
+		if err != nil || got.ID != id {
+			t.Fatalf("%s resolves to %+v, %v; want its own grant %s", sandbox, got, err, id)
+		}
+	}
+	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb3", source.Placeholder); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("an unrelated sandbox resolved the placeholder: %v", err)
+	}
+
+	// Naming the owner's grant for a refusal is scoped to the owner.
+	if got, err := s.FindSecretGrantByPlaceholder("alice", source.Placeholder); err != nil || got.ID != "g1" {
+		t.Fatalf("owner's grant for the placeholder: %+v, %v", got, err)
+	}
+	if _, err := s.FindSecretGrantByPlaceholder("bob", source.Placeholder); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("another owner found the placeholder: %v", err)
 	}
 }
 

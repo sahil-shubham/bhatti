@@ -199,7 +199,7 @@ func TestCreateTimeSecretGrant(t *testing.T) {
 	if env["GH_TOKEN"] != g.Placeholder || !gateway.IsPlaceholder(env["GH_TOKEN"]) || env["OTHER"] != "x" {
 		t.Fatalf("guest env %v, want GH_TOKEN = the placeholder %q", env, g.Placeholder)
 	}
-	stored, err := srv.store.GetSecretGrantByPlaceholder(g.Placeholder)
+	stored, err := srv.store.GetSandboxSecretGrantByPlaceholder(sb.ID, g.Placeholder)
 	if err != nil || stored.SandboxID != sb.ID || stored.SandboxID != eng.LastCreateSpec.SandboxID || len(stored.Hosts) != 2 {
 		t.Fatalf("stored grant %+v err=%v", stored, err)
 	}

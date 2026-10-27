@@ -79,6 +79,21 @@ func (s *Server) checkSandboxQuota(w http.ResponseWriter, r *http.Request, user 
 	return true
 }
 
+// checkSandboxSize answers 400 and returns false when a sandbox of this size
+// is over user's per-sandbox caps. Create and snapshot resume both ask, so the
+// limits and their messages are one thing.
+func checkSandboxSize(w http.ResponseWriter, user *store.User, cpus float64, memoryMB int) bool {
+	if cpus > float64(user.MaxCPUsPerSandbox) {
+		errResp(w, 400, fmt.Sprintf("max %d CPUs per sandbox", user.MaxCPUsPerSandbox))
+		return false
+	}
+	if memoryMB > user.MaxMemoryMBPerSandbox {
+		errResp(w, 400, fmt.Sprintf("max %d MB memory per sandbox", user.MaxMemoryMBPerSandbox))
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
 
@@ -159,12 +174,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Enforce per-user resource caps
-		if req.CPUs > float64(user.MaxCPUsPerSandbox) {
-			errResp(w, 400, fmt.Sprintf("max %d CPUs per sandbox", user.MaxCPUsPerSandbox))
-			return
-		}
-		if req.MemoryMB > user.MaxMemoryMBPerSandbox {
-			errResp(w, 400, fmt.Sprintf("max %d MB memory per sandbox", user.MaxMemoryMBPerSandbox))
+		if !checkSandboxSize(w, user, req.CPUs, req.MemoryMB) {
 			return
 		}
 
@@ -207,7 +217,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// placeholders are minted just before boot.
 		grantHostsBySecret := make(map[string][]string, len(req.SecretGrants))
 		if len(req.SecretGrants) > 0 && req.From != "" {
-			errResp(w, 400, "secret grants can't be injected into a fork (its environment is the source's); grant to it after it's created")
+			errResp(w, 400, "secret grants can't be injected into a fork (its environment is the source's); it inherits the source's active grants, and `bhatti secret grant` adds more once it exists")
 			return
 		}
 		for _, g := range req.SecretGrants {
@@ -579,8 +589,8 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		handlerPhase("engine_create_start")
 		var info engine.SandboxInfo
 		var err error
-		var src *store.Sandbox // fork source
-		var grants []store.SecretGrant
+		var src *store.Sandbox         // fork source
+		var grants []store.SecretGrant // the sandbox's own at boot, or a fork's inherited ones
 		if req.From != "" {
 			// Fork: clone a running sandbox (memory copy) instead of a fresh boot.
 			forker, ok := s.engine.(interface {
@@ -597,10 +607,11 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// The fork inherits the source's image + resources (the record matches
-			// the actual forked VM, which restores the source's vCPU/mem).
+			// the actual forked VM: the source's vCPUs and RAM, a clone of its disk).
 			spec.Image = src.Image
 			spec.CPUs = src.CPUs
 			spec.MemoryMB = src.MemoryMB
+			spec.DiskSizeMB = src.DiskSizeMB
 			info, err = forker.Fork(r.Context(), src.EngineID, spec.Name)
 		} else {
 			// netd names the guest by our ID, so a grant minted now resolves
@@ -699,7 +710,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if src != nil {
-			s.inheritSandboxCA(user.ID, src.ID, sbID)
+			grants = s.inheritFromSandbox(user.ID, src, sb)
 		}
 
 		// Record volume attachments
@@ -726,16 +737,11 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				Meta: map[string]any{"operation": "fork", "source_sandbox": src.ID},
 			})
 		}
-		created := struct {
-			store.Sandbox
-			SecretGrants []grantView `json:"secret_grants,omitempty"`
-		}{Sandbox: sb}
-		now := time.Now()
-		for _, g := range grants {
-			s.recordGrant(g, sb.Name)
-			created.SecretGrants = append(created.SecretGrants, viewGrant(g, sb.Name, now))
+		inheritedFrom := ""
+		if src != nil {
+			inheritedFrom = "sandbox:" + src.ID
 		}
-		writeJSON(w, 201, created)
+		writeJSON(w, 201, createdSandbox{Sandbox: sb, SecretGrants: s.announceGrants(grants, sb.Name, inheritedFrom)})
 	default:
 		errResp(w, 405, "method not allowed")
 	}

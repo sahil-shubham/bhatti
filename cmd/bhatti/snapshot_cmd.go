@@ -18,8 +18,10 @@ var snapshotCmd = &cobra.Command{
 	Use:   "snapshot <create|list|resume|delete|export|import>",
 	Short: "Manage named VM snapshots",
 	Long: `Snapshots capture the entire VM state: memory, CPU, disk. Resume
-produces an exact continuation — processes running, files open. Export and
-import move a snapshot to another host of the same OS and architecture.`,
+produces an exact continuation — processes running, files open — with copies
+of the secret grants the sandbox held when the snapshot was taken (see
+'bhatti secret'). Export and import move a snapshot to another host of the
+same OS and architecture.`,
 	Example: `  bhatti snapshot create dev --name dev-ready
   bhatti snapshot resume dev-ready --name dev-2
   bhatti snapshot list

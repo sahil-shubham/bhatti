@@ -464,6 +464,19 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 
 	manifestJSON, _ := json.Marshal(manifestIface)
 	snap := newSnapshotRecord(user.ID, req.Name, sb.ID, filepath.Join(snapDir, req.Name), manifestJSON)
+	// What a resume can't read back from the engine's manifest, and the CA and
+	// placeholders a memory snapshot's guest carries: the source may be gone
+	// by the time anyone resumes. A filesystem snapshot cold-boots a fresh
+	// guest, which has neither.
+	snap.Source = store.SnapshotSource{Image: sb.Image, DiskSizeMB: sb.DiskSizeMB, HasInit: sb.HasInit}
+	if req.Type != "filesystem" {
+		sub, err := s.captureSubstitution(user.ID, sb.ID)
+		if err != nil {
+			errRespInternal(w, r, "read substitution state failed", err)
+			return
+		}
+		snap.Substitution = sub
+	}
 	sizeMB := snap.SizeMB
 	if err := s.store.CreateSnapshot(snap); err != nil {
 		errRespInternal(w, r, "store snapshot record failed", err)
@@ -513,10 +526,9 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		CreatedFrom string `json:"created_from"`
 		UserID      string `json:"user_id"`
 		SubnetIndex int    `json:"subnet_index"`
-		VMConfig    struct {
-			VcpuCount  int64 `json:"vcpu_count"`
-			MemSizeMib int64 `json:"mem_size_mib"`
-		} `json:"vm_config"`
+		// What the engine recorded of the VM it restores (krucible's names).
+		Vcpus  uint8  `json:"vcpus"`
+		MemMiB uint32 `json:"mem_mib"`
 		Drives []struct {
 			DriveID      string `json:"drive_id"`
 			Role         string `json:"role"`
@@ -542,6 +554,12 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	}
 
 	if !s.checkSandboxQuota(w, r, user) {
+		return
+	}
+	// A snapshot can hold a bigger VM than the caps allow (imported from a
+	// host with other limits, or the caps came down since): resume is held to
+	// them like create.
+	if !checkSandboxSize(w, user, float64(m.Vcpus), int(m.MemMiB)) {
 		return
 	}
 
@@ -578,6 +596,16 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
+	memory := m.Type != "filesystem"
+	// What the new sandbox is told about its source, and where that came from:
+	// the snapshot's own record or, for one taken before snapshots recorded
+	// their source, the live source (if it still exists). Never both.
+	source, sub, inheritedFrom := snap.Source, snap.Substitution, "snapshot:"+snapName
+	if snap.SourceRecordedAt == nil {
+		source, sub = s.liveSnapshotSource(user.ID, snap.SourceSandbox)
+		inheritedFrom = "sandbox:" + snap.SourceSandbox
+	}
+
 	sbID := genID()
 	sb := store.Sandbox{
 		ID: sbID, Name: sandboxName, EngineID: info.EngineID,
@@ -585,25 +613,26 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		EngineMeta: json.RawMessage("{}"),
 		CreatedBy:  user.ID, CreatedAt: time.Now(),
 		KeepHot: req.KeepHot,
+		// The record shows the VM that was restored: its vCPUs and RAM from the
+		// manifest, the rest from its source's record (the restored disk carries
+		// the source's boot config, --init included).
+		CPUs: float64(m.Vcpus), MemoryMB: int(m.MemMiB),
+		DiskSizeMB: source.DiskSizeMB, Image: source.Image, HasInit: source.HasInit,
 	}
-	memory := m.Type != "filesystem"
 	if memory && len(m.NetPolicy) > 0 && string(m.NetPolicy) != "null" {
 		sb.NetPolicy = m.NetPolicy // the restore runs under the source's egress policy
-	}
-	// The restored disk carries its source's boot config (--init included);
-	// best effort, a source destroyed since leaves it unknown (false).
-	if src, err := s.store.GetSandboxByID(snap.SourceSandbox); err == nil {
-		sb.HasInit = src.HasInit
 	}
 	if err := s.store.CreateSandbox(sb); err != nil {
 		s.engine.Destroy(r.Context(), info.EngineID)
 		errRespInternal(w, r, "store sandbox failed", err)
 		return
 	}
+	var grants []store.SecretGrant
 	if memory {
-		// The restored guest trusts its source's CA (it's in the RAM and disk
-		// it came back with); a source destroyed since took its CA along.
-		s.inheritSandboxCA(user.ID, snap.SourceSandbox, sbID)
+		// The restored guest trusts its source's CA and holds its placeholders
+		// (they're in the RAM and disk it came back with): give the new sandbox
+		// the same.
+		grants = s.inheritSubstitution(user.ID, sb, inheritedFrom, sub)
 	}
 
 	// Create volume_attachments for volumes in the snapshot manifest.
@@ -642,7 +671,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 			Meta: map[string]any{"operation": "snapshot_restore", "snapshot": snapName},
 		})
 	}
-	writeJSON(w, 201, sb)
+	writeJSON(w, 201, createdSandbox{Sandbox: sb, SecretGrants: s.announceGrants(grants, sb.Name, inheritedFrom)})
 }
 
 // --- Image Pull (async) ---

@@ -17,7 +17,13 @@ var secretCmd = &cobra.Command{
 	Short: "Manage encrypted secrets and sandbox grants",
 	Long: `Secrets are encrypted at rest (age) and scoped to your API key.
 A grant gives a sandbox a placeholder instead of the real secret. netd swaps
-it for the real value only in HTTPS request headers to the granted hosts.`,
+it for the real value only in HTTPS request headers to the granted hosts.
+
+A fork, and each sandbox resumed from a snapshot, holds its source's
+placeholders, so it gets a copy of the source's active grants: the same
+placeholder, hosts and expiry. Each copy shows in 'grants' and is revoked on
+its own; deleting a secret revokes every copy. A snapshot keeps its source's
+grants when it is taken, but they are not exported.`,
 	Example: `  bhatti secret set GH_TOKEN ghp_example
   bhatti secret grant GH_TOKEN --sandbox dev --host api.github.com
   bhatti secret grants
