@@ -64,6 +64,21 @@ type createFileReq struct {
 	Mode      string `json:"mode,omitempty"` // default "0644"
 }
 
+// checkSandboxQuota answers the request and returns false when user may not add
+// a sandbox. A failed count refuses: read as 0, it would skip the limit.
+func (s *Server) checkSandboxQuota(w http.ResponseWriter, r *http.Request, user *store.User) bool {
+	count, err := s.store.CountUserSandboxes(user.ID)
+	if err != nil {
+		errRespInternal(w, r, "count sandboxes failed", err)
+		return false
+	}
+	if count >= user.MaxSandboxes {
+		errResp(w, 429, fmt.Sprintf("sandbox limit reached (%d/%d)", count, user.MaxSandboxes))
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
 
@@ -139,10 +154,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Enforce per-user sandbox count limit
-		count, _ := s.store.CountUserSandboxes(user.ID)
-		if count >= user.MaxSandboxes {
-			errResp(w, 429, fmt.Sprintf("sandbox limit reached (%d/%d)", count, user.MaxSandboxes))
+		if !s.checkSandboxQuota(w, r, user) {
 			return
 		}
 

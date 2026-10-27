@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
@@ -45,6 +47,12 @@ func (p *portingEngine) ResumeFromManifestJSON(ctx context.Context, snapDir stri
 
 func setupPorting(t *testing.T) (*httptest.Server, *portingEngine, *store.Store, string) {
 	t.Helper()
+	_, ts, eng, st, dir := setupPortingServer(t)
+	return ts, eng, st, dir
+}
+
+func setupPortingServer(t *testing.T) (*Server, *httptest.Server, *portingEngine, *store.Store, string) {
+	t.Helper()
 	dir := t.TempDir()
 	st, err := store.New(filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -59,7 +67,7 @@ func setupPorting(t *testing.T) (*httptest.Server, *portingEngine, *store.Store,
 	srv := New(eng, st, dir)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() { srv.Close(); ts.Close(); st.Close() })
-	return ts, eng, st, dir
+	return srv, ts, eng, st, dir
 }
 
 func postArchive(t *testing.T, ts *httptest.Server, query string, body io.Reader) *http.Response {
@@ -162,6 +170,78 @@ func TestSnapshotImportRegistersAResumableSnapshot(t *testing.T) {
 	resp.Body.Close()
 	if eng.resumed.snapDir != final || eng.resumed.manifest != manifest {
 		t.Fatalf("resume used %+v; want %s with the imported manifest", eng.resumed, final)
+	}
+}
+
+func seedSnapshot(t *testing.T, st *store.Store) {
+	t.Helper()
+	if err := st.CreateSnapshot(store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "job-base",
+		MemPath: "/x/job-base/mem.snap", ManifestJSON: `{"type":"memory"}`, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSnapshotResumeKeepHot: a CI job VM must be stored keep_hot from the
+// first moment, or a thermal pass between resume and a PATCH could pause it.
+func TestSnapshotResumeKeepHot(t *testing.T) {
+	for _, keep := range []bool{true, false} {
+		t.Run(fmt.Sprint("keep_hot=", keep), func(t *testing.T) {
+			srv, ts, eng, st, _ := setupPortingServer(t)
+			seedSnapshot(t, st)
+			resp := doReq(t, ts, "POST", "/snapshots/job-base/resume", map[string]any{"name": "job", "keep_hot": keep})
+			if resp.StatusCode != 201 {
+				t.Fatalf("resume: %d %s", resp.StatusCode, errorBody(t, resp))
+			}
+			resp.Body.Close()
+			sb, err := st.GetSandbox("usr_test", "job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sb.KeepHot != keep {
+				t.Fatalf("stored KeepHot=%v, want %v", sb.KeepHot, keep)
+			}
+
+			// Idle past the warm timeout: only the keep_hot sandbox survives a pass.
+			srv.lastActivity.Store(sb.EngineID, time.Now().Add(-time.Minute))
+			eng.mu.Lock()
+			eng.thermal[sb.EngineID] = "hot"
+			eng.ActivityResult = &proto.ActivityInfo{LastActivityUnix: time.Now().Add(-time.Minute).Unix()}
+			eng.mu.Unlock()
+			srv.runThermalCycle(eng, ThermalConfig{WarmTimeout: 50 * time.Millisecond, ColdTimeout: time.Hour})
+			eng.mu.Lock()
+			state := eng.thermal[sb.EngineID]
+			eng.mu.Unlock()
+			if keep && state == "warm" {
+				t.Fatal("keep_hot resumed sandbox was thermally paused")
+			}
+			if !keep && state != "warm" {
+				t.Fatalf("control: non-keep_hot sandbox thermal=%q, want warm", state)
+			}
+		})
+	}
+}
+
+// TestSnapshotResumeCountFailureFailsClosed: an unreadable sandbox count
+// must refuse the resume, not read as 0 and bypass the quota.
+func TestSnapshotResumeCountFailureFailsClosed(t *testing.T) {
+	ts, eng, st, dir := setupPorting(t)
+	seedSnapshot(t, st)
+	db, err := sql.Open("sqlite", filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`ALTER TABLE sandboxes RENAME TO sandboxes_gone`); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doReq(t, ts, "POST", "/snapshots/job-base/resume", map[string]any{"name": "job"})
+	defer resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Fatalf("resume with failing count: %d, want 500", resp.StatusCode)
+	}
+	if eng.resumed.snapDir != "" {
+		t.Fatal("engine resumed a VM despite the failed quota check")
 	}
 }
 

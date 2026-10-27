@@ -488,7 +488,8 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	}
 
 	var req struct {
-		Name string `json:"name"` // new sandbox name
+		Name    string `json:"name"`     // new sandbox name
+		KeepHot bool   `json:"keep_hot"` // never thermal-pause the resumed sandbox
 	}
 	if err := readJSON(r, &req); err != nil {
 		errResp(w, 400, "invalid json: "+err.Error())
@@ -540,10 +541,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	// Enforce sandbox count limit
-	count, _ := s.store.CountUserSandboxes(user.ID)
-	if count >= user.MaxSandboxes {
-		errResp(w, 429, fmt.Sprintf("sandbox limit reached (%d/%d)", count, user.MaxSandboxes))
+	if !s.checkSandboxQuota(w, r, user) {
 		return
 	}
 
@@ -586,6 +584,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		Status: info.Status, IP: info.IP,
 		EngineMeta: json.RawMessage("{}"),
 		CreatedBy:  user.ID, CreatedAt: time.Now(),
+		KeepHot: req.KeepHot,
 	}
 	memory := m.Type != "filesystem"
 	if memory && len(m.NetPolicy) > 0 && string(m.NetPolicy) != "null" {
@@ -635,7 +634,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		"name", sandboxName, "user", user.Name)
 	s.RecordEvent(store.Event{
 		Type: "snapshot.resumed", UserID: user.ID, SandboxID: sbID,
-		Meta: map[string]any{"name": snapName, "new_sandbox": sandboxName},
+		Meta: map[string]any{"name": snapName, "new_sandbox": sandboxName, "keep_hot": req.KeepHot},
 	})
 	if info.GuestReseedUnsupported {
 		s.RecordEvent(store.Event{

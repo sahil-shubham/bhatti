@@ -103,6 +103,7 @@ var snapshotResumeCmd = &cobra.Command{
 		defer printTiming()
 
 		name, _ := cmd.Flags().GetString("name")
+		keepHot, _ := cmd.Flags().GetBool("keep-hot")
 
 		var sb struct {
 			ID   string `json:"id"`
@@ -112,6 +113,9 @@ var snapshotResumeCmd = &cobra.Command{
 		body := map[string]any{}
 		if name != "" {
 			body["name"] = name
+		}
+		if keepHot {
+			body["keep_hot"] = true
 		}
 		if err := apiJSON("POST", "/snapshots/"+args[0]+"/resume", body, &sb); err != nil {
 			return err
@@ -315,6 +319,7 @@ func init() {
 	snapshotCreateCmd.Flags().String("name", "", "Snapshot name (required)")
 	snapshotCreateCmd.Flags().String("type", "", "Snapshot type: memory (default, RAM+disk) | filesystem (disk-only)")
 	snapshotResumeCmd.Flags().String("name", "", "New sandbox name")
+	snapshotResumeCmd.Flags().Bool("keep-hot", false, "Prevent thermal transitions, e.g. for CI job VMs")
 
 	snapshotCmd.AddCommand(snapshotCreateCmd)
 	snapshotCmd.AddCommand(snapshotListCmd)
