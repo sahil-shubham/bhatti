@@ -17,6 +17,22 @@ var ErrBadSnapshotArchive = errors.New("not a valid snapshot archive")
 // as 422 with the engine's message.
 var ErrSnapshotIncompatible = errors.New("snapshot can't run on this host")
 
+// ErrSnapshotInUse is wrapped by RemoveSnapshot's refusal of a snapshot whose
+// disks other disks are layered over: the sandboxes, snapshots and saved
+// images that would stop working. The API reports it as 409 with the engine's
+// message, which says how many.
+var ErrSnapshotInUse = errors.New("snapshot is in use")
+
+// SnapshotRemover is optionally implemented by engines whose snapshot disks
+// can be layered over: resuming creates a disk over the snapshot's, so
+// deleting the snapshot's files is not always safe.
+type SnapshotRemover interface {
+	// RemoveSnapshot deletes the snapshot directory snapDir, or refuses with
+	// ErrSnapshotInUse while a disk made over its files is still there. A
+	// directory that is gone already is not an error.
+	RemoveSnapshot(ctx context.Context, snapDir string) error
+}
+
 // SnapshotExport configures ExportSnapshot.
 type SnapshotExport struct {
 	// Name is the snapshot's name, offered to the importer as its default.

@@ -440,23 +440,33 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 		return fail(err)
 	}
 	p.Rules = append(p.Rules, VMMRule{spec.RootDisk, vmmRWFile})
-	if spec.RootDiskFormat == "qcow2" {
-		chain, err := backingChain(spec.RootDisk)
+	// backs lets the helper read the files the qcow2 disk at path backs
+	// onto, through the whole chain. The helper may write a disk's header, so
+	// what the header names is taken only from where this host keeps images,
+	// or from what the daemon itself put in the chain when it made the disk
+	// (spec.Backing): a rewritten header can't point the next launch at any
+	// other file.
+	backs := func(what, path string) error {
+		chain, err := backingChain(path)
 		if err != nil {
-			return fail(err)
+			return err
 		}
 		for _, b := range chain {
-			// The root disk is the helper's to write, header and all, so the
-			// files it names are taken only from where this host keeps images.
-			if !e.vmmBaseAllowed(vm, b) {
-				return fail(fmt.Errorf("root disk backs onto %s, which isn't an image of this host's", b))
+			if !e.vmmBaseAllowed(vm, b) && !slices.Contains(spec.Backing, b) {
+				return fmt.Errorf("%s backs onto %s, which isn't an image of this host's", what, b)
 			}
 			if e.dropVMM {
 				if err := e.vmmReadable(b); err != nil {
-					return fail(err)
+					return err
 				}
 			}
 			p.Rules = append(p.Rules, VMMRule{b, vmmReadFile})
+		}
+		return nil
+	}
+	if spec.RootDiskFormat == "qcow2" {
+		if err := backs("root disk", spec.RootDisk); err != nil {
+			return fail(err)
 		}
 	}
 	if spec.KernelImage != "" {
@@ -502,6 +512,11 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 				return fail(err)
 			}
 			p.Rules = append(p.Rules, VMMRule{v.Path, access})
+			if v.Format == "qcow2" {
+				if err := backs("volume "+v.BlockID, v.Path); err != nil {
+					return fail(err)
+				}
+			}
 		}
 	}
 
@@ -606,10 +621,12 @@ func (e *Engine) vmmBaseAllowed(vm *VM, path string) bool {
 
 // backingChain lists the files the image at path backs onto, nearest first,
 // as libkrun's qcow2 driver finds them: a relative name is relative to the
-// image that holds it.
+// image that holds it. A root disk of the deepest chain nodes.go admits
+// (maxChainDepth images) names one fewer qcow2 file and its raw base, so a
+// chain of maxChainDepth files is complete, and one more is refused.
 func backingChain(path string) ([]string, error) {
 	var chain []string
-	for len(chain) < 8 {
+	for {
 		if !isQcow2(path) {
 			return chain, nil
 		}
@@ -620,13 +637,15 @@ func backingChain(path string) ([]string, error) {
 		if name == "" {
 			return chain, nil
 		}
+		if len(chain) == maxChainDepth {
+			return nil, fmt.Errorf("%s: backing chain deeper than %d", path, maxChainDepth)
+		}
 		if !filepath.IsAbs(name) {
 			name = filepath.Join(filepath.Dir(path), name)
 		}
 		chain = append(chain, name)
 		path = name
 	}
-	return nil, fmt.Errorf("%s: backing chain deeper than %d", path, len(chain))
 }
 
 // linkInto hard-links src at dst, replacing what's there, and returns dst —

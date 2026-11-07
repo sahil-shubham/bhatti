@@ -105,6 +105,14 @@ type VMSpec struct {
 	// krun_add_disk2 (which composes with the root setter); the guest device name
 	// + mount path travel in the config (VolumeMountConfig).
 	Volumes []VMVolume `json:"volumes,omitempty"`
+	// Backing is every file the root disk's and the volumes' chains named when
+	// the daemon made them: the nodes (snapshot disks) a resumed or forked
+	// sandbox's disks are layered over, and what they in turn name. The
+	// daemon alone reads it. The helper may write its root disk, header
+	// included, so at each launch the chain is checked against this list (and
+	// the images the host keeps): a rewritten header can't make the next
+	// launch open another file. Empty for a sandbox over a base alone.
+	Backing []string `json:"backing,omitempty"`
 	// KernelCmdline overrides the default block-root cmdline used with
 	// KernelImage. Empty = the built-in default (root=/dev/vda … init=ExecPath).
 	KernelCmdline string `json:"kernel_cmdline,omitempty"`

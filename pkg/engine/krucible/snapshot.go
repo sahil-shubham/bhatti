@@ -225,13 +225,25 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 }
 
 // ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
-// (the server's `snapshotResumer` capability): clone the saved disk and
-// volumes, restore RAM/device/vCPU state, and reuse the in-guest token (the
-// restored guest enforces it from RAM). ownerUserID homes the new sandbox on the
-// owner's shared netd — a fork/restore is an INDEPENDENT sandbox of the same
-// owner, so it must join that owner's fabric (and get a fresh, distinct IP there),
-// not spin up an isolated netd it shares with nothing.
+// (the server's `snapshotResumer` capability): its root and volumes are disks
+// of its own layered over the snapshot's (nodes.go), so none is copied however
+// much the snapshot holds; it restores RAM/device/vCPU state, and reuses the
+// in-guest token (the restored guest enforces it from RAM). ownerUserID homes
+// the new sandbox on the owner's shared netd — a fork/restore is an
+// INDEPENDENT sandbox of the same owner, so it must join that owner's fabric
+// (and get a fresh, distinct IP there), not spin up an isolated netd it
+// shares with nothing.
+//
+// The snapshot's files are never written: they are what every sandbox
+// resumed from it reads through.
 func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName, ownerUserID string) (engine.SandboxInfo, error) {
+	return e.resume(ctx, snapDir, manifestJSON, newName, ownerUserID, false)
+}
+
+// resume is ResumeFromManifestJSON. own says snapDir is private to this call
+// (a fork's staging copy), so a disk that can't be layered over is moved
+// rather than copied again.
+func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte, newName, ownerUserID string, own bool) (engine.SandboxInfo, error) {
 	var m krucibleSnapManifest
 	if err := json.Unmarshal(manifestJSON, &m); err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("parse snapshot manifest: %w", err)
@@ -247,39 +259,39 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 		configFile = "config.ext4"
 	}
 	spec := engine.SandboxSpec{
-		Name:      newName,
-		CPUs:      float64(m.Vcpus),
-		MemoryMB:  int(m.MemMiB),
-		BaseImage: filepath.Join(snapDir, diskFile), // the frozen disk; create() copies it as the root
-		UserID:    ownerUserID,                      // join the owner's shared netd
+		Name:     newName,
+		CPUs:     float64(m.Vcpus),
+		MemoryMB: int(m.MemMiB),
+		UserID:   ownerUserID, // join the owner's shared netd
 	}
+	opts := createOpts{nodeDisk: filepath.Join(snapDir, diskFile), ownDisks: own}
 	if m.Type == "filesystem" {
 		// Disk-only snapshot: cold-boot a fresh sandbox from the frozen disk
-		// (new identity/config, no RAM restore) — the same path as `create
-		// --image` on a captured node.
-		return e.create(ctx, spec, createOpts{})
+		// (new identity/config, no RAM restore).
+		return e.create(ctx, spec, opts)
 	}
 	// Reproduce the captured device set: libkrun refuses to restore the guest's
-	// RAM into any other. Block volumes restore cleanly: clone each frozen
-	// volume into the new sandbox (independent copy — fork/restore diverges from
-	// the source). Memory snapshots of mounted sandboxes are refused at
-	// checkpoint (virtio-fs can't be restored), so m.Mounts is empty here.
+	// RAM into any other. Block volumes restore cleanly: each frozen volume is
+	// re-attached as a disk of the new sandbox's own over it (fork/restore
+	// diverges from the source). Memory snapshots of mounted sandboxes are
+	// refused at checkpoint (virtio-fs can't be restored), so m.Mounts is
+	// empty here.
 	spec.NetPolicy = m.NetPolicy
-	var restoreVols []restoreVol
 	for _, v := range m.Volumes {
-		restoreVols = append(restoreVols, restoreVol{path: filepath.Join(snapDir, v.File), readOnly: v.ReadOnly})
+		opts.restoreVolumes = append(opts.restoreVolumes, restoreVol{path: filepath.Join(snapDir, v.File), readOnly: v.ReadOnly})
 	}
-	return e.create(ctx, spec, createOpts{
-		snapshotDir:    snapDir,
-		forcedToken:    m.Token,
-		restoreVolumes: restoreVols,
-	})
+	opts.snapshotDir = snapDir
+	opts.forcedToken = m.Token
+	return e.create(ctx, spec, opts)
 }
 
 // Fork checkpoints a running sandbox to a temporary directory, restores a
 // second VM from it, then removes the directory. The new VM privately maps
-// memory.bin: unlinking it does not invalidate an already running restore.
-func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.SandboxInfo, error) {
+// memory.bin: unlinking it does not invalidate an already running restore. Its
+// disks stay: they are layered over the copy of the source's overlay the
+// checkpoint made, which the node store keeps until nothing is layered over it
+// (nodes.go).
+func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (info engine.SandboxInfo, err error) {
 	// Fast, friendly refusal: a --mount sandbox can't be memory-forked (libkrun
 	// can't restore a virtio-fs device from a memory snapshot). Check up front so
 	// the caller gets a clear error immediately, instead of one surfacing from deep
@@ -315,16 +327,23 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (engine.Sa
 	if err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("fork: temp dir: %w", err)
 	}
-	// Restore clones disks and maps RAM privately; Linux keeps the unlinked
+	// Restore layers disks and maps RAM privately; Linux keeps the unlinked
 	// memory.bin backing mapped in the fork after this directory is removed.
-	defer os.RemoveAll(tmp)
+	defer func() {
+		os.RemoveAll(tmp)
+		if err != nil {
+			// A node the fork linked had this directory for its only other
+			// name, and no disk is layered over it now.
+			e.scheduleNodeSweep()
+		}
+	}()
 
 	manifest, err := e.Checkpoint(ctx, sandboxID, "", 0, "snap", tmp)
 	if err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("fork: checkpoint: %w", err)
 	}
 	manifestJSON, _ := json.Marshal(manifest)
-	return e.ResumeFromManifestJSON(ctx, filepath.Join(tmp, "snap"), manifestJSON, newName, ownerUserID)
+	return e.resume(ctx, filepath.Join(tmp, "snap"), manifestJSON, newName, ownerUserID, true)
 }
 
 // SaveImage captures the sandbox's current filesystem as a reusable bootable

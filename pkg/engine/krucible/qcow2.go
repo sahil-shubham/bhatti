@@ -22,6 +22,15 @@ const (
 // the raw image at backing, with virtual size `size`. Every read falls
 // through to the backing file until the guest writes, so creation is O(1)
 // regardless of the base's size and needs no reflink-capable filesystem.
+func createQcow2Overlay(dst, backing string, size uint64) error {
+	return createQcow2OverlayOn(dst, backing, "raw", size)
+}
+
+// createQcow2OverlayOn is createQcow2Overlay over a backing file in any
+// format the header can name: "raw", or "qcow2" for an overlay over another
+// overlay (a snapshot's disk). The format is written into the header because
+// a reader that had to guess could be made to open a raw image as qcow2 by
+// whatever its guest put in it.
 //
 // Layout (one cluster each, then the L1 table):
 //
@@ -29,9 +38,15 @@ const (
 //	cluster 1  refcount table (one entry -> cluster 2)
 //	cluster 2  refcount block (refcount 1 for every metadata cluster)
 //	cluster 3+ L1 table, all zero (no L2 tables yet)
-func createQcow2Overlay(dst, backing string, size uint64) error {
+func createQcow2OverlayOn(dst, backing, backingFormat string, size uint64) error {
+	if backingFormat != "raw" && backingFormat != "qcow2" {
+		return fmt.Errorf("qcow2 overlay: backing format %q", backingFormat)
+	}
 	if size == 0 {
 		return fmt.Errorf("qcow2 overlay: zero virtual size")
+	}
+	if n := len(backing); n == 0 || n > qcow2MaxBackingName {
+		return fmt.Errorf("qcow2 overlay: backing name %q doesn't fit the header (%d bytes, at most %d)", backing, n, qcow2MaxBackingName)
 	}
 	// Readers treat the size as whole 512-byte sectors and drop a partial one;
 	// round up (as `qemu-img create` does) so the base's tail stays visible.
@@ -58,12 +73,12 @@ func createQcow2Overlay(dst, backing string, size uint64) error {
 	be := binary.BigEndian
 	copy(c0[0:4], "QFI\xfb")
 	be.PutUint32(c0[4:], 3) // version
-	// Extensions start at header_length: backing format ("raw", padded to 8),
-	// then the end marker; the backing file name follows.
+	// Extensions start at header_length: the backing format ("raw" or "qcow2",
+	// padded to 8), then the end marker; the backing file name follows.
 	ext := qcow2HeaderLen
 	be.PutUint32(c0[ext:], qcow2ExtBackingFmt)
-	be.PutUint32(c0[ext+4:], 3)
-	copy(c0[ext+8:], "raw")
+	be.PutUint32(c0[ext+4:], uint32(len(backingFormat)))
+	copy(c0[ext+8:], backingFormat)
 	ext += 8 + 8
 	ext += 8 // end-of-extensions: type 0, length 0 (already zero)
 	backingOff := ext
@@ -173,6 +188,25 @@ func qcow2Backing(path string) (string, error) {
 		return "", fmt.Errorf("read qcow2 backing name: %w", err)
 	}
 	return string(name), nil
+}
+
+// qcow2VirtualSize returns the size of the disk the qcow2 image at path
+// presents to its guest, which is not the size of the file: an overlay is a
+// few hundred KiB however large the disk it stands for.
+func qcow2VirtualSize(path string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var h [32]byte
+	if _, err := f.ReadAt(h[:], 0); err != nil {
+		return 0, fmt.Errorf("read qcow2 header: %w", err)
+	}
+	if string(h[:4]) != "QFI\xfb" {
+		return 0, fmt.Errorf("%s is not a qcow2 image", path)
+	}
+	return binary.BigEndian.Uint64(h[24:]), nil
 }
 
 // setQcow2Backing points the qcow2 image at path, which has a backing file,

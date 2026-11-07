@@ -583,6 +583,11 @@ type Engine struct {
 	vmmIDs              map[uint32]string // helper uid → sandbox id
 	kvmGID              uint32            // group that may open /dev/kvm; 0 = anyone may
 	cg                  *cgroupManager    // places helpers in cgroups; nil places none (cgroup.go)
+	// Node sweeps (nodes.go): at most one runs, and requests that arrive
+	// during it fold into one more.
+	sweepMu    sync.Mutex
+	sweeping   bool
+	sweepAgain bool
 }
 
 // errNoCheckpoint is returned by every operation that needs saved VM state
@@ -721,18 +726,27 @@ func (e *Engine) agentFor(id string) (*agent.AgentClient, error) {
 }
 
 // createOpts carries restore hints for create(): restore from a named checkpoint
-// (snapshotDir), reuse its in-guest token (forcedToken), and clone its volumes.
+// (snapshotDir), reuse its in-guest token (forcedToken), and re-attach its
+// volumes.
 type createOpts struct {
 	snapshotDir    string
 	forcedToken    string
-	restoreVolumes []restoreVol // frozen volume images to clone in + re-attach (restore/fork)
+	restoreVolumes []restoreVol // frozen volume images to layer over + re-attach (restore/fork)
+	// nodeDisk is the snapshot disk the root is layered over, instead of an
+	// image the spec names: a resume or fork makes the root an overlay over
+	// it (nodes.go), so it costs a header whatever the snapshot holds.
+	nodeDisk string
+	// ownDisks says the snapshot's disks are the caller's to move rather
+	// than keep: a fork's staging copy, which a root that can't be layered
+	// (a chain at its deepest) takes by rename instead of copying again.
+	ownDisks bool
 }
 
-// restoreVol is a frozen volume image (from a snapshot dir) to clone into a
-// restored/forked sandbox and re-attach as /dev/vdc+, reproducing the snapshot's
-// device set. An independent copy — libkrun block devices are boot-fixed, so the
-// running source can't be CoW-rebased; cloneFile is instant on CoW FS (APFS/
-// btrfs), a full copy elsewhere.
+// restoreVol is a frozen volume image (from a snapshot dir) to re-attach to a
+// restored/forked sandbox as /dev/vdc+, reproducing the snapshot's device set.
+// The sandbox gets its own disk over it, so writes diverge from the snapshot
+// and from its siblings; libkrun block devices are boot-fixed, so the running
+// source can't be CoW-rebased, and the frozen copy it left is what is shared.
 type restoreVol struct {
 	path     string
 	readOnly bool
@@ -883,28 +897,25 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		cdVolumes = append(cdVolumes, configdrive.VolumeMountConfig{Device: fmt.Sprintf("/dev/vd%c", 'b'+rune(i)), Mount: v.Mount, FS: "ext4", ReadOnly: v.ReadOnly})
 	}
 
-	// Restore/fork: clone each frozen volume into this sandbox and re-attach it as
-	// /dev/vdc+, reproducing the snapshot's device set (so a memory restore's RAM
-	// view of its disks stays valid). Independent copy; the captured config drive
+	// Restore/fork: re-attach each frozen volume as /dev/vdc+, reproducing the
+	// snapshot's device set (so a memory restore's RAM view of its disks stays
+	// valid), as a disk of this sandbox's own over it. The captured config
 	// already carries the guest mount points, so no cdVolumes entry is needed.
-	for _, rv := range opts.restoreVolumes {
-		idx := len(baseSpec.Volumes)
-		dst := filepath.Join(sandboxDir, fmt.Sprintf("restorevol%d.img", idx))
-		if err = cloneFile(rv.path, dst); err != nil {
-			return info, fmt.Errorf("restore volume %d: %w", idx, err)
-		}
-		format := "raw"
-		if isQcow2(dst) {
-			format = "qcow2"
-		}
-		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", idx), Path: dst, Format: format, ReadOnly: rv.readOnly})
+	if err = e.layerRestoredVolumes(sandboxDir, &baseSpec, opts.restoreVolumes, opts.ownDisks); err != nil {
+		return info, err
 	}
 
 	var requiresGrowth bool
 	// Rootfs + config drive. Block-root pairs root=/dev/vda with the config drive
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
-		rootImg, rootFormat, rootBase, perr := e.prepareRootDisk(sandboxDir, spec)
+		var rootImg, rootFormat, rootBase string
+		var perr error
+		if opts.nodeDisk != "" {
+			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(sandboxDir, opts.nodeDisk, opts.ownDisks)
+		} else {
+			rootImg, rootFormat, rootBase, perr = e.prepareRootDisk(sandboxDir, spec)
+		}
 		if perr != nil {
 			return info, perr
 		}
@@ -921,6 +932,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		baseSpec.RootDisk = rootImg
 		baseSpec.RootDiskFormat = rootFormat
 		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
+		if baseSpec.Backing, err = e.diskBacking(baseSpec); err != nil {
+			return info, fmt.Errorf("read the disks' backing chains: %w", err)
+		}
 
 		if token == "" {
 			if token, err = genToken(); err != nil {
@@ -1262,6 +1276,7 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	vm.mu.Lock()
 	dir := vm.SandboxDir
 	sockDir := vm.SockDir
+	layered := len(vm.baseSpec.Backing) > 0
 	vm.Status = "stopped"
 	vm.mu.Unlock()
 
@@ -1280,6 +1295,10 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 
 	os.RemoveAll(dir)
 	os.RemoveAll(sockDir)
+	if layered {
+		// It may have been the last to hold a node.
+		e.scheduleNodeSweep()
+	}
 	slog.Info("krucible sandbox destroyed", "id", id)
 	return nil
 }

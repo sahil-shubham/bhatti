@@ -12,6 +12,7 @@ package krucible
 // removes once nothing names it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // basesDir is where base images live, each named by its contents.
@@ -70,11 +72,7 @@ func resolveBasePath(p string) (string, error) {
 // its base until its overlay names it) and an import hold it shared. An
 // flock, so `bhatti admin gc-images` in another process honours it too.
 func lockBases(dataDir string, exclusive bool) (unlock func(), err error) {
-	dir := filepath.Join(dataDir, "images")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Join(dir, ".bases.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := openBasesLock(dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +90,45 @@ func lockBases(dataDir string, exclusive bool) (unlock func(), err error) {
 		return nil, fmt.Errorf("lock %s: %w", f.Name(), err)
 	}
 	return func() { f.Close() }, nil
+}
+
+// lockBasesCtx is lockBases that stops waiting when ctx is done: a request
+// that needs the lock exclusively (deleting a snapshot) shouldn't sit behind
+// an import for as long as the import takes, once its client has gone.
+func lockBasesCtx(ctx context.Context, dataDir string, exclusive bool) (unlock func(), err error) {
+	f, err := openBasesLock(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	how := syscall.LOCK_SH
+	if exclusive {
+		how = syscall.LOCK_EX
+	}
+	for {
+		switch err = syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB); err {
+		case nil:
+			return func() { f.Close() }, nil
+		case syscall.EWOULDBLOCK, syscall.EINTR:
+		default:
+			f.Close()
+			return nil, fmt.Errorf("lock %s: %w", f.Name(), err)
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// openBasesLock opens the lock file, making its directory.
+func openBasesLock(dataDir string) (*os.File, error) {
+	dir := filepath.Join(dataDir, "images")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(filepath.Join(dir, ".bases.lock"), os.O_RDWR|os.O_CREATE, 0o600)
 }
 
 // syncDir makes a rename or link in dir durable. Best effort: everything
@@ -323,13 +360,18 @@ func keyOf(fi os.FileInfo) (fileKey, bool) {
 // one of keep (the configured base image). A qcow2 image it can't read stops
 // it before anything is removed, since that image might name any base.
 // Dotfiles (an install or import still writing) are never removed. With
-// dryRun it only reports what it would remove.
+// dryRun it only reports what it would remove. It sweeps the node store
+// (nodes.go) first and reports what it removed there too: a node nothing
+// needs would otherwise keep naming the base under it.
 func GCImages(dataDir string, keep []string, dryRun bool) (removed []string, err error) {
 	unlock, err := lockBases(dataDir, true)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
+	if removed, err = sweepNodesLocked(dataDir, dryRun); err != nil {
+		return removed, err
+	}
 
 	used := map[fileKey]bool{}
 	mark := func(path string) {
