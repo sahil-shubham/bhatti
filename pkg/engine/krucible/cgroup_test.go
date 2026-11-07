@@ -931,3 +931,112 @@ func zombie(pid int) bool {
 	args, err := procArgs(pid)
 	return err == nil && len(args) == 0
 }
+
+func TestFailedUnrefRemainsPendingForRestart(t *testing.T) {
+	sd := newFakeSystemd()
+	m := newTestManager(sd)
+	t.Cleanup(m.close)
+	ps := testVM(t)
+	const oldPID = 4242
+	sd.units[ps.unit] = &fakeUnit{props: map[string]any{}, active: "inactive", refs: 1}
+	m.held[ps.unit] = oldPID
+	rejected := true
+	sd.unrefErr = func(string) error {
+		if rejected {
+			rejected = false
+			return errors.New("temporarily denied")
+		}
+		return nil
+	}
+
+	m.release(ps.unit, oldPID)
+	if got := m.held[ps.unit]; got != oldPID {
+		t.Fatalf("failed release forgot pid %d's reference: held %v", oldPID, m.held)
+	}
+	if u, ok := sd.unit(ps.unit); !ok || u.refs != 1 {
+		t.Fatalf("a rejected release changed the systemd reference: %+v, loaded %v", u, ok)
+	}
+	cmd, err := startHelper(t, m, ps, filepath.Join(t.TempDir(), "worked"), nil)
+	if err != nil {
+		t.Fatalf("restart could not retry the pending release: %v", err)
+	}
+	if u, ok := sd.unit(ps.unit); !ok || u.refs != 1 || u.props["PIDs"].([]uint32)[0] != uint32(cmd.Process.Pid) {
+		t.Fatalf("restart did not retain its own reference: %+v, loaded %v", u, ok)
+	}
+}
+
+func TestUnrefTerminalAnswersForgetOnlyTheReleasedReference(t *testing.T) {
+	for _, answer := range []error{errNoSuchUnit, errUnitNotReferenced} {
+		t.Run(answer.Error(), func(t *testing.T) {
+			sd := newFakeSystemd()
+			m := newTestManager(sd)
+			ps := testVM(t)
+			sd.units[ps.unit] = &fakeUnit{props: map[string]any{}, active: "active"}
+			m.held[ps.unit] = 4242
+			sd.unrefErr = func(string) error { return fmt.Errorf("systemd: %w", answer) }
+
+			m.release(ps.unit, 4242)
+			m.release(ps.unit, 4242)
+			if len(m.held) != 0 || len(sd.calls("unref")) != 1 {
+				t.Fatalf("terminal release was not completed once: held %v, calls %v", m.held, sd.calls("unref"))
+			}
+		})
+	}
+}
+
+type pausedUnrefSystemd struct {
+	systemdAPI
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (s *pausedUnrefSystemd) UnrefUnit(ctx context.Context, unit string) error {
+	close(s.entered)
+	select {
+	case <-s.resume:
+		return s.systemdAPI.UnrefUnit(ctx, unit)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestReleaseSerializesConcurrentIncarnationHandover(t *testing.T) {
+	sd := newFakeSystemd()
+	m := newTestManager(sd)
+	ps := testVM(t)
+	const oldPID, nextPID = 1001, 2002
+	sd.units[ps.unit] = &fakeUnit{props: map[string]any{}, active: "inactive", refs: 1}
+	m.held[ps.unit] = oldPID
+	paused := &pausedUnrefSystemd{systemdAPI: sd, entered: make(chan struct{}), resume: make(chan struct{})}
+	m.sd = paused
+	released := make(chan struct{})
+	go func() {
+		m.release(ps.unit, oldPID)
+		close(released)
+	}()
+	<-paused.entered
+
+	// A takeover must not publish a new incarnation while an earlier watcher
+	// can still unreference that name. The fake makes that overlap observable
+	// without depending on the scheduler pausing between two mutex operations.
+	replaced := make(chan struct{})
+	go func() {
+		m.mu.Lock()
+		sd.mu.Lock()
+		sd.units[ps.unit] = &fakeUnit{props: map[string]any{}, active: "active", refs: 1}
+		m.held[ps.unit] = nextPID
+		sd.mu.Unlock()
+		m.mu.Unlock()
+		close(replaced)
+	}()
+	select {
+	case <-replaced:
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(paused.resume)
+	<-released
+	<-replaced
+	if u, ok := sd.unit(ps.unit); !ok || u.refs != 1 || m.held[ps.unit] != nextPID {
+		t.Fatalf("old watcher released the next incarnation: unit %+v, loaded %v, held %v", u, ok, m.held)
+	}
+}

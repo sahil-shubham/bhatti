@@ -151,6 +151,8 @@ func mapBusError(err error) error {
 		return fmt.Errorf("%w: %v", errNoSuchUnit, err)
 	case "org.freedesktop.systemd1.UnitExists":
 		return fmt.Errorf("%w: %v", errUnitExists, err)
+	case "org.freedesktop.systemd1.NotReferenced":
+		return fmt.Errorf("%w: %v", errUnitNotReferenced, err)
 	}
 	return err
 }

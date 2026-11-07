@@ -766,3 +766,81 @@ func TestSystemdOOMKillOutlivesTheScope(t *testing.T) {
 		t.Errorf("systemd's saved Result = %q (%v), want oom-kill", u.Result, uerr)
 	}
 }
+
+// rejectUnrefOnceSystemd leaves the real connection and its reference intact
+// when one release is rejected, as a temporary authorization failure would.
+type rejectUnrefOnceSystemd struct {
+	systemdAPI
+	unit     string
+	once     sync.Once
+	rejected chan struct{}
+}
+
+func (s *rejectUnrefOnceSystemd) UnrefUnit(ctx context.Context, name string) error {
+	if name == s.unit {
+		reject := false
+		s.once.Do(func() { reject = true })
+		if reject {
+			close(s.rejected)
+			return fmt.Errorf("temporary reference release failure")
+		}
+	}
+	return s.systemdAPI.UnrefUnit(ctx, name)
+}
+
+func TestSystemdFailedUnrefCanBeRetried(t *testing.T) {
+	m := systemdManager(t, false)
+	ps := vmSpecFor(t, testOwnerFor(t, m), 901)
+	real := m.sd
+	sd := &rejectUnrefOnceSystemd{systemdAPI: real, unit: ps.unit, rejected: make(chan struct{})}
+	m.sd = sd
+
+	cmd, dir, err := startStandin(t, m, ps, "idle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first helper to begin", func() bool { return exists(filepath.Join(dir, standinStarted)) })
+	reap(t, cmd)
+
+	// Let the exit watcher's release finish before retrying, so this tests a
+	// failed RPC, not a race with the next incarnation's reference.
+	watcherDone := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(watcherDone)
+	}()
+	select {
+	case <-watcherDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exited helper's cleanup did not finish")
+	}
+	select {
+	case <-sd.rejected:
+	default:
+		t.Fatal("the exit cleanup never attempted the rejected release")
+	}
+	waitFor(t, "the inactive scope retained after the rejected release", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		units, err := real.Units(ctx, ps.unit)
+		return err == nil && len(units) == 1 && units[0].Active == "inactive"
+	})
+
+	// This can only reuse the name if the manager remembers the failed release
+	// and retries it on the still-open connection.
+	again, againDir, err := startStandin(t, m, ps, "idle")
+	if err != nil {
+		t.Fatalf("restart after a temporary UnrefUnit failure: %v", err)
+	}
+	waitFor(t, "the replacement helper to begin", func() bool { return exists(filepath.Join(againDir, standinStarted)) })
+	if cg, err := procCgroupPath(again.Process.Pid); err != nil || !memberOf(cg, ps) {
+		t.Fatalf("replacement helper's cgroup = %q, %v; want %s", cg, err, ps.path())
+	}
+	reap(t, again)
+	waitFor(t, "the replacement scope to release normally", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		units, err := real.Units(ctx, ps.unit)
+		return err == nil && len(units) == 0
+	})
+}

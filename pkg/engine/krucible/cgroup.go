@@ -203,8 +203,9 @@ type unitUsage struct {
 }
 
 var (
-	errNoSuchUnit = errors.New("no such unit")
-	errUnitExists = errors.New("unit already exists")
+	errNoSuchUnit        = errors.New("no such unit")
+	errUnitExists        = errors.New("unit already exists")
+	errUnitNotReferenced = errors.New("unit not referenced")
 )
 
 // systemdAPI is the part of systemd's manager interface placement uses. The
@@ -548,15 +549,24 @@ func (m *cgroupManager) discard(unit string) {
 // it holds one.
 func (m *cgroupManager) unref(unit string) {
 	m.mu.Lock()
-	_, held := m.held[unit]
-	delete(m.held, unit)
-	m.mu.Unlock()
-	if !held {
+	defer m.mu.Unlock()
+	m.unrefLocked(unit)
+}
+
+// unrefLocked keeps the ownership decision and RPC together: publishing a new
+// incarnation before this release finishes could unreference the new unit.
+// A failed RPC leaves the reference pending for cleanup or the next start.
+func (m *cgroupManager) unrefLocked(unit string) {
+	if _, held := m.held[unit]; !held {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_ = m.sd.UnrefUnit(ctx, unit) // already unreferenced is fine
+	if err := m.sd.UnrefUnit(ctx, unit); err != nil && !errors.Is(err, errNoSuchUnit) && !errors.Is(err, errUnitNotReferenced) {
+		slog.Warn("krucible.cgroup.unref_failed", "unit", unit, "error", err)
+		return
+	}
+	delete(m.held, unit)
 }
 
 // release drops the reference taken for pid, and only that one: a scope's name
@@ -564,10 +574,9 @@ func (m *cgroupManager) unref(unit string) {
 // previous run's watcher.
 func (m *cgroupManager) release(unit string, pid int) {
 	m.mu.Lock()
-	mine := m.held[unit] == pid
-	m.mu.Unlock()
-	if mine {
-		m.unref(unit)
+	defer m.mu.Unlock()
+	if m.held[unit] == pid {
+		m.unrefLocked(unit)
 	}
 }
 

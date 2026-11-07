@@ -31,6 +31,7 @@ type fakeSystemd struct {
 
 	moveAfter time.Duration // how long after the answer a pid shows in its scope; <0: never
 	startErr  func(name string) error
+	unrefErr  func(name string) error
 	onStart   func(name string, props map[string]any) // runs inside StartTransientUnit, before it answers
 	hold      chan struct{}                           // if set, a scope's StartTransientUnit waits for it to close
 	inflight  int
@@ -198,6 +199,14 @@ func (f *fakeSystemd) UnrefUnit(ctx context.Context, name string) error {
 		return fmt.Errorf("%w: fake", errNoSuchUnit)
 	}
 	f.record("unref %s", name)
+	if f.unrefErr != nil {
+		if err := f.unrefErr(name); err != nil {
+			return err
+		}
+	}
+	if u.refs == 0 {
+		return fmt.Errorf("%w: fake", errUnitNotReferenced)
+	}
 	u.refs--
 	if u.active != "active" && u.refs <= 0 {
 		delete(f.units, name)
