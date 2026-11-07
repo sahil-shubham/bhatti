@@ -168,6 +168,11 @@ func AllowAllEgress() *EgressPolicy {
 type Verdict struct {
 	Allow  bool
 	Reason string
+	// HardDeny marks a refusal no rule could have avoided: the destination can
+	// never be allowed (host, loopback, link-local/metadata, the gateway,
+	// other owners' ranges). Any other denial is a policy decision. Callers
+	// that count refusals read this flag, never the Reason text.
+	HardDeny bool
 }
 
 func allow(reason string) Verdict { return Verdict{Allow: true, Reason: reason} }
@@ -228,7 +233,7 @@ func withoutAddr(prefixes []netip.Prefix, a netip.Addr) []netip.Prefix {
 func (p *EgressPolicy) check(host string, ip netip.Addr, extraHardDeny []netip.Prefix) Verdict {
 	c := classify(ip, extraHardDeny)
 	if c == classHardDeny {
-		return deny("destination is in a hard-denied range (host/loopback/link-local/metadata)")
+		return Verdict{Reason: "destination is in a hard-denied range (host/loopback/link-local/metadata)", HardDeny: true}
 	}
 	if p.SiblingSubnet.IsValid() && p.SiblingSubnet.Contains(canonical(ip)) {
 		if p.Siblings == PosturePublic {
@@ -267,8 +272,9 @@ type Resolver interface {
 // DeniedError is returned when every resolved address for a destination fails
 // the guard (so callers can distinguish policy denial from a network error).
 type DeniedError struct {
-	Host   string
-	Reason string
+	Host     string
+	Reason   string
+	HardDeny bool // the verdict's flag: the destination can never be allowed
 }
 
 func (e *DeniedError) Error() string {
@@ -332,20 +338,20 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		return nil, fmt.Errorf("gateway dial: bad port %q: %w", port, err)
 	}
 	var vetted []netip.Addr
-	lastReason := "no addresses resolved"
+	lastReason, lastHard := "no addresses resolved", false
 	for _, ip := range ips {
 		v := d.vet(network, host, ip, uint16(portNum))
 		if v.Allow {
 			vetted = append(vetted, ip)
 			continue
 		}
-		lastReason = v.Reason
+		lastReason, lastHard = v.Reason, v.HardDeny
 		if d.OnDeny != nil {
 			d.OnDeny(host, ip, v.Reason)
 		}
 	}
 	if len(vetted) == 0 {
-		return nil, &DeniedError{Host: addrForErr(host, addr), Reason: lastReason}
+		return nil, &DeniedError{Host: addrForErr(host, addr), Reason: lastReason, HardDeny: lastHard}
 	}
 
 	var dialErr error
@@ -368,7 +374,7 @@ func (d *Dialer) DialAs(ctx context.Context, network, host string, ip netip.Addr
 		if d.OnDeny != nil {
 			d.OnDeny(host, ip, v.Reason)
 		}
-		return nil, &DeniedError{Host: addrForErr(host, ip.String()), Reason: v.Reason}
+		return nil, &DeniedError{Host: addrForErr(host, ip.String()), Reason: v.Reason, HardDeny: v.HardDeny}
 	}
 	return d.dialOne(ctx, network, net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
 }

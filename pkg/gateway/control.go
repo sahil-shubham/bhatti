@@ -115,9 +115,14 @@ type ControlMsg struct {
 }
 
 type controlReply struct {
-	Version int    `json:"version"`
-	Error   string `json:"error,omitempty"`
+	Version int       `json:"version"`
+	Error   string    `json:"error,omitempty"`
+	Stats   *NetStats `json:"stats,omitempty"` // only on a stats op that succeeded
 }
+
+// errUnknownOp answers an op the netd does not know. QueryStats matches this
+// text to spot a netd that predates the stats op, so it must not change.
+const errUnknownOp = "unknown control operation"
 
 // ControlHandler applies control messages to a gateway. A nil policy means
 // deny, including when the sender omitted the policy.
@@ -169,8 +174,10 @@ func serveControlConn(conn net.Conn, h ControlHandler) {
 			}
 		case ControlDel:
 			h.DelSandbox(m.GuestIP)
+		case ControlStats:
+			reply.answerStats(h)
 		default:
-			reply.Error = "unknown control operation"
+			reply.Error = errUnknownOp
 		}
 		if err := enc.Encode(reply); err != nil {
 			return
