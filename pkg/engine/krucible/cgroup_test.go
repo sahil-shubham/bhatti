@@ -672,6 +672,7 @@ func TestFinalNumbersAreReadThenReleased(t *testing.T) {
 	}
 	reap(t, cmd)
 	waitFor(t, "the scope to be released", func() bool { _, ok := sd.unit(ps.unit); return !ok })
+	m.wg.Wait() // collection can precede confirmation of the release RPC
 	if got := sd.calls("usage"); !slices.Equal(got, []string{ps.unit}) {
 		t.Fatalf("read usage of %v, want the scope once", got)
 	}
@@ -887,20 +888,20 @@ func TestStartWithoutPlacementIsPlainStart(t *testing.T) {
 }
 
 // TestIsHelperRecognisesAGatedHelper: a helper started to be placed has the
-// same argv as any other, `bhatti-vmm <spec>` (its gate is in the
+// same argv shape as any other, `<configured-binary> <spec>` (its gate is in the
 // environment), so every daemon release, including those before placement,
 // tells it apart from any other process. A rolled-back daemon that didn't
 // would record its sandbox stopped and boot a second VM on the same disks.
 func TestIsHelperRecognisesAGatedHelper(t *testing.T) {
 	spec := filepath.Join(t.TempDir(), "vmspec.json")
 	pid := gatedStandin(t, spec)
-	if args, _ := procArgs(pid); !slices.Equal(args, []string{"bhatti-vmm", spec}) || !isHelper(pid, spec) {
+	if args, _ := procArgs(pid); !slices.Equal(args, []string{filepath.Base(os.Args[0]), spec}) || !isHelper(pid, spec, os.Args[0]) {
 		t.Fatalf("a gated helper isn't taken for its helper: argv %q", args)
 	}
-	if isHelper(pid, spec+".other") {
+	if isHelper(pid, spec+".other", os.Args[0]) {
 		t.Fatal("a helper taken for another sandbox's")
 	}
-	if isHelper(adoptee(t), spec) {
+	if isHelper(adoptee(t), spec, os.Args[0]) {
 		t.Fatal("sleep taken for a helper")
 	}
 }
@@ -908,21 +909,48 @@ func TestIsHelperRecognisesAGatedHelper(t *testing.T) {
 // TestRecoveryKillsAStrayHelperOfAStoppedSandbox: a helper still running the
 // spec of a sandbox recorded stopped (a daemon that couldn't recognise it let
 // it run) is killed at recovery, before anything can boot that sandbox again
-// on the same disks. A helper of a sandbox recorded running is left alone.
+// on the same disks. A running sandbox's helper and an unrelated process
+// editing the stopped sandbox's exact spec are left alone.
 func TestRecoveryKillsAStrayHelperOfAStoppedSandbox(t *testing.T) {
 	stoppedDir, runningDir := t.TempDir(), t.TempDir()
 	stray := gatedStandin(t, filepath.Join(stoppedDir, "vmspec.json"))
+	editorSpec := filepath.Join(stoppedDir, "vmspec.json")
+	editor := gatedStandinAs(t, editorSpec, "vim")
 	live := gatedStandin(t, filepath.Join(runningDir, "vmspec.json"))
 
 	killStrays([]*VM{
 		{ID: "stopped", SandboxDir: stoppedDir, Status: "stopped"},
 		{ID: "running", SandboxDir: runningDir, Status: "running"},
-	})
+	}, os.Args[0])
 
 	waitFor(t, "the stray to die", func() bool { return !pidAlive(stray) || zombie(stray) })
-	if !pidAlive(live) {
+	if !running(live, filepath.Base(os.Args[0]), filepath.Join(runningDir, "vmspec.json")) {
 		t.Fatal("the helper of a running sandbox was killed")
 	}
+	if !running(editor, "vim", editorSpec) {
+		t.Fatal("an unrelated process editing the stopped sandbox's spec was killed")
+	}
+}
+
+// A recorded PID is no safer than a scanned PID: the exact spec argument alone
+// must not authorize killing an unrelated executable.
+func TestKillHelperRejectsUnrelatedProcessWithMatchingSpec(t *testing.T) {
+	spec := filepath.Join(t.TempDir(), "vmspec.json")
+	editor := gatedStandinAs(t, spec, "vim")
+	if isHelper(editor, spec, os.Args[0]) {
+		t.Error("an unrelated argv[0] was recognised as the configured helper")
+	}
+	killHelper(editor, spec, os.Args[0])
+	if !running(editor, "vim", spec) {
+		t.Fatal("killHelper killed an unrelated process with the matching spec")
+	}
+
+	helper := gatedStandin(t, spec)
+	if !isHelper(helper, spec, os.Args[0]) {
+		t.Fatal("the configured helper was not recognised")
+	}
+	killHelper(helper, spec, os.Args[0])
+	waitFor(t, "the configured helper to die", func() bool { return !pidAlive(helper) || zombie(helper) })
 }
 
 // zombie reports whether pid has exited but not been reaped: the stand-ins
@@ -1020,18 +1048,21 @@ func TestReleaseSerializesConcurrentIncarnationHandover(t *testing.T) {
 	// can still unreference that name. The fake makes that overlap observable
 	// without depending on the scheduler pausing between two mutex operations.
 	replaced := make(chan struct{})
-	go func() {
-		m.mu.Lock()
+	replace := func() {
 		sd.mu.Lock()
 		sd.units[ps.unit] = &fakeUnit{props: map[string]any{}, active: "active", refs: 1}
 		m.held[ps.unit] = nextPID
 		sd.mu.Unlock()
 		m.mu.Unlock()
 		close(replaced)
-	}()
-	select {
-	case <-replaced:
-	case <-time.After(50 * time.Millisecond):
+	}
+	if m.mu.TryLock() {
+		replace()
+	} else {
+		go func() {
+			m.mu.Lock()
+			replace()
+		}()
 	}
 	close(paused.resume)
 	<-released

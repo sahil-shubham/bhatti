@@ -70,7 +70,7 @@ func (e *Engine) watchAdoptedVM(vm *VM) {
 	pid, spec := vm.HelperPID, vm.specPath()
 	stop := e.monitorChannel()
 	go func() {
-		if !waitProcessExit(pid, func() bool { return pidAlive(pid) && isHelper(pid, spec) }, stop) {
+		if !waitProcessExit(pid, func() bool { return pidAlive(pid) && isHelper(pid, spec, e.cfg.VMMBinary) }, stop) {
 			return
 		}
 		select {

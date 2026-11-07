@@ -243,10 +243,11 @@ type cgroupManager struct {
 	requested string // the configured value
 	reason    string // why an automatic choice isn't systemd
 
-	sd      systemdAPI
-	procCg  func(pid int) (string, error)
-	slots   chan struct{}
-	timeout time.Duration
+	sd        systemdAPI
+	procCg    func(pid int) (string, error)
+	procStart func(pid int) (uint64, error)
+	slots     chan struct{}
+	timeout   time.Duration
 
 	mu     sync.Mutex
 	slices map[string]bool // slices ensured by this daemon
@@ -464,7 +465,7 @@ func (m *cgroupManager) place(ctx context.Context, pid int, ps placementSpec, st
 		m.forgetSlices()
 		return fmt.Errorf("place %s: %w", ps.unit, err)
 	}
-	if err := m.startScope(ctx, pid, ps); err != nil {
+	if err := m.startScope(ctx, pid, ps, !stopOnFail); err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			if created := m.reconcileScope(pid, ps); created && stopOnFail {
 				m.discard(ps.unit)
@@ -479,6 +480,9 @@ func (m *cgroupManager) place(ctx context.Context, pid int, ps placementSpec, st
 		}
 		return fmt.Errorf("place %s: %w", ps.unit, err)
 	}
+	if !stopOnFail && !ps.alive(pid) {
+		return fmt.Errorf("pid %d changed identity while being adopted", pid)
+	}
 	return nil
 }
 
@@ -487,8 +491,11 @@ func (m *cgroupManager) place(ctx context.Context, pid int, ps placementSpec, st
 // yet forgotten, or kept loaded by this daemon's reference — is waited out and
 // released, not failed on: a stop followed at once by a start is ordinary. A
 // name held by a scope that is still running is never taken from it.
-func (m *cgroupManager) startScope(ctx context.Context, pid int, ps placementSpec) error {
+func (m *cgroupManager) startScope(ctx context.Context, pid int, ps placementSpec, adopting bool) error {
 	for delay := time.Millisecond; ; delay = min(delay*2, 50*time.Millisecond) {
+		if adopting && !ps.alive(pid) {
+			return fmt.Errorf("pid %d changed identity before scope placement", pid)
+		}
 		err := m.sd.StartTransientUnit(ctx, ps.unit, scopeProps(ps, pid))
 		if err == nil {
 			m.mu.Lock()
@@ -705,6 +712,48 @@ func (m *cgroupManager) accounting(s placedScope) string {
 	return "cgroup"
 }
 
+// Pin before recovery's socket probes: pinning only when adoption begins can
+// capture a recycled PID after the original helper has already exited.
+func (m *cgroupManager) adoptionIdentity(pid int, alive func(int) bool) func(int) bool {
+	if !m.placing() {
+		return nil
+	}
+	pinned, err := m.pinProcess(pid, alive)
+	if err != nil {
+		return func(int) bool { return false }
+	}
+	return pinned
+}
+
+func (m *cgroupManager) pinProcess(pid int, alive func(int) bool) (func(int) bool, error) {
+	readStart := m.procStart
+	if readStart == nil {
+		readStart = procStartTime
+	}
+	if alive == nil {
+		alive = pidAlive
+	}
+	start, err := readStart(pid)
+	if err != nil {
+		return nil, fmt.Errorf("read start time of pid %d: %w", pid, err)
+	}
+	unchanged := func(candidate int) bool {
+		if candidate != pid {
+			return false
+		}
+		before, err := readStart(pid)
+		if err != nil || before != start || !alive(pid) {
+			return false
+		}
+		after, err := readStart(pid)
+		return err == nil && after == start
+	}
+	if !unchanged(pid) {
+		return nil, fmt.Errorf("pid %d changed identity while being identified", pid)
+	}
+	return unchanged, nil
+}
+
 // adopt takes over a helper this daemon didn't start: one a previous daemon left
 // running, already identified as ps's helper by its caller. rec is what the
 // helper's record says about its scope.
@@ -720,6 +769,11 @@ func (m *cgroupManager) adopt(ctx context.Context, pid int, ps placementSpec, re
 	if !m.placing() {
 		return placedScope{}, nil
 	}
+	pinned, err := m.pinProcess(pid, ps.alive)
+	if err != nil {
+		return placedScope{}, err
+	}
+	ps.alive = pinned
 	ctx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 	cg, err := m.procCg(pid)
@@ -729,6 +783,9 @@ func (m *cgroupManager) adopt(ctx context.Context, pid int, ps placementSpec, re
 	units, err := m.sd.Units(ctx, ps.unit)
 	if err != nil {
 		return placedScope{}, fmt.Errorf("look up %s: %w", ps.unit, err)
+	}
+	if !ps.alive(pid) {
+		return placedScope{}, fmt.Errorf("pid %d changed identity during scope lookup", pid)
 	}
 	running := len(units) == 1 && units[0].running()
 	if memberOf(cg, ps) {
@@ -741,6 +798,10 @@ func (m *cgroupManager) adopt(ctx context.Context, pid int, ps placementSpec, re
 			m.mu.Lock()
 			m.held[ps.unit] = pid
 			m.mu.Unlock()
+		}
+		if !ps.alive(pid) {
+			m.release(ps.unit, pid)
+			return placedScope{}, fmt.Errorf("pid %d changed identity while referencing its scope", pid)
 		}
 		m.track(ps, pid)
 		return placedScope{unit: ps.unit, partial: rec.partial}, nil
@@ -815,7 +876,7 @@ func (e *Engine) placementFor(vm *VM) (placementSpec, error) {
 		return ps, err
 	}
 	spec := vm.specPath()
-	ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec) }
+	ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec, e.cfg.VMMBinary) }
 	return ps, nil
 }
 
@@ -858,7 +919,7 @@ func (e *Engine) Accounting(id string) string {
 // adoptScope settles the scope of a helper recovery has just adopted. A failure
 // leaves the guest running, unaccounted, and says so: stopping a guest because
 // it can't be measured would turn a daemon restart into a reboot.
-func (e *Engine) adoptScope(vm *VM) {
+func (e *Engine) adoptScope(vm *VM, identity func(int) bool) {
 	if !e.cg.placing() {
 		return
 	}
@@ -868,6 +929,9 @@ func (e *Engine) adoptScope(vm *VM) {
 	ps, err := e.placementFor(vm)
 	var scope placedScope
 	if err == nil {
+		if identity != nil {
+			ps.alive = identity
+		}
 		scope, err = e.cg.adopt(context.Background(), pid, ps, recorded)
 	}
 	if err != nil {
@@ -883,12 +947,15 @@ func (e *Engine) adoptScope(vm *VM) {
 
 // adoptNetdScopeLocked is adoptScope for an adopted gateway. It is retried by
 // the next ensureNetd until it holds. Caller holds inst.mu.
-func (e *Engine) adoptNetdScopeLocked(inst *netdInstance) {
+func (e *Engine) adoptNetdScopeLocked(inst *netdInstance, identity func(int) bool) {
 	if !e.cg.placing() || inst.scopePID == inst.pid {
 		return
 	}
 	ps, err := e.netdPlacementFor(inst)
 	if err == nil {
+		if identity != nil {
+			ps.alive = identity
+		}
 		var scope placedScope
 		if scope, err = e.cg.adopt(context.Background(), inst.pid, ps, inst.scope); err == nil {
 			inst.scope, inst.scopePID = scope, inst.pid

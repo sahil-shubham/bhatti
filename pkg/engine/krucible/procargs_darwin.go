@@ -38,6 +38,21 @@ func procArgs(pid int) ([]string, error) {
 	return args, nil
 }
 
+// Darwin exposes argv here but has no procfs executable symlink to cross-check.
+func procExecutableMatches(_ int, _ string) bool { return true }
+
+func procStartTime(pid int) (uint64, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return 0, err
+	}
+	start := kp.Proc.P_starttime
+	if int(kp.Proc.P_pid) != pid || start.Sec < 0 || start.Usec < 0 || start.Usec >= 1_000_000 {
+		return 0, errors.New("kern.proc.pid: invalid process start time")
+	}
+	return uint64(start.Sec)*1_000_000 + uint64(start.Usec), nil
+}
+
 // listPIDs returns the pids of the processes running now.
 func listPIDs() ([]int, error) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")

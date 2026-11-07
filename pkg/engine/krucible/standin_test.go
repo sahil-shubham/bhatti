@@ -65,11 +65,17 @@ func standinMain(mode string, fd int, spec string) {
 	os.Exit(0)
 }
 
-// gatedStandin starts this test binary as an idle stand-in for the helper
-// running spec, started the way the daemon starts a placed one (argv
-// [bhatti-vmm spec], its gate in the environment) with its gate opened, and
-// returns its pid once it has begun. It is killed when the test ends.
+// gatedStandin starts this test binary as an idle stand-in for the configured
+// helper, with argv [basename(binary) spec] and its gate opened. It returns
+// its pid once it has begun and is killed when the test ends.
 func gatedStandin(t *testing.T, spec string) int {
+	t.Helper()
+	return gatedStandinAs(t, spec, filepath.Base(os.Args[0]))
+}
+
+// gatedStandinAs also permits an unrelated process's argv without changing
+// the executable, so helper identity tests can distinguish argv from exe.
+func gatedStandinAs(t *testing.T, spec, argv0 string) int {
 	t.Helper()
 	g, err := launchgate.New()
 	if err != nil {
@@ -77,7 +83,7 @@ func gatedStandin(t *testing.T, spec string) int {
 	}
 	t.Cleanup(g.Close)
 	cmd := exec.Command(os.Args[0], spec)
-	cmd.Args[0] = "bhatti-vmm"
+	cmd.Args[0] = argv0
 	cmd.Env = append(os.Environ(), standinEnv+"=idle")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := g.Start(cmd); err != nil {
@@ -88,5 +94,6 @@ func gatedStandin(t *testing.T, spec string) int {
 		t.Fatal(err)
 	}
 	waitFor(t, "the stand-in to start", func() bool { return exists(filepath.Join(filepath.Dir(spec), standinStarted)) })
+	execd(t, cmd.Process.Pid, argv0, spec)
 	return cmd.Process.Pid
 }

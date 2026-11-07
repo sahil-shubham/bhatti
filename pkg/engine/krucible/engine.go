@@ -298,6 +298,13 @@ func (e *Engine) ensureNetd(ownerKey string) (retErr error) {
 	// disconnects existing guests permanently until they are restarted. Kill it
 	// FIRST so its obsolete rules cannot forward another packet; the fresh
 	// gateway serves new sandboxes only. Report each affected running sandbox.
+	var identity func(int) bool
+	if inst.pid > 0 && inst.cmd == nil {
+		sock := inst.sock
+		identity = e.cg.adoptionIdentity(inst.pid, func(pid int) bool {
+			return pidAlive(pid) && isNetd(pid, sock)
+		})
+	}
 	if inst.pid > 0 && isNetd(inst.pid, inst.sock) {
 		_, sockErr := os.Stat(inst.sock)
 		_, ctlErr := os.Stat(inst.ctlSock)
@@ -308,7 +315,7 @@ func (e *Engine) ensureNetd(ownerKey string) (retErr error) {
 				serveBrokerLocked(inst, broker)
 				if inst.cmd == nil {
 					e.watchAdoptedNetdLocked(inst)
-					e.adoptNetdScopeLocked(inst)
+					e.adoptNetdScopeLocked(inst, identity)
 				}
 				return e.shareNetdSocket(inst)
 			}
@@ -780,7 +787,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	defer func() {
 		if err != nil {
 			if vm != nil {
-				vm.kill()
+				vm.kill(e.cfg.VMMBinary)
 				e.releaseVMM(vm)
 			}
 			if netdKey != "" {
@@ -1225,7 +1232,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 
 // kill terminates a helper that this daemon owns or adopted. The watcher owns
 // cmd.Wait; signal under the short state lock, then wait without holding it.
-func (vm *VM) kill() {
+func (vm *VM) kill(binary string) {
 	vm.mu.Lock()
 	cmd, waitDone, reaped := vm.cmd, vm.waitDone, vm.exitDone
 	pid, cancel := vm.HelperPID, vm.cancel
@@ -1239,7 +1246,7 @@ func (vm *VM) kill() {
 			<-waitDone
 		}
 	} else if pid > 0 {
-		killHelper(pid, vm.specPath())
+		killHelper(pid, vm.specPath(), binary)
 	}
 	if cancel != nil {
 		cancel()
@@ -1271,7 +1278,7 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	// kill() handles both an owned helper (vm.cmd) and one adopted across a daemon
 	// restart (only vm.HelperPID set) — the inlined cmd-only kill here used to leak
 	// the latter, leaving a live VM with its backing files deleted.
-	vm.kill()
+	vm.kill(e.cfg.VMMBinary)
 	e.releaseVMM(vm)
 	vm.mu.Lock()
 	dir := vm.SandboxDir
@@ -1320,7 +1327,7 @@ func (e *UncleanStopError) UncleanStopReason() string { return e.Reason.Error() 
 // powerOffLocked handles an explicit, possibly unclean stop. The caller owns
 // launchMu; neither killing the process nor persisting the record holds vm.mu.
 func (e *Engine) powerOffLocked(vm *VM) {
-	vm.kill()
+	vm.kill(e.cfg.VMMBinary)
 	vm.mu.Lock()
 	vm.Status = "stopped"
 	vm.Thermal = "cold"

@@ -109,10 +109,10 @@ func startStandin(t *testing.T, m *cgroupManager, ps placementSpec, mode string)
 	dir = t.TempDir()
 	spec := filepath.Join(dir, "vmspec.json")
 	cmd = exec.Command(os.Args[0], spec)
-	cmd.Args[0] = "bhatti-vmm"
+	cmd.Args[0] = filepath.Base(os.Args[0])
 	cmd.Env = append(os.Environ(), standinEnv+"="+mode)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec) }
+	ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec, os.Args[0]) }
 	err = m.start(context.Background(), cmd, ps, nil)
 	t.Cleanup(func() {
 		if cmd.Process != nil {
@@ -258,7 +258,7 @@ func TestSystemdAddRefKeepsTheUnitNotTheCgroup(t *testing.T) {
 		dir := t.TempDir()
 		spec := filepath.Join(dir, "vmspec.json")
 		cmd := exec.Command(os.Args[0], spec)
-		cmd.Args[0] = "bhatti-vmm"
+		cmd.Args[0] = filepath.Base(os.Args[0])
 		cmd.Env = append(os.Environ(), standinEnv+"=hog:48")
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		g, err := launchgate.New()
@@ -504,14 +504,14 @@ func TestSystemdAdoptsAcrossARestart(t *testing.T) {
 	}
 	ps := vmSpecFor(t, owner, 7)
 	spec := filepath.Join(dir, "vmspec.json")
-	ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec) }
+	ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec, os.Args[0]) }
 
 	// Find the helper the way recovery would: by its argv, on /proc.
 	var pid int
 	waitFor(t, "the helper to allocate", func() bool { return exists(filepath.Join(dir, "standin.allocated")) })
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {
-		if p, err := strconv.Atoi(e.Name()); err == nil && isHelper(p, spec) {
+		if p, err := strconv.Atoi(e.Name()); err == nil && isHelper(p, spec, os.Args[0]) {
 			pid = p
 		}
 	}
@@ -562,7 +562,7 @@ func TestSystemdAdoptsAnUnplacedHelperAsPartial(t *testing.T) {
 	dir := t.TempDir()
 	spec := filepath.Join(dir, "vmspec.json")
 	cmd := exec.Command(os.Args[0], spec)
-	cmd.Args[0] = "bhatti-vmm"
+	cmd.Args[0] = filepath.Base(os.Args[0])
 	cmd.Env = append(os.Environ(), standinEnv+"=hog:64")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	g, err := launchgate.New()
@@ -702,7 +702,7 @@ func TestSystemdOOMKillOutlivesTheScope(t *testing.T) {
 	dir := t.TempDir()
 	spec := filepath.Join(dir, "vmspec.json")
 	cmd := exec.Command(os.Args[0], spec)
-	cmd.Args[0] = "bhatti-vmm"
+	cmd.Args[0] = filepath.Base(os.Args[0])
 	cmd.Env = append(os.Environ(), standinEnv+"=hog:200")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	g, err := launchgate.New()
@@ -892,10 +892,10 @@ func TestSystemdLostStartReplyReleasesScopeName(t *testing.T) {
 			dir := t.TempDir()
 			spec := filepath.Join(dir, "vmspec.json")
 			cmd := exec.Command(os.Args[0], spec)
-			cmd.Args[0] = "bhatti-vmm"
+			cmd.Args[0] = filepath.Base(os.Args[0])
 			cmd.Env = append(os.Environ(), standinEnv+"=idle")
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec) }
+			ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec, os.Args[0]) }
 			t.Cleanup(func() {
 				if cmd.Process != nil {
 					reap(t, cmd)

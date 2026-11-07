@@ -208,15 +208,13 @@ func pidAlive(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
-// isHelper reports whether pid is a bhatti-vmm started on spec, its only
-// argument. Once a process exits its pid can be anyone's, so a pid read back
-// from state.json names a helper only together with this. Every daemon
-// version recognises a helper this way, which is why the launch gate travels
-// in the environment (pkg/launchgate): a daemon rolled back to an older
-// release still knows the helpers this one started.
-func isHelper(pid int, spec string) bool {
+// A spec path alone also matches an administrator's editor. Require the
+// configured helper's executable as well, including the kernel's executable
+// identity where the platform exposes it.
+func isHelper(pid int, spec, binary string) bool {
 	args, err := procArgs(pid)
-	return err == nil && len(args) == 2 && args[1] == spec
+	return err == nil && len(args) == 2 && args[1] == spec &&
+		filepath.Base(args[0]) == filepath.Base(binary) && procExecutableMatches(pid, binary)
 }
 
 // isNetd reports whether pid is the bhatti-netd serving sock.
@@ -237,8 +235,8 @@ func isNetd(pid int, sock string) bool {
 // for it to go: whatever runs on the sandbox's disks next mustn't share them
 // with it. An adopted helper isn't our child — init reaps it — except when a
 // test runs both daemons in one process, so it's reaped here if it is.
-func killHelper(pid int, spec string) {
-	if !isHelper(pid, spec) {
+func killHelper(pid int, spec, binary string) {
+	if !isHelper(pid, spec, binary) {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGKILL)
@@ -311,12 +309,16 @@ func (e *Engine) recover() {
 	}
 	for _, vm := range recovered {
 		recStatus := vm.Status
+		spec := vm.specPath()
+		identity := e.cg.adoptionIdentity(vm.HelperPID, func(pid int) bool {
+			return pidAlive(pid) && isHelper(pid, spec, e.cfg.VMMBinary)
+		})
 		helper := ""
 		if reason := unverified[vm.netdKey]; reason != nil && recStatus == "running" {
 			// If the gateway cannot be safely replaced, keeping a connected
 			// VMM alive would leave its unverified egress policy in effect.
 			slog.Error("krucible.netd_quarantine", "sandbox_id", vm.ID, "error", reason)
-			killHelper(vm.HelperPID, vm.specPath())
+			killHelper(vm.HelperPID, vm.specPath(), e.cfg.VMMBinary)
 			e.emitLifecycle(engine.LifecycleEvent{Kind: engine.NetworkLost, EngineID: vm.ID,
 				SandboxID: vm.sandboxRef, UserID: vm.UserID,
 				Reason: "gateway recovery failed: " + reason.Error() + "; existing guests cannot reattach their Unixstream NIC until restarted"})
@@ -334,7 +336,7 @@ func (e *Engine) recover() {
 					slog.Warn("krucible.agent.info", "id", vm.ID, "error", vm.AgentInfoErr)
 				}
 			}
-			e.adoptScope(vm)
+			e.adoptScope(vm, identity)
 		default:
 			vm.Status, vm.Thermal, vm.HelperPID, vm.scope = "stopped", "cold", 0, placedScope{}
 		}
@@ -342,7 +344,7 @@ func (e *Engine) recover() {
 		slog.Info("krucible recovered sandbox", "id", vm.ID, "name", vm.Name,
 			"helper", helper, "status", vm.Status, "thermal", vm.Thermal)
 	}
-	killStrays(recovered)
+	killStrays(recovered, e.cfg.VMMBinary)
 	// Replay even absent policies: a registered old grant must be replaced by
 	// deny. No helper is allowed to rely on a versionless control socket.
 	for _, vm := range recovered {
@@ -366,7 +368,7 @@ func (e *Engine) recover() {
 // say) recorded the sandbox stopped and let it run. It is no one's to adopt,
 // and the sandbox's next boot would share its disks with it. One /proc scan
 // covers every sandbox.
-func killStrays(recovered []*VM) {
+func killStrays(recovered []*VM, binary string) {
 	stopped := map[string]*VM{}
 	for _, vm := range recovered {
 		if vm.Status == "stopped" {
@@ -386,9 +388,9 @@ func killStrays(recovered []*VM) {
 		if err != nil || len(args) != 2 {
 			continue
 		}
-		if vm := stopped[args[1]]; vm != nil {
+		if vm := stopped[args[1]]; vm != nil && isHelper(pid, args[1], binary) {
 			slog.Warn("krucible.recover.stray_helper_killed", "sandbox_id", vm.ID, "pid", pid)
-			killHelper(pid, args[1])
+			killHelper(pid, args[1], binary)
 		}
 	}
 }
@@ -400,18 +402,18 @@ func killStrays(recovered []*VM) {
 // came up — is killed: the sandbox's next boot would share its disks.
 func (e *Engine) adoptHelper(vm *VM, recStatus string) string {
 	pid, spec := vm.HelperPID, vm.specPath()
-	if pid <= 0 || !pidAlive(pid) || !isHelper(pid, spec) {
+	if pid <= 0 || !pidAlive(pid) || !isHelper(pid, spec, e.cfg.VMMBinary) {
 		return ""
 	}
 	if recStatus != "running" {
 		slog.Warn("krucible recover: killing a helper whose launch never finished", "id", vm.ID, "pid", pid)
-		killHelper(pid, spec)
+		killHelper(pid, spec, e.cfg.VMMBinary)
 		return ""
 	}
 	state, err := e.helperState(vm)
 	if err != nil {
 		slog.Warn("krucible recover: killing a helper that doesn't answer", "id", vm.ID, "pid", pid, "error", err)
-		killHelper(pid, spec)
+		killHelper(pid, spec, e.cfg.VMMBinary)
 		return ""
 	}
 	return state

@@ -207,7 +207,7 @@ func TestStartAfterStopReusesTheScopeName(t *testing.T) {
 func recoverFixture(t *testing.T, sd *fakeSystemd) *Engine {
 	t.Helper()
 	return &Engine{
-		cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t)}, vms: map[string]*VM{}, netds: map[string]*netdInstance{},
+		cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t), VMMBinary: os.Args[0]}, vms: map[string]*VM{}, netds: map[string]*netdInstance{},
 		cg: newTestManager(sd),
 	}
 }
@@ -263,7 +263,7 @@ func TestRecoverPlacesAHelperAPreviousDaemonNeverPlaced(t *testing.T) {
 	sd.moveAfter = 5 * time.Millisecond
 	e := recoverFixture(t, sd)
 	spec, ctl := sandboxPaths(t, e, testID)
-	pid := fakeHelper(t, spec) // started as a pre-placement daemon did: [bhatti-vmm spec], in the daemon's cgroup
+	pid := fakeHelper(t, spec) // same argv shape as a pre-placement daemon's helper, in the daemon's cgroup
 	fakeControl(t, ctl, "running")
 	ps := recordRunning(t, e, testID, pid, placedScope{})
 
@@ -291,7 +291,7 @@ func TestRecoverPlacesAHelperAPreviousDaemonNeverPlaced(t *testing.T) {
 		t.Fatalf("after another restart: %+v", got)
 	}
 	// A fresh start clears it: the new helper is placed from its first instruction.
-	e2.vms[testID].kill()
+	e2.vms[testID].kill(e2.cfg.VMMBinary)
 	if e2.vms[testID].scope != (placedScope{}) {
 		t.Fatal("a killed helper's scope was kept")
 	}

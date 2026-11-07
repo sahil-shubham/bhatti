@@ -54,7 +54,7 @@ func TestKrucibleDaemonRestartKeepsSandboxes(t *testing.T) {
 			_ = cur.Destroy(context.Background(), id)
 		}
 		for i, pid := range helpers {
-			killHelper(pid, filepath.Join(dataDir, "sandboxes", ids[i], "vmspec.json"))
+			killHelper(pid, filepath.Join(dataDir, "sandboxes", ids[i], "vmspec.json"), cur.cfg.VMMBinary)
 		}
 		if netdPID > 0 && isNetd(netdPID, filepath.Join(cur.netdDir("u:"+owner), "n.sock")) {
 			_ = syscall.Kill(netdPID, syscall.SIGKILL)
