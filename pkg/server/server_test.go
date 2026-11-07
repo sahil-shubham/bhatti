@@ -1154,20 +1154,24 @@ func TestExecTimeout(t *testing.T) {
 	}
 }
 
-func TestExecTimeoutClamped(t *testing.T) {
+func TestExecTimeoutOutOfRangeRejected(t *testing.T) {
 	_, ts := setup(t)
-	sb := createSandbox(t, ts, uniqueName(t, "clamp"))
+	sb := createSandbox(t, ts, uniqueName(t, "bounds"))
 
-	// timeout_sec > 86400 should be ignored (uses default 300)
-	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
-		"cmd":         []string{"echo", "ok"},
-		"timeout_sec": 100000,
-	})
-	if resp.StatusCode != 200 {
+	for _, tc := range []struct {
+		timeout int
+		want    int
+	}{{86400, 200}, {86401, 400}, {-1, 400}} {
+		resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/exec", map[string]any{
+			"cmd":         []string{"echo", "ok"},
+			"timeout_sec": tc.timeout,
+		})
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("timeout_sec %d: status %d, want %d: %s", tc.timeout, resp.StatusCode, tc.want, body)
+		}
 	}
-	resp.Body.Close()
 }
 
 func TestErrorSanitization(t *testing.T) {

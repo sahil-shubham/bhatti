@@ -51,6 +51,12 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		errResp(w, 400, "sync requires an attached exec")
 		return
 	}
+	// Refuse rather than fall back to the default: a caller asking for two
+	// days would otherwise be killed after five minutes.
+	if req.TimeoutSec < 0 || req.TimeoutSec > maxExecTimeoutSec {
+		errResp(w, 400, fmt.Sprintf("timeout_sec must be between 1 and %d (0 for the default of 300)", maxExecTimeoutSec))
+		return
+	}
 	if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
 		errResp(w, 500, "wake sandbox: "+err.Error())
 		return
@@ -68,9 +74,8 @@ func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id st
 		}
 	}
 
-	// Apply exec timeout (default 300s, max 86400s / 24h)
 	timeout := 300 * time.Second
-	if req.TimeoutSec > 0 && req.TimeoutSec <= maxExecTimeoutSec {
+	if req.TimeoutSec > 0 {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
 	}
 	execCtx, cancel := context.WithTimeout(r.Context(), timeout)
