@@ -495,14 +495,17 @@ func TestNewRefusesADatabaseFromANewerBuild(t *testing.T) {
 	})
 }
 
-// TestConcurrentOpenersRunEachStepOnce: two processes can open one new
-// database at once (the daemon booting while an admin command runs). The one
-// that waits for the other's write lock finds its steps already run, because a
-// step may assume it runs exactly once, on the schema the step before it left.
+// TestConcurrentOpenersRunEachStepOnce: two processes can open one database
+// that has steps to run at once (the daemon booting after an upgrade while an
+// admin command runs). The one that waits for the other's write lock finds
+// its steps already run, because a step may assume it runs exactly once, on
+// the schema the step before it left.
 func TestConcurrentOpenersRunEachStepOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	// Put the database in WAL mode first: switching a brand-new file takes
-	// a lock that busy_timeout, set after it, does not wait for.
+	// Create the file first. Connections that switch a brand-new file into
+	// WAL mode at the same moment can get SQLITE_BUSY from that first
+	// statement without waiting, busy_timeout or not; what is under test
+	// here is the migration, on a database that already exists.
 	first, err := open(t.Context(), path, nil)
 	if err != nil {
 		t.Fatal(err)
