@@ -896,11 +896,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// add_disk2 compose with the root setter.
 	var cdVolumes []configdrive.VolumeMountConfig
 	for i, v := range spec.ResolvedVolumes {
-		format := "raw"
-		if isQcow2(v.FilePath) {
-			format = "qcow2"
-		}
-		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", i), Path: v.FilePath, Format: format, ReadOnly: v.ReadOnly})
+		// Persistent volumes are daemon-created raw disks; their guest-owned
+		// bytes cannot select a format or authorize a backing file.
+		baseSpec.Volumes = append(baseSpec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", i), Path: v.FilePath, Format: "raw", ReadOnly: v.ReadOnly})
 		cdVolumes = append(cdVolumes, configdrive.VolumeMountConfig{Device: fmt.Sprintf("/dev/vd%c", 'b'+rune(i)), Mount: v.Mount, FS: "ext4", ReadOnly: v.ReadOnly})
 	}
 
