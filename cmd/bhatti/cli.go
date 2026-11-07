@@ -544,12 +544,14 @@ func baseTransport() http.RoundTripper {
 	return http.DefaultTransport
 }
 
+// httpClient retries rate-limited requests (see retryPolicy). The retry layer
+// wraps the timing one so --timing reports only the attempt that answered.
 func httpClient() *http.Client {
-	tr := baseTransport()
+	var tr http.RoundTripper = baseTransport()
 	if currentTiming != nil {
-		return &http.Client{Transport: &timingTransport{inner: tr, timing: currentTiming}}
+		tr = &timingTransport{inner: tr, timing: currentTiming}
 	}
-	return &http.Client{Transport: tr}
+	return &http.Client{Transport: &rateLimitTransport{inner: tr, policy: rateLimitRetry}}
 }
 
 // wsDialer returns a websocket dialer that honors the unix control socket.

@@ -279,7 +279,7 @@ func runForward(ctx context.Context, sandbox string, specs []portSpec, address s
 					defer wg.Done()
 					defer session.release(local)
 					defer local.Close()
-					ws, resp, err := dialer.DialContext(ctx, b.endpoint, header)
+					ws, resp, err := dialWS(ctx, dialer, b.endpoint, header)
 					if err != nil {
 						session.report(tunnelDialError(err, resp))
 						return

@@ -214,7 +214,7 @@ the shell keeps running. Reconnect with 'bhatti shell' again.`,
 		if apiToken != "" {
 			header.Set("Authorization", "Bearer "+apiToken)
 		}
-		conn, _, err := wsDialer().Dial(endpoint, header)
+		conn, _, err := dialWS(cmd.Context(), wsDialer(), endpoint, header)
 		if err != nil {
 			return err
 		}

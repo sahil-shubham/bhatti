@@ -74,6 +74,7 @@ var fileWriteCmd = &cobra.Command{
 func putFile(id, guestPath string, in *os.File) error {
 	var body io.Reader = http.NoBody
 	var size int64
+	var replay func() (io.ReadCloser, error)
 	if st, err := in.Stat(); err == nil && st.Mode().IsRegular() {
 		pos, err := in.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -83,6 +84,10 @@ func putFile(id, guestPath string, in *os.File) error {
 			// ReadAt, not the shared offset: after an early answer the transport may
 			// still be draining the body, and must not move the caller's file.
 			body = io.NewSectionReader(in, pos, size)
+			// A rate-limited retry re-reads the same range.
+			replay = func() (io.ReadCloser, error) {
+				return io.NopCloser(io.NewSectionReader(in, pos, size)), nil
+			}
 		}
 	} else {
 		data, err := io.ReadAll(in)
@@ -97,6 +102,9 @@ func putFile(id, guestPath string, in *os.File) error {
 		apiURL+"/sandboxes/"+id+"/files?path="+url.QueryEscape(guestPath), body)
 	if err != nil {
 		return err
+	}
+	if replay != nil {
+		req.GetBody = replay
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = size
