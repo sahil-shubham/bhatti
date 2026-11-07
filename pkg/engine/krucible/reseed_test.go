@@ -25,33 +25,40 @@ func TestFakeReseedVMMProcess(t *testing.T) {
 	if os.Getenv("BHATTI_FAKE_RESEED_VMM") != "1" {
 		return
 	}
-	data, err := os.ReadFile(os.Args[len(os.Args)-1])
+	fakeReseedVMM(os.Args[len(os.Args)-1], func(err error) { t.Fatal(err) })
+}
+
+// fakeReseedVMM serves what a started bhatti-vmm's guest would, for the spec at
+// specPath, until it is killed. fatal ends the helper: the test running it, or
+// the process the test binary became (standin_test.go).
+func fakeReseedVMM(specPath string, fatal func(error)) {
+	data, err := os.ReadFile(specPath)
 	if err != nil {
-		t.Fatal(err)
+		fatal(err)
 	}
 	var spec VMSpec
 	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatal(err)
+		fatal(err)
 	}
-	dir := filepath.Dir(os.Args[len(os.Args)-1])
+	dir := filepath.Dir(specPath)
 	configJSON, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
-		t.Fatal(err)
+		fatal(err)
 	}
 	var cfg struct {
 		Token string `json:"token"`
 	}
 	if err := json.Unmarshal(configJSON, &cfg); err != nil {
-		t.Fatal(err)
+		fatal(err)
 	}
 	control, err := net.Listen("unix", spec.VsockControlUDS)
 	if err != nil {
-		t.Fatal(err)
+		fatal(err)
 	}
 	defer control.Close()
 	vmm, err := net.Listen("unix", spec.ControlSocketUDS)
 	if err != nil {
-		t.Fatal(err)
+		fatal(err)
 	}
 	defer vmm.Close()
 	go func() {

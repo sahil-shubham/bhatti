@@ -14,6 +14,7 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
+	"github.com/sahil-shubham/bhatti/pkg/launchgate"
 )
 
 // Recovery makes krucible restart-safe. A daemon's shutdown lets go of its
@@ -47,6 +48,11 @@ type vmRecord struct {
 	NetIP      string `json:"net_ip,omitempty"`      // guest IP on the netd gateway subnet
 	SandboxRef string `json:"sandbox_ref,omitempty"` // the server's sandbox ID, named to the credential broker
 	VMMUID     uint32 `json:"vmm_uid,omitempty"`     // the helper's own uid (vmmuser.go), kept for the sandbox's life
+	// The cgroup scope HelperPID runs in (cgroup.go), checked against the
+	// helper's actual cgroup before recovery trusts it; partial when the helper
+	// was placed after it had started.
+	CgroupUnit    string `json:"cgroup_unit,omitempty"`
+	CgroupPartial bool   `json:"cgroup_partial,omitempty"`
 	// Missing legacy policy is deny at netd; never infer public from absence.
 	NetPolicy *gateway.NetPolicyWire `json:"net_policy,omitempty"`
 }
@@ -62,18 +68,27 @@ type netdRecord struct {
 	Pid       int    `json:"pid"`
 	NextGuest int    `json:"next_guest"`
 	VMMGID    uint32 `json:"vmm_gid,omitempty"` // the group of the owner's helpers, which its socket opens to
+	Scope     string `json:"scope,omitempty"`   // the cgroup scope Pid runs in (cgroup.go)
+	// ScopePartial: placed after it had started, so its earlier memory is accounted to the daemon.
+	ScopePartial bool `json:"scope_partial,omitempty"`
 }
 
 func netdStatePath(dir string) string { return filepath.Join(dir, "netd.json") }
 
 // writeNetdRecord persists the instance. Caller must hold inst.mu (it reads
-// nextGuest + pid). Best-effort + atomic (temp + rename).
-func writeNetdRecord(inst *netdInstance) {
+// nextGuest, pid and scope). Best-effort + atomic (temp + rename).
+func writeNetdRecord(inst *netdInstance) { writeNetdRecordFor(inst, inst.pid, inst.scope) }
+
+// writeNetdRecordFor persists the instance as running pid in scope, which is
+// how a gateway is recorded before it is let go (placement) and before the
+// instance itself is updated.
+func writeNetdRecordFor(inst *netdInstance, pid int, scope placedScope) {
 	if inst.dir == "" {
 		return
 	}
 	rec := netdRecord{Owner: inst.owner, Sock: inst.sock, Dir: inst.dir,
-		SubnetIdx: inst.subnetIdx, Pid: inst.pid, NextGuest: inst.nextGuest, VMMGID: inst.vmmGID}
+		SubnetIdx: inst.subnetIdx, Pid: pid, NextGuest: inst.nextGuest, VMMGID: inst.vmmGID,
+		Scope: scope.unit, ScopePartial: scope.partial}
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return
@@ -97,6 +112,7 @@ func (vm *VM) toRecordLocked() vmRecord {
 		LogPath: vm.logPath, BaseSpec: vm.baseSpec,
 		HelperPID: vm.HelperPID, NetdKey: vm.netdKey, SubnetIdx: vm.subnetIdx, NetIP: vm.netIP, SandboxRef: vm.sandboxRef,
 		VMMUID: vm.vmmUID, NetPolicy: vm.netPolicy,
+		CgroupUnit: vm.scope.unit, CgroupPartial: vm.scope.partial,
 	}
 }
 
@@ -138,6 +154,7 @@ func vmFromRecord(rec vmRecord) *VM {
 		baseSpec: rec.BaseSpec, logPath: rec.LogPath,
 		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP, sandboxRef: rec.SandboxRef,
 		vmmUID: rec.VMMUID, netPolicy: rec.NetPolicy,
+		scope: placedScope{unit: rec.CgroupUnit, partial: rec.CgroupPartial},
 	}
 }
 
@@ -164,6 +181,7 @@ func (e *Engine) readoptNetd(vm *VM) {
 				inst.nextGuest = rec.NextGuest
 				if rec.Pid > 0 && pidAlive(rec.Pid) && isNetd(rec.Pid, inst.sock) {
 					inst.pid = rec.Pid // adopt the live gateway
+					inst.scope = placedScope{unit: rec.Scope, partial: rec.ScopePartial}
 				} else if rec.Pid > 0 {
 					inst.lostAtRecovery = true
 				}
@@ -191,12 +209,17 @@ func pidAlive(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
-// isHelper reports whether pid is a bhatti-vmm started on spec, its only
-// argument. Once a process exits its pid can be anyone's, so a pid read back
-// from state.json names a helper only together with this.
+// isHelper reports whether pid is a bhatti-vmm started on spec, its last and
+// only other argument. Once a process exits its pid can be anyone's, so a pid
+// read back from state.json names a helper only together with this. A helper
+// started to be placed in a cgroup also carries --gate-fd N ahead of the spec.
 func isHelper(pid int, spec string) bool {
 	args, err := procArgs(pid)
-	return err == nil && len(args) == 2 && args[1] == spec
+	if err != nil || len(args) < 2 {
+		return false
+	}
+	_, rest, err := launchgate.SplitArgs(args[1:])
+	return err == nil && len(rest) == 1 && rest[0] == spec
 }
 
 // isNetd reports whether pid is the bhatti-netd serving sock.
@@ -314,8 +337,9 @@ func (e *Engine) recover() {
 					slog.Warn("krucible.agent.info", "id", vm.ID, "error", vm.AgentInfoErr)
 				}
 			}
+			e.adoptScope(vm)
 		default:
-			vm.Status, vm.Thermal, vm.HelperPID = "stopped", "cold", 0
+			vm.Status, vm.Thermal, vm.HelperPID, vm.scope = "stopped", "cold", 0, placedScope{}
 		}
 		vm.persist()
 		slog.Info("krucible recovered sandbox", "id", vm.ID, "name", vm.Name,
@@ -335,6 +359,7 @@ func (e *Engine) recover() {
 			e.watchAdoptedVM(vm)
 		}
 	}
+	e.reportOrphanScopes()
 }
 
 // adoptHelper says what the helper a record names is doing: "running" or

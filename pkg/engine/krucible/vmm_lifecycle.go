@@ -120,7 +120,7 @@ func (e *Engine) unexpectedVMExit(vm *VM, event engine.LifecycleEvent) {
 	vm.mu.Lock()
 	cancel := vm.cancel
 	vm.cmd, vm.waitDone, vm.exitDone, vm.cancel = nil, nil, nil, nil
-	vm.HelperPID, vm.Status, vm.Thermal = 0, "stopped", "cold"
+	vm.HelperPID, vm.Status, vm.Thermal, vm.scope = 0, "stopped", "cold", placedScope{}
 	vm.Agent, vm.AgentInfoErr = nil, nil
 	vm.mu.Unlock()
 	if cancel != nil {

@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	filippo.io/age v1.3.1
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/google/go-containerregistry v0.21.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.18.4

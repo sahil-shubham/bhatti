@@ -67,6 +67,7 @@ func (e *Engine) watchAdoptedNetdLocked(inst *netdInstance) {
 func (e *Engine) netdExitedLocked(inst *netdInstance) {
 	inst.cmd, inst.waitDone, inst.exitDone = nil, nil, nil
 	inst.pid, inst.watchedPID = 0, 0
+	inst.scope, inst.scopePID = placedScope{}, 0
 	writeNetdRecord(inst)
 	if inst.brokerLn != nil {
 		_ = inst.brokerLn.Close()

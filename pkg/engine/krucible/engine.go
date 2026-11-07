@@ -3,7 +3,6 @@ package krucible
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -62,6 +61,9 @@ type Config struct {
 	// DaemonListen lists API/proxy TCP listeners; netd protects their bind
 	// addresses in addition to all host interface addresses.
 	DaemonListen []string
+	// Cgroups is how helpers are placed in cgroups: "auto" (also ""), "systemd"
+	// or "none" (cgroup.go). The daemon passes the config's cgroups: value.
+	Cgroups string
 }
 
 // maxUnixPath is the conservative AF_UNIX sun_path cap (macOS = 104).
@@ -124,13 +126,14 @@ type netdInstance struct {
 	refs           int
 	brokerLn       net.Listener
 	vmmGID         uint32
+	scope          placedScope // the cgroup scope it runs in (cgroup.go); inst.mu
+	scopePID       int         // the pid whose scope is settled: spawned placed, or adopted and checked
 }
 
 // netdDir is the deterministic per-owner directory (so recovery finds the same
 // socket + state file the create path used).
 func (e *Engine) netdDir(ownerKey string) string {
-	h := sha256.Sum256([]byte(ownerKey))
-	return filepath.Join(e.cfg.SocketDir, "netd-"+hex.EncodeToString(h[:6]))
+	return filepath.Join(e.cfg.SocketDir, "netd-"+ownerSlug(ownerKey))
 }
 
 // waitForSocket blocks until path exists (a listening UDS) or the deadline.
@@ -149,11 +152,15 @@ func waitForSocket(path string, d time.Duration) error {
 // owner (UserID) ⇒ same netd ⇒ siblings reach each other. No owner ⇒ keyed by
 // sandbox id, so each unowned sandbox gets its own isolated netd (prior
 // single-sandbox behavior is preserved).
-func netdKeyFor(spec engine.SandboxSpec, id string) string {
-	if spec.UserID != "" {
-		return "u:" + spec.UserID
+func netdKeyFor(spec engine.SandboxSpec, id string) string { return ownerKeyFor(spec.UserID, id) }
+
+// ownerKeyFor is the key an owner is known by to netd and to its cgroup slice:
+// the user's, or the sandbox's own when it has none.
+func ownerKeyFor(userID, sandboxID string) string {
+	if userID != "" {
+		return "u:" + userID
 	}
-	return "s:" + id
+	return "s:" + sandboxID
 }
 
 // acquireNetd returns (creating if needed) the owner's shared netd instance and
@@ -301,6 +308,7 @@ func (e *Engine) ensureNetd(ownerKey string) (retErr error) {
 				serveBrokerLocked(inst, broker)
 				if inst.cmd == nil {
 					e.watchAdoptedNetdLocked(inst)
+					e.adoptNetdScopeLocked(inst)
 				}
 				return e.shareNetdSocket(inst)
 			}
@@ -351,17 +359,39 @@ func (e *Engine) ensureNetd(ownerKey string) (retErr error) {
 	cmd.Stdout = lf
 	cmd.Stderr = lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
+	ps, err := e.netdPlacementFor(inst)
+	if err != nil {
+		return fmt.Errorf("start bhatti-netd: %w", err)
+	}
+	logPath := filepath.Join(inst.dir, "netd.log")
+	// netd.json names the gateway and its scope before the gateway can run, as a
+	// VM's state.json does, so a daemon that dies from here leaves nothing unrecorded.
+	var scope placedScope
+	if err := e.cg.start(context.Background(), cmd, ps, func(pid int, unit string) {
+		if pid == 0 {
+			writeNetdRecord(inst) // placement failed: back to what the instance says
+			return
+		}
+		scope = placedScope{unit: unit}
+		writeNetdRecordFor(inst, pid, scope)
+	}); err != nil {
+		if tail := strings.TrimSpace(tailFile(logPath, 1024)); tail != "" {
+			err = fmt.Errorf("%w; netd log: %s", err, tail)
+		}
 		return fmt.Errorf("start bhatti-netd: %w", err)
 	}
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- cmd.Wait() }()
-	logPath := filepath.Join(inst.dir, "netd.log")
+	failed := func(cause error) error {
+		err := netdStartFailed(cmd, waitDone, logPath, cause)
+		writeNetdRecord(inst) // it is gone: the record names what the instance does
+		return err
+	}
 	if werr := waitForSocket(inst.sock, 5*time.Second); werr != nil {
-		return netdStartFailed(cmd, waitDone, logPath, fmt.Errorf("bhatti-netd not listening: %w", werr))
+		return failed(fmt.Errorf("bhatti-netd not listening: %w", werr))
 	}
 	if werr := waitForSocket(inst.ctlSock, 5*time.Second); werr != nil {
-		return netdStartFailed(cmd, waitDone, logPath, fmt.Errorf("bhatti-netd control socket not listening: %w", werr))
+		return failed(fmt.Errorf("bhatti-netd control socket not listening: %w", werr))
 	}
 	// The socket path appears before netd finishes confinement and starts its
 	// accept loop. Give this newly spawned process time to answer, but never
@@ -373,12 +403,13 @@ func (e *Engine) ensureNetd(ownerKey string) (retErr error) {
 			break
 		}
 		if time.Now().After(deadline) {
-			return netdStartFailed(cmd, waitDone, logPath, fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr))
+			return failed(fmt.Errorf("bhatti-netd incompatible control/enforcement protocol: %w", verr))
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	inst.cmd = cmd
 	inst.pid = cmd.Process.Pid
+	inst.scope, inst.scopePID = scope, inst.pid
 	inst.waitDone = waitDone
 	inst.exitDone = make(chan struct{})
 	inst.stopping = false
@@ -497,7 +528,8 @@ type VM struct {
 	Status       string          // "running" | "stopped"
 	baseSpec     VMSpec          // the spec to (re-)launch with
 	logPath      string
-	HelperPID    int // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
+	HelperPID    int         // bhatti-vmm pid, persisted so recovery can adopt/kill it after a daemon restart
+	scope        placedScope // the cgroup scope HelperPID runs in (cgroup.go); persisted so recovery can check it
 	cmd          *exec.Cmd
 	waitDone     <-chan error  // cmd.Wait's result, owned by the death watcher
 	exitDone     chan struct{} // watcher closes on reap before taking launchMu
@@ -550,6 +582,7 @@ type Engine struct {
 	confineVMM, dropVMM bool
 	vmmIDs              map[uint32]string // helper uid → sandbox id
 	kvmGID              uint32            // group that may open /dev/kvm; 0 = anyone may
+	cg                  *cgroupManager    // places helpers in cgroups; nil places none (cgroup.go)
 }
 
 // errNoCheckpoint is returned by every operation that needs saved VM state
@@ -646,6 +679,18 @@ func New(cfg Config) (*Engine, error) {
 	eng := &Engine{vms: make(map[string]*VM), netds: make(map[string]*netdInstance), cfg: cfg, caps: caps}
 	if err := eng.initConfinement(); err != nil {
 		return nil, err
+	}
+	// Before recovery, which places the helpers a previous daemon left unplaced.
+	// A bhatti that asked for systemd and can't have it refuses to start here.
+	cg, err := resolveCgroups(cfg.Cgroups, defaultCgroupHost())
+	if err != nil {
+		return nil, err
+	}
+	eng.cg = cg
+	if st := cg.status(); st.Mode == engine.CgroupNone && st.Requested == "auto" {
+		slog.Warn("krucible.cgroups", "mode", st.Mode, "requested", st.Requested, "reason", st.Reason) // helpers go unaccounted: worth noticing
+	} else {
+		slog.Info("krucible.cgroups", "mode", st.Mode, "requested", st.Requested, "reason", st.Reason)
 	}
 	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
 	return eng, nil
@@ -1058,21 +1103,33 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 		}
 		cmd.Env = append(cmd.Env, VMMPolicyEnv+"="+policy)
 	}
-	if err := cmd.Start(); err != nil {
+	ps, err := e.placementFor(vm)
+	if err != nil {
 		vmCancel()
 		vm.closeConfigSrv()
 		return fmt.Errorf("start vmm helper: %w", err)
 	}
-	// Named in state.json before the guest is up: a daemon that goes away
-	// mid-launch leaves a helper the next one has to find, to kill (recover).
-	vm.mu.Lock()
-	vm.HelperPID = cmd.Process.Pid
-	vm.mu.Unlock()
-	vm.persist()
+	// The helper is named in state.json before the guest is up: a daemon that
+	// goes away mid-launch leaves a helper the next one has to find, to kill
+	// (recover). Placing it also records the scope it runs in, before the
+	// helper can do anything.
+	if err := e.cg.start(ctx, cmd, ps, func(pid int, unit string) {
+		vm.mu.Lock()
+		vm.HelperPID, vm.scope = pid, placedScope{unit: unit}
+		vm.mu.Unlock()
+		vm.persist()
+	}); err != nil {
+		vmCancel()
+		vm.closeConfigSrv()
+		if tail := vmmLogExcerpt(vm.logPath, 4096); tail != "" {
+			err = fmt.Errorf("%w\nvmm log:\n%s", err, tail)
+		}
+		return fmt.Errorf("start vmm helper: %w", err)
+	}
 	defer func() {
 		if err != nil {
 			vm.mu.Lock()
-			vm.HelperPID = 0
+			vm.HelperPID, vm.scope = 0, placedScope{}
 			vm.mu.Unlock()
 			vm.persist()
 		}
@@ -1175,7 +1232,7 @@ func (vm *VM) kill() {
 	}
 	vm.mu.Lock()
 	vm.cmd, vm.cancel, vm.waitDone, vm.exitDone = nil, nil, nil, nil
-	vm.HelperPID = 0
+	vm.HelperPID, vm.scope = 0, placedScope{}
 	vm.mu.Unlock()
 	vm.closeConfigSrv()
 }
@@ -1564,6 +1621,8 @@ func (e *Engine) Shutdown() {
 		}
 		inst.mu.Unlock()
 	}
+	// Last: it drops the references on the scopes, which the helpers outlive.
+	e.cg.close()
 }
 
 // --- helpers ---
