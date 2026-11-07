@@ -151,12 +151,8 @@ func handleControlConnection(conn net.Conn) {
 			proto.WriteFrame(conn, proto.ERROR, []byte("session not found"))
 			return
 		}
-		s.mu.Lock()
-		if s.Cmd != nil && s.Cmd.Process != nil {
-			// Kill entire process group for reliable cleanup
-			syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGKILL)
-		}
-		s.mu.Unlock()
+		// Kill entire process group for reliable cleanup
+		s.signalGroup(syscall.SIGKILL)
 		exit := proto.ExitPayload(0)
 		proto.WriteFrame(conn, proto.EXIT, exit[:])
 

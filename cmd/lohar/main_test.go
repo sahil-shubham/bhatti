@@ -3,9 +3,15 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // requireUnrestrictedCgroup skips the calling test unless we have direct
@@ -41,6 +47,54 @@ func requireUnrestrictedCgroup(t *testing.T) {
 	if parts[1] != "/" {
 		t.Skipf("requires unrestricted cgroup v2 (we're nested at %q — container or K8s pod). "+
 			"This test runs on real hosts only; verify on agni-01.", parts[1])
+	}
+}
+
+var guestExecProbe struct {
+	once sync.Once
+	err  error
+}
+
+// requireGuestExec skips the calling test unless this process can start a
+// child as uid/gid 1000, which is how lohar runs every exec, session and init
+// command. That takes CAP_SETUID and CAP_SETGID, so in practice root: CI runs
+// the suite once unprivileged and again under sudo, where these tests run.
+// Probed rather than inferred from the uid, so a root stripped of those
+// capabilities skips too.
+func requireGuestExec(t *testing.T) {
+	t.Helper()
+	guestExecProbe.once.Do(func() {
+		cmd := exec.Command("/bin/true")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1000, Gid: 1000}}
+		guestExecProbe.err = runTracked(cmd)
+	})
+	if guestExecProbe.err != nil {
+		t.Skipf("cannot start a child as uid/gid 1000 (needs root): %v", guestExecProbe.err)
+	}
+}
+
+// processGone reports whether pid is dead. A zombie counts as dead: where
+// nothing reaps orphans (a container without an init, say) a killed process
+// stays one indefinitely, and kill -0 still succeeds on it.
+func processGone(pid int) bool {
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	// "pid (comm) S ...": comm may hold spaces and parens, so the state
+	// follows the last ')'.
+	i := bytes.LastIndexByte(stat, ')')
+	return i >= 0 && i+2 < len(stat) && (stat[i+2] == 'Z' || stat[i+2] == 'X')
+}
+
+func waitProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !processGone(pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d still alive", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

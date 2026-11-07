@@ -4,18 +4,15 @@ package main
 
 import (
 	"net"
-	"os"
 	"testing"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
 )
 
 func TestPipedExecOnlySyncsBeforeOptInExit(t *testing.T) {
-	// handlePipedExec intentionally runs commands as uid 1000, so an
-	// unprivileged host cannot exercise the real guest command path.
-	if os.Geteuid() != 0 {
-		t.Skip("requires root to spawn the guest uid 1000 command")
-	}
+	// handlePipedExec intentionally runs commands as uid 1000, so a host that
+	// cannot setuid cannot exercise the real guest command path.
+	requireGuestExec(t)
 	original := execSync
 	defer func() { execSync = original }()
 	for _, requested := range []bool{false, true} {

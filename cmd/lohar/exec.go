@@ -111,7 +111,7 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 		return
 	}
 
-	done, err := startTracked(cmd)
+	group, err := startGroup(cmd)
 	if err != nil {
 		stdinPipe.Close()
 		stdoutPipe.Close()
@@ -184,9 +184,7 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 				// Kill entire process group (negative PID), not just the shell.
 				// This ensures child processes (npm install → node, etc.) are
 				// also terminated. Requires Setpgid: true on SysProcAttr.
-				if cmd.Process != nil {
-					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				}
+				group.signal(syscall.SIGKILL)
 				return
 			}
 		}
@@ -194,7 +192,7 @@ func handlePipedExec(conn net.Conn, req proto.ExecRequest) {
 
 	// Drain stdout/stderr before reporting the reaper's exit status.
 	ioWg.Wait()
-	exitCode := waitTracked(cmd, done).code()
+	exitCode := group.wait().code()
 
 	if req.Sync != nil && *req.Sync {
 		execSync()

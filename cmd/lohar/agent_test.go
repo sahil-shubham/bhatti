@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,7 @@ func startTestAgent(t *testing.T) (controlSock, forwardSock string, cleanup func
 	dir := t.TempDir()
 	controlSock = filepath.Join(dir, "control.sock")
 	forwardSock = filepath.Join(dir, "forward.sock")
+	raceLog := filepath.Join(dir, "race")
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperAgent")
 	cmd.Env = append(os.Environ(),
@@ -34,6 +37,10 @@ func startTestAgent(t *testing.T) (controlSock, forwardSock string, cleanup func
 		"LOHAR_SOCK="+controlSock,
 		"LOHAR_FWD_SOCK="+forwardSock,
 		"GO_WANT_HELPER_PROCESS=1",
+		// The agent's goroutines run in this subprocess, so a data race there
+		// would only reach its stderr and the test would still pass. Under
+		// -race the reports go to files that cleanup turns into failures.
+		"GORACE="+strings.TrimSpace(os.Getenv("GORACE")+" log_path="+raceLog),
 	)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -51,6 +58,11 @@ func startTestAgent(t *testing.T) (controlSock, forwardSock string, cleanup func
 	return controlSock, forwardSock, func() {
 		cmd.Process.Kill()
 		cmd.Wait()
+		reports, _ := filepath.Glob(raceLog + ".*")
+		for _, path := range reports {
+			report, _ := os.ReadFile(path)
+			t.Errorf("data race in the agent subprocess:\n%s", report)
+		}
 	}
 }
 
@@ -80,14 +92,14 @@ func sendExec(t *testing.T, conn net.Conn, req proto.ExecRequest) {
 	}
 }
 
-// readAllExec reads all frames until EXIT, collecting stdout/stderr.
-func readAllExec(t *testing.T, conn net.Conn) (stdout, stderr string, exitCode int32) {
-	t.Helper()
+// collectExec reads frames until EXIT, collecting stdout/stderr. It never
+// fails the test itself, so goroutines can use it.
+func collectExec(conn net.Conn) (stdout, stderr string, exitCode int32, err error) {
 	var outBuf, errBuf bytes.Buffer
 	for {
 		msgType, payload, err := proto.ReadFrame(conn)
 		if err != nil {
-			t.Fatalf("read frame: %v", err)
+			return "", "", 0, fmt.Errorf("read frame: %w", err)
 		}
 		switch msgType {
 		case proto.STDOUT:
@@ -97,18 +109,29 @@ func readAllExec(t *testing.T, conn net.Conn) (stdout, stderr string, exitCode i
 		case proto.EXIT:
 			code, ok := proto.ParseExitCode(payload)
 			if !ok {
-				t.Fatal("bad exit payload")
+				return "", "", 0, errors.New("bad exit payload")
 			}
-			return outBuf.String(), errBuf.String(), code
+			return outBuf.String(), errBuf.String(), code, nil
 		case proto.ERROR:
-			t.Fatalf("agent error: %s", payload)
+			return "", "", 0, fmt.Errorf("agent error: %s", payload)
 		}
 	}
+}
+
+// readAllExec reads all frames until EXIT, collecting stdout/stderr.
+func readAllExec(t *testing.T, conn net.Conn) (stdout, stderr string, exitCode int32) {
+	t.Helper()
+	stdout, stderr, exitCode, err := collectExec(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stdout, stderr, exitCode
 }
 
 // --- Non-TTY exec tests ---
 
 func TestAgentExec(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -130,6 +153,7 @@ func TestAgentExec(t *testing.T) {
 }
 
 func TestAgentExecFailure(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -164,6 +188,7 @@ func TestAgentExecNotFound(t *testing.T) {
 }
 
 func TestAgentExecStderr(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -185,6 +210,7 @@ func TestAgentExecStderr(t *testing.T) {
 }
 
 func TestAgentExecEnv(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -206,6 +232,7 @@ func TestAgentExecEnv(t *testing.T) {
 }
 
 func TestAgentExecCwd(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -225,6 +252,7 @@ func TestAgentExecCwd(t *testing.T) {
 }
 
 func TestAgentExecLargeOutput(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -246,6 +274,7 @@ func TestAgentExecLargeOutput(t *testing.T) {
 }
 
 func TestAgentKill(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -271,6 +300,7 @@ func TestAgentKill(t *testing.T) {
 // --- Stdin piping ---
 
 func TestAgentExecStdin(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -296,6 +326,7 @@ func TestAgentExecStdin(t *testing.T) {
 // --- Mixed stdout + stderr ---
 
 func TestAgentExecMixedOutput(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -321,6 +352,7 @@ func TestAgentExecMixedOutput(t *testing.T) {
 // --- Default environment ---
 
 func TestAgentExecDefaultEnv(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -341,7 +373,7 @@ func TestAgentExecDefaultEnv(t *testing.T) {
 	if !strings.Contains(stdout, "TERM=xterm-256color") {
 		t.Errorf("missing default TERM in: %q", stdout)
 	}
-	if !strings.Contains(stdout, "HOME=/root") {
+	if !strings.Contains(stdout, "HOME=/home/lohar") {
 		t.Errorf("missing default HOME in: %q", stdout)
 	}
 	if !strings.Contains(stdout, "LANG=en_US.UTF-8") {
@@ -352,32 +384,48 @@ func TestAgentExecDefaultEnv(t *testing.T) {
 // --- Multiple commands on same agent (concurrency) ---
 
 func TestAgentMultipleCommands(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
 	// Run 5 commands concurrently on the same agent, each on its own connection.
+	// The goroutines report errors instead of failing the test: FailNow from
+	// anywhere but the test goroutine would leave the loop below waiting forever.
 	const n = 5
 	type result struct {
 		stdout string
 		code   int32
+		err    error
 	}
 	results := make(chan result, n)
 
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			conn := dialControl(t, ctrl)
+	for range n {
+		go func() {
+			conn, err := net.Dial("unix", ctrl)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
 			defer conn.Close()
 
-			sendExec(t, conn, proto.ExecRequest{
+			err = proto.SendJSON(conn, proto.EXEC_REQ, proto.ExecRequest{
 				Argv: []string{"sh", "-c", "echo " + strings.Repeat("x", 100)},
 			})
-			stdout, _, code := readAllExec(t, conn)
-			results <- result{stdout, code}
-		}(i)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			stdout, _, code, err := collectExec(conn)
+			results <- result{stdout, code, err}
+		}()
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		r := <-results
+		if r.err != nil {
+			t.Errorf("command %d: %v", i, r.err)
+			continue
+		}
 		if r.code != 0 {
 			t.Errorf("command %d: exit code %d", i, r.code)
 		}
@@ -391,6 +439,7 @@ func TestAgentMultipleCommands(t *testing.T) {
 // --- Host disconnect during exec ---
 
 func TestAgentHostDisconnect(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -481,6 +530,7 @@ func waitForOutput(t *testing.T, ch <-chan ttyFrame, substr string, timeout time
 }
 
 func TestAgentTTY(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -527,6 +577,7 @@ func TestAgentTTY(t *testing.T) {
 }
 
 func TestAgentTTYResize(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -1125,7 +1176,7 @@ func TestAgentFileReadDirectory(t *testing.T) {
 	conn := dialControl(t, ctrl)
 	defer conn.Close()
 
-	proto.SendJSON(conn, proto.FILE_READ_REQ, map[string]string{"path": "/tmp"})
+	proto.SendJSON(conn, proto.FILE_READ_REQ, map[string]string{"path": t.TempDir()})
 
 	msgType, payload, err := proto.ReadFrame(conn)
 	if err != nil {
@@ -1213,7 +1264,7 @@ func TestAgentFileWriteNegativeSize(t *testing.T) {
 	defer conn.Close()
 
 	proto.SendJSON(conn, proto.FILE_WRITE_REQ, map[string]any{
-		"path": "/tmp/bad.txt", "mode": "0644", "size": -1,
+		"path": filepath.Join(t.TempDir(), "bad.txt"), "mode": "0644", "size": -1,
 	})
 
 	msgType, payload, err := proto.ReadFrame(conn)
@@ -1771,6 +1822,7 @@ func TestAgentFileReadLargeFileWithLimit(t *testing.T) {
 }
 
 func TestAgentKillProcessGroup(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 
@@ -1798,10 +1850,11 @@ func TestAgentKillProcessGroup(t *testing.T) {
 			t.Fatalf("unexpected %d: %s", msgType, payload)
 		}
 	}
-	if childPID == "" {
-		t.Fatal("didn't get child PID from stdout")
+	pid, err := strconv.Atoi(childPID)
+	if err != nil {
+		t.Fatalf("child PID %q: %v", childPID, err)
 	}
-	t.Logf("child PID: %s", childPID)
+	t.Logf("child PID: %d", pid)
 
 	// Send KILL — should kill the shell AND the sleep child
 	proto.WriteFrame(conn, proto.KILL, nil)
@@ -1818,39 +1871,13 @@ func TestAgentKillProcessGroup(t *testing.T) {
 	}
 	conn.Close()
 
-	// Give the OS a moment to reap
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify the child process is dead: kill -0 returns error for dead PIDs
-	conn2 := dialControl(t, ctrl)
-	defer conn2.Close()
-	proto.SendJSON(conn2, proto.EXEC_REQ, proto.ExecRequest{
-		Argv: []string{"sh", "-c", "kill -0 " + childPID + " 2>&1; echo exit=$?"},
-	})
-
-	var out bytes.Buffer
-	for {
-		msgType, payload, err := proto.ReadFrame(conn2)
-		if err != nil {
-			break
-		}
-		if msgType == proto.STDOUT {
-			out.Write(payload)
-		}
-		if msgType == proto.EXIT {
-			break
-		}
-	}
-	output := out.String()
-	// kill -0 should fail because the child is dead
-	if strings.Contains(output, "exit=0") {
-		t.Errorf("child PID %s is still alive after process group kill: %q", childPID, output)
-	} else {
-		t.Logf("✓ child PID %s killed by process group SIGKILL", childPID)
-	}
+	// The child must die with the shell, not merely lose its parent.
+	waitProcessGone(t, pid)
+	t.Logf("✓ child PID %d killed by process group SIGKILL", pid)
 }
 
 func TestAgentKillTTYSessionGraceful(t *testing.T) {
+	requireGuestExec(t)
 	ctrl, _, cleanup := startTestAgent(t)
 	defer cleanup()
 

@@ -266,6 +266,12 @@ func TestNotifyReceiverEndToEnd(t *testing.T) {
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		t.Skip("requires cgroup v2 mounted at /sys/fs/cgroup")
 	}
+	requireUnrestrictedCgroup(t)
+	// A container can show us as the cgroup root (private cgroup namespace)
+	// and still mount the tree read-only.
+	if err := os.MkdirAll("/sys/fs/cgroup/system.slice", 0755); err != nil {
+		t.Skipf("can't create system.slice: %v", err)
+	}
 
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "notifier.service"),

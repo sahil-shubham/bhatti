@@ -78,7 +78,7 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
 	}
 
-	done, err := startTracked(cmd)
+	group, err := startGroup(cmd)
 	if err != nil {
 		slave.Close()
 		master.Close()
@@ -87,7 +87,9 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 		return
 	}
 	slave.Close()
-	sess.Cmd = cmd
+	sess.mu.Lock()
+	sess.group = group
+	sess.mu.Unlock()
 
 	// Send session info to host
 	proto.SendJSON(conn, proto.SESSION_INFO, proto.SessionInfo{
@@ -126,7 +128,7 @@ func handleTTYSession(conn net.Conn, req proto.ExecRequest) {
 				// to retrieve scrollback. The session is removed when:
 				//   1. A client attaches and we send the exit frame (handleSessionAttach)
 				//   2. The reap timer fires (30s after exit, no reattach)
-				exitCode := waitTracked(cmd, done).code()
+				exitCode := group.wait().code()
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
 				if sess.Attached != nil {
@@ -264,16 +266,12 @@ func readHostInput(conn net.Conn, sess *Session) {
 				}
 			}
 		case proto.KILL:
-			sess.mu.Lock()
-			if sess.Cmd != nil && sess.Cmd.Process != nil {
-				// TTY sessions use SIGTERM to allow graceful shutdown.
-				// The session's Setsid:true means the shell is the session
-				// leader — SIGTERM to the process group lets it clean up.
-				// This preserves the session model: if the process handles
-				// SIGTERM and stays alive, the session remains reattachable.
-				syscall.Kill(-sess.Cmd.Process.Pid, syscall.SIGTERM)
-			}
-			sess.mu.Unlock()
+			// TTY sessions use SIGTERM to allow graceful shutdown.
+			// The session's Setsid:true means the shell is the session
+			// leader — SIGTERM to the process group lets it clean up.
+			// This preserves the session model: if the process handles
+			// SIGTERM and stays alive, the session remains reattachable.
+			sess.signalGroup(syscall.SIGTERM)
 			return
 		}
 	}
@@ -359,7 +357,7 @@ func runInitSession(script, user string) {
 		},
 	}
 	cmd.Dir = "/workspace"
-	done, err := startTracked(cmd)
+	group, err := startGroup(cmd)
 	if err != nil {
 		slave.Close()
 		master.Close()
@@ -368,9 +366,11 @@ func runInitSession(script, user string) {
 		return
 	}
 	slave.Close()
-	sess.Cmd = cmd
+	sess.mu.Lock()
+	sess.group = group
+	sess.mu.Unlock()
 
-	logf("init session started (pid %d)", cmd.Process.Pid)
+	logf("init session started (pid %d)", group.pgid)
 
 	// Background reader: PTY master → scrollback (+ attached conn if any)
 	go func() {
@@ -388,7 +388,7 @@ func runInitSession(script, user string) {
 				sess.mu.Unlock()
 			}
 			if err != nil {
-				exitCode := waitTracked(cmd, done).code()
+				exitCode := group.wait().code()
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
 				if sess.Attached != nil {

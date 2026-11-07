@@ -33,23 +33,25 @@ jobs:
         # concurrency bug that Tranche 0a of PLAN-bhatti-v2.md is
         # chasing — sync.Map LoadOrStore+Store races on the thermal
         # manager, route-cache LRU under churn, rate-limiter eviction.
-        # cmd/lohar is excluded here because some of its tests need a
-        # real sandbox (PID 1 dirs, vsock); the shim subset runs with
-        # -race in the next step. Timeout bumped to 240s — -race adds
-        # ~2× overhead on the SQLite-backed store tests.
+        # cmd/lohar is excluded here: it has its own steps below (the whole
+        # suite, unprivileged and as root), because part of it needs root.
+        # Timeout bumped to 240s — -race adds ~2× overhead on the
+        # SQLite-backed store tests.
         run: go test -race $(go list ./... | grep -v cmd/lohar) -count=1 -timeout=240s
 
-      # The systemctl/journalctl/syslog/cgroup shim tests in cmd/lohar are
-      # tempdir-sandboxed unit tests that don't need a real Firecracker
-      # VM. Run them here with -race to catch concurrency bugs in the
-      # Registry mutex, the IPC dispatch's captureOutputMu, and the
-      # watcher's restartBurst map. The agent/session tests need a real
-      # sandbox (PID 1 dirs, vsock, etc.) so they're skipped here and
-      # left to the integration workflow.
-      - name: Test lohar shim (with -race)
-        run: |
-          go test -race -count=1 -timeout=120s ./cmd/lohar/ \
-            -skip '^(TestAgent|TestHelperAgent|TestSession|TestPipedSession)'
+      # cmd/lohar is the guest's PID 1, where a data race can end in a kernel
+      # panic, so its whole suite runs under -race, not a subset. Tests that
+      # start guest processes need root: lohar drops every child to uid 1000,
+      # which takes CAP_SETUID/CAP_SETGID. They skip in this pass (`-v` shows
+      # why) and run in the next one. The real-cgroup tests skip themselves
+      # unless they own the cgroup tree, and are otherwise left to real hosts.
+      - name: Test lohar (with -race)
+        run: go test -race -count=1 -timeout=120s ./cmd/lohar/
+
+      # Same suite again, with only the test binary running as root (passwordless
+      # sudo is a given on GitHub-hosted runners; the build stays unprivileged).
+      - name: Test lohar as root (with -race)
+        run: go test -race -count=1 -timeout=180s -exec sudo ./cmd/lohar/
 
   krucible-build:
     # The krucible engine's safety net: build the Rust fork (libkrun) + the cgo

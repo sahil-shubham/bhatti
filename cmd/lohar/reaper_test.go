@@ -154,9 +154,7 @@ func TestChildReaperLifecycle(t *testing.T) {
 		})
 	}
 
-	if os.Geteuid() != 0 && os.Geteuid() != 1000 {
-		t.Skip("exec handlers run processes with uid 1000")
-	}
+	requireGuestExec(t)
 	for _, tc := range []struct {
 		name, shell string
 		want        int32

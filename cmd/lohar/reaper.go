@@ -117,10 +117,15 @@ func startTracked(cmd *exec.Cmd) (<-chan childExit, error) {
 // wait4, so it must not be used for these processes. Release closes Go's
 // process handle (including the Linux pidfd); callers close any parent-side
 // pipes they created after draining them.
+//
+// Release also rewrites cmd.Process.Pid to -1, unsynchronised, so once a wait
+// may be running no other goroutine may read cmd.Process. Anything that has to
+// signal the child meanwhile goes through childGroup.
 func waitTracked(cmd *exec.Cmd, done <-chan childExit) childExit {
+	pid := cmd.Process.Pid
 	exit := <-done
 	if err := cmd.Process.Release(); err != nil {
-		logf("release process %d: %v", cmd.Process.Pid, err)
+		logf("release process %d: %v", pid, err)
 	}
 	return exit
 }
@@ -131,6 +136,53 @@ func runTracked(cmd *exec.Cmd) error {
 		return err
 	}
 	return waitTracked(cmd, done).err()
+}
+
+// childGroup is a tracked child and the process group it leads, for callers
+// that signal the group from one goroutine while another waits for the exit.
+//
+// Those goroutines must not read cmd.Process.Pid (see waitTracked), and a
+// late one would read -1 and signal PID 1. The group ID is copied here before
+// any other goroutine can see cmd. Once wait has collected the exit status
+// the PID is free for the kernel to hand to an unrelated process, so signal
+// stops: a stale KILL frame or idle timer must not reach whoever holds it now.
+type childGroup struct {
+	cmd  *exec.Cmd
+	done <-chan childExit
+	pgid int
+
+	mu        sync.Mutex
+	collected bool
+}
+
+// startGroup is startTracked for a child that leads its own process group
+// (Setpgid or Setsid); signal addresses -pgid, which names no group otherwise.
+func startGroup(cmd *exec.Cmd) (*childGroup, error) {
+	done, err := startTracked(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return &childGroup{cmd: cmd, done: done, pgid: cmd.Process.Pid}, nil
+}
+
+// signal sends sig to every process in the group until wait has returned.
+// Orphans that outlive the leader (and may still hold its pipes open) are
+// reached up to that point.
+func (g *childGroup) signal(sig syscall.Signal) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.collected {
+		syscall.Kill(-g.pgid, sig)
+	}
+}
+
+// wait is waitTracked plus the end of signalling.
+func (g *childGroup) wait() childExit {
+	exit := waitTracked(g.cmd, g.done)
+	g.mu.Lock()
+	g.collected = true
+	g.mu.Unlock()
+	return exit
 }
 
 // combinedOutputTracked captures stdout and stderr through a real pipe, not

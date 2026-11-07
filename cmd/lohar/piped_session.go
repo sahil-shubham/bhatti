@@ -73,7 +73,7 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
 	}
 
-	done, err := startTracked(cmd)
+	group, err := startGroup(cmd)
 	if err != nil {
 		stdinR.Close()
 		stdinW.Close()
@@ -118,7 +118,9 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 		}()
 	}
 
-	sess.Cmd = cmd
+	sess.mu.Lock()
+	sess.group = group
+	sess.mu.Unlock()
 	// Store the stdin write end in Master so reattach can write to it.
 	// For piped sessions: Master = stdin write pipe (we write TO the child).
 	sess.Master = stdinW
@@ -161,7 +163,7 @@ func handlePipedSession(conn net.Conn, req proto.ExecRequest) {
 			if err != nil {
 				// Pipe closed — process exited.
 				stderrDone.Wait()
-				exitCode := waitTracked(cmd, done).code()
+				exitCode := group.wait().code()
 				sess.mu.Lock()
 				sess.ExitCode = &exitCode
 				if sess.Attached != nil {
@@ -211,11 +213,7 @@ func readPipedHostInput(conn net.Conn, sess *Session) {
 				sess.Master.Write(payload)
 			}
 		case proto.KILL:
-			sess.mu.Lock()
-			if sess.Cmd != nil && sess.Cmd.Process != nil {
-				syscall.Kill(-sess.Cmd.Process.Pid, syscall.SIGTERM)
-			}
-			sess.mu.Unlock()
+			sess.signalGroup(syscall.SIGTERM)
 			return
 			// RESIZE: ignored for piped sessions (no PTY)
 		}

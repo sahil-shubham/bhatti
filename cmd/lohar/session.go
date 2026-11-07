@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,11 +19,11 @@ type Session struct {
 	ID         string
 	Argv       []string
 	TTY        bool
-	Master     *os.File     // PTY master fd (TTY only)
-	Cmd        *exec.Cmd
-	Scrollback *ringBuffer  // 64KB (TTY only)
-	Attached   net.Conn     // currently attached connection (nil = detached)
-	ExitCode   *int         // nil = still running
+	Master     *os.File    // PTY master fd (TTY only)
+	group      *childGroup // nil until the process has started; guarded by mu
+	Scrollback *ringBuffer // 64KB (TTY only)
+	Attached   net.Conn    // currently attached connection (nil = detached)
+	ExitCode   *int        // nil = still running
 	MaxIdle    time.Duration
 	CreatedAt  time.Time
 	mu         sync.Mutex
@@ -91,6 +90,18 @@ func listSessions() []proto.SessionInfo {
 	return out
 }
 
+// signalGroup signals the session's process group; call it without s.mu held.
+// It does nothing before the process has started or after its exit has been
+// collected, when the PID may belong to something else.
+func (s *Session) signalGroup(sig syscall.Signal) {
+	s.mu.Lock()
+	g := s.group
+	s.mu.Unlock()
+	if g != nil {
+		g.signal(sig)
+	}
+}
+
 func (s *Session) startIdleTimer() {
 	if s.MaxIdle <= 0 {
 		return // 0 = run forever
@@ -99,11 +110,7 @@ func (s *Session) startIdleTimer() {
 		return // already ticking
 	}
 	s.idleTimer = time.AfterFunc(s.MaxIdle, func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.Cmd != nil && s.Cmd.Process != nil && s.ExitCode == nil {
-			syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGKILL)
-		}
+		s.signalGroup(syscall.SIGKILL)
 	})
 }
 
@@ -119,7 +126,7 @@ func (s *Session) cancelIdleTimer() {
 type ringBuffer struct {
 	buf  []byte
 	size int
-	w    int  // next write position
+	w    int // next write position
 	full bool
 }
 
