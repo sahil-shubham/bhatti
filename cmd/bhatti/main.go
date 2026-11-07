@@ -20,6 +20,7 @@ import (
 
 	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/backup"
+	"github.com/sahil-shubham/bhatti/pkg/collector"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 	"github.com/sahil-shubham/bhatti/pkg/server"
@@ -258,6 +259,13 @@ func runDaemon() {
 	// Start metrics snapshots now that public proxy is wired up.
 	srv.StartMetricsSnapshots()
 
+	// What each sandbox, owner and the host use, read every 10 s and kept in
+	// memory for the API to serve. An engine that can't list what to measure
+	// gets the host alone.
+	statsSource, _ := eng.(engine.StatsSource)
+	sampler := collector.New(collector.Config{Source: statsSource, DataDir: cfg.DataDir})
+	sampler.Start()
+
 	// Record daemon.started event
 	recoveredCount := 0
 	if allSandboxes, err := st.ListAllSandboxes(context.Background()); err == nil {
@@ -297,6 +305,10 @@ func runDaemon() {
 	for _, s := range servers {
 		s.Shutdown(shutCtx)
 	}
+
+	// The sampler reads the engine's sandboxes, so it stops before the engine
+	// lets go of them.
+	sampler.Stop()
 
 	// Sandboxes outlive the daemon: Shutdown stops none of them, and the next
 	// daemon adopts them as they are.
