@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -159,19 +161,95 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 
 	var events []Event
 	for rows.Next() {
-		var e Event
-		var tsStr, metaStr string
-		if err := rows.Scan(&e.ID, &tsStr, &e.Type, &e.UserID, &e.SandboxID, &metaStr); err != nil {
+		e, err := scanEvent(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.Timestamp, _ = time.Parse("2006-01-02T15:04:05.000Z", tsStr)
-		if e.Timestamp.IsZero() {
-			e.Timestamp, _ = time.Parse("2006-01-02 15:04:05", tsStr)
-		}
-		json.Unmarshal([]byte(metaStr), &e.Meta)
 		events = append(events, e)
 	}
 	return events, rows.Err()
+}
+
+// scanEvent reads the six columns every events query selects. A meta that is
+// not valid JSON leaves Meta empty instead of failing the read: InsertEvents
+// writes valid JSON, and one damaged row must not stop a reader from getting
+// the rows after it.
+func scanEvent(rows *sql.Rows) (Event, error) {
+	var e Event
+	var tsStr, metaStr string
+	if err := rows.Scan(&e.ID, &tsStr, &e.Type, &e.UserID, &e.SandboxID, &metaStr); err != nil {
+		return Event{}, err
+	}
+	e.Timestamp, _ = time.Parse("2006-01-02T15:04:05.000Z", tsStr)
+	if e.Timestamp.IsZero() {
+		e.Timestamp, _ = time.Parse("2006-01-02 15:04:05", tsStr)
+	}
+	json.Unmarshal([]byte(metaStr), &e.Meta)
+	return e, nil
+}
+
+// EventQuery selects one user's events past a position in the events table.
+type EventQuery struct {
+	UserID     string // whose events; required, so events with no user can never be asked for through here
+	After      int64  // only events with a greater id
+	TypePrefix string // when set, only events whose type starts with it
+	SandboxID  string // when set, only this sandbox's events
+	Limit      int    // at most this many events; must be positive
+}
+
+// EventsAfter returns the events matching q in id order. Event ids are
+// assigned in commit order and never reused, so a reader that keeps the last id
+// it handled and asks for everything after it sees each event once and in
+// order, however long it was away. It is the one read the live event stream and
+// every consumer of it share.
+func (s *Store) EventsAfter(ctx context.Context, q EventQuery) ([]Event, error) {
+	if q.UserID == "" {
+		return nil, errors.New("store: events are read for a user")
+	}
+	if q.Limit <= 0 {
+		return nil, fmt.Errorf("store: events limit %d, want positive", q.Limit)
+	}
+	query := `SELECT id, ts, type, user_id, sandbox_id, meta FROM events WHERE user_id = ? AND id > ?`
+	args := []any{q.UserID, q.After}
+	if q.TypePrefix != "" {
+		// instr, not LIKE: the prefix is the caller's text, and "_" and "%" in it
+		// must stay literal ("restart_" is a prefix, not a pattern).
+		query += ` AND instr(type, ?) = 1`
+		args = append(args, q.TypePrefix)
+	}
+	if q.SandboxID != "" {
+		query += ` AND sandbox_id = ?`
+		args = append(args, q.SandboxID)
+	}
+	query += ` ORDER BY id LIMIT ?`
+	args = append(args, q.Limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// EventIDBounds returns the smallest and largest event id stored, both 0 when
+// there is none. Ids below oldest are gone: retention deletes from the old end,
+// and the ids of deleted rows are not handed out again.
+func (s *Store) EventIDBounds(ctx context.Context) (oldest, newest int64, err error) {
+	// Two subqueries, not MIN(id), MAX(id) in one SELECT: SQLite answers a lone
+	// min or max with one seek into the key, and scans the table for both.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE((SELECT MIN(id) FROM events), 0), COALESCE((SELECT MAX(id) FROM events), 0)`,
+	).Scan(&oldest, &newest)
+	return oldest, newest, err
 }
 
 // CountEvents returns the count of events matching the filter.
