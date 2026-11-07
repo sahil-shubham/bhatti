@@ -47,6 +47,8 @@ func (g *Gateway) installTCPForwarder() {
 			up, err = st.dialer.DialAs(context.Background(), "tcp", st.names.lookup(ip), ip, id.LocalPort)
 		}
 		if err != nil {
+			// Only the guard's refusal is a drop; an unreachable host is not.
+			st.stats.dialFailed(err)
 			r.Complete(true) // RST: denied by policy or unreachable
 			return
 		}
@@ -72,11 +74,15 @@ func (g *Gateway) installTCPForwarder() {
 }
 
 // siblingAllowed uses the same verdict for TCP and UDP, before either transport
-// dials. A debug verdict records both granted and denied sibling attempts.
+// dials. A debug verdict records both granted and denied sibling attempts, and
+// a refusal is counted against the guest that made it.
 func (g *Gateway) siblingAllowed(st *guestState, protocol string, ip netip.Addr, port uint16) bool {
 	v := st.pol.Check("", ip)
 	slog.Debug("netd.egress_verdict", "sandbox_id", st.sandbox, "protocol", protocol,
 		"destination", ip, "port", port, "allow", v.Allow, "reason", v.Reason)
+	if !v.Allow {
+		st.stats.denied(v.HardDeny)
+	}
 	return v.Allow
 }
 
@@ -128,7 +134,8 @@ func (g *Gateway) installUDPForwarder() {
 				return true // handled and dropped, not relayed to the host
 			}
 		} else if id.LocalPort == dnsPort {
-			if !resolverAllowed(ip, st.pol) {
+			if v := resolverVerdict(ip, st.pol); !v.Allow {
+				st.stats.denied(v.HardDeny)
 				return true
 			}
 			var wq waiter.Queue
@@ -138,7 +145,8 @@ func (g *Gateway) installUDPForwarder() {
 			}
 			go serveDNS(gonet.NewUDPConn(&wq, ep), dest, st)
 			return true
-		} else if !st.pol.Check("", ip).Allow {
+		} else if v := st.pol.Check("", ip); !v.Allow {
+			st.stats.denied(v.HardDeny)
 			return true // handled and dropped
 		}
 		var wq waiter.Queue

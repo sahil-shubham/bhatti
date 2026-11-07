@@ -94,6 +94,14 @@ func (p *guestPort) write(frame []byte) error {
 	return p.fc.WriteFrame(frame)
 }
 
+// send writes frame to the guest's link and counts it as st's Rx once the
+// link has taken it. st is the registration p is the attachment of.
+func (p *guestPort) send(st *guestState, frame []byte) {
+	if p.write(frame) == nil {
+		st.stats.rx(len(frame))
+	}
+}
+
 // guestState is one guest's per-sandbox egress config, delivered by the daemon
 // over the control channel and keyed by the guest's gateway IP.
 type guestState struct {
@@ -103,7 +111,8 @@ type guestState struct {
 	token   string
 	pol     *gateway.EgressPolicy
 	dialer  *gateway.Dialer
-	names   nameCache // answered IP → the name the guest looked up (dns.go)
+	names   nameCache      // answered IP → the name the guest looked up (dns.go)
+	stats   *guestCounters // nil only for states built by hand and the unregistered fallback
 }
 
 // NewGateway assigns the owner's /24 gateway, installs the forwarder and
@@ -223,8 +232,17 @@ func (g *Gateway) SetSandbox(guestIP, sandboxID string, pol *gateway.EgressPolic
 	if other := g.tokens[token]; other != nil && other != g.guests[guestAddr] {
 		return fmt.Errorf("guest attachment secret already in use")
 	}
+	// The daemon re-pushes policy for a guest that is already running, and that
+	// must not zero its counters. An address handed to another sandbox starts
+	// from zero: its traffic is not the previous guest's.
 	if old := g.guests[guestAddr]; old != nil {
 		delete(g.tokens, old.token)
+		if old.sandbox == sandboxID {
+			st.stats = old.stats
+		}
+	}
+	if st.stats == nil {
+		st.stats = new(guestCounters)
 	}
 	g.guests[guestAddr] = st
 	g.tokens[token] = st
@@ -345,29 +363,33 @@ func (g *Gateway) runGuest(p *guestPort) {
 
 // allowIngress gates policy lookup by the connection's registered identity,
 // not by a guest-controlled Ethernet/IP header. No IPv6 identity is assigned.
+// It also keeps the guest's books: a frame that passes is its Tx, one that
+// fails is a spoof. A link whose registration is gone has none to charge.
 func (g *Gateway) allowIngress(p *guestPort, frame []byte) bool {
-	g.polMu.RLock()
-	st := g.guests[p.ip]
-	active := st != nil && st.token == p.token && st.mac == p.mac
-	g.polMu.RUnlock()
-	if active && len(frame) >= header.EthernetMinimumSize {
+	st := g.activeState(p)
+	if st != nil && len(frame) >= header.EthernetMinimumSize {
 		eth := header.Ethernet(frame)
 		if eth.SourceAddress() == p.mac {
 			body := frame[header.EthernetMinimumSize:]
 			switch eth.Type() {
 			case header.IPv4ProtocolNumber:
 				if len(body) >= header.IPv4MinimumSize && header.IPv4(body).SourceAddress() == p.ip {
+					st.stats.tx(len(frame))
 					return true
 				}
 			case header.ARPProtocolNumber:
 				if len(body) >= header.ARPSize {
 					a := header.ARP(body)
 					if a.IsValid() && tcpip.LinkAddress(a.HardwareAddressSender()) == p.mac && tcpip.AddrFrom4([4]byte(a.ProtocolAddressSender())) == p.ip {
+						st.stats.tx(len(frame))
 						return true
 					}
 				}
 			}
 		}
+	}
+	if st != nil {
+		st.stats.spoofed()
 	}
 	if now := time.Now(); now.Sub(p.lastSpoofLog) >= time.Minute {
 		p.lastSpoofLog = now
@@ -391,18 +413,24 @@ func (g *Gateway) flood(frame []byte) {
 	ports := append([]*guestPort(nil), g.ports...)
 	g.mu.RUnlock()
 	for _, p := range ports {
-		if g.portActive(p) {
-			_ = p.write(frame)
+		if st := g.activeState(p); st != nil {
+			p.send(st, frame)
 		}
 	}
 }
 
-func (g *Gateway) portActive(p *guestPort) bool {
+// activeState is the registration p is the attachment of: the guest registered
+// at p's address, provided it still has p's token and MAC. It is nil for a link
+// whose guest was deleted or re-registered under another secret, which neither
+// sends nor receives.
+func (g *Gateway) activeState(p *guestPort) *guestState {
 	g.polMu.RLock()
 	st := g.guests[p.ip]
-	active := st != nil && st.token == p.token && st.mac == p.mac
 	g.polMu.RUnlock()
-	return active
+	if st != nil && st.token == p.token && st.mac == p.mac {
+		return st
+	}
+	return nil
 }
 
 // stackOutLoop pumps frames the stack emits (ARP replies for .1, forwarder
@@ -425,11 +453,13 @@ func (g *Gateway) stackOutLoop(ctx context.Context) error {
 			g.flood(frame)
 			continue
 		}
-		if p := g.lookup(dst); p != nil && g.portActive(p) {
-			_ = p.write(frame)
-		} else {
-			g.flood(frame)
+		if p := g.lookup(dst); p != nil {
+			if st := g.activeState(p); st != nil {
+				p.send(st, frame)
+				continue
+			}
 		}
+		g.flood(frame)
 	}
 }
 

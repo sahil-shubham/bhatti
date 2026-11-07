@@ -100,6 +100,7 @@ func answerDNS(query []byte, resolver string, st *guestState) []byte {
 		return nil
 	}
 	if !st.pol.AllowsName(q.Name.String()) {
+		st.stats.denied(false) // a name is only ever refused by policy; hard denial is for addresses
 		return refused(hdr, q)
 	}
 	up, err := net.Dial("udp", resolver)
@@ -173,13 +174,13 @@ func refused(hdr dnsmessage.Header, q dnsmessage.Question) []byte {
 	return out
 }
 
-// resolverAllowed checks the DNS server's destination independently of which
+// resolverVerdict checks the DNS server's destination independently of which
 // names a guest may resolve; netd's deployment hard-denials still apply.
-func resolverAllowed(ip netip.Addr, pol *gateway.EgressPolicy) bool {
+func resolverVerdict(ip netip.Addr, pol *gateway.EgressPolicy) gateway.Verdict {
 	if pol == nil {
-		return false
+		return gateway.Verdict{Reason: "no egress policy"}
 	}
 	open := gateway.AllowAllEgress()
 	open.ExtraHardDeny = pol.ExtraHardDeny
-	return open.Check("", ip).Allow
+	return open.Check("", ip)
 }
