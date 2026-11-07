@@ -46,7 +46,7 @@ func readAfter(t *testing.T, st *store.Store, user string, after int64) []store.
 	if err != nil {
 		t.Fatal(err)
 	}
-	return events
+	return events.Events
 }
 
 // waitForCount waits, as a reader does (take the wake-up channel, then read,

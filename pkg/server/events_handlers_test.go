@@ -736,3 +736,80 @@ func TestEventsHEADReturnsAndAllowsConnectionReuse(t *testing.T) {
 		}
 	}
 }
+
+type eventsFlushRecorder struct {
+	*httptest.ResponseRecorder
+	onFlush func()
+}
+
+func (w *eventsFlushRecorder) Flush() {
+	w.ResponseRecorder.Flush()
+	w.onFlush()
+}
+
+func TestEventsFollowReportsRetentionBetweenPages(t *testing.T) {
+	srv, _ := eventsServer(t, true)
+	batch := make([]store.Event, eventsPageLimit+3)
+	for i := range batch {
+		batch[i] = store.Event{Type: "backlog", UserID: "usr_test"}
+	}
+	seedEvents(t, srv, batch...)
+	ctx, stop := context.WithTimeout(t.Context(), eventWait)
+	defer stop()
+	request := httptest.NewRequest(http.MethodGet, "/events?after=0&follow=1", nil).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+testAPIKey)
+	var flushes int
+	out := &eventsFlushRecorder{ResponseRecorder: httptest.NewRecorder(), onFlush: func() {
+		flushes++
+		if flushes == 1 {
+			if n, err := srv.store.PurgeOldEvents(t.Context(), -time.Hour); err != nil || n != int64(len(batch)) {
+				t.Fatalf("retention removed %d events: %v", n, err)
+			}
+			seedEvents(t, srv, store.Event{Type: "survivor", UserID: "usr_test"})
+		} else {
+			stop()
+		}
+	}}
+	srv.ServeHTTP(out, request)
+	records := recordsOf(t, out.Result())
+	if len(records) != eventsPageLimit+2 {
+		t.Fatalf("got %d records, want one page, a retention gap and the surviving event", len(records))
+	}
+	gap := records[eventsPageLimit]
+	last := records[eventsPageLimit-1]
+	survivor := records[eventsPageLimit+1]
+	if gap["type"] != eventsGapType || gap["after"] != last["id"] || gap["oldest"] != survivor["id"] || survivor["type"] != "survivor" {
+		t.Fatalf("page boundary records = %v, %v, %v", last, gap, survivor)
+	}
+}
+
+func TestEventsFilteredFollowDoesNotRevisitScannedHistory(t *testing.T) {
+	srv, _ := eventsServer(t, true)
+	seedEvents(t, srv,
+		store.Event{Type: "skip", UserID: "usr_test"},
+		store.Event{Type: "skip", UserID: "usr_test"},
+		store.Event{Type: "skip", UserID: "usr_test"},
+	)
+	ctx, stop := context.WithTimeout(t.Context(), eventWait)
+	defer stop()
+	request := httptest.NewRequest(http.MethodGet, "/events?after=1&follow=1&type=keep", nil).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+testAPIKey)
+	var flushes int
+	out := &eventsFlushRecorder{ResponseRecorder: httptest.NewRecorder(), onFlush: func() {
+		flushes++
+		if flushes == 1 {
+			if _, err := srv.store.PurgeOldEvents(t.Context(), -time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			seedEvents(t, srv, store.Event{Type: "keep", UserID: "usr_test"})
+			srv.events.committed()
+		} else {
+			stop()
+		}
+	}}
+	srv.ServeHTTP(out, request)
+	records := recordsOf(t, out.Result())
+	if len(records) != 1 || records[0]["type"] != "keep" {
+		t.Fatalf("already-scanned filtered history was revisited after a wake: %v", records)
+	}
+}

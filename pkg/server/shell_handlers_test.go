@@ -151,7 +151,7 @@ func TestWebShellEventKeepsOwnerAfterSandboxDeletion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(events) == 1 {
+		if len(events.Events) == 1 {
 			return
 		}
 		select {

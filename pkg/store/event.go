@@ -204,17 +204,36 @@ type EventQuery struct {
 	Limit      int    // at most this many events; must be positive
 }
 
-// EventsAfter returns the events matching q in id order. Event ids are
-// assigned in commit order and never reused, so a reader that keeps the last id
-// it handled and asks for everything after it sees each event once and in
-// order, however long it was away. It is the one read the live event stream and
-// every consumer of it share.
-func (s *Store) EventsAfter(ctx context.Context, q EventQuery) ([]Event, error) {
+// EventPage couples matching events with the retention boundary from the same
+// read snapshot. ScannedThrough is safe to resume after even when filters
+// rejected every event; a full page stops at its last returned event instead.
+type EventPage struct {
+	Events         []Event
+	Oldest         int64
+	ScannedThrough int64
+}
+
+// EventsAfter returns one user's matching events in increasing ID order.
+// The read transaction ends before returning, so a slow consumer holds neither
+// a SQLite snapshot nor its WAL history while writing the page to the network.
+func (s *Store) EventsAfter(ctx context.Context, q EventQuery) (EventPage, error) {
 	if q.UserID == "" {
-		return nil, errors.New("store: events are read for a user")
+		return EventPage{}, errors.New("store: events are read for a user")
 	}
 	if q.Limit <= 0 {
-		return nil, fmt.Errorf("store: events limit %d, want positive", q.Limit)
+		return EventPage{}, fmt.Errorf("store: events limit %d, want positive", q.Limit)
+	}
+	// ReadOnly bypasses the store's immediate-write transaction mode. Bounds
+	// and rows must share a snapshot without excluding concurrent writers.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return EventPage{}, err
+	}
+	defer tx.Rollback()
+	page := EventPage{ScannedThrough: q.After}
+	var newest int64
+	if err := tx.QueryRowContext(ctx, eventIDBoundsSQL).Scan(&page.Oldest, &newest); err != nil {
+		return EventPage{}, err
 	}
 	query := `SELECT id, ts, type, user_id, sandbox_id, meta FROM events WHERE user_id = ? AND id > ?`
 	args := []any{q.UserID, q.After}
@@ -231,31 +250,40 @@ func (s *Store) EventsAfter(ctx context.Context, q EventQuery) ([]Event, error) 
 	query += ` ORDER BY id LIMIT ?`
 	args = append(args, q.Limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return EventPage{}, err
 	}
 	defer rows.Close()
-	var events []Event
 	for rows.Next() {
 		e, err := scanEvent(rows)
 		if err != nil {
-			return nil, err
+			return EventPage{}, err
 		}
-		events = append(events, e)
+		page.Events = append(page.Events, e)
 	}
-	return events, rows.Err()
+	if err := rows.Err(); err != nil {
+		return EventPage{}, err
+	}
+	if len(page.Events) == q.Limit {
+		page.ScannedThrough = page.Events[len(page.Events)-1].ID
+	} else {
+		// All matches through newest were exhausted, including any rejected
+		// tail. Never move a caller's cursor backwards when it is ahead of us.
+		page.ScannedThrough = max(q.After, newest)
+	}
+	return page, nil
 }
+
+// Separate min/max subqueries each seek the primary key; a combined aggregate
+// makes SQLite scan the entire event table.
+const eventIDBoundsSQL = `SELECT COALESCE((SELECT MIN(id) FROM events), 0), COALESCE((SELECT MAX(id) FROM events), 0)`
 
 // EventIDBounds returns the smallest and largest event id stored, both 0 when
 // there is none. Ids below oldest are gone: retention deletes from the old end,
 // and the ids of deleted rows are not handed out again.
 func (s *Store) EventIDBounds(ctx context.Context) (oldest, newest int64, err error) {
-	// Two subqueries, not MIN(id), MAX(id) in one SELECT: SQLite answers a lone
-	// min or max with one seek into the key, and scans the table for both.
-	err = s.db.QueryRowContext(ctx,
-		`SELECT COALESCE((SELECT MIN(id) FROM events), 0), COALESCE((SELECT MAX(id) FROM events), 0)`,
-	).Scan(&oldest, &newest)
+	err = s.db.QueryRowContext(ctx, eventIDBoundsSQL).Scan(&oldest, &newest)
 	return oldest, newest, err
 }
 

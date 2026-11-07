@@ -1,8 +1,12 @@
 package store
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -210,7 +214,7 @@ func mustAfter(t *testing.T, st *Store, q EventQuery) []Event {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return events
+	return events.Events
 }
 
 // A reader that keeps the last id it handled gets exactly the events after it,
@@ -507,5 +511,132 @@ func TestLadderGivesOldSandboxEventsToTheOwner(t *testing.T) {
 		if owners[typ] != user {
 			t.Errorf("%s: user %q, want %q", typ, owners[typ], user)
 		}
+	}
+}
+
+func TestEventsAfterAdvancesThroughExhaustedFilters(t *testing.T) {
+	st := testStore(t)
+	mustInsert(t, st,
+		Event{Type: "keep", UserID: "usr_a", SandboxID: "sb1"},
+		Event{Type: "skip", UserID: "usr_a", SandboxID: "sb2"},
+		Event{Type: "keep", UserID: "usr_b", SandboxID: "sb1"},
+	)
+	_, newest, err := st.EventIDBounds(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []EventQuery{
+		{UserID: "usr_a", TypePrefix: "absent", Limit: 10},
+		{UserID: "usr_a", SandboxID: "absent", Limit: 10},
+		{UserID: "absent", Limit: 10},
+		{UserID: "usr_a", TypePrefix: "keep", SandboxID: "sb1", Limit: 10},
+	} {
+		page, err := st.EventsAfter(t.Context(), query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.ScannedThrough != newest {
+			t.Errorf("exhausted query %+v scanned through %d, want %d", query, page.ScannedThrough, newest)
+		}
+		query.After = page.ScannedThrough
+		mustInsert(t, st, Event{Type: "keep", UserID: "usr_a", SandboxID: "sb1"})
+		next, err := st.EventsAfter(t.Context(), query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.ScannedThrough <= page.ScannedThrough {
+			t.Errorf("new commit did not advance the scan: %+v then %+v", page, next)
+		}
+		newest = next.ScannedThrough
+	}
+
+	full, err := st.EventsAfter(t.Context(), EventQuery{UserID: "usr_a", TypePrefix: "keep", Limit: 1})
+	if err != nil || len(full.Events) != 1 || full.ScannedThrough != full.Events[0].ID {
+		t.Fatalf("limited page skipped unread matches: %+v, %v", full, err)
+	}
+	future := newest + 100
+	empty, err := st.EventsAfter(t.Context(), EventQuery{UserID: "usr_a", After: future, Limit: 1})
+	if err != nil || len(empty.Events) != 0 || empty.ScannedThrough != future {
+		t.Fatalf("future cursor moved backwards: %+v, %v", empty, err)
+	}
+}
+
+// Interpose only at the database boundary to force retention into the exact
+// interval between reading bounds and rows. The real SQLite connections and
+// transactions still determine which committed snapshot the reader sees.
+type eventBoundsConnector struct {
+	base      driver.Driver
+	dsn       string
+	afterRead func()
+}
+
+func (c *eventBoundsConnector) Driver() driver.Driver { return c.base }
+
+func (c *eventBoundsConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.base.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &eventBoundsConn{Conn: conn, afterRead: c.afterRead}, nil
+}
+
+type eventBoundsConn struct {
+	driver.Conn
+	afterRead func()
+}
+
+func (c *eventBoundsConn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx, error) {
+	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, options)
+}
+
+func (c *eventBoundsConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	rows, err := c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
+	if err == nil && query == eventIDBoundsSQL {
+		rows = &eventBoundsRows{Rows: rows, afterRead: c.afterRead}
+	}
+	return rows, err
+}
+
+type eventBoundsRows struct {
+	driver.Rows
+	afterRead func()
+}
+
+func (r *eventBoundsRows) Close() error {
+	err := r.Rows.Close()
+	r.afterRead()
+	return err
+}
+
+func TestEventsAfterReadsBoundsAndRowsFromOneSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	writer, err := New(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	mustInsert(t, writer, Event{Type: "old.one", UserID: "usr_a"}, Event{Type: "old.two", UserID: "usr_a"})
+	before := mustAfter(t, writer, EventQuery{UserID: "usr_a"})
+	purge := sync.OnceFunc(func() {
+		if n, err := writer.PurgeOldEvents(t.Context(), -time.Hour); err != nil || n != 2 {
+			t.Fatalf("retention removed %d events: %v", n, err)
+		}
+		mustInsert(t, writer, Event{Type: "new", UserID: "usr_a"})
+	})
+	reader := &Store{db: sql.OpenDB(&eventBoundsConnector{
+		base: writer.db.Driver(), dsn: path + "?_txlock=immediate", afterRead: purge,
+	})}
+	defer reader.Close()
+
+	page, err := reader.EventsAfter(t.Context(), EventQuery{UserID: "usr_a", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ids(page.Events), ids(before)) || page.Oldest != before[0].ID || page.ScannedThrough != before[len(before)-1].ID {
+		t.Fatalf("mixed snapshots across retention: page %+v (ids %v), want ids %v and their bounds", page, ids(page.Events), ids(before))
+	}
+	next, err := reader.EventsAfter(t.Context(), EventQuery{UserID: "usr_a", After: page.ScannedThrough, Limit: 10})
+	if err != nil || len(next.Events) != 1 || next.Events[0].Type != "new" || next.Oldest != next.Events[0].ID {
+		t.Fatalf("next snapshot did not see retention and the new event: %+v, %v", next, err)
 	}
 }
