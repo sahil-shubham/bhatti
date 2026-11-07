@@ -208,13 +208,16 @@ func pidAlive(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
-// A spec path alone also matches an administrator's editor. Require the
-// configured helper's executable as well, including the kernel's executable
-// identity where the platform exposes it.
+// isHelper reports whether pid is a bhatti-vmm started on spec. A spec path
+// alone also matches an administrator's editor, so argv[0] must name the
+// configured helper too. Argv is the whole test, not the executable's path:
+// an update renames the runtime away from under the helpers the previous
+// daemon started, and the new daemon must still know them, or it records
+// their sandboxes stopped while they run and later boots a second VM on the
+// same disks.
 func isHelper(pid int, spec, binary string) bool {
 	args, err := procArgs(pid)
-	return err == nil && len(args) == 2 && args[1] == spec &&
-		filepath.Base(args[0]) == filepath.Base(binary) && procExecutableMatches(pid, binary)
+	return err == nil && len(args) == 2 && args[1] == spec && filepath.Base(args[0]) == filepath.Base(binary)
 }
 
 // isNetd reports whether pid is the bhatti-netd serving sock.

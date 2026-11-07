@@ -77,12 +77,20 @@ func gatedStandin(t *testing.T, spec string) int {
 // the executable, so helper identity tests can distinguish argv from exe.
 func gatedStandinAs(t *testing.T, spec, argv0 string) int {
 	t.Helper()
+	return gatedStandinFrom(t, os.Args[0], spec, argv0)
+}
+
+// gatedStandinFrom runs the stand-in from exe, a copy of this test binary, so
+// a test can move or delete the executable under a running helper, as an
+// update does to the runtime.
+func gatedStandinFrom(t *testing.T, exe, spec, argv0 string) int {
+	t.Helper()
 	g, err := launchgate.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(g.Close)
-	cmd := exec.Command(os.Args[0], spec)
+	cmd := exec.Command(exe, spec)
 	cmd.Args[0] = argv0
 	cmd.Env = append(os.Environ(), standinEnv+"=idle")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

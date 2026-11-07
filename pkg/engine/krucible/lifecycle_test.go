@@ -164,7 +164,7 @@ func TestRequestedVMMKillDoesNotEmitExit(t *testing.T) {
 }
 
 func TestAdoptedVMMDeathIsObservedWithoutRestart(t *testing.T) {
-	e := &Engine{cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t)}, vms: map[string]*VM{}, netds: map[string]*netdInstance{}}
+	e := &Engine{cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t), VMMBinary: os.Args[0]}, vms: map[string]*VM{}, netds: map[string]*netdInstance{}}
 	spec, control := sandboxPaths(t, e, "adopted")
 	pid := fakeHelper(t, spec)
 	fakeControl(t, control, "running")

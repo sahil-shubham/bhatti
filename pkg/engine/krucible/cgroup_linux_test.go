@@ -5,8 +5,6 @@ package krucible
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -30,39 +28,6 @@ func TestMapBusReferenceErrors(t *testing.T) {
 	denied := dbus.Error{Name: "org.freedesktop.DBus.Error.AccessDenied"}
 	if err := mapBusError(denied); errors.Is(err, errNoSuchUnit) || errors.Is(err, errUnitNotReferenced) {
 		t.Fatalf("a rejected release was treated as completed: %v", err)
-	}
-}
-
-// argv can name the configured helper even when /proc exposes a different
-// executable. A copy deliberately has a different inode as well as path.
-func TestHelperRejectsReadableExecutableMismatch(t *testing.T) {
-	spec := filepath.Join(t.TempDir(), "vmspec.json")
-	pid := gatedStandin(t, spec)
-	if _, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err != nil {
-		t.Fatalf("reading stand-in executable: %v", err)
-	}
-	if !isHelper(pid, spec, os.Args[0]) {
-		t.Fatal("the actual configured executable was not recognised")
-	}
-
-	binary, err := os.ReadFile(os.Args[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherBinary := filepath.Join(t.TempDir(), filepath.Base(os.Args[0]))
-	if err := os.WriteFile(otherBinary, binary, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if isHelper(pid, spec, otherBinary) {
-		t.Error("matching argv accepted a different readable executable")
-	}
-	killHelper(pid, spec, otherBinary)
-	if !running(pid, filepath.Base(os.Args[0]), spec) {
-		t.Fatal("killHelper killed a process from a different executable")
-	}
-	killStrays([]*VM{{ID: "stopped", SandboxDir: filepath.Dir(spec), Status: "stopped"}}, otherBinary)
-	if !running(pid, filepath.Base(os.Args[0]), spec) {
-		t.Fatal("killStrays killed a process from a different executable")
 	}
 }
 

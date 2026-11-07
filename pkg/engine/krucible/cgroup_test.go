@@ -1151,3 +1151,51 @@ func TestAdoptReconcilesLostReplyWithoutStoppingTheHelper(t *testing.T) {
 		t.Fatalf("uncertain adoption leaked its reference: %+v, loaded %v, held %v", u, ok, m.held)
 	}
 }
+
+// TestHelperOutlivesItsReplacedRuntime: an update renames the runtime holding
+// the running helpers' executable away and deletes it. The daemon that starts
+// next must still know those helpers by their argv, or it records their
+// sandboxes stopped while they run and later boots a second VM on the same
+// disks; and a stray among them must still be one it can clean up.
+func TestHelperOutlivesItsReplacedRuntime(t *testing.T) {
+	binary, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := func(dir string) string {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		exe := filepath.Join(dir, "bhatti-vmm")
+		if err := os.WriteFile(exe, binary, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return exe
+	}
+	root := t.TempDir()
+	runtime := filepath.Join(root, "runtime")
+	old := install(runtime)
+
+	live, stray := filepath.Join(t.TempDir(), "vmspec.json"), filepath.Join(t.TempDir(), "vmspec.json")
+	livePID := gatedStandinFrom(t, old, live, old)
+	strayPID := gatedStandinFrom(t, old, stray, old)
+
+	// The update: the old runtime moves aside, the new one takes its path,
+	// and the old one is deleted with the staging area.
+	if err := os.Rename(runtime, filepath.Join(root, "replaced.runtime")); err != nil {
+		t.Fatal(err)
+	}
+	configured := install(runtime)
+	if err := os.RemoveAll(filepath.Join(root, "replaced.runtime")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !isHelper(livePID, live, configured) {
+		t.Fatal("a helper the previous daemon started isn't recognised once its runtime was replaced")
+	}
+	killStrays([]*VM{{ID: "stopped", SandboxDir: filepath.Dir(stray), Status: "stopped"}}, configured)
+	waitFor(t, "the stray to die", func() bool { return !pidAlive(strayPID) || zombie(strayPID) })
+	if !pidAlive(livePID) || zombie(livePID) {
+		t.Fatal("cleaning up the stray killed the live helper")
+	}
+}

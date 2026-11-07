@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -20,21 +19,6 @@ func procArgs(pid int) ([]string, error) {
 		return nil, nil // a zombie: its argv is gone with its memory
 	}
 	return strings.Split(string(b), "\x00"), nil
-}
-
-func procExecutableMatches(pid int, binary string) bool {
-	exe, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
-	if err != nil {
-		return os.IsPermission(err)
-	}
-	expected, err := filepath.EvalSymlinks(binary)
-	if err != nil {
-		return false
-	}
-	expected, err = filepath.Abs(expected)
-	// Replacing an installed helper does not invalidate the still-running
-	// previous version: procfs appends this suffix to its original path.
-	return err == nil && strings.TrimSuffix(exe, " (deleted)") == expected
 }
 
 func procStartTime(pid int) (uint64, error) {
