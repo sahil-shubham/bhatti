@@ -1,0 +1,6 @@
+kernel: 6.12.76-linuxkit
+machine: aarch64
+systemd: systemd 257 (257.13-1~deb13u1)
+proc_pressure: present
+cgroup_fs: cgroup2fs
+userland: "Debian GNU/Linux 13 (trixie)"

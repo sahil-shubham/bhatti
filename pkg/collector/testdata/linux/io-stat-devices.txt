@@ -1,0 +1,24 @@
+scope-busy/io.stat rows (root-filesystem direct I/O only):
+254:0 rbytes=1651507200 wbytes=1677721600 rios=1895 wios=1984 dbytes=0 dios=0
+    -> /sys/devices/platform/4000c000.virtio_mmio/virtio9/block/vda  slaves=[] holders=[]
+    kind=whole disk
+    not stacked (no slaves, no holders)
+
+scope-busy-multidev/io.stat rows (root disk + every other whole disk read + a loop device on the root disk):
+7:0 rbytes=10240 wbytes=33554432 rios=10 wios=64 dbytes=0 dios=0
+    -> /sys/devices/virtual/block/loop0  slaves=[] holders=[]
+    kind=loop device  backing_file=/var/tmp/loop.img (a file on this container's root filesystem)
+    not stacked (no slaves, no holders)
+254:16 rbytes=16777216 wbytes=0 rios=16 wios=0 dbytes=0 dios=0
+    -> /sys/devices/platform/4000d000.virtio_mmio/virtio10/block/vdb  slaves=[] holders=[]
+    kind=whole disk
+    not stacked (no slaves, no holders)
+254:0 rbytes=83886080 wbytes=67108864 rios=144 wios=64 dbytes=0 dios=0
+    -> /sys/devices/platform/4000c000.virtio_mmio/virtio9/block/vda  slaves=[] holders=[]
+    kind=whole disk
+    not stacked (no slaves, no holders)
+
+block devices in this VM that can do I/O: vda vdb 
+root-host/io.stat (the VM's root cgroup) rows: 42; rows with no counters at all: 39
+scope-busy-multidev wbytes: loop rows 33554432, other rows 67108864 (the workload wrote 33554432 to loop, 67108864 direct to the root disk)
+loop writes are NOT charged again to the disk row: summing rows does not double count here
