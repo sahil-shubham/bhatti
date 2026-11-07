@@ -844,3 +844,94 @@ func TestSystemdFailedUnrefCanBeRetried(t *testing.T) {
 		return err == nil && len(units) == 0
 	})
 }
+
+// loseStartReplySystemd lets systemd accept AddRef on the real connection,
+// then hides that reply until the placement context expires.
+type loseStartReplySystemd struct {
+	systemdAPI
+	unit string
+	lost bool
+}
+
+func (s *loseStartReplySystemd) StartTransientUnit(ctx context.Context, name string, props []unitProp) error {
+	if name != s.unit || s.lost {
+		return s.systemdAPI.StartTransientUnit(ctx, name, props)
+	}
+	if err := s.systemdAPI.StartTransientUnit(ctx, name, props); err != nil {
+		return err
+	}
+	s.lost = true
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestSystemdLostStartReplyReleasesScopeName(t *testing.T) {
+	for _, kind := range []string{"vm", "netd"} {
+		t.Run(kind, func(t *testing.T) {
+			m := systemdManager(t, false)
+			owner := testOwnerFor(t, m)
+			ps := vmSpecFor(t, owner, 903)
+			if kind == "netd" {
+				var err error
+				ps, err = netdPlacement(owner)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			real := m.sd
+			sd := &loseStartReplySystemd{systemdAPI: real, unit: ps.unit}
+			m.sd = sd
+			unrelatedPS := vmSpecFor(t, owner, 902)
+			unrelated, unrelatedDir, err := startStandin(t, m, unrelatedPS, "idle")
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "the unrelated helper to begin", func() bool { return exists(filepath.Join(unrelatedDir, standinStarted)) })
+			m.timeout = 250 * time.Millisecond
+
+			dir := t.TempDir()
+			spec := filepath.Join(dir, "vmspec.json")
+			cmd := exec.Command(os.Args[0], spec)
+			cmd.Args[0] = "bhatti-vmm"
+			cmd.Env = append(os.Environ(), standinEnv+"=idle")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			ps.alive = func(pid int) bool { return pidAlive(pid) && isHelper(pid, spec) }
+			t.Cleanup(func() {
+				if cmd.Process != nil {
+					reap(t, cmd)
+				}
+			})
+			err = m.start(context.Background(), cmd, ps, nil)
+			if !sd.lost || err == nil {
+				t.Fatalf("creation was not accepted with an interrupted reply: lost %v, error %v", sd.lost, err)
+			}
+			if cmd.ProcessState == nil || pidAlive(cmd.Process.Pid) {
+				t.Error("the helper was not killed and reaped after the lost placement reply")
+			}
+			if exists(filepath.Join(dir, standinStarted)) {
+				t.Error("the helper performed work after an unconfirmed placement")
+			}
+			waitFor(t, "the scope name to be released on the same connection", func() bool {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				units, err := real.Units(ctx, ps.unit)
+				return err == nil && len(units) == 0
+			})
+
+			again, againDir, err := startStandin(t, m, ps, "idle")
+			if err != nil {
+				t.Fatalf("retry the same %s scope after its creation reply was lost: %v", kind, err)
+			}
+			waitFor(t, "the replacement helper to begin", func() bool { return exists(filepath.Join(againDir, standinStarted)) })
+			if cg, err := procCgroupPath(again.Process.Pid); err != nil || !memberOf(cg, ps) {
+				t.Fatalf("replacement helper's cgroup = %q, %v; want %s", cg, err, ps.path())
+			}
+			if !pidAlive(unrelated.Process.Pid) {
+				t.Error("reconciling the uncertain placement killed an unrelated active helper")
+			}
+			if cg, err := procCgroupPath(unrelated.Process.Pid); err != nil || !memberOf(cg, unrelatedPS) {
+				t.Errorf("unrelated helper's cgroup changed to %q, %v; want %s", cg, err, unrelatedPS.path())
+			}
+		})
+	}
+}

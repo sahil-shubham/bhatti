@@ -1040,3 +1040,83 @@ func TestReleaseSerializesConcurrentIncarnationHandover(t *testing.T) {
 		t.Fatalf("old watcher released the next incarnation: unit %+v, loaded %v, held %v", u, ok, m.held)
 	}
 }
+
+type lostScopeReplySystemd struct {
+	systemdAPI
+	unit string
+	lost bool
+}
+
+func (s *lostScopeReplySystemd) StartTransientUnit(ctx context.Context, name string, props []unitProp) error {
+	err := s.systemdAPI.StartTransientUnit(ctx, name, props)
+	if err != nil || name != s.unit || s.lost {
+		return err
+	}
+	s.lost = true
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *lostScopeReplySystemd) Units(ctx context.Context, pattern string) ([]unitStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.systemdAPI.Units(ctx, pattern)
+}
+
+func (s *lostScopeReplySystemd) UnrefUnit(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.systemdAPI.UnrefUnit(ctx, name)
+}
+
+func TestStartReconcilesLostScopeReply(t *testing.T) {
+	netd, err := netdPlacement(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ps := range []placementSpec{testVM(t), netd} {
+		t.Run(ps.unit, func(t *testing.T) {
+			sd := newFakeSystemd()
+			m := newTestManager(sd)
+			m.timeout = 50 * time.Millisecond
+			m.sd = &lostScopeReplySystemd{systemdAPI: sd, unit: ps.unit}
+			t.Cleanup(m.close)
+			marker := filepath.Join(t.TempDir(), "worked")
+			cmd, err := startHelper(t, m, ps, marker, nil)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("lost reply = %v, want the interrupted creation error", err)
+			}
+			if pidAlive(cmd.Process.Pid) || cmd.ProcessState == nil || exists(marker) {
+				t.Fatal("the helper escaped its failed placement")
+			}
+			if got := sd.calls("unref"); !slices.Equal(got, []string{ps.unit}) {
+				t.Fatalf("accepted creation's reference was not reconciled: %v", got)
+			}
+			waitFor(t, "the failed scope to be collected", func() bool { _, ok := sd.unit(ps.unit); return !ok })
+			if _, err := startHelper(t, m, ps, filepath.Join(t.TempDir(), "retry"), nil); err != nil {
+				t.Fatalf("same-name retry after a lost reply: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdoptReconcilesLostReplyWithoutStoppingTheHelper(t *testing.T) {
+	sd := newFakeSystemd()
+	m := newTestManager(sd)
+	m.timeout = 50 * time.Millisecond
+	t.Cleanup(m.close)
+	ps, pid := testVM(t), adoptee(t)
+	m.sd = &lostScopeReplySystemd{systemdAPI: sd, unit: ps.unit}
+
+	if _, err := m.adopt(context.Background(), pid, ps, placedScope{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("adopt = %v, want the interrupted creation error", err)
+	}
+	if len(sd.calls("stop")) != 0 || !pidAlive(pid) {
+		t.Fatal("reconciling adoption stopped a running helper")
+	}
+	if u, ok := sd.unit(ps.unit); !ok || u.refs != 0 || len(m.held) != 0 {
+		t.Fatalf("uncertain adoption leaked its reference: %+v, loaded %v, held %v", u, ok, m.held)
+	}
+}

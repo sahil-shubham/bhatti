@@ -465,6 +465,11 @@ func (m *cgroupManager) place(ctx context.Context, pid int, ps placementSpec, st
 		return fmt.Errorf("place %s: %w", ps.unit, err)
 	}
 	if err := m.startScope(ctx, pid, ps); err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if created := m.reconcileScope(pid, ps); created && stopOnFail {
+				m.discard(ps.unit)
+			}
+		}
 		m.forgetSlices()
 		return fmt.Errorf("place %s: %w", ps.unit, err)
 	}
@@ -507,6 +512,34 @@ func (m *cgroupManager) startScope(ctx context.Context, pid int, ps placementSpe
 		case <-time.After(delay):
 		}
 	}
+}
+
+// A canceled creation call can have taken AddRef before its reply was lost.
+// UnrefUnit affects only this connection's reference, so even an uncertain
+// reference can safely be released; a failed release stays pending. Only a
+// scope actually holding the attempted PID may be stopped by launch cleanup.
+func (m *cgroupManager) reconcileScope(pid int, ps placementSpec) bool {
+	m.mu.Lock()
+	if held, ok := m.held[ps.unit]; ok && held != pid {
+		m.mu.Unlock()
+		return false
+	}
+	m.held[ps.unit] = pid
+	m.mu.Unlock()
+	defer m.release(ps.unit, pid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+	defer cancel()
+	units, err := m.sd.Units(ctx, ps.unit)
+	if err != nil {
+		slog.Warn("krucible.cgroup.reconcile_failed", "unit", ps.unit, "pid", pid, "error", err)
+		return false
+	}
+	if len(units) != 1 {
+		return false
+	}
+	cg, err := m.procCg(pid)
+	return err == nil && memberOf(cg, ps)
 }
 
 // waitMember polls until pid's cgroup is ps's scope. Polling checks what
