@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -37,13 +38,30 @@ func openRaw(t *testing.T) *sql.DB {
 	return db
 }
 
+// inTx runs fn in a transaction on db and commits it unless fn fails, the way
+// New runs a migration step.
+func inTx(t *testing.T, db *sql.DB, fn func(ctx context.Context, tx *sql.Tx) (bool, error)) (bool, error) {
+	t.Helper()
+	tx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	ran, err := fn(t.Context(), tx)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return ran, nil
+}
+
 // createV1Secrets installs the post-ALTER v1 secrets schema:
-// PRIMARY KEY(name), plus the columns added by the additive
-// migrations in store.go's `migrations` const (value_encrypted,
-// updated_at, user_id). This is the state migrateSecretsToV2
-// actually sees in production — the additive migrations always run
-// before the v1→v2 rewrite, so the rewrite assumes those columns
-// exist.
+// PRIMARY KEY(name), plus the columns originalColumns adds
+// (value_encrypted, updated_at, user_id). This is the state
+// migrateSecretsToV2 actually sees in production: the step that adds
+// those columns runs before the v1→v2 rewrite, which assumes they exist.
 func createV1Secrets(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`CREATE TABLE secrets (
@@ -64,7 +82,7 @@ func TestMigrateSecretsToV2_FromV1(t *testing.T) {
 	db := openRaw(t)
 	createV1Secrets(t, db)
 
-	didMigrate, err := migrateSecretsToV2(t.Context(), db)
+	didMigrate, err := inTx(t, db, migrateSecretsToV2)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -92,12 +110,12 @@ func TestMigrateSecretsToV2_Idempotent(t *testing.T) {
 	createV1Secrets(t, db)
 
 	// First call: v1 → v2.
-	if didMigrate, err := migrateSecretsToV2(t.Context(), db); err != nil || !didMigrate {
+	if didMigrate, err := inTx(t, db, migrateSecretsToV2); err != nil || !didMigrate {
 		t.Fatalf("first call: didMigrate=%v err=%v", didMigrate, err)
 	}
 
 	// Second call: must be a no-op.
-	didMigrate, err := migrateSecretsToV2(t.Context(), db)
+	didMigrate, err := inTx(t, db, migrateSecretsToV2)
 	if err != nil {
 		t.Fatalf("second call err: %v", err)
 	}
@@ -106,7 +124,7 @@ func TestMigrateSecretsToV2_Idempotent(t *testing.T) {
 	}
 
 	// Third call for good measure.
-	if didMigrate, err := migrateSecretsToV2(t.Context(), db); err != nil || didMigrate {
+	if didMigrate, err := inTx(t, db, migrateSecretsToV2); err != nil || didMigrate {
 		t.Fatalf("third call: didMigrate=%v err=%v (expected false, nil)", didMigrate, err)
 	}
 }
@@ -125,7 +143,7 @@ func TestMigrateSecretsToV2_PreservesData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := migrateSecretsToV2(t.Context(), db); err != nil {
+	if _, err := inTx(t, db, migrateSecretsToV2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,12 +164,14 @@ func TestMigrateSecretsToV2_PreservesData(t *testing.T) {
 }
 
 // TestMigrateSecretsToV2_FullStorePath exercises the production path:
-// open a Store (which runs the migration via New), close, reopen.
-// Asserts that the second New invocation does not rewrite the table.
-// We detect this indirectly by adding a marker (an extra index on
-// the v2 secrets table) after the first boot and verifying it
-// survives the second boot — a CREATE-INSERT-DROP-RENAME rewrite
-// would lose the marker along with the dropped table.
+// open a Store (which runs the steps via New), then reopen it as a database
+// from before the ladder, which reads as version 0 whatever it holds. That
+// is every production database on its first boot of this build: the
+// baseline runs over a secrets table that is already v2. We detect a rewrite
+// indirectly by adding a marker (an extra index on the v2 secrets table)
+// after the first boot and verifying it survives the second boot: a
+// CREATE-INSERT-DROP-RENAME rewrite would lose the marker along with the
+// dropped table.
 func TestMigrateSecretsToV2_FullStorePath(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "store.db")
@@ -169,14 +189,9 @@ func TestMigrateSecretsToV2_FullStorePath(t *testing.T) {
 	); err != nil {
 		t.Fatalf("create marker index: %v", err)
 	}
-	s1.Close()
-
-	// Second boot — if the migration re-runs, it drops `secrets` and
+	// Second boot: if the rebuild runs again it drops `secrets` and
 	// renames `secrets_v2`. The marker index would be lost.
-	s2, err := New(t.Context(), dbPath)
-	if err != nil {
-		t.Fatalf("second New: %v", err)
-	}
+	s2 := reopenFromBeforeTheLadder(t, s1, dbPath)
 	defer s2.Close()
 
 	var markerCount int

@@ -43,7 +43,7 @@ func TestRestartPendingMarker(t *testing.T) {
 		t.Fatalf("pending after unexpected stops = %v, want only the keep_hot one", got)
 	}
 
-	// Reopening the database runs the migrations again and keeps the marker.
+	// Reopening the database (the column exists by then) works.
 	path := filepath.Join(t.TempDir(), "reopen.db")
 	s2, err := New(t.Context(), path)
 	if err != nil {

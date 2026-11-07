@@ -72,10 +72,10 @@ func TestMigrateGrantPlaceholderScope(t *testing.T) {
 	}
 	legacyGrantRows(t, db)
 
-	if ran, err := migrateGrantPlaceholderScope(t.Context(), db); err != nil || !ran {
+	if ran, err := inTx(t, db, migrateGrantPlaceholderScope); err != nil || !ran {
 		t.Fatalf("first run: ran=%v err=%v, want the rebuild", ran, err)
 	}
-	if ran, err := migrateGrantPlaceholderScope(t.Context(), db); err != nil || ran {
+	if ran, err := inTx(t, db, migrateGrantPlaceholderScope); err != nil || ran {
 		t.Fatalf("second run: ran=%v err=%v, want a no-op", ran, err)
 	}
 
@@ -110,7 +110,7 @@ func TestMigrateGrantPlaceholderScope(t *testing.T) {
 // there is nothing to rebuild.
 func TestMigrateGrantPlaceholderScopeFreshDatabase(t *testing.T) {
 	db := openRaw(t)
-	if ran, err := migrateGrantPlaceholderScope(t.Context(), db); err != nil || ran {
+	if ran, err := inTx(t, db, migrateGrantPlaceholderScope); err != nil || ran {
 		t.Fatalf("no table: ran=%v err=%v, want a no-op", ran, err)
 	}
 }
@@ -161,10 +161,11 @@ func TestOpenUpgradesAnOlderDatabase(t *testing.T) {
 				t.Fatalf("open %d: index %s: n=%d err=%v", pass, idx, n, err)
 			}
 		}
-		// All its indexes are in place now, the placeholder one included: none
-		// of them may read as the old table-wide constraint and rebuild it on
-		// every start.
-		if ran, err := migrateGrantPlaceholderScope(t.Context(), s.db); err != nil || ran {
+		// All its indexes are in place now, the placeholder one included. A
+		// database from before the ladder runs this check on its first boot of
+		// this build, and none of them may read as the old table-wide
+		// constraint and have a table that is already right rebuilt.
+		if ran, err := inTx(t, s.db, migrateGrantPlaceholderScope); err != nil || ran {
 			t.Fatalf("open %d: the rebuilt table was rebuilt again: ran=%v err=%v", pass, ran, err)
 		}
 		// An older snapshot recorded nothing — and, unlike one taken since that

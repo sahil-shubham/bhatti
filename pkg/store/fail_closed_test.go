@@ -75,6 +75,9 @@ func TestNextSubnetIndexRejectsFailedScanAndInvalidIndex(t *testing.T) {
 	}
 }
 
+// TestNewRejectsNonDuplicateMigrationError: a column the database lacks and
+// cannot take fails the open, naming the step and the column, and leaves the
+// database at the version it had.
 func TestNewRejectsNonDuplicateMigrationError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration.db")
 	s, err := New(t.Context(), path)
@@ -89,14 +92,21 @@ func TestNewRejectsNonDuplicateMigrationError(t *testing.T) {
 	if _, err := s.db.Exec(`CREATE VIRTUAL TABLE sandboxes USING fts5(content)`); err != nil {
 		t.Fatal(err)
 	}
+	// Reopened as a database from before the ladder, so the step runs again.
+	setUserVersion(t, s.db, 0)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if opened, err := New(t.Context(), path); err == nil || !strings.Contains(err.Error(), "ALTER TABLE sandboxes ADD COLUMN") {
-		if opened != nil {
-			opened.Close()
-		}
-		t.Fatalf("expected named migration failure, got %v", err)
+	opened, err := New(t.Context(), path)
+	if err == nil {
+		opened.Close()
+		t.Fatal("opened a database whose sandboxes table cannot take its columns")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "migration 1") || !strings.Contains(msg, "sandboxes.rootfs_path") {
+		t.Fatalf("error does not name migration 1 and the column it could not add: %v", err)
+	}
+	if v := userVersion(t, rawOpen(t, path)); v != 0 {
+		t.Fatalf("version after the failed open = %d, want 0", v)
 	}
 }
 

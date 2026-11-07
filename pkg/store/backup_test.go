@@ -214,12 +214,9 @@ func TestVolumeBackupMigrationPreservesHistoricalUnverifiedMode(t *testing.T) {
 		VALUES ('older', 'data', 'usr', 'key', 123, CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatal(err)
 	}
-	st.Close()
-
-	st, err = New(t.Context(), dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Reopened as a database from before the ladder, which runs the step that
+	// adds consistency_mode over a volume_backups table that lacks it.
+	st = reopenFromBeforeTheLadder(t, st, dbPath)
 	defer st.Close()
 	got, err := st.GetVolumeBackup(t.Context(), "usr", "older")
 	if err != nil {
