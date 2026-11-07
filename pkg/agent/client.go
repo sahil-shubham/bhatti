@@ -390,9 +390,9 @@ func (c *AgentClient) Forward(ctx context.Context, port uint16) (io.ReadWriteClo
 // serving, and ErrGuestUnconfigured means the agent runs but will never accept
 // us (that one ends the wait at once).
 func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
 	defer cancel()
+	deadline, _ := ctx.Deadline() // the caller's, if that comes first
 
 	start := time.Now()
 	attempt := 0
@@ -438,15 +438,22 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 			return nil
 		}
 
-		lastErr = err
+		probeErr := err
 		if err == nil {
-			lastErr = fmt.Errorf("probe exited %d: %s", result.ExitCode, strings.TrimSpace(result.Stderr))
+			probeErr = fmt.Errorf("probe exited %d: %s", result.ExitCode, strings.TrimSpace(result.Stderr))
+		}
+		// A probe the overall deadline cut short says only that time ran out;
+		// keep what the probe before it learned about the guest. Judged by the
+		// clock: a socket deadline can fire before the context's timer marks
+		// it done.
+		if (ctx.Err() == nil && time.Now().Before(deadline)) || lastErr == nil {
+			lastErr = probeErr
 		}
 		slog.Debug("wait_ready.attempt_failed",
 			"attempt", attempt,
 			"attempt_ms", time.Since(attemptStart).Milliseconds(),
 			"total_ms", time.Since(start).Milliseconds(),
-			"error", lastErr,
+			"error", probeErr,
 			"addr", c.controlSock)
 		if errors.Is(err, ErrGuestUnconfigured) {
 			lastErr = nil // err, as the cause, says it
