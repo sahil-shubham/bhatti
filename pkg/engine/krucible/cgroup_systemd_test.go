@@ -215,7 +215,10 @@ func TestSystemdPlacesBeforeWorkAndAccounts(t *testing.T) {
 	// The guest's memory is the scope's, and the slice adds its scopes up.
 	vmMem, netdMem, sliceMem := readInt(t, vmScope, "memory.current"), readInt(t, netdScope, "memory.current"), readInt(t, ownerSlice, "memory.current")
 	t.Logf("memory.current: vm scope %d MiB, netd scope %d MiB, owner slice %d MiB", vmMem>>20, netdMem>>20, sliceMem>>20)
-	if vmMem < 64<<20 || vmMem > 128<<20 {
+	// memcg charges in per-CPU batches, so memory.current can trail the pages
+	// just touched by a few MiB; what matters is that the 64 MiB landed here,
+	// not in the daemon's cgroup.
+	if vmMem < 56<<20 || vmMem > 128<<20 {
 		t.Errorf("vm scope memory.current = %d MiB, want about the 64 MiB the helper touched", vmMem>>20)
 	}
 	if netdMem > 48<<20 {
