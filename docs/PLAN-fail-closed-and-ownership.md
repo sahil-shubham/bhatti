@@ -690,10 +690,15 @@ Deferred work gets issues, not paragraphs here: Go 1.22 routing + middleware, th
    exception — a guest whose `SetSandbox` has not landed within N ms — not the type's
    default answer for every future forgotten field. Open: decide N, and whether the
    bounded window is even needed once the daemon pushes policy before the VMM connects.
-4. **Does the `notify` broadcast (T3 item 4) move too much cost onto SQLite?** Each
-   subscriber wakes and runs one indexed `SELECT … WHERE id > cursor`. That is a local
-   WAL-mode read and it is already how `/events?since=` works. Probably fine, but measure
-   with 20 concurrent SSE subscribers on the local restore before deleting the registry.
+4. **Does the `notify` broadcast (T3 item 4) move too much cost onto SQLite?** No; measured
+   when it landed. A wake-up is one read of the follower's own events past its cursor. With
+   20 followers on a 100-events/s producer every follower got every event, delivery lag was
+   p50 253 ms / p99 495 ms (the recorder's 500 ms flush bounds it), and the process spent 3%
+   of one core, the followers' own decoding included; 200 followers took 18%. What mattered
+   was the index: `idx_events_user` is ordered by `ts`, so SQLite sorted a user's events by
+   id on every wake-up, which cost 0.15 ms on 50k rows for a user with 500 events, 3.8 ms on
+   500k rows for one with 20k, and 53 ms for one with 250k. `events(user_id, id)` (`e386330`)
+   makes it 37–75 µs at any size.
 5. **Should the `ThermalEngine` assertion become a startup check?** After T1, it is the
    only remaining silent-degradation path — an engine missing one of six methods boots
    clean and never cools a sandbox. containerd's answer is `RequiredPlugins` +

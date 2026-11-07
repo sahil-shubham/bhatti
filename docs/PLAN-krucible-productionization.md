@@ -256,10 +256,11 @@ the move that unblocks §6b's first brick.
 
 ### 6d. Streaming (parallel, low-risk polish)
 
-**Where we are.** Already solid: an `EventRecorder` pub/sub bus (`Subscribe(filter)` + fan-out + a persistent `events`
-table with `/events?since=<id>` replay) and exec streaming over NDJSON + WebSocket. **Forward path:** a unified live
-*fleet* stream (SSE/WS over `EventRecorder.Subscribe`), richer event types on the bus (output/log/thermal/network), and
-backpressure/replay polish — pairs naturally with §6a (observe the mesh).
+**Where we are.** Already solid: a persistent `events` table that the `EventRecorder` fills and `GET /events?after=<id>`
+reads (NDJSON, the caller's own events, replay from a cursor, `follow=1` to keep it open; `bhatti events`), and exec
+streaming over NDJSON + WebSocket. **Forward path:** richer event types (output/log/thermal/network — the thermal
+manager's events record no owner yet, so `/events` does not serve them) and, if a browser needs it, an SSE/WS framing of
+the same endpoint — pairs naturally with §6a (observe the mesh).
 
 ### 6e. Agent-state timeline (volumes & versioning)
 
