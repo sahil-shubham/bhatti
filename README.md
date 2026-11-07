@@ -114,6 +114,10 @@ sudo bhatti update --tiers all  # Server: also pull additional tiers
 > different VMM, so the installer refuses an in-place jump and points you at a fresh
 > v2 install. To stay on v1, pin it: `sudo BHATTI_VERSION=v1.11.12 bhatti update`.
 
+A server update downloads and verifies the whole release while the daemon keeps
+serving, then stops it only to swap the staged files in, so the API is down for
+seconds and a failed download leaves the running install untouched.
+
 Existing sandboxes keep the lohar binary on their own root disk after a server
 update. They still run, but features added to newer lohar builds do not appear
 in those sandboxes: fork, secret grants, or root-disk growth may return an
