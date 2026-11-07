@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -233,16 +234,7 @@ func adminStatusHuman(ctx context.Context, st *store.Store) error {
 			if user == "" {
 				user = "-"
 			}
-			sandbox := e.SandboxID
-			if sandbox == "" {
-				sandbox = "-"
-			}
-			// Try to get sandbox name from meta
-			if name, ok := e.Meta["name"].(string); ok && name != "" {
-				sandbox = name
-			} else if name, ok := e.Meta["sandbox"].(string); ok && name != "" {
-				sandbox = name
-			}
+			sandbox := eventSandboxLabel(e)
 			details := formatEventDetails(e)
 			fmt.Printf("  %s  %-24s %-12s %-16s %s\n", ts, e.Type, user, sandbox, details)
 		}
@@ -313,15 +305,7 @@ var adminEventsCmd = &cobra.Command{
 			if user == "" {
 				user = "-"
 			}
-			sandbox := e.SandboxID
-			if sandbox == "" {
-				sandbox = "-"
-			}
-			if name, ok := e.Meta["name"].(string); ok && name != "" {
-				sandbox = name
-			} else if name, ok := e.Meta["sandbox"].(string); ok && name != "" {
-				sandbox = name
-			}
+			sandbox := eventSandboxLabel(e)
 			details := formatEventDetails(e)
 			fmt.Printf("%-20s %-24s %-12s %-16s %s\n", ts, e.Type, user, sandbox, details)
 		}
@@ -480,6 +464,22 @@ func parseSince(s string) time.Time {
 	return time.Time{}
 }
 
+// eventSandboxLabel is the sandbox column of an event listing: the name the
+// event recorded in its meta (the sandbox may be gone by now, so an ID alone
+// is a poor label), else the ID, else "-".
+func eventSandboxLabel(e store.Event) string {
+	if name, ok := e.Meta["name"].(string); ok && name != "" {
+		return name
+	}
+	if name, ok := e.Meta["sandbox"].(string); ok && name != "" {
+		return name
+	}
+	if e.SandboxID != "" {
+		return e.SandboxID
+	}
+	return "-"
+}
+
 // formatEventDetails produces a one-line summary from the meta JSON.
 func formatEventDetails(e store.Event) string {
 	switch {
@@ -538,18 +538,21 @@ func formatEventDetails(e store.Event) string {
 		return fmt.Sprintf("signal=%s", fmtAny(e.Meta["signal"]))
 	}
 
-	// Generic: dump first 3 meta keys
+	// Generic: first 3 meta keys, sorted so the same event always prints the same.
 	if len(e.Meta) == 0 {
 		return ""
 	}
-	var parts []string
-	i := 0
-	for k, v := range e.Meta {
-		if i >= 3 {
-			break
-		}
-		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
-		i++
+	keys := make([]string, 0, len(e.Meta))
+	for k := range e.Meta {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) > 3 {
+		keys = keys[:3]
+	}
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s=%v", k, e.Meta[k])
 	}
 	return strings.Join(parts, " ")
 }

@@ -76,6 +76,7 @@ func init() {
 	startCmd.GroupID = "core"
 	execCmd.GroupID = "core"
 	shellCmd.GroupID = "core"
+	eventsCmd.GroupID = "core"
 	shareCmd.GroupID = "core"
 
 	imageCmd.GroupID = "resource"
@@ -103,6 +104,7 @@ func init() {
 	rootCmd.AddCommand(inspectCmd)
 	rootCmd.AddCommand(execCmd)
 	rootCmd.AddCommand(shellCmd)
+	rootCmd.AddCommand(eventsCmd)
 	shellCmd.Flags().Bool("new", false, "Force a new session (don't reattach)")
 	rootCmd.AddCommand(psCmd)
 	rootCmd.AddCommand(portsCmd)

@@ -156,6 +156,7 @@
       <a href="#bhatti-create" >bhatti create</a>
       <a href="#bhatti-destroy" >bhatti destroy</a>
       <a href="#bhatti-edit" >bhatti edit</a>
+      <a href="#bhatti-events" >bhatti events</a>
       <a href="#bhatti-exec" >bhatti exec</a>
       <a href="#bhatti-file" style="margin-top: 8px;">bhatti file</a>
       <a class="sub" href="#bhatti-file-ls">ls</a>
@@ -351,6 +352,51 @@ toggling keep_hot to control thermal management.</div>
             <td>--keep-hot</td>
             <td><span class="default-val">false</span></td>
             <td>Prevent thermal transitions</td>
+          </tr>
+        </table>
+      </section>
+      <section class="command" id="bhatti-events">
+        <h2><a href="#bhatti-events">bhatti events</a></h2>
+        <p>Show or follow events recorded for your account</p>
+        <div class="description">Show the events recorded against your own account.
+
+Events are numbered, and --after N continues after event N, so a client that
+remembers the last number it saw misses nothing. The server prunes old events
+(its retention), so a very old number can fall off the front; the command says
+so when that happens.
+
+Without --follow it prints up to 1000 events, from the oldest still retained or
+from --after, and tells you how to continue if there are more. With --follow it
+keeps printing events as they happen: without --after it starts at the live
+edge (only new events), while --follow --after 0 replays everything retained
+first. A followed stream that the server ends exits non-zero and prints the
+--after value to resume from.
+
+Each line is: id, local time, type, sandbox, details. --json prints the records
+exactly as the server sent them, one per line.</div>
+        <pre>  bhatti events --type thermal --sandbox dev
+  bhatti events --follow --json | jq -r .type</pre>
+        <table>
+          <tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+          <tr>
+            <td>--after</td>
+            <td><span class="default-val">0</span></td>
+            <td>Only events after this event number</td>
+          </tr>
+          <tr>
+            <td>--follow, -f</td>
+            <td><span class="default-val">false</span></td>
+            <td>Keep streaming new events</td>
+          </tr>
+          <tr>
+            <td>--sandbox</td>
+            <td>—</td>
+            <td>Only events of this sandbox (name or ID)</td>
+          </tr>
+          <tr>
+            <td>--type</td>
+            <td>—</td>
+            <td>Event type prefix (thermal matches thermal.*)</td>
           </tr>
         </table>
       </section>
