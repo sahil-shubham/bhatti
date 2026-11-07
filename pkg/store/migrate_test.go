@@ -35,13 +35,15 @@ func setUserVersion(t *testing.T, db *sql.DB, v int) {
 // the ladder can have, which the steps after it are not (see migrations).
 var baseline = migrations[:3]
 
-// reopenFromBeforeTheLadder rewinds the database behind s to version 0, as
-// every older release left it, closes s, and opens the file again with only
-// the baseline. Opening it with the whole ladder would run the later steps
-// over a schema that already has what they add, which no database from
-// before the ladder does.
+// reopenFromBeforeTheLadder runs the baseline again over the database behind
+// s, as a database from before the ladder gets it: rewound to version 0, as
+// every older release left it, and opened with the baseline alone, because
+// the later steps expect a schema without what they add and this one has it.
+// It closes s, and returns the reopened store with the version s had, since
+// the steps after the baseline did run on this database.
 func reopenFromBeforeTheLadder(t *testing.T, s *Store, path string) *Store {
 	t.Helper()
+	was := userVersion(t, s.db)
 	setUserVersion(t, s.db, 0)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -50,6 +52,7 @@ func reopenFromBeforeTheLadder(t *testing.T, s *Store, path string) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setUserVersion(t, reopened.db, was)
 	return reopened
 }
 
@@ -580,4 +583,47 @@ func TestUpToDateDatabaseOpensBesideAWriter(t *testing.T) {
 		t.Fatalf("opening beside a writer: %v", err)
 	}
 	opened.Close()
+}
+
+// TestEventsCursorIndex: a follower reads one user's events after a cursor,
+// which wants an index on (user_id, id) to seek by. A new database has it,
+// and so does one that last ran only the baseline: the step after the
+// baseline runs on that database alone.
+func TestEventsCursorIndex(t *testing.T) {
+	const want = "events: index unique=0 origin=c partial=0 on (user_id, id) name=idx_events_user_id"
+
+	t.Run("new database", func(t *testing.T) {
+		if !slices.Contains(schemaOf(t, testStore(t).db), want) {
+			t.Errorf("no index on events (user_id, id)")
+		}
+	})
+
+	t.Run("database at the baseline", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.db")
+		s, err := open(t.Context(), path, baseline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v := userVersion(t, s.db); v != len(baseline) {
+			t.Fatalf("version after the baseline = %d, want %d", v, len(baseline))
+		}
+		if slices.Contains(schemaOf(t, s.db), want) {
+			t.Fatal("the baseline already has the index, so the step after it has nothing to show")
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		s, err = New(t.Context(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if v := userVersion(t, s.db); v != len(migrations) {
+			t.Errorf("version = %d, want %d", v, len(migrations))
+		}
+		if !slices.Contains(schemaOf(t, s.db), want) {
+			t.Errorf("no index on events (user_id, id) after the step that makes it")
+		}
+	})
 }

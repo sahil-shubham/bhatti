@@ -33,6 +33,7 @@ var migrations = []migration{
 	{"tables and columns", migrateTablesAndColumns},
 	{"secrets keyed by user", migrateSecretsKey},
 	{"secret grants unique per sandbox", migrateSecretGrants},
+	{"events cursor index", migrateEventsCursorIndex},
 }
 
 // errSchemaNewer marks a database that a newer build has migrated past the
@@ -584,4 +585,16 @@ func migrateGrantPlaceholderScope(ctx context.Context, tx *sql.Tx) (bool, error)
 		}
 	}
 	return true, nil
+}
+
+// migrateEventsCursorIndex lets a follower read one user's events after a
+// cursor (WHERE user_id = ? AND id > ? ORDER BY id LIMIT n) by seeking to it.
+// idx_events_user is ordered by (user_id, ts), so without this index SQLite
+// finds all of the user's events and sorts them by id on every wake-up.
+//
+// The first step after the baseline: it runs once, on the schema the baseline
+// left, so it needs no IF NOT EXISTS.
+func migrateEventsCursorIndex(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `CREATE INDEX idx_events_user_id ON events(user_id, id)`)
+	return err
 }
