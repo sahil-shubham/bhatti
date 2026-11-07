@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
@@ -38,9 +39,8 @@ type eventsControl struct {
 
 // EndEventStreams ends every open /events follow stream, and any opened later.
 // The daemon calls it as HTTP shutdown begins: http.Server.Shutdown waits for
-// each request to finish and a follow stream never does, so without this a
-// restart with `bhatti events --follow` attached sits out the whole drain
-// timeout. Close ends them too, at its own pace.
+// each request to finish, so followers must also be interrupted when blocked
+// writing to clients that stopped reading. Close ends them too.
 func (s *Server) EndEventStreams() { s.endEventStreams() }
 
 // handleEvents serves GET /events: the caller's own events from the events
@@ -174,11 +174,32 @@ func (s *Server) pageEvents(ctx context.Context, r *http.Request, out *eventsWri
 // server shuts down. Each pass reads from the cursor until caught up, and the
 // recorder's tail runs the next pass after the next flush.
 func (s *Server) followEvents(ctx context.Context, r *http.Request, out *eventsWriter, rec *EventRecorder, query store.EventQuery) {
+	if s.eventStreamCtx.Err() != nil {
+		out.begin()
+		out.flush()
+		return
+	}
 	// One context for every way the stream ends: the client going, Close, and
 	// EndEventStreams.
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	defer context.AfterFunc(s.eventStreamCtx, stop)()
+	controller := http.NewResponseController(out.w)
+	interrupted := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		defer close(interrupted)
+		// Cancellation must interrupt Encode/Flush as well as database reads
+		// and idle waits. Slow readers have no deadline during normal use.
+		controller.SetWriteDeadline(time.Now())
+	})
+	defer func() {
+		if !stopInterrupt() {
+			// Wait before clearing: an idle stream can then finish its HTTP
+			// framing cleanly, and no callback can affect a reused connection.
+			<-interrupted
+			controller.SetWriteDeadline(time.Time{})
+		}
+	}()
 
 	err := rec.tail(ctx, func() error {
 		for {

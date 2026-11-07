@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -832,5 +833,133 @@ func TestEventsFollowDeliversExternalStoreCommits(t *testing.T) {
 		if got := stream.next(); got["type"] != kind {
 			t.Fatalf("external commit delivered %v, want %s", got, kind)
 		}
+	}
+}
+
+type eventsWriteAttempt struct{ done chan error }
+
+type eventsObservedConn struct {
+	net.Conn
+	writes      chan eventsWriteAttempt
+	hadDeadline atomic.Bool
+}
+
+func (c *eventsObservedConn) Write(p []byte) (int, error) {
+	attempt := eventsWriteAttempt{done: make(chan error, 1)}
+	c.writes <- attempt
+	n, err := c.Conn.Write(p)
+	attempt.done <- err
+	return n, err
+}
+
+func (c *eventsObservedConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.hadDeadline.Store(true)
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+type eventsPipeListener struct {
+	conn   chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+	addr   net.Addr
+}
+
+func (l *eventsPipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conn:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *eventsPipeListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *eventsPipeListener) Addr() net.Addr { return l.addr }
+
+func TestEndEventStreamsInterruptsBlockedWrites(t *testing.T) {
+	for _, size := range []int{128, 32 << 10} {
+		t.Run(fmt.Sprintf("payload=%d", size), func(t *testing.T) {
+			testEndEventStreamsBlockedWrite(t, size)
+		})
+	}
+}
+
+func testEndEventStreamsBlockedWrite(t *testing.T, payloadSize int) {
+	t.Helper()
+	srv, _ := eventsServer(t, true)
+	client, serverConn := net.Pipe()
+	observed := &eventsObservedConn{Conn: serverConn, writes: make(chan eventsWriteAttempt, 8)}
+	listener := &eventsPipeListener{
+		conn: make(chan net.Conn, 1), closed: make(chan struct{}), addr: serverConn.LocalAddr(),
+	}
+	listener.conn <- observed
+	server := &http.Server{Handler: srv}
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+		<-served
+	})
+	client.SetDeadline(time.Now().Add(eventWait))
+	if _, err := fmt.Fprintf(client, "GET /events?follow=1 HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer %s\r\n\r\n", testAPIKey); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: http.MethodGet})
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("follow response = %v, %v", response, err)
+	}
+	select {
+	case first := <-observed.writes:
+		if err := <-first.done; err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(eventWait):
+		t.Fatal("response headers were not written")
+	}
+
+	seedEvents(t, srv, store.Event{
+		Type: "backpressure", UserID: "usr_test", Meta: map[string]any{"pad": strings.Repeat("x", payloadSize)},
+	})
+	srv.events.committed()
+	var blocked eventsWriteAttempt
+	select {
+	case blocked = <-observed.writes:
+	case <-time.After(eventWait):
+		t.Fatal("event write never started")
+	}
+	// net.Pipe has no socket buffer. Reading one byte proves Write entered
+	// the pipe; withholding the rest deterministically keeps it blocked.
+	if _, err := client.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-blocked.done:
+		t.Fatalf("event write finished before cancellation: %v", err)
+	default:
+	}
+	if observed.hadDeadline.Load() {
+		t.Fatal("a normal follow stream imposed a write timeout")
+	}
+
+	srv.EndEventStreams()
+	ctx, cancel := context.WithTimeout(t.Context(), eventWait)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("blocked event write held HTTP shutdown: %v", err)
+	}
+	select {
+	case err := <-blocked.done:
+		if err == nil {
+			t.Fatal("blocked write was not interrupted")
+		}
+	case <-time.After(eventWait):
+		t.Fatal("event write remained blocked after shutdown")
 	}
 }
