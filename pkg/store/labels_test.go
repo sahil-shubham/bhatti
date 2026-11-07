@@ -25,7 +25,7 @@ func labelTestSandbox(t *testing.T, s *Store, id, name string, labels map[string
 		Image:     "minimal",
 		Labels:    labels,
 	}
-	if err := s.CreateSandbox(sb); err != nil {
+	if err := s.CreateSandbox(t.Context(), sb); err != nil {
 		t.Fatal(err)
 	}
 	return sb
@@ -35,7 +35,7 @@ func labelTestSandbox(t *testing.T, s *Store, id, name string, labels map[string
 // labels set at Create are returned from Get and List.
 func TestSandboxLabels_CreateAndRead(t *testing.T) {
 	s := testStore(t)
-	s.CreateUser(User{
+	s.CreateUser(t.Context(), User{
 		ID: "usr_test", Name: "test", APIKeyHash: "h",
 		MaxSandboxes: 10, CreatedAt: time.Now(),
 	})
@@ -43,7 +43,7 @@ func TestSandboxLabels_CreateAndRead(t *testing.T) {
 	labels := map[string]string{"pool": "workers", "env": "prod"}
 	labelTestSandbox(t, s, "sb1", "w1", labels)
 
-	got, err := s.GetSandbox("usr_test", "sb1")
+	got, err := s.GetSandbox(t.Context(), "usr_test", "sb1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestSandboxLabels_CreateAndRead(t *testing.T) {
 // read, an empty map serialises back as a nil map (omitempty on JSON).
 func TestSandboxLabels_EmptyMapIsBenign(t *testing.T) {
 	s := testStore(t)
-	s.CreateUser(User{
+	s.CreateUser(t.Context(), User{
 		ID: "usr_test", Name: "test", APIKeyHash: "h",
 		MaxSandboxes: 10, CreatedAt: time.Now(),
 	})
@@ -68,7 +68,7 @@ func TestSandboxLabels_EmptyMapIsBenign(t *testing.T) {
 	labelTestSandbox(t, s, "sb_empty", "e", map[string]string{})
 
 	for _, id := range []string{"sb_nil", "sb_empty"} {
-		got, err := s.GetSandbox("usr_test", id)
+		got, err := s.GetSandbox(t.Context(), "usr_test", id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +83,7 @@ func TestSandboxLabels_EmptyMapIsBenign(t *testing.T) {
 // (AND), and extra labels on a sandbox don't break the match.
 func TestSandboxLabels_FilterAND(t *testing.T) {
 	s := testStore(t)
-	s.CreateUser(User{
+	s.CreateUser(t.Context(), User{
 		ID: "usr_test", Name: "test", APIKeyHash: "h",
 		MaxSandboxes: 10, CreatedAt: time.Now(),
 	})
@@ -107,7 +107,7 @@ func TestSandboxLabels_FilterAND(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := s.ListSandboxesWithFilter("usr_test", tt.filter)
+			got, err := s.ListSandboxesWithFilter(t.Context(), "usr_test", tt.filter)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -131,7 +131,7 @@ func TestSandboxLabels_FilterAND(t *testing.T) {
 // inserts/overwrites, `remove` deletes, and other labels are preserved.
 func TestSandboxLabels_UpdateMerge(t *testing.T) {
 	s := testStore(t)
-	s.CreateUser(User{
+	s.CreateUser(t.Context(), User{
 		ID: "usr_test", Name: "test", APIKeyHash: "h",
 		MaxSandboxes: 10, CreatedAt: time.Now(),
 	})
@@ -143,14 +143,14 @@ func TestSandboxLabels_UpdateMerge(t *testing.T) {
 	})
 
 	// Overwrite env, add a new key, remove tier.
-	err := s.UpdateSandboxLabels("usr_test", "sb1",
+	err := s.UpdateSandboxLabels(t.Context(), "usr_test", "sb1",
 		map[string]string{"env": "staging", "team": "platform"},
 		[]string{"tier"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetSandbox("usr_test", "sb1")
+	got, err := s.GetSandbox(t.Context(), "usr_test", "sb1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,11 +178,11 @@ func TestSandboxLabels_UpdateMerge(t *testing.T) {
 // edits via spoofed IDs.
 func TestSandboxLabels_UpdateWrongUser(t *testing.T) {
 	s := testStore(t)
-	s.CreateUser(User{ID: "usr_a", Name: "a", APIKeyHash: "ha", MaxSandboxes: 10, CreatedAt: time.Now()})
-	s.CreateUser(User{ID: "usr_b", Name: "b", APIKeyHash: "hb", MaxSandboxes: 10, CreatedAt: time.Now()})
+	s.CreateUser(t.Context(), User{ID: "usr_a", Name: "a", APIKeyHash: "ha", MaxSandboxes: 10, CreatedAt: time.Now()})
+	s.CreateUser(t.Context(), User{ID: "usr_b", Name: "b", APIKeyHash: "hb", MaxSandboxes: 10, CreatedAt: time.Now()})
 
 	// sandbox owned by usr_a
-	if err := s.CreateSandbox(Sandbox{
+	if err := s.CreateSandbox(t.Context(), Sandbox{
 		ID: "sb1", Name: "w1", Status: "running",
 		CreatedBy: "usr_a", CreatedAt: time.Now(), CPUs: 1, MemoryMB: 256, Image: "minimal",
 		Labels: map[string]string{"pool": "workers"},
@@ -191,13 +191,13 @@ func TestSandboxLabels_UpdateWrongUser(t *testing.T) {
 	}
 
 	// usr_b tries to update — must fail with not-found.
-	err := s.UpdateSandboxLabels("usr_b", "sb1", map[string]string{"hijacked": "yes"}, nil)
+	err := s.UpdateSandboxLabels(t.Context(), "usr_b", "sb1", map[string]string{"hijacked": "yes"}, nil)
 	if err == nil {
 		t.Fatal("expected not-found error for cross-user update, got nil")
 	}
 
 	// And the original sandbox's labels are untouched.
-	got, _ := s.GetSandbox("usr_a", "sb1")
+	got, _ := s.GetSandbox(t.Context(), "usr_a", "sb1")
 	if _, ok := got.Labels["hijacked"]; ok {
 		t.Fatalf("cross-user update succeeded: %v", got.Labels)
 	}
@@ -207,19 +207,19 @@ func TestSandboxLabels_UpdateWrongUser(t *testing.T) {
 // is a no-op that still validates ownership.
 func TestSandboxLabels_UpdateNoOp(t *testing.T) {
 	s := testStore(t)
-	s.CreateUser(User{ID: "usr_test", Name: "t", APIKeyHash: "h", MaxSandboxes: 10, CreatedAt: time.Now()})
+	s.CreateUser(t.Context(), User{ID: "usr_test", Name: "t", APIKeyHash: "h", MaxSandboxes: 10, CreatedAt: time.Now()})
 	labelTestSandbox(t, s, "sb1", "w1", map[string]string{"a": "1"})
 
-	if err := s.UpdateSandboxLabels("usr_test", "sb1", nil, nil); err != nil {
+	if err := s.UpdateSandboxLabels(t.Context(), "usr_test", "sb1", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := s.GetSandbox("usr_test", "sb1")
+	got, _ := s.GetSandbox(t.Context(), "usr_test", "sb1")
 	if got.Labels["a"] != "1" {
 		t.Fatalf("no-op altered labels: %v", got.Labels)
 	}
 
 	// Non-existent sandbox still errors.
-	if err := s.UpdateSandboxLabels("usr_test", "sb_nope", nil, nil); err == nil {
+	if err := s.UpdateSandboxLabels(t.Context(), "usr_test", "sb_nope", nil, nil); err == nil {
 		t.Fatal("expected error for non-existent sandbox")
 	}
 }

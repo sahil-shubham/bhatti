@@ -72,10 +72,10 @@ func TestMigrateGrantPlaceholderScope(t *testing.T) {
 	}
 	legacyGrantRows(t, db)
 
-	if ran, err := migrateGrantPlaceholderScope(db); err != nil || !ran {
+	if ran, err := migrateGrantPlaceholderScope(t.Context(), db); err != nil || !ran {
 		t.Fatalf("first run: ran=%v err=%v, want the rebuild", ran, err)
 	}
-	if ran, err := migrateGrantPlaceholderScope(db); err != nil || ran {
+	if ran, err := migrateGrantPlaceholderScope(t.Context(), db); err != nil || ran {
 		t.Fatalf("second run: ran=%v err=%v, want a no-op", ran, err)
 	}
 
@@ -110,7 +110,7 @@ func TestMigrateGrantPlaceholderScope(t *testing.T) {
 // there is nothing to rebuild.
 func TestMigrateGrantPlaceholderScopeFreshDatabase(t *testing.T) {
 	db := openRaw(t)
-	if ran, err := migrateGrantPlaceholderScope(db); err != nil || ran {
+	if ran, err := migrateGrantPlaceholderScope(t.Context(), db); err != nil || ran {
 		t.Fatalf("no table: ran=%v err=%v, want a no-op", ran, err)
 	}
 }
@@ -142,17 +142,17 @@ func TestOpenUpgradesAnOlderDatabase(t *testing.T) {
 	}
 
 	for pass := range 2 {
-		s, err := New(path)
+		s, err := New(t.Context(), path)
 		if err != nil {
 			t.Fatalf("open %d: %v", pass, err)
 		}
-		if g, err := s.GetSandboxSecretGrantByPlaceholder("sb1", "ph1"); err != nil || g.ID != "g1" {
+		if g, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), "sb1", "ph1"); err != nil || g.ID != "g1" {
 			t.Fatalf("open %d: grant lost: %+v, %v", pass, g, err)
 		}
 		if pass == 0 {
 			putGrant(t, s, grantFixture("g3", "alice", "GH_TOKEN", "sb-clone", "ph1", time.Now()))
 		}
-		if g, err := s.GetSandboxSecretGrantByPlaceholder("sb-clone", "ph1"); err != nil || g.ID != "g3" {
+		if g, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), "sb-clone", "ph1"); err != nil || g.ID != "g3" {
 			t.Fatalf("open %d: the clone's grant: %+v, %v", pass, g, err)
 		}
 		for _, idx := range []string{"idx_secret_grants_sandbox", "idx_secret_grants_user_created", "idx_secret_grants_placeholder"} {
@@ -164,22 +164,22 @@ func TestOpenUpgradesAnOlderDatabase(t *testing.T) {
 		// All its indexes are in place now, the placeholder one included: none
 		// of them may read as the old table-wide constraint and rebuild it on
 		// every start.
-		if ran, err := migrateGrantPlaceholderScope(s.db); err != nil || ran {
+		if ran, err := migrateGrantPlaceholderScope(t.Context(), s.db); err != nil || ran {
 			t.Fatalf("open %d: the rebuilt table was rebuilt again: ran=%v err=%v", pass, ran, err)
 		}
 		// An older snapshot recorded nothing — and, unlike one taken since that
 		// kept nothing, says so: reopening never gives it a record.
-		snap, err := s.GetSnapshot("alice", "base")
+		snap, err := s.GetSnapshot(t.Context(), "alice", "base")
 		if err != nil || snap.SizeMB != 7 || snap.SourceRecordedAt != nil || snap.Source != (SnapshotSource{}) ||
 			snap.Substitution.CA != nil || len(snap.Substitution.Grants) != 0 {
 			t.Fatalf("open %d: an older snapshot: %+v, %v", pass, snap, err)
 		}
 		if pass == 0 {
-			if err := s.CreateSnapshot(snapshotFixture("s2", "alice", "newer")); err != nil {
+			if err := s.CreateSnapshot(t.Context(), snapshotFixture("s2", "alice", "newer")); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if newer, err := s.GetSnapshot("alice", "newer"); err != nil || newer.SourceRecordedAt == nil {
+		if newer, err := s.GetSnapshot(t.Context(), "alice", "newer"); err != nil || newer.SourceRecordedAt == nil {
 			t.Fatalf("open %d: a snapshot taken after the upgrade: %+v, %v", pass, newer, err)
 		}
 		if err := s.Close(); err != nil {

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -26,7 +27,7 @@ func (g *SecretGrant) Live(now time.Time) bool {
 
 const grantCols = `id, user_id, secret_name, sandbox_id, hosts_json, placeholder, created_at, expires_at, revoked_at`
 
-func (s *Store) CreateSecretGrant(g SecretGrant) error {
+func (s *Store) CreateSecretGrant(ctx context.Context, g SecretGrant) error {
 	hosts := g.Hosts
 	if hosts == nil {
 		hosts = []string{}
@@ -38,7 +39,7 @@ func (s *Store) CreateSecretGrant(g SecretGrant) error {
 	if g.CreatedAt.IsZero() {
 		g.CreatedAt = time.Now().UTC()
 	}
-	_, err = s.db.Exec(`INSERT INTO secret_grants (id, user_id, secret_name, sandbox_id, hosts_json, placeholder, created_at, expires_at, revoked_at)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO secret_grants (id, user_id, secret_name, sandbox_id, hosts_json, placeholder, created_at, expires_at, revoked_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.ID, g.UserID, g.SecretName, g.SandboxID, string(hostsJSON), g.Placeholder,
 		g.CreatedAt.UTC(), utcGrantTime(g.ExpiresAt), utcGrantTime(g.RevokedAt))
@@ -55,8 +56,8 @@ func utcGrantTime(t *time.Time) any {
 	return t.UTC()
 }
 
-func (s *Store) GetSecretGrant(userID, id string) (*SecretGrant, error) {
-	g, err := scanSecretGrant(s.db.QueryRow(`SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? AND id = ?`, userID, id))
+func (s *Store) GetSecretGrant(ctx context.Context, userID, id string) (*SecretGrant, error) {
+	g, err := scanSecretGrant(s.db.QueryRowContext(ctx, `SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? AND id = ?`, userID, id))
 	if err != nil {
 		return nil, fmt.Errorf("get secret grant %q: %w", id, err)
 	}
@@ -68,8 +69,8 @@ func (s *Store) GetSecretGrant(userID, id string) (*SecretGrant, error) {
 // clone's memory and environment hold its source's placeholder, so the source
 // and each clone have a grant of their own for it. The broker resolves
 // through this lookup, so a placeholder works only where it was granted.
-func (s *Store) GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder string) (*SecretGrant, error) {
-	g, err := scanSecretGrant(s.db.QueryRow(`SELECT `+grantCols+` FROM secret_grants WHERE sandbox_id = ? AND placeholder = ?`, sandboxID, placeholder))
+func (s *Store) GetSandboxSecretGrantByPlaceholder(ctx context.Context, sandboxID, placeholder string) (*SecretGrant, error) {
+	g, err := scanSecretGrant(s.db.QueryRowContext(ctx, `SELECT `+grantCols+` FROM secret_grants WHERE sandbox_id = ? AND placeholder = ?`, sandboxID, placeholder))
 	if err != nil {
 		return nil, fmt.Errorf("get secret grant by placeholder: %w", err)
 	}
@@ -80,16 +81,16 @@ func (s *Store) GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder string
 // placeholder, whichever sandbox holds it (the oldest if several do). It
 // names the owner's grant when a refusal is explained and authorizes
 // nothing: use GetSandboxSecretGrantByPlaceholder for that.
-func (s *Store) FindSecretGrantByPlaceholder(userID, placeholder string) (*SecretGrant, error) {
-	g, err := scanSecretGrant(s.db.QueryRow(`SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? AND placeholder = ? ORDER BY created_at, id LIMIT 1`, userID, placeholder))
+func (s *Store) FindSecretGrantByPlaceholder(ctx context.Context, userID, placeholder string) (*SecretGrant, error) {
+	g, err := scanSecretGrant(s.db.QueryRowContext(ctx, `SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? AND placeholder = ? ORDER BY created_at, id LIMIT 1`, userID, placeholder))
 	if err != nil {
 		return nil, fmt.Errorf("find secret grant by placeholder: %w", err)
 	}
 	return g, nil
 }
 
-func (s *Store) ListSecretGrants(userID string) ([]SecretGrant, error) {
-	rows, err := s.db.Query(`SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? ORDER BY created_at DESC, id DESC`, userID)
+func (s *Store) ListSecretGrants(ctx context.Context, userID string) ([]SecretGrant, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+grantCols+` FROM secret_grants WHERE user_id = ? ORDER BY created_at DESC, id DESC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list secret grants: %w", err)
 	}
@@ -97,8 +98,8 @@ func (s *Store) ListSecretGrants(userID string) ([]SecretGrant, error) {
 	return scanSecretGrants(rows)
 }
 
-func (s *Store) ListSandboxSecretGrants(sandboxID string) ([]SecretGrant, error) {
-	rows, err := s.db.Query(`SELECT `+grantCols+` FROM secret_grants WHERE sandbox_id = ? ORDER BY created_at DESC, id DESC`, sandboxID)
+func (s *Store) ListSandboxSecretGrants(ctx context.Context, sandboxID string) ([]SecretGrant, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+grantCols+` FROM secret_grants WHERE sandbox_id = ? ORDER BY created_at DESC, id DESC`, sandboxID)
 	if err != nil {
 		return nil, fmt.Errorf("list sandbox secret grants: %w", err)
 	}
@@ -143,8 +144,8 @@ func scanSecretGrant(row scanner) (*SecretGrant, error) {
 	return &g, nil
 }
 
-func (s *Store) RevokeSecretGrant(userID, id string, at time.Time) error {
-	res, err := s.db.Exec(`UPDATE secret_grants SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ? AND id = ?`, at.UTC(), userID, id)
+func (s *Store) RevokeSecretGrant(ctx context.Context, userID, id string, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE secret_grants SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ? AND id = ?`, at.UTC(), userID, id)
 	if err != nil {
 		return fmt.Errorf("revoke secret grant %q: %w", id, err)
 	}
@@ -158,8 +159,8 @@ func (s *Store) RevokeSecretGrant(userID, id string, at time.Time) error {
 	return nil
 }
 
-func (s *Store) DeleteSandboxSecretGrants(sandboxID string) error {
-	_, err := s.db.Exec(`DELETE FROM secret_grants WHERE sandbox_id = ?`, sandboxID)
+func (s *Store) DeleteSandboxSecretGrants(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM secret_grants WHERE sandbox_id = ?`, sandboxID)
 	if err != nil {
 		return fmt.Errorf("delete sandbox secret grants: %w", err)
 	}
@@ -169,14 +170,14 @@ func (s *Store) DeleteSandboxSecretGrants(sandboxID string) error {
 // DeleteSecretGrantsForSecret drops every grant of a secret: the grants
 // sandboxes hold and the ones snapshots keep for their resumes. A secret
 // created later under the same name must not inherit either.
-func (s *Store) DeleteSecretGrantsForSecret(userID, secretName string) error {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteSecretGrantsForSecret(ctx context.Context, userID, secretName string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("delete secret grants: %w", err)
 	}
 	defer tx.Rollback()
 	for _, table := range []string{"secret_grants", "snapshot_grants"} {
-		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE user_id = ? AND secret_name = ?`, userID, secretName); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE user_id = ? AND secret_name = ?`, userID, secretName); err != nil {
 			return fmt.Errorf("delete secret grants: %w", err)
 		}
 	}

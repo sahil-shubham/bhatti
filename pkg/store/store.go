@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -122,7 +123,7 @@ ALTER TABLE sandboxes ADD COLUMN restart_pending INTEGER NOT NULL DEFAULT 0;
 `
 
 // New opens (or creates) the SQLite database and runs migrations.
-func New(dbPath string) (*Store, error) {
+func New(ctx context.Context, dbPath string) (*Store, error) {
 	if err := restrictDBFiles(dbPath); err != nil {
 		return nil, err
 	}
@@ -140,13 +141,13 @@ func New(dbPath string) (*Store, error) {
 		}
 	}()
 	var journalMode string
-	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
 		return nil, fmt.Errorf("store: read journal mode: %w", err)
 	}
 	if !strings.EqualFold(journalMode, "wal") {
 		return nil, fmt.Errorf("store: journal mode %q, want wal", journalMode)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return nil, fmt.Errorf("store: migrate base schema: %w", err)
 	}
 	for _, stmt := range strings.Split(migrations, ";") {
@@ -154,7 +155,7 @@ func New(dbPath string) (*Store, error) {
 		if stmt == "" || strings.HasPrefix(stmt, "--") {
 			continue
 		}
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
+		if _, err := db.ExecContext(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
 			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
 		}
 	}
@@ -252,13 +253,13 @@ func New(dbPath string) (*Store, error) {
 		ON sandboxes(created_by, name) WHERE status != 'destroyed'`,
 	}
 	for _, stmt := range createStatements {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
 		}
 	}
 	// volume_backups is created after the legacy migrations above, so upgrade
 	// existing tables only after CREATE TABLE IF NOT EXISTS has run.
-	if _, err := db.Exec(`ALTER TABLE volume_backups ADD COLUMN consistency_mode TEXT NOT NULL DEFAULT 'unverified'`); err != nil &&
+	if _, err := db.ExecContext(ctx, `ALTER TABLE volume_backups ADD COLUMN consistency_mode TEXT NOT NULL DEFAULT 'unverified'`); err != nil &&
 		!strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
 		return nil, fmt.Errorf("store: migrate volume backup consistency mode: %w", err)
 	}
@@ -272,7 +273,7 @@ func New(dbPath string) (*Store, error) {
 		`source_has_init INTEGER NOT NULL DEFAULT 0`,
 		`source_recorded_at DATETIME`,
 	} {
-		if _, err := db.Exec(`ALTER TABLE snapshots ADD COLUMN ` + col); err != nil &&
+		if _, err := db.ExecContext(ctx, `ALTER TABLE snapshots ADD COLUMN `+col); err != nil &&
 			!strings.Contains(strings.ToLower(err.Error()), "duplicate column name:") {
 			return nil, fmt.Errorf("store: migrate snapshots %s: %w", col, err)
 		}
@@ -280,14 +281,14 @@ func New(dbPath string) (*Store, error) {
 
 	// Migrate secrets from v1 (PRIMARY KEY name) to v2 (PRIMARY KEY
 	// (user_id, name)). Idempotent — a no-op once the table is v2.
-	if _, err := migrateSecretsToV2(db); err != nil {
+	if _, err := migrateSecretsToV2(ctx, db); err != nil {
 		return nil, fmt.Errorf("migrate secrets v1→v2: %w", err)
 	}
 
 	// A clone holds its source's placeholder, so secret_grants is unique per
 	// sandbox, not table-wide. Idempotent, and before the CREATE INDEX
 	// statements below: rebuilding the table drops its indexes.
-	if _, err := migrateGrantPlaceholderScope(db); err != nil {
+	if _, err := migrateGrantPlaceholderScope(ctx, db); err != nil {
 		return nil, fmt.Errorf("migrate secret grants placeholder scope: %w", err)
 	}
 
@@ -369,7 +370,7 @@ func New(dbPath string) (*Store, error) {
 	)`,
 	}
 	for _, stmt := range createStatements {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("store: migrate %s: %w", stmt, err)
 		}
 	}
@@ -409,13 +410,13 @@ func restrictDBFiles(dbPath string) error {
 // re-copies every secret on every restart and opens a narrow crash
 // window between DROP and RENAME where the secrets table doesn't
 // exist. Tranche 0a item #6 of PLAN-bhatti-v2.md.
-func migrateSecretsToV2(db *sql.DB) (bool, error) {
+func migrateSecretsToV2(ctx context.Context, db *sql.DB) (bool, error) {
 	// Composite PK on (user_id, name) means user_id is part of the
 	// primary key (pk > 0 in pragma_table_info). On a v1 schema,
 	// user_id doesn't exist at all and the query returns 0.
 	var pkCount int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name='user_id' AND pk > 0`,
+	if err := db.QueryRowContext(
+		ctx, `SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name='user_id' AND pk > 0`,
 	).Scan(&pkCount); err != nil {
 		return false, fmt.Errorf("inspect secrets schema: %w", err)
 	}
@@ -423,7 +424,7 @@ func migrateSecretsToV2(db *sql.DB) (bool, error) {
 		return false, nil
 	}
 
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS secrets_v2 (
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS secrets_v2 (
 		user_id TEXT NOT NULL DEFAULT '',
 		name TEXT NOT NULL,
 		path TEXT NOT NULL DEFAULT '',
@@ -434,15 +435,15 @@ func migrateSecretsToV2(db *sql.DB) (bool, error) {
 	)`); err != nil {
 		return false, fmt.Errorf("create secrets_v2: %w", err)
 	}
-	if _, err := db.Exec(`INSERT OR IGNORE INTO secrets_v2 (user_id, name, path, value_encrypted, created_at, updated_at)
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO secrets_v2 (user_id, name, path, value_encrypted, created_at, updated_at)
 		SELECT COALESCE(user_id, ''), name, COALESCE(path, ''), value_encrypted,
 		       created_at, COALESCE(updated_at, created_at) FROM secrets`); err != nil {
 		return false, fmt.Errorf("copy secrets v1→v2: %w", err)
 	}
-	if _, err := db.Exec(`DROP TABLE IF EXISTS secrets`); err != nil {
+	if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS secrets`); err != nil {
 		return false, fmt.Errorf("drop secrets: %w", err)
 	}
-	if _, err := db.Exec(`ALTER TABLE secrets_v2 RENAME TO secrets`); err != nil {
+	if _, err := db.ExecContext(ctx, `ALTER TABLE secrets_v2 RENAME TO secrets`); err != nil {
 		return false, fmt.Errorf("rename secrets_v2: %w", err)
 	}
 	return true, nil
@@ -473,9 +474,9 @@ const secretGrantsTable = `CREATE TABLE IF NOT EXISTS secret_grants (
 // Idempotent: a no-op once rebuilt, or while the table doesn't exist yet.
 // Returns true if the rebuild ran on this call. The rebuild drops the old
 // table's indexes; the caller recreates them afterwards.
-func migrateGrantPlaceholderScope(db *sql.DB) (bool, error) {
+func migrateGrantPlaceholderScope(ctx context.Context, db *sql.DB) (bool, error) {
 	var wide int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_index_list('secret_grants') AS il
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('secret_grants') AS il
 		WHERE il."unique" = 1
 		  AND (SELECT COUNT(*) FROM pragma_index_info(il.name)) = 1
 		  AND (SELECT name FROM pragma_index_info(il.name)) = 'placeholder'`).Scan(&wide); err != nil {
@@ -484,7 +485,7 @@ func migrateGrantPlaceholderScope(db *sql.DB) (bool, error) {
 	if wide == 0 {
 		return false, nil
 	}
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin secret_grants rebuild: %w", err)
 	}
@@ -496,7 +497,7 @@ func migrateGrantPlaceholderScope(db *sql.DB) (bool, error) {
 		 SELECT id, user_id, secret_name, sandbox_id, hosts_json, placeholder, created_at, expires_at, revoked_at FROM secret_grants_wide`,
 		`DROP TABLE secret_grants_wide`,
 	} {
-		if _, err := tx.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return false, fmt.Errorf("rebuild secret_grants: %w", err)
 		}
 	}

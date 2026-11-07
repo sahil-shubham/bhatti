@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -124,22 +125,22 @@ var adminStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "One-shot system overview",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
 		if isJSON(cmd) {
-			return adminStatusJSON(st)
+			return adminStatusJSON(cmd.Context(), st)
 		}
-		return adminStatusHuman(st)
+		return adminStatusHuman(cmd.Context(), st)
 	},
 }
 
-func adminStatusJSON(st *store.Store) error {
-	latest, _ := st.LatestMetricsSnapshot()
-	sums, _ := st.SumMetricsSnapshots(time.Time{})
-	events, _ := st.QueryEvents(store.EventFilter{Limit: 10})
-	users, _ := st.ListUsers()
-	sandboxes, _ := st.ListAllSandboxes()
+func adminStatusJSON(ctx context.Context, st *store.Store) error {
+	latest, _ := st.LatestMetricsSnapshot(ctx)
+	sums, _ := st.SumMetricsSnapshots(ctx, time.Time{})
+	events, _ := st.QueryEvents(ctx, store.EventFilter{Limit: 10})
+	users, _ := st.ListUsers(ctx)
+	sandboxes, _ := st.ListAllSandboxes(ctx)
 
 	outputJSON(map[string]any{
 		"gauges":        latest,
@@ -151,11 +152,11 @@ func adminStatusJSON(st *store.Store) error {
 	return nil
 }
 
-func adminStatusHuman(st *store.Store) error {
-	latest, _ := st.LatestMetricsSnapshot()
-	sums, _ := st.SumMetricsSnapshots(time.Time{})
-	users, _ := st.ListUsers()
-	sandboxes, _ := st.ListAllSandboxes()
+func adminStatusHuman(ctx context.Context, st *store.Store) error {
+	latest, _ := st.LatestMetricsSnapshot(ctx)
+	sums, _ := st.SumMetricsSnapshots(ctx, time.Time{})
+	users, _ := st.ListUsers(ctx)
+	sandboxes, _ := st.ListAllSandboxes(ctx)
 
 	// Header + update check
 	fmt.Printf("Bhatti %s\n", version)
@@ -223,7 +224,7 @@ func adminStatusHuman(st *store.Store) error {
 	}
 
 	// Recent events
-	events, _ := st.QueryEvents(store.EventFilter{Limit: 10})
+	events, _ := st.QueryEvents(ctx, store.EventFilter{Limit: 10})
 	if len(events) > 0 {
 		fmt.Println("RECENT EVENTS")
 		for _, e := range events {
@@ -256,7 +257,7 @@ var adminEventsCmd = &cobra.Command{
 	Use:   "events",
 	Short: "Query event log",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
 		f := store.EventFilter{}
@@ -266,7 +267,7 @@ var adminEventsCmd = &cobra.Command{
 		}
 		if v, _ := cmd.Flags().GetString("user"); v != "" {
 			// Resolve user name to ID
-			if u, err := st.GetUserByName(v); err == nil {
+			if u, err := st.GetUserByName(cmd.Context(), v); err == nil {
 				f.UserID = u.ID
 			} else {
 				f.UserID = v // might be an ID directly
@@ -282,7 +283,7 @@ var adminEventsCmd = &cobra.Command{
 			f.Limit = v
 		}
 		if v, _ := cmd.Flags().GetBool("count"); v {
-			count, err := st.CountEvents(f)
+			count, err := st.CountEvents(cmd.Context(), f)
 			if err != nil {
 				return err
 			}
@@ -290,7 +291,7 @@ var adminEventsCmd = &cobra.Command{
 			return nil
 		}
 
-		events, err := st.QueryEvents(f)
+		events, err := st.QueryEvents(cmd.Context(), f)
 		if err != nil {
 			return err
 		}
@@ -334,7 +335,7 @@ var adminMetricsCmd = &cobra.Command{
 	Use:   "metrics",
 	Short: "Query metrics snapshots",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
 		sinceStr, _ := cmd.Flags().GetString("since")
@@ -343,7 +344,7 @@ var adminMetricsCmd = &cobra.Command{
 			since = time.Now().Add(-1 * time.Hour)
 		}
 
-		snaps, err := st.QueryMetricsSnapshots(since, 0)
+		snaps, err := st.QueryMetricsSnapshots(cmd.Context(), since, 0)
 		if err != nil {
 			return err
 		}

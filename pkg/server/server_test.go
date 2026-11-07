@@ -42,13 +42,13 @@ var testHTTPClient = &http.Client{Transport: &http.Transport{DisableKeepAlives: 
 func setup(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyHash := sha256Hex(testAPIKey)
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_test", Name: "test-user", APIKeyHash: keyHash,
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),
@@ -719,17 +719,17 @@ func TestExecStreamNDJSON(t *testing.T) {
 func setupTwoUsers(t *testing.T) (*httptest.Server, func(t *testing.T, method, path string, body any) *http.Response, func(t *testing.T, method, path string, body any) *http.Response) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_alice", Name: "alice", APIKeyHash: sha256Hex("alice-key"),
 		MaxSandboxes: 3, MaxCPUsPerSandbox: 2, MaxMemoryMBPerSandbox: 1024,
 		SubnetIndex: 1, CreatedAt: time.Now(),
 	})
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_bob", Name: "bob", APIKeyHash: sha256Hex("bob-key"),
 		MaxSandboxes: 3, MaxCPUsPerSandbox: 2, MaxMemoryMBPerSandbox: 1024,
 		SubnetIndex: 2, CreatedAt: time.Now(),
@@ -1000,13 +1000,13 @@ func TestCrossUserSecretIsolationHTTP(t *testing.T) {
 func TestSecretEncryptDecrypt(t *testing.T) {
 	// Setup server with a real dataDir containing an age key
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyHash := sha256Hex("encrypt-test-key")
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_enc", Name: "encrypt-user", APIKeyHash: keyHash,
 		MaxSandboxes: 5, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),
@@ -1045,7 +1045,7 @@ func TestSecretEncryptDecrypt(t *testing.T) {
 	resp.Body.Close()
 
 	// Verify the stored bytes are NOT plaintext
-	raw, err := st.GetSecretValue("usr_enc", "my-api-key")
+	raw, err := st.GetSecretValue(t.Context(), "usr_enc", "my-api-key")
 	if err != nil {
 		t.Fatalf("get raw secret: %v", err)
 	}
@@ -1080,7 +1080,7 @@ func TestSecretEncryptDecrypt(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	raw2, _ := st.GetSecretValue("usr_enc", "my-api-key")
+	raw2, _ := st.GetSecretValue(t.Context(), "usr_enc", "my-api-key")
 	if string(raw2) == "sk-updated-value" {
 		t.Fatal("updated secret stored as plaintext")
 	}

@@ -15,13 +15,13 @@ import (
 
 func TestWebSocketTerminal(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	keyHash := sha256Hex("ws-test-token")
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_ws", Name: "ws-user", APIKeyHash: keyHash,
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),

@@ -13,7 +13,7 @@ import (
 func TestReconcileOrphanedVolumeFilesKeepsRecordedVolumeOnAttachmentError(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "state.db")
-	st, err := store.New(dbPath)
+	st, err := store.New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func TestReconcileOrphanedVolumeFilesKeepsRecordedVolumeOnAttachmentError(t *tes
 	if err := os.WriteFile(file, []byte("live volume"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreatePersistentVolume(store.PersistentVolume{
+	if err := st.CreatePersistentVolume(t.Context(), store.PersistentVolume{
 		ID: "vol", UserID: "owner", Name: "live", SizeMB: 10,
 		FilePath: file, Status: "ready", CreatedAt: time.Now(),
 	}); err != nil {
@@ -42,14 +42,14 @@ func TestReconcileOrphanedVolumeFilesKeepsRecordedVolumeOnAttachmentError(t *tes
 	if _, err := db.Exec(`INSERT INTO volume_attachments(volume_id, sandbox_id, mount, read_only) VALUES ('vol','sb','/data','broken')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetPersistentVolume("owner", "live"); err == nil {
+	if _, err := st.GetPersistentVolume(t.Context(), "owner", "live"); err == nil {
 		t.Fatal("fixture: attachment scan unexpectedly succeeded")
 	}
 	orphan := filepath.Join(volDir, "orphan.ext4")
 	if err := os.WriteFile(orphan, []byte("orphan"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOrphanedVolumeFiles(dir, st)
+	reconcileOrphanedVolumeFiles(t.Context(), dir, st)
 	if _, err := os.Stat(file); err != nil {
 		t.Fatalf("recorded volume deleted after attachment scan failure: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestReconcileOrphanedVolumeFilesKeepsRecordedVolumeOnAttachmentError(t *tes
 
 func TestReconcileOrphanedVolumeFilesKeepsFilesOnDatabaseError(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "state.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestReconcileOrphanedVolumeFilesKeepsFilesOnDatabaseError(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE volumes_v2`); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOrphanedVolumeFiles(dir, st)
+	reconcileOrphanedVolumeFiles(t.Context(), dir, st)
 	if _, err := os.Stat(file); err != nil {
 		t.Fatalf("volume deleted when database query failed: %v", err)
 	}

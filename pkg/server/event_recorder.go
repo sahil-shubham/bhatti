@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"sync"
@@ -239,7 +240,9 @@ func (r *EventRecorder) loop() {
 		if len(batch) == 0 {
 			return
 		}
-		if err := r.store.InsertEvents(batch); err != nil {
+		// Not the server's context: the last batch is flushed from Close, after
+		// every context the server owns has been cancelled.
+		if err := r.store.InsertEvents(context.Background(), batch); err != nil {
 			slog.Error("event recorder flush failed", "count", len(batch), "error", err)
 			// Events are lost on flush failure — acceptable trade-off
 			// vs blocking the API. The dropped counter doesn't track

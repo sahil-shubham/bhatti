@@ -356,7 +356,7 @@ func TestCLIPS(t *testing.T) {
 func testLocalStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestUserCreateAndLookup(t *testing.T) {
 	key := generateAPIKey()
 	hash := sha256HexCLI(key)
 
-	err := st.CreateUser(store.User{
+	err := st.CreateUser(t.Context(), store.User{
 		ID: "usr_clitest", Name: "cli-user", APIKeyHash: hash,
 		MaxSandboxes: 10, MaxCPUsPerSandbox: 2, MaxMemoryMBPerSandbox: 2048,
 		SubnetIndex: 1, CreatedAt: time.Now(),
@@ -407,7 +407,7 @@ func TestUserCreateAndLookup(t *testing.T) {
 	}
 
 	// Lookup by hash (simulates auth middleware)
-	u, err := st.GetUserByKeyHash(hash)
+	u, err := st.GetUserByKeyHash(t.Context(), hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +416,7 @@ func TestUserCreateAndLookup(t *testing.T) {
 	}
 
 	// List
-	users, _ := st.ListUsers()
+	users, _ := st.ListUsers(t.Context())
 	if len(users) != 1 {
 		t.Fatalf("expected 1 user, got %d", len(users))
 	}
@@ -428,7 +428,7 @@ func TestUserRotateKeyFlow(t *testing.T) {
 	oldKey := generateAPIKey()
 	oldHash := sha256HexCLI(oldKey)
 
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_rot", Name: "rotate-test", APIKeyHash: oldHash,
 		MaxSandboxes: 5, SubnetIndex: 1, CreatedAt: time.Now(),
 	})
@@ -436,18 +436,18 @@ func TestUserRotateKeyFlow(t *testing.T) {
 	// Rotate
 	newKey := generateAPIKey()
 	newHash := sha256HexCLI(newKey)
-	if err := st.RotateUserKey("usr_rot", newHash); err != nil {
+	if err := st.RotateUserKey(t.Context(), "usr_rot", newHash); err != nil {
 		t.Fatal(err)
 	}
 
 	// Old key doesn't work
-	_, err := st.GetUserByKeyHash(oldHash)
+	_, err := st.GetUserByKeyHash(t.Context(), oldHash)
 	if err == nil {
 		t.Fatal("old key should not work after rotation")
 	}
 
 	// New key works
-	u, err := st.GetUserByKeyHash(newHash)
+	u, err := st.GetUserByKeyHash(t.Context(), newHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,31 +459,31 @@ func TestUserRotateKeyFlow(t *testing.T) {
 func TestUserDeleteFlowWithProtection(t *testing.T) {
 	st := testLocalStore(t)
 
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_delf", Name: "del-flow", APIKeyHash: "h1",
 		MaxSandboxes: 5, SubnetIndex: 1, CreatedAt: time.Now(),
 	})
 
 	// Create a sandbox
-	st.CreateSandbox(store.Sandbox{
+	st.CreateSandbox(t.Context(), store.Sandbox{
 		ID: "sb_delf", Name: "del-sb", Status: "running",
 		CreatedBy: "usr_delf", CreatedAt: time.Now(),
 	})
 
 	// Delete should fail
-	if err := st.DeleteUser("usr_delf"); !errors.Is(err, store.ErrInUse) {
+	if err := st.DeleteUser(t.Context(), "usr_delf"); !errors.Is(err, store.ErrInUse) {
 		t.Fatalf("expected deletion refused as in use, got: %v", err)
 	}
 
 	// Destroy sandbox
-	st.DeleteSandboxByID("sb_delf")
+	st.DeleteSandboxByID(t.Context(), "sb_delf")
 
 	// Now delete succeeds
-	if err := st.DeleteUser("usr_delf"); err != nil {
+	if err := st.DeleteUser(t.Context(), "usr_delf"); err != nil {
 		t.Fatal(err)
 	}
 
-	users, _ := st.ListUsers()
+	users, _ := st.ListUsers(t.Context())
 	if len(users) != 0 {
 		t.Fatal("expected 0 users after delete")
 	}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -44,14 +45,14 @@ type MetricsSnapshot struct {
 }
 
 // InsertEvents inserts a batch of events in a single transaction.
-func (s *Store) InsertEvents(events []Event) error {
-	tx, err := s.db.Begin()
+func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`INSERT INTO events (type, user_id, sandbox_id, meta) VALUES (?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO events (type, user_id, sandbox_id, meta) VALUES (?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
@@ -62,7 +63,7 @@ func (s *Store) InsertEvents(events []Event) error {
 		if err != nil {
 			metaJSON = []byte(`{"error":"marshal_failed"}`)
 		}
-		if _, err := stmt.Exec(e.Type, e.UserID, e.SandboxID, string(metaJSON)); err != nil {
+		if _, err := stmt.ExecContext(ctx, e.Type, e.UserID, e.SandboxID, string(metaJSON)); err != nil {
 			return fmt.Errorf("insert event %s: %w", e.Type, err)
 		}
 	}
@@ -71,8 +72,8 @@ func (s *Store) InsertEvents(events []Event) error {
 }
 
 // InsertMetricsSnapshot inserts a single metrics snapshot row.
-func (s *Store) InsertMetricsSnapshot(m MetricsSnapshot) error {
-	_, err := s.db.Exec(`INSERT INTO metrics_snapshots (
+func (s *Store) InsertMetricsSnapshot(ctx context.Context, m MetricsSnapshot) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO metrics_snapshots (
 		api_requests, api_errors, api_auth_failures, api_rate_limited,
 		proxy_requests, proxy_errors, proxy_cold_wakes, proxy_rate_limited,
 		events_dropped,
@@ -101,7 +102,7 @@ type EventFilter struct {
 }
 
 // QueryEvents returns events matching the filter, ordered by timestamp descending.
-func (s *Store) QueryEvents(f EventFilter) ([]Event, error) {
+func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error) {
 	var conditions []string
 	var args []any
 
@@ -135,7 +136,7 @@ func (s *Store) QueryEvents(f EventFilter) ([]Event, error) {
 
 	if f.CountOnly {
 		var count int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM events "+where, args...).Scan(&count)
+		err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events "+where, args...).Scan(&count)
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +151,7 @@ func (s *Store) QueryEvents(f EventFilter) ([]Event, error) {
 	query := fmt.Sprintf("SELECT id, ts, type, user_id, sandbox_id, meta FROM events %s ORDER BY ts DESC LIMIT ?", where)
 	args = append(args, limit)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -174,9 +175,9 @@ func (s *Store) QueryEvents(f EventFilter) ([]Event, error) {
 }
 
 // CountEvents returns the count of events matching the filter.
-func (s *Store) CountEvents(f EventFilter) (int, error) {
+func (s *Store) CountEvents(ctx context.Context, f EventFilter) (int, error) {
 	f.CountOnly = true
-	events, err := s.QueryEvents(f)
+	events, err := s.QueryEvents(ctx, f)
 	if err != nil {
 		return 0, err
 	}
@@ -189,7 +190,7 @@ func (s *Store) CountEvents(f EventFilter) (int, error) {
 }
 
 // QueryMetricsSnapshots returns metrics snapshots since the given time.
-func (s *Store) QueryMetricsSnapshots(since time.Time, limit int) ([]MetricsSnapshot, error) {
+func (s *Store) QueryMetricsSnapshots(ctx context.Context, since time.Time, limit int) ([]MetricsSnapshot, error) {
 	query := `SELECT ts,
 		api_requests, api_errors, api_auth_failures, api_rate_limited,
 		proxy_requests, proxy_errors, proxy_cold_wakes, proxy_rate_limited,
@@ -202,7 +203,7 @@ func (s *Store) QueryMetricsSnapshots(since time.Time, limit int) ([]MetricsSnap
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
 
-	rows, err := s.db.Query(query, since.UTC().Format("2006-01-02T15:04:05.000Z"))
+	rows, err := s.db.QueryContext(ctx, query, since.UTC().Format("2006-01-02T15:04:05.000Z"))
 	if err != nil {
 		return nil, err
 	}
@@ -232,10 +233,10 @@ func (s *Store) QueryMetricsSnapshots(since time.Time, limit int) ([]MetricsSnap
 }
 
 // LatestMetricsSnapshot returns the most recent snapshot, or a zero value if none exist.
-func (s *Store) LatestMetricsSnapshot() (MetricsSnapshot, error) {
+func (s *Store) LatestMetricsSnapshot(ctx context.Context) (MetricsSnapshot, error) {
 	var m MetricsSnapshot
 	var tsStr string
-	err := s.db.QueryRow(`SELECT ts,
+	err := s.db.QueryRowContext(ctx, `SELECT ts,
 		api_requests, api_errors, api_auth_failures, api_rate_limited,
 		proxy_requests, proxy_errors, proxy_cold_wakes, proxy_rate_limited,
 		events_dropped,
@@ -259,9 +260,9 @@ func (s *Store) LatestMetricsSnapshot() (MetricsSnapshot, error) {
 
 // SumMetricsSnapshots returns column sums across all snapshots since the given time.
 // Used by `bhatti admin status` to compute totals like "84,521 requests".
-func (s *Store) SumMetricsSnapshots(since time.Time) (MetricsSnapshot, error) {
+func (s *Store) SumMetricsSnapshots(ctx context.Context, since time.Time) (MetricsSnapshot, error) {
 	var m MetricsSnapshot
-	err := s.db.QueryRow(`SELECT
+	err := s.db.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(api_requests), 0), COALESCE(SUM(api_errors), 0),
 		COALESCE(SUM(api_auth_failures), 0), COALESCE(SUM(api_rate_limited), 0),
 		COALESCE(SUM(proxy_requests), 0), COALESCE(SUM(proxy_errors), 0),
@@ -278,9 +279,9 @@ func (s *Store) SumMetricsSnapshots(since time.Time) (MetricsSnapshot, error) {
 }
 
 // PurgeOldEvents deletes events older than the given duration.
-func (s *Store) PurgeOldEvents(retention time.Duration) (int64, error) {
+func (s *Store) PurgeOldEvents(ctx context.Context, retention time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-retention).UTC().Format("2006-01-02T15:04:05.000Z")
-	res, err := s.db.Exec("DELETE FROM events WHERE ts < ?", cutoff)
+	res, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE ts < ?", cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -288,9 +289,9 @@ func (s *Store) PurgeOldEvents(retention time.Duration) (int64, error) {
 }
 
 // PurgeOldMetricsSnapshots deletes snapshots older than the given duration.
-func (s *Store) PurgeOldMetricsSnapshots(retention time.Duration) (int64, error) {
+func (s *Store) PurgeOldMetricsSnapshots(ctx context.Context, retention time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-retention).UTC().Format("2006-01-02T15:04:05.000Z")
-	res, err := s.db.Exec("DELETE FROM metrics_snapshots WHERE ts < ?", cutoff)
+	res, err := s.db.ExecContext(ctx, "DELETE FROM metrics_snapshots WHERE ts < ?", cutoff)
 	if err != nil {
 		return 0, err
 	}

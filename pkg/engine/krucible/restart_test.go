@@ -205,7 +205,7 @@ func TestKrucibleServerRestartKeepsSandboxes(t *testing.T) {
 	start := func() *daemon {
 		t.Helper()
 		eng := recoveryEngine(t, dataDir, sockDir, base)
-		st, err := store.New(filepath.Join(dbDir, "state.db"))
+		st, err := store.New(t.Context(), filepath.Join(dbDir, "state.db"))
 		if err != nil {
 			t.Fatalf("store: %v", err)
 		}
@@ -278,7 +278,7 @@ func TestKrucibleServerRestartKeepsSandboxes(t *testing.T) {
 
 	a := start()
 	sum := sha256.Sum256([]byte(apiKey))
-	if err := a.st.CreateUser(store.User{
+	if err := a.st.CreateUser(t.Context(), store.User{
 		ID: "usr_restart", Name: "restart-user", APIKeyHash: hex.EncodeToString(sum[:]),
 		MaxSandboxes: 10, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 7, CreatedAt: time.Now(),

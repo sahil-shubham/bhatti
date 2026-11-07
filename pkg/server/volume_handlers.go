@@ -26,7 +26,7 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListPersistentVolumes(user.ID)
+		list, err := s.store.ListPersistentVolumes(r.Context(), user.ID)
 		if err != nil {
 			errRespInternal(w, r, "list volumes failed", err)
 			return
@@ -54,8 +54,8 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 		}
 
 		// Check quota
-		used, _ := s.store.UserVolumeStorageUsed(user.ID)
-		userObj, _ := s.store.GetUser(user.ID)
+		used, _ := s.store.UserVolumeStorageUsed(r.Context(), user.ID)
+		userObj, _ := s.store.GetUser(r.Context(), user.ID)
 		maxStorage := 20480 // default 20GB
 		if userObj != nil {
 			maxStorage = userObj.MaxVolumeStorageMB
@@ -74,7 +74,7 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 			SizeMB: req.SizeMB, FilePath: volPath,
 			Status: "creating", CreatedAt: time.Now(),
 		}
-		if err := s.store.CreatePersistentVolume(vol); err != nil {
+		if err := s.store.CreatePersistentVolume(r.Context(), vol); err != nil {
 			if errors.Is(err, store.ErrConflict) {
 				errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
 			} else {
@@ -84,11 +84,11 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 		}
 
 		if err := createVolumeFile(volPath, req.SizeMB); err != nil {
-			s.store.DeletePersistentVolume(user.ID, req.Name)
+			s.store.DeletePersistentVolume(r.Context(), user.ID, req.Name)
 			errRespInternal(w, r, "create volume file failed", err)
 			return
 		}
-		s.store.UpdatePersistentVolumeStatus(user.ID, req.Name, "ready")
+		s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, req.Name, "ready")
 		vol.Status = "ready"
 
 		slog.Info("volume.created", "name", req.Name, "user", user.Name, "size_mb", req.SizeMB)
@@ -138,7 +138,7 @@ func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) 
 
 	switch r.Method {
 	case http.MethodGet:
-		vol, err := s.store.GetPersistentVolume(user.ID, name)
+		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
@@ -146,12 +146,12 @@ func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 200, vol)
 	case http.MethodDelete:
 		// Check for file path before deleting from store
-		vol, err := s.store.GetPersistentVolume(user.ID, name)
+		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
-		if err := s.store.DeletePersistentVolume(user.ID, name); err != nil {
+		if err := s.store.DeletePersistentVolume(r.Context(), user.ID, name); err != nil {
 			switch {
 			case errors.Is(err, store.ErrVolumeAttached):
 				errResp(w, 409, err.Error())
@@ -189,7 +189,7 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 	switch {
 	case subPath == "" && r.Method == http.MethodGet:
 		// List backups
-		backups, err := s.store.ListVolumeBackups(user.ID, volumeName)
+		backups, err := s.store.ListVolumeBackups(r.Context(), user.ID, volumeName)
 		if err != nil {
 			errRespInternal(w, r, "list backups failed", err)
 			return
@@ -201,7 +201,7 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 
 	case subPath == "" && r.Method == http.MethodPost:
 		// Trigger backup
-		vol, err := s.store.GetPersistentVolume(user.ID, volumeName)
+		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, volumeName)
 		if err != nil {
 			errResp(w, 404, "volume not found")
 			return
@@ -222,7 +222,7 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 			errResp(w, 400, "missing backup_id")
 			return
 		}
-		vol, err := s.store.GetPersistentVolume(user.ID, volumeName)
+		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, volumeName)
 		if err != nil {
 			errResp(w, 404, "volume not found")
 			return
@@ -232,7 +232,7 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 			errResp(w, 409, "volume is attached to a sandbox — detach before restoring")
 			return
 		}
-		backup, err := s.store.GetVolumeBackup(user.ID, req.BackupID)
+		backup, err := s.store.GetVolumeBackup(r.Context(), user.ID, req.BackupID)
 		if err != nil {
 			errResp(w, 404, "backup not found")
 			return
@@ -250,7 +250,7 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 	case subPath != "" && subPath != "restore" && r.Method == http.MethodDelete:
 		// Delete a backup
 		backupID := subPath
-		b, err := s.store.GetVolumeBackup(user.ID, backupID)
+		b, err := s.store.GetVolumeBackup(r.Context(), user.ID, backupID)
 		if err != nil {
 			errResp(w, 404, "backup not found")
 			return
@@ -259,7 +259,7 @@ func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, use
 			slog.Warn("s3 delete failed", "key", b.S3Key, "error", err)
 			// Continue — remove from DB even if S3 delete fails
 		}
-		s.store.DeleteVolumeBackup(user.ID, backupID)
+		s.store.DeleteVolumeBackup(r.Context(), user.ID, backupID)
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 
 	default:
@@ -315,7 +315,7 @@ func (s *Server) performVolumeBackup(ctx context.Context, user *store.User, vol 
 		ID: id, VolumeName: vol.Name, UserID: user.ID, S3Key: s3Key,
 		SizeBytes: fi.Size(), ConsistencyMode: mode, CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.CreateVolumeBackup(record); err != nil {
+	if err := s.store.CreateVolumeBackup(ctx, record); err != nil {
 		return nil, fmt.Errorf("record backup: %w", err)
 	}
 	slog.Info("volume backup created",
@@ -331,13 +331,13 @@ func (s *Server) performVolumeBackup(ctx context.Context, user *store.User, vol 
 // A thaw failure can mean FIFREEZE is still in effect. The krucible engine
 // powers off before returning an unclean-stop error; mirror that state in the
 // store and event stream so an operator cannot mistake the VM for running.
-func (s *Server) reconcileBackupUncleanStop(sb *store.Sandbox, backupErr error) error {
+func (s *Server) reconcileBackupUncleanStop(ctx context.Context, sb *store.Sandbox, backupErr error) error {
 	reason, unclean := uncleanStopReason(backupErr)
 	if !unclean {
 		return backupErr
 	}
 	// The owner didn't ask for this power-off: a keep_hot sandbox is marked to restart.
-	if err := s.store.StopSandboxUnexpected(sb.ID); err != nil {
+	if err := s.store.StopSandboxUnexpected(detached(ctx), sb.ID); err != nil {
 		backupErr = errors.Join(backupErr, fmt.Errorf("record stopped sandbox %q after thaw failure: %w", sb.ID, err))
 	}
 	s.recordUncleanStop(*sb, reason)
@@ -350,7 +350,7 @@ func (s *Server) cloneVolumeForBackup(ctx context.Context, vol *store.Persistent
 	unlockAttachments := s.store.LockPersistentVolumeAttachments(vol.UserID, vol.Name)
 	defer unlockAttachments()
 	// The lock covers both this read and the clone, not the S3 upload.
-	current, err := s.store.GetPersistentVolume(vol.UserID, vol.Name)
+	current, err := s.store.GetPersistentVolume(ctx, vol.UserID, vol.Name)
 	if err != nil {
 		return "", "", fmt.Errorf("load volume attachments: %w", err)
 	}
@@ -364,7 +364,7 @@ func (s *Server) cloneVolumeForBackup(ctx context.Context, vol *store.Persistent
 	engineIDs := make([]string, 0, len(attachments))
 	sandboxes := make([]*store.Sandbox, 0, len(attachments))
 	for _, attachment := range attachments {
-		sb, err := s.store.GetSandboxByID(attachment.SandboxID)
+		sb, err := s.store.GetSandboxByID(ctx, attachment.SandboxID)
 		if err != nil {
 			return "", "", fmt.Errorf("load attached sandbox %q: %w", attachment.SandboxID, err)
 		}
@@ -439,7 +439,7 @@ func (s *Server) cloneVolumeForBackup(ctx context.Context, vol *store.Persistent
 			releaseErr := leases[i].release(cleanupCtx)
 			cancel()
 			if releaseErr != nil {
-				releaseErr = s.reconcileBackupUncleanStop(leases[i].sandbox, releaseErr)
+				releaseErr = s.reconcileBackupUncleanStop(detached(ctx), leases[i].sandbox, releaseErr)
 				err = errors.Join(err, fmt.Errorf("release attached volume backup lease: %w", releaseErr))
 			}
 		}
@@ -467,7 +467,7 @@ func (s *Server) cloneVolumeForBackup(ctx context.Context, vol *store.Persistent
 			leases = append(leases, backupLease{release: thaw, sandbox: sandboxes[i]})
 		}
 		if err != nil {
-			err = s.reconcileBackupUncleanStop(sandboxes[i], err)
+			err = s.reconcileBackupUncleanStop(ctx, sandboxes[i], err)
 			return "", "", fmt.Errorf("quiesce sandbox %q volume mount %q: %w", engineID, attachment.Mount, err)
 		}
 		switch guestMode {
@@ -542,7 +542,7 @@ func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	vol, err := s.store.GetPersistentVolume(user.ID, name)
+	vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
 	if err != nil {
 		errResp(w, 404, "volume not found")
 		return
@@ -569,7 +569,7 @@ func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	s.store.UpdatePersistentVolumeSize(user.ID, name, req.SizeMB)
+	s.store.UpdatePersistentVolumeSize(r.Context(), user.ID, name, req.SizeMB)
 	slog.Info("volume.resized", "name", name, "user", user.Name, "new_size_mb", req.SizeMB)
 	s.RecordEvent(store.Event{
 		Type: "volume.resized", UserID: user.ID,
@@ -596,7 +596,7 @@ func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	src, err := s.store.GetPersistentVolume(user.ID, srcName)
+	src, err := s.store.GetPersistentVolume(r.Context(), user.ID, srcName)
 	if err != nil {
 		errResp(w, 404, "source volume not found")
 		return
@@ -615,7 +615,7 @@ func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, us
 		SizeMB: src.SizeMB, FilePath: dstPath,
 		Status: "creating", CreatedAt: time.Now(),
 	}
-	if err := s.store.CreatePersistentVolume(vol); err != nil {
+	if err := s.store.CreatePersistentVolume(r.Context(), vol); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
 		} else {
@@ -625,12 +625,12 @@ func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, us
 	}
 
 	if err := exec.Command("cp", "--sparse=always", src.FilePath, dstPath).Run(); err != nil {
-		s.store.DeletePersistentVolume(user.ID, req.Name)
+		s.store.DeletePersistentVolume(r.Context(), user.ID, req.Name)
 		errRespInternal(w, r, "copy volume file failed", err)
 		return
 	}
 
-	s.store.UpdatePersistentVolumeStatus(user.ID, req.Name, "ready")
+	s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, req.Name, "ready")
 	vol.Status = "ready"
 
 	slog.Info("volume.snapshot", "src", srcName, "dst", req.Name, "user", user.Name, "size_mb", src.SizeMB)

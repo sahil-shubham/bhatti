@@ -298,12 +298,12 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 	// Alias lookup BEFORE rate limiting — unknown aliases get fast 404.
 	route, cached := h.routeCache.Get(alias)
 	if !cached {
-		rule, err := h.store.GetPublishRuleByAlias(alias)
+		rule, err := h.store.GetPublishRuleByAlias(r.Context(), alias)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
 		}
-		sb, err := h.store.GetSandboxByID(rule.SandboxID)
+		sb, err := h.store.GetSandboxByID(r.Context(), rule.SandboxID)
 		if err != nil || sb.Status == "destroyed" {
 			errResp(w, 404, "not found")
 			return

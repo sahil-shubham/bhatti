@@ -91,7 +91,7 @@ func runDaemon() {
 	slog.Info("SSH key ready", "path", keyPath)
 
 	// Open store
-	st, err := store.New(filepath.Join(cfg.DataDir, "state.db"))
+	st, err := store.New(context.Background(), filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
 		slog.Error("open store", "error", err)
 		os.Exit(1)
@@ -130,7 +130,7 @@ func runDaemon() {
 
 	// Detach volumes orphaned by crashed sandboxes after krucible has
 	// reconciled its helpers in New.
-	if n, err := st.DetachOrphanedPersistentVolumes(); err != nil {
+	if n, err := st.DetachOrphanedPersistentVolumes(context.Background()); err != nil {
 		slog.Warn("orphan volume detach failed", "error", err)
 	} else if n > 0 {
 		slog.Info("detached orphaned volume attachments", "count", n)
@@ -139,7 +139,7 @@ func runDaemon() {
 	// v0.3: Reconcile orphaned volume files on disk.
 	// If daemon crashed between store.DeletePersistentVolume (removes DB row)
 	// and os.Remove (removes .ext4 file), the file lingers with no store record.
-	reconcileOrphanedVolumeFiles(cfg.DataDir, st)
+	reconcileOrphanedVolumeFiles(context.Background(), cfg.DataDir, st)
 
 	// v0.3: Clean stale checkpoint temp dirs left by crashed checkpoints
 	snapshotDir := filepath.Join(cfg.DataDir, "snapshots")
@@ -166,10 +166,10 @@ func runDaemon() {
 
 	// Register tier rootfs images as system images so --image browser/minimal/docker works.
 	// Uses user_id='' (admin images visible to all users). Idempotent — skips if already exists.
-	registerTierImages(cfg, st)
+	registerTierImages(context.Background(), cfg, st)
 
 	// v0.4: Clean orphaned publish rules
-	if n, err := st.CleanupOrphanedPublishRules(); err != nil {
+	if n, err := st.CleanupOrphanedPublishRules(context.Background()); err != nil {
 		slog.Warn("orphaned publish rule cleanup failed", "error", err)
 	} else if n > 0 {
 		slog.Info("cleaned up orphaned publish rules", "count", n)
@@ -256,7 +256,7 @@ func runDaemon() {
 
 	// Record daemon.started event
 	recoveredCount := 0
-	if allSandboxes, err := st.ListAllSandboxes(); err == nil {
+	if allSandboxes, err := st.ListAllSandboxes(context.Background()); err == nil {
 		for _, sb := range allSandboxes {
 			if sb.Status == "running" || sb.Status == "stopped" {
 				recoveredCount++
@@ -514,7 +514,7 @@ func startDomainMode(cfg *pkg.Config, eng engine.Engine, st *store.Store, srv *s
 // reconcileOrphanedVolumeFiles walks the volumes directory and removes
 // .ext4 files that have no matching store record. This handles the crash
 // window between store.DeletePersistentVolume and os.Remove.
-func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
+func reconcileOrphanedVolumeFiles(ctx context.Context, dataDir string, st *store.Store) {
 	volRoot := filepath.Join(dataDir, "volumes")
 	userDirs, err := os.ReadDir(volRoot)
 	if err != nil {
@@ -535,7 +535,7 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 				continue
 			}
 			volName := strings.TrimSuffix(f.Name(), ".ext4")
-			exists, err := st.PersistentVolumeExists(userID, volName)
+			exists, err := st.PersistentVolumeExists(ctx, userID, volName)
 			if err != nil {
 				slog.Warn("skipping volume file cleanup: database lookup failed", "user_id", userID, "volume", volName, "error", err)
 				continue
@@ -556,7 +556,7 @@ func reconcileOrphanedVolumeFiles(dataDir string, st *store.Store) {
 // Tiers are discovered by globbing for rootfs-*-{arch}.ext4 in the images
 // directory — no hardcoded list. Adding a new tier only requires the file
 // to exist on disk (placed there by install.sh).
-func registerTierImages(cfg *pkg.Config, st *store.Store) {
+func registerTierImages(ctx context.Context, cfg *pkg.Config, st *store.Store) {
 	// Guest arch == host arch (HVF and KVM both run native-arch guests), so the
 	// binary's own GOARCH is the truth. (Previously sniffed /proc/cpuinfo,
 	// which doesn't exist on macOS — it only worked there by fallback accident.)
@@ -584,10 +584,10 @@ func registerTierImages(cfg *pkg.Config, st *store.Store) {
 			continue
 		}
 		// Check if already registered
-		if _, err := st.GetImage("", tier); err == nil {
+		if _, err := st.GetImage(ctx, "", tier); err == nil {
 			continue // already exists
 		}
-		st.CreateImage(store.ImageRecord{
+		st.CreateImage(ctx, store.ImageRecord{
 			ID:        fmt.Sprintf("tier_%s_%s", tier, arch),
 			UserID:    "", // admin image, visible to all
 			Name:      tier,

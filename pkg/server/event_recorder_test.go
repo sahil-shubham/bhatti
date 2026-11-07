@@ -9,7 +9,7 @@ import (
 )
 
 func TestEventRecorder(t *testing.T) {
-	st, err := store.New(filepath.Join(t.TempDir(), "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestEventRecorder(t *testing.T) {
 	rec.Close()
 
 	// Verify events were persisted
-	events, err := st.QueryEvents(store.EventFilter{Limit: 100})
+	events, err := st.QueryEvents(t.Context(), store.EventFilter{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestEventRecorder(t *testing.T) {
 }
 
 func TestEventRecorderDropsOnFullBuffer(t *testing.T) {
-	st, err := store.New(filepath.Join(t.TempDir(), "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestEventRecorderDropsOnFullBuffer(t *testing.T) {
 	}
 
 	// All non-dropped events should be persisted
-	events, err := st.QueryEvents(store.EventFilter{Limit: 2000})
+	events, err := st.QueryEvents(t.Context(), store.EventFilter{Limit: 2000})
 	if err != nil {
 		t.Fatal(err)
 	}

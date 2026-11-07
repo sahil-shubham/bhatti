@@ -45,7 +45,7 @@ func createRunningBox(t *testing.T, srv *Server, eng *mockEngine, name string) s
 		Status: "running", IP: info.IP, CreatedBy: "usr_test",
 		CreatedAt: time.Now(),
 	}
-	if err := srv.store.CreateSandbox(sb); err != nil {
+	if err := srv.store.CreateSandbox(t.Context(), sb); err != nil {
 		t.Fatal(err)
 	}
 	eng.mu.Lock()
@@ -185,7 +185,7 @@ func TestThermalAttachedInteractiveNotColdStopped(t *testing.T) {
 	te := srv.engine.(ThermalEngine)
 	srv.runThermalCycle(te, cfg)
 
-	sb, err := srv.store.GetSandboxByID(eid)
+	sb, err := srv.store.GetSandboxByID(t.Context(), eid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestThermalAttachedInteractiveNotColdStopped(t *testing.T) {
 	srv.lastActivity.Store(eid, time.Now().Add(-time.Minute))
 	srv.runThermalCycle(te, cfg)
 
-	sb, err = srv.store.GetSandboxByID(eid)
+	sb, err = srv.store.GetSandboxByID(t.Context(), eid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,10 +247,10 @@ func TestThermalWarmToCold(t *testing.T) {
 	srv.runThermalCycle(te, cfg)
 
 	// Sandbox should be stopped in store
-	sb, err := srv.store.GetSandboxByID(eid)
+	sb, err := srv.store.GetSandboxByID(t.Context(), eid)
 	if err != nil {
 		// Engine IDs and sandbox IDs differ in mock — look up by listing
-		sandboxes, _ := srv.store.ListAllSandboxes()
+		sandboxes, _ := srv.store.ListAllSandboxes(t.Context())
 		for _, s := range sandboxes {
 			if s.EngineID == eid {
 				sb = &s
@@ -420,7 +420,7 @@ func TestListEnrichedURLs(t *testing.T) {
 // findSandbox finds a sandbox by engine ID in the store.
 func findSandbox(t *testing.T, srv *Server, engineID string) *store.Sandbox {
 	t.Helper()
-	sandboxes, err := srv.store.ListAllSandboxes()
+	sandboxes, err := srv.store.ListAllSandboxes(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +566,7 @@ func TestEnsureHotRecoverFromUnknown(t *testing.T) {
 	eng.mu.Unlock()
 
 	sb := findSandbox(t, srv, eid)
-	srv.store.UpdateSandboxStatus(sb.ID, "unknown")
+	srv.store.UpdateSandboxStatus(t.Context(), sb.ID, "unknown")
 
 	// ensureHot should recover it
 	if err := srv.ensureHot(context.Background(), eid); err != nil {
@@ -688,7 +688,7 @@ func TestThermalUncleanPowerOffRecordsReasonWithoutRetry(t *testing.T) {
 	}
 	srv.events.Close()
 	srv.events = nil
-	events, err := srv.store.QueryEvents(store.EventFilter{SandboxID: eid})
+	events, err := srv.store.QueryEvents(t.Context(), store.EventFilter{SandboxID: eid})
 	if err != nil {
 		t.Fatal(err)
 	}

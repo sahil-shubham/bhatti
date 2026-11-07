@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,7 +148,7 @@ func coveredBy(allow []gateway.HostPattern, p gateway.HostPattern) bool {
 
 // mintSandboxCA creates the sandbox's CA and stores it (key encrypted like a
 // secret), returning the certificate for the guest's trust store.
-func (s *Server) mintSandboxCA(userID, sandboxID, name string) (string, error) {
+func (s *Server) mintSandboxCA(ctx context.Context, userID, sandboxID, name string) (string, error) {
 	certPEM, keyPEM, err := broker.NewSandboxCA("bhatti sandbox "+name, time.Now())
 	if err != nil {
 		return "", err
@@ -156,7 +157,7 @@ func (s *Server) mintSandboxCA(userID, sandboxID, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("encrypt sandbox CA key: %w", err)
 	}
-	if err := s.store.PutSandboxCA(store.SandboxCA{SandboxID: sandboxID, UserID: userID, CertPEM: string(certPEM), KeyEnc: keyEnc}); err != nil {
+	if err := s.store.PutSandboxCA(ctx, store.SandboxCA{SandboxID: sandboxID, UserID: userID, CertPEM: string(certPEM), KeyEnc: keyEnc}); err != nil {
 		return "", err
 	}
 	return string(certPEM), nil
@@ -166,16 +167,16 @@ func (s *Server) mintSandboxCA(userID, sandboxID, name string) (string, error) {
 // guest trusts and each live grant, whose placeholders sit in its environment.
 // A fork takes it from its live source; a snapshot keeps it, so every resume
 // has it after the source is gone.
-func (s *Server) captureSubstitution(userID, sandboxID string) (store.SnapshotSubstitution, error) {
+func (s *Server) captureSubstitution(ctx context.Context, userID, sandboxID string) (store.SnapshotSubstitution, error) {
 	var sub store.SnapshotSubstitution
-	ca, err := s.store.GetSandboxCA(sandboxID)
+	ca, err := s.store.GetSandboxCA(ctx, sandboxID)
 	switch {
 	case err == nil && ca.UserID == userID:
 		sub.CA = ca
 	case err != nil && !errors.Is(err, store.ErrNotFound):
 		return sub, fmt.Errorf("read sandbox CA: %w", err)
 	}
-	grants, err := s.store.ListSandboxSecretGrants(sandboxID)
+	grants, err := s.store.ListSandboxSecretGrants(ctx, sandboxID)
 	if err != nil {
 		return sub, fmt.Errorf("read sandbox grants: %w", err)
 	}
@@ -199,18 +200,18 @@ func (s *Server) captureSubstitution(userID, sandboxID string) (store.SnapshotSu
 // since is skipped. Failures are logged, not fatal: the clone is already
 // running and without a grant just gets no substitution. Returns the grants
 // it made.
-func (s *Server) inheritSubstitution(userID string, to store.Sandbox, from string, sub store.SnapshotSubstitution) []store.SecretGrant {
+func (s *Server) inheritSubstitution(ctx context.Context, userID string, to store.Sandbox, from string, sub store.SnapshotSubstitution) []store.SecretGrant {
 	if sub.CA != nil {
 		ca := *sub.CA
 		ca.SandboxID, ca.UserID, ca.CreatedAt = to.ID, userID, time.Now()
-		if err := s.store.PutSandboxCA(ca); err != nil {
+		if err := s.store.PutSandboxCA(ctx, ca); err != nil {
 			slog.Warn("sandbox.ca_inherit", "from", from, "to", to.ID, "error", err)
 		}
 	}
 	now := time.Now().UTC()
 	var made []store.SecretGrant
 	for _, g := range sub.Grants {
-		if _, err := s.store.GetSecret(userID, g.SecretName); err != nil {
+		if _, err := s.store.GetSecret(ctx, userID, g.SecretName); err != nil {
 			slog.Info("sandbox.grant_inherit_skipped", "from", from, "to", to.ID, "secret", g.SecretName, "error", err)
 			continue
 		}
@@ -218,7 +219,7 @@ func (s *Server) inheritSubstitution(userID string, to store.Sandbox, from strin
 			ID: genID(), UserID: userID, SecretName: g.SecretName, SandboxID: to.ID,
 			Hosts: g.Hosts, Placeholder: g.Placeholder, CreatedAt: now, ExpiresAt: g.ExpiresAt,
 		}
-		if err := s.store.CreateSecretGrant(copied); err != nil {
+		if err := s.store.CreateSecretGrant(ctx, copied); err != nil {
 			slog.Warn("sandbox.grant_inherit", "from", from, "to", to.ID, "secret", g.SecretName, "error", err)
 			continue
 		}
@@ -228,13 +229,13 @@ func (s *Server) inheritSubstitution(userID string, to store.Sandbox, from strin
 }
 
 // inheritFromSandbox is inheritSubstitution from a live source.
-func (s *Server) inheritFromSandbox(userID string, src *store.Sandbox, to store.Sandbox) []store.SecretGrant {
-	sub, err := s.captureSubstitution(userID, src.ID)
+func (s *Server) inheritFromSandbox(ctx context.Context, userID string, src *store.Sandbox, to store.Sandbox) []store.SecretGrant {
+	sub, err := s.captureSubstitution(ctx, userID, src.ID)
 	if err != nil {
 		slog.Warn("sandbox.substitution_inherit", "from", src.ID, "to", to.ID, "error", err)
 		return nil
 	}
-	return s.inheritSubstitution(userID, to, "sandbox:"+src.ID, sub)
+	return s.inheritSubstitution(ctx, userID, to, "sandbox:"+src.ID, sub)
 }
 
 // liveSnapshotSource stands in for what a snapshot taken before snapshots
@@ -245,8 +246,8 @@ func (s *Server) inheritFromSandbox(userID string, src *store.Sandbox, to store.
 // nothing. Only for snapshots without a record of their own
 // (SourceRecordedAt nil): one that has a record is never mixed with the live
 // source, whatever the source gained since.
-func (s *Server) liveSnapshotSource(userID, sourceID string) (store.SnapshotSource, store.SnapshotSubstitution) {
-	src, err := s.store.GetSandboxByID(sourceID)
+func (s *Server) liveSnapshotSource(ctx context.Context, userID, sourceID string) (store.SnapshotSource, store.SnapshotSubstitution) {
+	src, err := s.store.GetSandboxByID(ctx, sourceID)
 	if err != nil || src.CreatedBy != userID {
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			slog.Warn("snapshot.source_lookup", "source", sourceID, "error", err)
@@ -254,7 +255,7 @@ func (s *Server) liveSnapshotSource(userID, sourceID string) (store.SnapshotSour
 		return store.SnapshotSource{}, store.SnapshotSubstitution{}
 	}
 	source := store.SnapshotSource{Image: src.Image, DiskSizeMB: src.DiskSizeMB, HasInit: src.HasInit}
-	sub, err := s.captureSubstitution(userID, src.ID)
+	sub, err := s.captureSubstitution(ctx, userID, src.ID)
 	if err != nil {
 		slog.Warn("snapshot.source_substitution", "source", sourceID, "error", err)
 		return source, store.SnapshotSubstitution{}
@@ -264,11 +265,11 @@ func (s *Server) liveSnapshotSource(userID, sourceID string) (store.SnapshotSour
 
 // discardSubstitution drops a sandbox's grants and CA (destroyed, or its
 // create failed after they were minted).
-func (s *Server) discardSubstitution(sandboxID string) {
-	if err := s.store.DeleteSandboxSecretGrants(sandboxID); err != nil {
+func (s *Server) discardSubstitution(ctx context.Context, sandboxID string) {
+	if err := s.store.DeleteSandboxSecretGrants(detached(ctx), sandboxID); err != nil {
 		slog.Warn("sandbox.grants_cleanup", "sandbox", sandboxID, "error", err)
 	}
-	if err := s.store.DeleteSandboxCA(sandboxID); err != nil {
+	if err := s.store.DeleteSandboxCA(detached(ctx), sandboxID); err != nil {
 		slog.Warn("sandbox.ca_cleanup", "sandbox", sandboxID, "error", err)
 	}
 }
@@ -281,7 +282,7 @@ type createGrantReq struct {
 }
 
 // newGrant mints a placeholder and records the grant.
-func (s *Server) newGrant(userID, secret, sandboxID string, hosts []string, ttl time.Duration) (store.SecretGrant, error) {
+func (s *Server) newGrant(ctx context.Context, userID, secret, sandboxID string, hosts []string, ttl time.Duration) (store.SecretGrant, error) {
 	ph, err := gateway.NewPlaceholder()
 	if err != nil {
 		return store.SecretGrant{}, err
@@ -295,7 +296,7 @@ func (s *Server) newGrant(userID, secret, sandboxID string, hosts []string, ttl 
 		exp := now.Add(ttl)
 		g.ExpiresAt = &exp
 	}
-	if err := s.store.CreateSecretGrant(g); err != nil {
+	if err := s.store.CreateSecretGrant(ctx, g); err != nil {
 		return store.SecretGrant{}, err
 	}
 	return g, nil
@@ -352,7 +353,7 @@ func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request,
 		errResp(w, 400, "invalid json: "+err.Error())
 		return
 	}
-	if _, err := s.store.GetSecret(user.ID, name); err != nil {
+	if _, err := s.store.GetSecret(r.Context(), user.ID, name); err != nil {
 		errResp(w, 404, fmt.Sprintf("secret %q not found", name))
 		return
 	}
@@ -379,14 +380,14 @@ func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request,
 		errRespInternal(w, r, "guest agent cannot install sandbox CA", err)
 		return
 	}
-	if _, err := s.store.GetSandboxCA(sb.ID); errors.Is(err, store.ErrNotFound) {
+	if _, err := s.store.GetSandboxCA(r.Context(), sb.ID); errors.Is(err, store.ErrNotFound) {
 		errResp(w, 409, fmt.Sprintf("sandbox %q has no substitution CA (it was created without a network, before credential substitution, or from a filesystem snapshot); recreate it to grant secrets", sb.Name))
 		return
 	} else if err != nil {
 		errRespInternal(w, r, "load sandbox CA failed", err)
 		return
 	}
-	g, err := s.newGrant(user.ID, name, sb.ID, hosts, ttl)
+	g, err := s.newGrant(r.Context(), user.ID, name, sb.ID, hosts, ttl)
 	if err != nil {
 		errRespInternal(w, r, "create grant failed", err)
 		return
@@ -402,13 +403,13 @@ func (s *Server) handleSecretGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := UserFromContext(r.Context())
-	grants, err := s.store.ListSecretGrants(user.ID)
+	grants, err := s.store.ListSecretGrants(r.Context(), user.ID)
 	if err != nil {
 		errRespInternal(w, r, "list grants failed", err)
 		return
 	}
 	names := map[string]string{}
-	if sbs, err := s.store.ListSandboxes(user.ID); err == nil {
+	if sbs, err := s.store.ListSandboxes(r.Context(), user.ID); err == nil {
 		for _, sb := range sbs {
 			names[sb.ID] = sb.Name
 		}
@@ -428,12 +429,12 @@ func (s *Server) handleSecretGrantRevoke(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	user := UserFromContext(r.Context())
-	g, err := s.store.GetSecretGrant(user.ID, id)
+	g, err := s.store.GetSecretGrant(r.Context(), user.ID, id)
 	if err != nil {
 		errResp(w, 404, fmt.Sprintf("grant %q not found", id))
 		return
 	}
-	if err := s.store.RevokeSecretGrant(user.ID, id, time.Now().UTC()); err != nil {
+	if err := s.store.RevokeSecretGrant(r.Context(), user.ID, id, time.Now().UTC()); err != nil {
 		errRespInternal(w, r, "revoke grant failed", err)
 		return
 	}

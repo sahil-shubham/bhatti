@@ -10,6 +10,7 @@ package broker
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"log/slog"
 	"net"
@@ -23,12 +24,12 @@ import (
 
 // Store is what the broker reads. *store.Store implements it.
 type Store interface {
-	GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder string) (*store.SecretGrant, error)
-	FindSecretGrantByPlaceholder(userID, placeholder string) (*store.SecretGrant, error)
-	ListSandboxSecretGrants(sandboxID string) ([]store.SecretGrant, error)
-	GetSecretValue(userID, name string) ([]byte, error)
-	GetSandboxCA(sandboxID string) (*store.SandboxCA, error)
-	GetSandboxByEngineID(engineID string) (*store.Sandbox, error)
+	GetSandboxSecretGrantByPlaceholder(ctx context.Context, sandboxID, placeholder string) (*store.SecretGrant, error)
+	FindSecretGrantByPlaceholder(ctx context.Context, userID, placeholder string) (*store.SecretGrant, error)
+	ListSandboxSecretGrants(ctx context.Context, sandboxID string) ([]store.SecretGrant, error)
+	GetSecretValue(ctx context.Context, userID, name string) ([]byte, error)
+	GetSandboxCA(ctx context.Context, sandboxID string) (*store.SandboxCA, error)
+	GetSandboxByEngineID(ctx context.Context, engineID string) (*store.Sandbox, error)
 }
 
 // Config wires the broker to the daemon.
@@ -63,9 +64,12 @@ const (
 	maxReason = 200
 )
 
-// Serve answers requests from userID's netd on ln until ln is closed. It
-// implements engine.CredentialBroker.
+// Serve answers requests from userID's netd on ln until ln is closed, which
+// also cancels the requests still in flight: with its netd gone nobody is left
+// to read the answers. It implements engine.CredentialBroker.
 func (b *Broker) Serve(ln net.Listener, userID string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -76,11 +80,11 @@ func (b *Broker) Serve(ln net.Listener, userID string) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go b.serveConn(conn, userID)
+		go b.serveConn(ctx, conn, userID)
 	}
 }
 
-func (b *Broker) serveConn(conn net.Conn, userID string) {
+func (b *Broker) serveConn(ctx context.Context, conn net.Conn, userID string) {
 	defer conn.Close()
 	br := bufio.NewReaderSize(conn, gateway.BrokerMaxRequest)
 	for {
@@ -89,24 +93,24 @@ func (b *Broker) serveConn(conn net.Conn, userID string) {
 		if err := gateway.ReadBrokerMessage(br, &req); err != nil {
 			return
 		}
-		if err := gateway.WriteBrokerMessage(conn, b.handle(userID, req)); err != nil {
+		if err := gateway.WriteBrokerMessage(conn, b.handle(ctx, userID, req)); err != nil {
 			return
 		}
 	}
 }
 
-func (b *Broker) handle(userID string, req gateway.BrokerRequest) gateway.BrokerResponse {
+func (b *Broker) handle(ctx context.Context, userID string, req gateway.BrokerRequest) gateway.BrokerResponse {
 	// A netd of a sandbox with no owner has nothing to ask for.
 	if userID == "" || req.Sandbox == "" {
 		return refuse("no owner")
 	}
 	switch req.Op {
 	case gateway.BrokerResolve:
-		return b.resolve(userID, req)
+		return b.resolve(ctx, userID, req)
 	case gateway.BrokerCert:
-		return b.cert(userID, req)
+		return b.cert(ctx, userID, req)
 	case gateway.BrokerReport:
-		b.report(userID, req)
+		b.report(ctx, userID, req)
 		return gateway.BrokerResponse{}
 	}
 	return refuse("unknown op")
@@ -118,20 +122,20 @@ func refuse(reason string) gateway.BrokerResponse { return gateway.BrokerRespons
 // server passes its own ID to the engine for the sandboxes it creates, but a
 // fork or restore is created inside the engine and netd knows it by the
 // engine's ID.
-func (b *Broker) sandboxFor(userID, ref string) string {
-	if sb, err := b.cfg.Store.GetSandboxByEngineID(ref); err == nil && sb.CreatedBy == userID {
+func (b *Broker) sandboxFor(ctx context.Context, userID, ref string) string {
+	if sb, err := b.cfg.Store.GetSandboxByEngineID(ctx, ref); err == nil && sb.CreatedBy == userID {
 		return sb.ID
 	}
 	return ref
 }
 
-func (b *Broker) resolve(userID string, req gateway.BrokerRequest) gateway.BrokerResponse {
-	sandboxID := b.sandboxFor(userID, req.Sandbox)
+func (b *Broker) resolve(ctx context.Context, userID string, req gateway.BrokerRequest) gateway.BrokerResponse {
+	sandboxID := b.sandboxFor(ctx, userID, req.Sandbox)
 	host := normalizeHost(req.Host)
 	if !gateway.IsPlaceholder(req.Placeholder) || host == "" {
 		return b.deny(userID, sandboxID, host, nil, "malformed request")
 	}
-	g, own, err := b.grantFor(userID, sandboxID, req.Placeholder)
+	g, own, err := b.grantFor(ctx, userID, sandboxID, req.Placeholder)
 	if err != nil {
 		slog.Error("broker.resolve", "sandbox", sandboxID, "error", err)
 		return refuse("broker error")
@@ -152,7 +156,7 @@ func (b *Broker) resolve(userID string, req gateway.BrokerRequest) gateway.Broke
 	case !hostGranted(g.Hosts, host):
 		return b.deny(userID, sandboxID, host, g, "host not granted")
 	}
-	ciphertext, err := b.cfg.Store.GetSecretValue(g.UserID, g.SecretName)
+	ciphertext, err := b.cfg.Store.GetSecretValue(ctx, g.UserID, g.SecretName)
 	if err != nil {
 		return b.deny(userID, sandboxID, host, g, "secret not found")
 	}
@@ -176,15 +180,15 @@ func (b *Broker) resolve(userID string, req gateway.BrokerRequest) gateway.Broke
 // use. When it has none, the owner's grant of another sandbox comes back with
 // own=false so the refusal can say so; nil when the owner has no such
 // placeholder at all.
-func (b *Broker) grantFor(userID, sandboxID, placeholder string) (g *store.SecretGrant, own bool, err error) {
-	g, err = b.cfg.Store.GetSandboxSecretGrantByPlaceholder(sandboxID, placeholder)
+func (b *Broker) grantFor(ctx context.Context, userID, sandboxID, placeholder string) (g *store.SecretGrant, own bool, err error) {
+	g, err = b.cfg.Store.GetSandboxSecretGrantByPlaceholder(ctx, sandboxID, placeholder)
 	switch {
 	case err == nil && g.UserID == userID:
 		return g, true, nil
 	case err != nil && !errors.Is(err, store.ErrNotFound):
 		return nil, false, err
 	}
-	g, err = b.cfg.Store.FindSecretGrantByPlaceholder(userID, placeholder)
+	g, err = b.cfg.Store.FindSecretGrantByPlaceholder(ctx, userID, placeholder)
 	switch {
 	case err == nil:
 		return g, false, nil
@@ -197,13 +201,13 @@ func (b *Broker) grantFor(userID, sandboxID, placeholder string) (g *store.Secre
 // cert issues a leaf for host from the sandbox's CA, only while a live grant
 // of the sandbox covers host. Refusals aren't audited: netd asks for every
 // TLS connection to :443, granted or not.
-func (b *Broker) cert(userID string, req gateway.BrokerRequest) gateway.BrokerResponse {
-	sandboxID := b.sandboxFor(userID, req.Sandbox)
+func (b *Broker) cert(ctx context.Context, userID string, req gateway.BrokerRequest) gateway.BrokerResponse {
+	sandboxID := b.sandboxFor(ctx, userID, req.Sandbox)
 	host := normalizeHost(req.Host)
 	if !validHostname(host) {
 		return refuse("invalid host")
 	}
-	grants, err := b.cfg.Store.ListSandboxSecretGrants(sandboxID)
+	grants, err := b.cfg.Store.ListSandboxSecretGrants(ctx, sandboxID)
 	if err != nil {
 		slog.Error("broker.cert", "sandbox", sandboxID, "error", err)
 		return refuse("broker error")
@@ -219,7 +223,7 @@ func (b *Broker) cert(userID string, req gateway.BrokerRequest) gateway.BrokerRe
 	if !covered {
 		return refuse("no live grant covers host")
 	}
-	ca, err := b.cfg.Store.GetSandboxCA(sandboxID)
+	ca, err := b.cfg.Store.GetSandboxCA(ctx, sandboxID)
 	if err != nil || ca.UserID != userID {
 		return refuse("sandbox has no CA")
 	}
@@ -237,11 +241,11 @@ func (b *Broker) cert(userID string, req gateway.BrokerRequest) gateway.BrokerRe
 }
 
 // report records a refusal netd made itself.
-func (b *Broker) report(userID string, req gateway.BrokerRequest) {
-	sandboxID := b.sandboxFor(userID, req.Sandbox)
+func (b *Broker) report(ctx context.Context, userID string, req gateway.BrokerRequest) {
+	sandboxID := b.sandboxFor(ctx, userID, req.Sandbox)
 	var g *store.SecretGrant
 	if gateway.IsPlaceholder(req.Placeholder) {
-		if got, _, err := b.grantFor(userID, sandboxID, req.Placeholder); err == nil {
+		if got, _, err := b.grantFor(ctx, userID, sandboxID, req.Placeholder); err == nil {
 			g = got
 		}
 	}

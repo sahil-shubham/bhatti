@@ -19,7 +19,7 @@ func grantFixture(id, user, secret, sandbox, placeholder string, created time.Ti
 
 func putGrant(t *testing.T, s *Store, g SecretGrant) {
 	t.Helper()
-	if err := s.CreateSecretGrant(g); err != nil {
+	if err := s.CreateSecretGrant(t.Context(), g); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -31,7 +31,7 @@ func TestSecretGrantCreateAndLookup(t *testing.T) {
 	g := grantFixture("g1", "alice", "GH_TOKEN", "sb1", "bhatti_sec_123", when)
 	g.ExpiresAt = &expires
 	putGrant(t, s, g)
-	got, err := s.GetSandboxSecretGrantByPlaceholder(g.SandboxID, g.Placeholder)
+	got, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), g.SandboxID, g.Placeholder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,10 +41,10 @@ func TestSecretGrantCreateAndLookup(t *testing.T) {
 	if !got.CreatedAt.Equal(when) || got.CreatedAt.Location() != time.UTC || got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) || got.ExpiresAt.Location() != time.UTC || got.RevokedAt != nil {
 		t.Fatalf("times not UTC or nullable: %+v", got)
 	}
-	if _, err := s.GetSandboxSecretGrantByPlaceholder(g.SandboxID, "absent"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), g.SandboxID, "absent"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent placeholder: %v", err)
 	}
-	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb2", g.Placeholder); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), "sb2", g.Placeholder); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("another sandbox resolved the placeholder: %v", err)
 	}
 }
@@ -53,13 +53,13 @@ func TestSecretGrantOwnership(t *testing.T) {
 	s := testStore(t)
 	g := grantFixture("g1", "alice", "GH_TOKEN", "sb1", "placeholder1", time.Now())
 	putGrant(t, s, g)
-	if _, err := s.GetSecretGrant("bob", g.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSecretGrant(t.Context(), "bob", g.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("other user can read grant: %v", err)
 	}
-	if _, err := s.GetSecretGrant("alice", "absent"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSecretGrant(t.Context(), "alice", "absent"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent grant: %v", err)
 	}
-	got, err := s.GetSecretGrant("alice", g.ID)
+	got, err := s.GetSecretGrant(t.Context(), "alice", g.ID)
 	if err != nil || got.ID != g.ID {
 		t.Fatalf("owner cannot read grant: %+v, %v", got, err)
 	}
@@ -75,24 +75,24 @@ func TestSecretGrantPlaceholderIsPerSandbox(t *testing.T) {
 	putGrant(t, s, source)
 	clone := grantFixture("g2", "alice", "GH_TOKEN", "sb2", source.Placeholder, time.Now())
 	putGrant(t, s, clone)
-	if err := s.CreateSecretGrant(grantFixture("g3", "alice", "GH_TOKEN", "sb1", source.Placeholder, time.Now())); err == nil {
+	if err := s.CreateSecretGrant(t.Context(), grantFixture("g3", "alice", "GH_TOKEN", "sb1", source.Placeholder, time.Now())); err == nil {
 		t.Fatal("a sandbox was granted the same placeholder twice")
 	}
 	for sandbox, id := range map[string]string{"sb1": "g1", "sb2": "g2"} {
-		got, err := s.GetSandboxSecretGrantByPlaceholder(sandbox, source.Placeholder)
+		got, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), sandbox, source.Placeholder)
 		if err != nil || got.ID != id {
 			t.Fatalf("%s resolves to %+v, %v; want its own grant %s", sandbox, got, err, id)
 		}
 	}
-	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb3", source.Placeholder); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder(t.Context(), "sb3", source.Placeholder); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an unrelated sandbox resolved the placeholder: %v", err)
 	}
 
 	// Naming the owner's grant for a refusal is scoped to the owner.
-	if got, err := s.FindSecretGrantByPlaceholder("alice", source.Placeholder); err != nil || got.ID != "g1" {
+	if got, err := s.FindSecretGrantByPlaceholder(t.Context(), "alice", source.Placeholder); err != nil || got.ID != "g1" {
 		t.Fatalf("owner's grant for the placeholder: %+v, %v", got, err)
 	}
-	if _, err := s.FindSecretGrantByPlaceholder("bob", source.Placeholder); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FindSecretGrantByPlaceholder(t.Context(), "bob", source.Placeholder); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("another owner found the placeholder: %v", err)
 	}
 }
@@ -122,19 +122,19 @@ func TestSecretGrantRevocation(t *testing.T) {
 	s := testStore(t)
 	putGrant(t, s, grantFixture("g1", "alice", "GH_TOKEN", "sb1", "placeholder1", time.Now()))
 	first := time.Date(2026, 10, 4, 12, 0, 0, 0, time.FixedZone("east", 3*3600))
-	if err := s.RevokeSecretGrant("bob", "g1", first); !errors.Is(err, ErrNotFound) {
+	if err := s.RevokeSecretGrant(t.Context(), "bob", "g1", first); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("wrong user revoke: %v", err)
 	}
-	if err := s.RevokeSecretGrant("alice", "absent", first); !errors.Is(err, ErrNotFound) {
+	if err := s.RevokeSecretGrant(t.Context(), "alice", "absent", first); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing grant revoke: %v", err)
 	}
-	if err := s.RevokeSecretGrant("alice", "g1", first); err != nil {
+	if err := s.RevokeSecretGrant(t.Context(), "alice", "g1", first); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeSecretGrant("alice", "g1", first.Add(time.Hour)); err != nil {
+	if err := s.RevokeSecretGrant(t.Context(), "alice", "g1", first.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetSecretGrant("alice", "g1")
+	got, err := s.GetSecretGrant(t.Context(), "alice", "g1")
 	if err != nil || got.RevokedAt == nil || !got.RevokedAt.Equal(first) || got.RevokedAt.Location() != time.UTC {
 		t.Fatalf("first revocation not retained in UTC: %+v, %v", got, err)
 	}
@@ -146,11 +146,11 @@ func TestSecretGrantLists(t *testing.T) {
 	putGrant(t, s, grantFixture("old", "alice", "GH", "sb1", "p1", start))
 	putGrant(t, s, grantFixture("other", "bob", "GH", "sb1", "p2", start.Add(time.Minute)))
 	putGrant(t, s, grantFixture("new", "alice", "API", "sb2", "p3", start.Add(2*time.Minute)))
-	grants, err := s.ListSecretGrants("alice")
+	grants, err := s.ListSecretGrants(t.Context(), "alice")
 	if err != nil || len(grants) != 2 || grants[0].ID != "new" || grants[1].ID != "old" {
 		t.Fatalf("user's newest-first grants: %+v, %v", grants, err)
 	}
-	grants, err = s.ListSandboxSecretGrants("sb1")
+	grants, err = s.ListSandboxSecretGrants(t.Context(), "sb1")
 	if err != nil || len(grants) != 2 || grants[0].ID != "other" || grants[1].ID != "old" {
 		t.Fatalf("sandbox grants: %+v, %v", grants, err)
 	}
@@ -167,27 +167,27 @@ func TestSecretGrantDeletionScope(t *testing.T) {
 	} {
 		putGrant(t, s, g)
 	}
-	if err := s.DeleteSandboxSecretGrants("sb1"); err != nil {
+	if err := s.DeleteSandboxSecretGrants(t.Context(), "sb1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSecretGrant("alice", "a1"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSecretGrant(t.Context(), "alice", "a1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("sandbox grant survived: %v", err)
 	}
-	if err := s.DeleteSecretGrantsForSecret("alice", "GH"); err != nil {
+	if err := s.DeleteSecretGrantsForSecret(t.Context(), "alice", "GH"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSecretGrant("alice", "a2"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSecretGrant(t.Context(), "alice", "a2"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("secret grant survived: %v", err)
 	}
 	for _, tc := range []struct{ user, id string }{{"bob", "b1"}, {"alice", "a3"}} {
-		if _, err := s.GetSecretGrant(tc.user, tc.id); err != nil {
+		if _, err := s.GetSecretGrant(t.Context(), tc.user, tc.id); err != nil {
 			t.Fatalf("unrelated grant %s deleted: %v", tc.id, err)
 		}
 	}
-	if err := s.DeleteSandboxSecretGrants("sb2"); err != nil {
+	if err := s.DeleteSandboxSecretGrants(t.Context(), "sb2"); err != nil {
 		t.Fatal(err)
 	}
-	grants, err := s.ListSandboxSecretGrants("sb2")
+	grants, err := s.ListSandboxSecretGrants(t.Context(), "sb2")
 	if err != nil || len(grants) != 0 {
 		t.Fatalf("sandbox grants survived deletion: %+v, %v", grants, err)
 	}
@@ -195,30 +195,30 @@ func TestSecretGrantDeletionScope(t *testing.T) {
 
 func TestSandboxCAPutGetReplaceDelete(t *testing.T) {
 	s := testStore(t)
-	if _, err := s.GetSandboxCA("sb1"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSandboxCA(t.Context(), "sb1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing CA: %v", err)
 	}
 	when := time.Date(2026, 10, 4, 12, 0, 0, 0, time.FixedZone("west", -7*3600))
 	ca := SandboxCA{SandboxID: "sb1", UserID: "alice", CertPEM: "cert1", KeyEnc: []byte{0, 1, 2}, CreatedAt: when}
-	if err := s.PutSandboxCA(ca); err != nil {
+	if err := s.PutSandboxCA(t.Context(), ca); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetSandboxCA("sb1")
+	got, err := s.GetSandboxCA(t.Context(), "sb1")
 	if err != nil || got.SandboxID != ca.SandboxID || got.UserID != ca.UserID || got.CertPEM != ca.CertPEM || !reflect.DeepEqual(got.KeyEnc, ca.KeyEnc) || !got.CreatedAt.Equal(when) || got.CreatedAt.Location() != time.UTC {
 		t.Fatalf("CA mismatch: %+v, %v", got, err)
 	}
 	ca.UserID, ca.CertPEM, ca.KeyEnc, ca.CreatedAt = "bob", "cert2", []byte{3, 4}, when.Add(time.Hour)
-	if err := s.PutSandboxCA(ca); err != nil {
+	if err := s.PutSandboxCA(t.Context(), ca); err != nil {
 		t.Fatal(err)
 	}
-	got, err = s.GetSandboxCA("sb1")
+	got, err = s.GetSandboxCA(t.Context(), "sb1")
 	if err != nil || got.UserID != ca.UserID || got.CertPEM != ca.CertPEM || !reflect.DeepEqual(got.KeyEnc, ca.KeyEnc) || !got.CreatedAt.Equal(ca.CreatedAt) {
 		t.Fatalf("CA replacement mismatch: %+v, %v", got, err)
 	}
-	if err := s.DeleteSandboxCA("sb1"); err != nil {
+	if err := s.DeleteSandboxCA(t.Context(), "sb1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSandboxCA("sb1"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSandboxCA(t.Context(), "sb1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("CA survived deletion: %v", err)
 	}
 }
@@ -230,15 +230,15 @@ func TestSandboxNetPolicyRoundTrip(t *testing.T) {
 		{ID: "sb-policy", Name: "with-policy", CreatedBy: "alice", CreatedAt: time.Now(), NetPolicy: policy},
 		{ID: "sb-legacy", Name: "without-policy", CreatedBy: "alice", CreatedAt: time.Now()},
 	} {
-		if err := s.CreateSandbox(sb); err != nil {
+		if err := s.CreateSandbox(t.Context(), sb); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.GetSandboxByID("sb-policy")
+	got, err := s.GetSandboxByID(t.Context(), "sb-policy")
 	if err != nil || !reflect.DeepEqual(got.NetPolicy, policy) {
 		t.Fatalf("policy did not round-trip: %+v, %v", got, err)
 	}
-	got, err = s.GetSandboxByID("sb-legacy")
+	got, err = s.GetSandboxByID(t.Context(), "sb-legacy")
 	if err != nil || got.NetPolicy != nil {
 		t.Fatalf("legacy policy should be nil: %+v, %v", got, err)
 	}
@@ -246,26 +246,26 @@ func TestSandboxNetPolicyRoundTrip(t *testing.T) {
 
 func TestGrantSchemaReopenIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	s, err := New(path)
+	s, err := New(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	putGrant(t, s, grantFixture("g1", "alice", "GH", "sb1", "p1", time.Now()))
-	if err := s.PutSandboxCA(SandboxCA{SandboxID: "sb1", UserID: "alice", CertPEM: "cert", KeyEnc: []byte("encrypted")}); err != nil {
+	if err := s.PutSandboxCA(t.Context(), SandboxCA{SandboxID: "sb1", UserID: "alice", CertPEM: "cert", KeyEnc: []byte("encrypted")}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = New(path)
+	s, err = New(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if _, err := s.GetSecretGrant("alice", "g1"); err != nil {
+	if _, err := s.GetSecretGrant(t.Context(), "alice", "g1"); err != nil {
 		t.Fatalf("grant lost after reopen: %v", err)
 	}
-	if ca, err := s.GetSandboxCA("sb1"); err != nil || ca.CertPEM != "cert" {
+	if ca, err := s.GetSandboxCA(t.Context(), "sb1"); err != nil || ca.CertPEM != "cert" {
 		t.Fatalf("CA lost after reopen: %+v, %v", ca, err)
 	}
 }

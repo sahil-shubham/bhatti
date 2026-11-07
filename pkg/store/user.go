@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -20,9 +21,9 @@ type User struct {
 	CreatedAt             time.Time `json:"created_at"`
 }
 
-func (s *Store) CreateUser(u User) error {
-	_, err := s.db.Exec(
-		`INSERT INTO users (id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, created_at)
+func (s *Store) CreateUser(ctx context.Context, u User) error {
+	_, err := s.db.ExecContext(
+		ctx, `INSERT INTO users (id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.ID, u.Name, u.APIKeyHash, u.MaxSandboxes, u.MaxCPUsPerSandbox, u.MaxMemoryMBPerSandbox, u.SubnetIndex, u.CreatedAt,
 	)
@@ -43,20 +44,20 @@ func scanUser(s scanner) (*User, error) {
 }
 
 // GetUserByKeyHash looks up a user by the SHA-256 hash of their API key.
-func (s *Store) GetUserByKeyHash(hash string) (*User, error) {
-	row := s.db.QueryRow(`SELECT `+userSelectCols+` FROM users WHERE api_key_hash = ?`, hash)
+func (s *Store) GetUserByKeyHash(ctx context.Context, hash string) (*User, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+userSelectCols+` FROM users WHERE api_key_hash = ?`, hash)
 	return scanUser(row)
 }
 
 // GetUser looks up a user by ID.
-func (s *Store) GetUser(id string) (*User, error) {
-	row := s.db.QueryRow(`SELECT `+userSelectCols+` FROM users WHERE id = ?`, id)
+func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+userSelectCols+` FROM users WHERE id = ?`, id)
 	return scanUser(row)
 }
 
 // ListUsers returns all users.
-func (s *Store) ListUsers() ([]User, error) {
-	rows, err := s.db.Query(`SELECT ` + userSelectCols + ` FROM users ORDER BY created_at`)
+func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userSelectCols+` FROM users ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -73,8 +74,8 @@ func (s *Store) ListUsers() ([]User, error) {
 }
 
 // DeleteUser removes a user. Fails if the user has active sandboxes or secrets.
-func (s *Store) DeleteUser(id string) error {
-	count, err := s.CountUserSandboxes(id)
+func (s *Store) DeleteUser(ctx context.Context, id string) error {
+	count, err := s.CountUserSandboxes(ctx, id)
 	if err != nil {
 		return fmt.Errorf("store: count user sandboxes: %w", err)
 	}
@@ -84,14 +85,14 @@ func (s *Store) DeleteUser(id string) error {
 	if count > 0 {
 		return wrap(ErrInUse, "user has %d active sandbox(es) — destroy them first", count)
 	}
-	secrets, err := s.ListUserSecrets(id)
+	secrets, err := s.ListUserSecrets(ctx, id)
 	if err != nil {
 		return fmt.Errorf("store: list user secrets: %w", err)
 	}
 	if len(secrets) > 0 {
 		return wrap(ErrInUse, "user has %d secret(s) — delete them first", len(secrets))
 	}
-	res, err := s.db.Exec(`DELETE FROM users WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -103,9 +104,9 @@ func (s *Store) DeleteUser(id string) error {
 }
 
 // NextSubnetIndex returns MAX(subnet_index)+1 for allocating new user networks.
-func (s *Store) NextSubnetIndex() (int, error) {
+func (s *Store) NextSubnetIndex(ctx context.Context) (int, error) {
 	var maxIdx sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MAX(subnet_index) FROM users`).Scan(&maxIdx); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(subnet_index) FROM users`).Scan(&maxIdx); err != nil {
 		return 0, fmt.Errorf("store: next subnet index: %w", err)
 	}
 	if !maxIdx.Valid {
@@ -118,8 +119,8 @@ func (s *Store) NextSubnetIndex() (int, error) {
 }
 
 // RotateUserKey updates a user's API key hash. Returns error if user not found.
-func (s *Store) RotateUserKey(id, newKeyHash string) error {
-	res, err := s.db.Exec(`UPDATE users SET api_key_hash = ? WHERE id = ?`, newKeyHash, id)
+func (s *Store) RotateUserKey(ctx context.Context, id, newKeyHash string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET api_key_hash = ? WHERE id = ?`, newKeyHash, id)
 	if err != nil {
 		return classify(err)
 	}
@@ -132,10 +133,10 @@ func (s *Store) RotateUserKey(id, newKeyHash string) error {
 
 // --- Templates ---
 
-func (s *Store) GetUserByName(name string) (*User, error) {
+func (s *Store) GetUserByName(ctx context.Context, name string) (*User, error) {
 	var u User
-	err := s.db.QueryRow(
-		`SELECT id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox,
+	err := s.db.QueryRowContext(
+		ctx, `SELECT id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox,
 		 max_memory_mb_per_sandbox, subnet_index, created_at
 		 FROM users WHERE name = ?`, name).Scan(
 		&u.ID, &u.Name, &u.APIKeyHash, &u.MaxSandboxes, &u.MaxCPUsPerSandbox,

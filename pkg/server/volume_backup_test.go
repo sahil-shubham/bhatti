@@ -131,7 +131,7 @@ func setupBackupTest(t *testing.T) (*Server, *backupTestEngine, *backupTestBacke
 	t.Helper()
 	dir := t.TempDir()
 	trace := filepath.Join(dir, "trace")
-	st, err := store.New(filepath.Join(dir, "state.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func setupBackupTest(t *testing.T) (*Server, *backupTestEngine, *backupTestBacke
 		ID: "v1", UserID: "usr", Name: "data", SizeMB: 1,
 		FilePath: file, Status: "ready", CreatedAt: time.Now(),
 	}
-	if err := st.CreatePersistentVolume(*vol); err != nil {
+	if err := st.CreatePersistentVolume(t.Context(), *vol); err != nil {
 		t.Fatal(err)
 	}
 	backend := &backupTestBackend{trace: trace}
@@ -176,13 +176,13 @@ func addBackupTestAttachment(t *testing.T, s *Server, eng *backupTestEngine, sbI
 		t.Fatal(err)
 	}
 	eng.thermal[info.EngineID] = "hot"
-	if err := s.store.CreateSandbox(store.Sandbox{
+	if err := s.store.CreateSandbox(t.Context(), store.Sandbox{
 		ID: sbID, Name: sbID, EngineID: info.EngineID,
 		Status: "running", CreatedBy: "usr", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.store.AttachPersistentVolume("usr", "data", sbID, mount, readOnly); err != nil {
+	if err := s.store.AttachPersistentVolume(t.Context(), "usr", "data", sbID, mount, readOnly); err != nil {
 		t.Fatal(err)
 	}
 	return info.EngineID
@@ -212,7 +212,7 @@ func TestVolumeBackupWakesFreezesClonesThawsThenUploads(t *testing.T) {
 	if result.ConsistencyMode != "frozen" || backend.uploads != 1 || eng.badThawCtx {
 		t.Fatalf("backup not thawed safely: record=%+v uploads=%d badThawCtx=%v", result, backend.uploads, eng.badThawCtx)
 	}
-	stored, err := s.store.GetVolumeBackup("usr", result.ID)
+	stored, err := s.store.GetVolumeBackup(t.Context(), "usr", result.ID)
 	if err != nil || stored.ConsistencyMode != "frozen" {
 		t.Fatalf("record mode: %+v, err=%v", stored, err)
 	}
@@ -221,7 +221,7 @@ func TestVolumeBackupWakesFreezesClonesThawsThenUploads(t *testing.T) {
 	}
 	rec.Close()
 	recClosed = true
-	events, err := s.store.QueryEvents(store.EventFilter{Limit: 10})
+	events, err := s.store.QueryEvents(t.Context(), store.EventFilter{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestVolumeBackupStoppedAttachmentWithoutLeaseFailsClosed(t *testing.T) {
 func TestVolumeBackupEngineRunningOverridesStaleStoppedStoreStatus(t *testing.T) {
 	s, eng, _, user, vol, trace := setupBackupTest(t)
 	id := addBackupTestAttachment(t, s, eng, "sb1", "/workspace", false)
-	if err := s.store.UpdateSandboxStatus("sb1", "stopped"); err != nil {
+	if err := s.store.UpdateSandboxStatus(t.Context(), "sb1", "stopped"); err != nil {
 		t.Fatal(err)
 	}
 	result, err := s.performVolumeBackup(context.Background(), user, vol)
@@ -338,7 +338,7 @@ func TestVolumeBackupCloningFailureStillThaws(t *testing.T) {
 	if got := backupTrace(t, trace); got != "freeze "+id+" /workspace\nclone\nthaw "+id+" /workspace\n" {
 		t.Fatalf("thaw must follow failed copy: %s", got)
 	}
-	list, err := s.store.ListVolumeBackups("usr", "data")
+	list, err := s.store.ListVolumeBackups(t.Context(), "usr", "data")
 	if err != nil || len(list) != 0 || backend.uploads != 0 {
 		t.Fatalf("failed clone was recorded/uploaded: list=%+v uploads=%d err=%v", list, backend.uploads, err)
 	}
@@ -389,7 +389,7 @@ func TestVolumeBackupBlocksNewReadOnlyAttachmentUntilCloneAndThaw(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.store.CreateSandbox(store.Sandbox{
+	if err := s.store.CreateSandbox(t.Context(), store.Sandbox{
 		ID: "sb2", Name: "sb2", EngineID: second.EngineID,
 		Status: "running", CreatedBy: "usr", CreatedAt: time.Now(),
 	}); err != nil {
@@ -427,7 +427,7 @@ func TestVolumeBackupBlocksNewReadOnlyAttachmentUntilCloneAndThaw(t *testing.T) 
 	attached := make(chan error, 1)
 	go func() {
 		close(started)
-		attached <- s.store.AttachPersistentVolume("usr", "data", "sb2", "/read-b", true)
+		attached <- s.store.AttachPersistentVolume(context.Background(), "usr", "data", "sb2", "/read-b", true)
 	}()
 	<-started
 	select {
@@ -454,7 +454,7 @@ func TestVolumeBackupBlocksNewReadOnlyAttachmentUntilCloneAndThaw(t *testing.T) 
 	case <-time.After(3 * time.Second):
 		t.Fatal("new guest stayed blocked after clone")
 	}
-	current, err := s.store.GetPersistentVolume("usr", "data")
+	current, err := s.store.GetPersistentVolume(t.Context(), "usr", "data")
 	if err != nil || len(current.Attachments) != 2 || backend.uploads != 1 {
 		t.Fatalf("attachment/backup result incorrect: volume=%+v uploads=%d err=%v", current, backend.uploads, err)
 	}
@@ -474,7 +474,7 @@ func TestVolumeBackupThawFailureDoesNotPublish(t *testing.T) {
 	if backend.uploads != 0 || strings.Contains(backupTrace(t, trace), "upload") {
 		t.Fatal("thaw failure uploaded an unconfirmed backup")
 	}
-	list, err := s.store.ListVolumeBackups("usr", "data")
+	list, err := s.store.ListVolumeBackups(t.Context(), "usr", "data")
 	if err != nil || len(list) != 0 {
 		t.Fatalf("thaw failure recorded a backup: list=%+v err=%v", list, err)
 	}
@@ -496,7 +496,7 @@ func TestVolumeBackupUnconfirmedThawPersistsStoppedSandboxAndEvent(t *testing.T)
 	if result != nil || err == nil || !strings.Contains(err.Error(), "guest thaw ACK lost") {
 		t.Fatalf("unconfirmed thaw was hidden: result=%+v err=%v", result, err)
 	}
-	sb, err := s.store.GetSandboxByID("sb1")
+	sb, err := s.store.GetSandboxByID(t.Context(), "sb1")
 	if err != nil || sb.Status != "stopped" || sb.StoppedAt == nil {
 		t.Fatalf("powered-off VM persisted as running: sandbox=%+v err=%v", sb, err)
 	}
@@ -509,7 +509,7 @@ func TestVolumeBackupUnconfirmedThawPersistsStoppedSandboxAndEvent(t *testing.T)
 	}
 	rec.Close()
 	closed = true
-	events, err := s.store.QueryEvents(store.EventFilter{Limit: 10})
+	events, err := s.store.QueryEvents(t.Context(), store.EventFilter{Limit: 10})
 	if err != nil || len(events) != 1 || events[0].Type != "sandbox.unclean_stop" || events[0].Meta["reason"] != "guest thaw ACK lost" {
 		t.Fatalf("missing unclean-stop event: events=%+v err=%v", events, err)
 	}
@@ -523,7 +523,7 @@ func TestVolumeBackupAmbiguousFreezeAndFailedCleanupPersistsStoppedState(t *test
 	if result != nil || err == nil || !strings.Contains(err.Error(), "thaw unconfirmed") || backend.uploads != 0 {
 		t.Fatalf("ambiguous freeze cleanup was not surfaced: result=%+v err=%v uploads=%d", result, err, backend.uploads)
 	}
-	sb, err := s.store.GetSandboxByID("sb1")
+	sb, err := s.store.GetSandboxByID(t.Context(), "sb1")
 	if err != nil || sb.Status != "stopped" || sb.StoppedAt == nil {
 		t.Fatalf("ambiguous freeze did not persist powered-off VM: sandbox=%+v err=%v", sb, err)
 	}
@@ -580,7 +580,7 @@ func TestVolumeBackupMultipleReadOnlyGuestsAndSyncOnlyMode(t *testing.T) {
 	if result.ConsistencyMode != "sync_only" || backend.uploads != 1 {
 		t.Fatalf("least strong mode missing: %+v uploads=%d", result, backend.uploads)
 	}
-	list, err := s.store.ListVolumeBackups("usr", "data")
+	list, err := s.store.ListVolumeBackups(t.Context(), "usr", "data")
 	if err != nil || len(list) != 1 || list[0].ConsistencyMode != "sync_only" {
 		t.Fatalf("persisted backup misstated quiesce mode: list=%+v err=%v", list, err)
 	}

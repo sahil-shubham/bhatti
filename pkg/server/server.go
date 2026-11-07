@@ -395,7 +395,7 @@ func (s *Server) SetPublicProxy(h *PublicProxyHandler) { s.publicProxy = h }
 // Used by autocert.Manager during TLS handshake for uncached certs.
 // Checks in-memory route cache first to avoid SQLite queries from
 // unauthenticated TLS handshakes (DoS protection).
-func (s *Server) HostPolicy(_ context.Context, host string) error {
+func (s *Server) HostPolicy(ctx context.Context, host string) error {
 	if host == s.apiHost {
 		return nil
 	}
@@ -408,7 +408,7 @@ func (s *Server) HostPolicy(_ context.Context, host string) error {
 			}
 		}
 		// Slow path: SQLite lookup
-		if _, err := s.store.GetPublishRuleByAlias(alias); err != nil {
+		if _, err := s.store.GetPublishRuleByAlias(ctx, alias); err != nil {
 			return fmt.Errorf("no publish rule for %q", alias)
 		}
 		return nil
@@ -434,7 +434,7 @@ func (s *Server) startTaskCleanup() {
 			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
-				if n, err := s.store.CleanupOldTasks(24 * time.Hour); err != nil {
+				if n, err := s.store.CleanupOldTasks(s.ctx, 24*time.Hour); err != nil {
 					slog.Warn("task cleanup failed", "error", err)
 				} else if n > 0 {
 					slog.Info("cleaned up old tasks", "count", n)
@@ -508,7 +508,7 @@ func (s *Server) Shutdown(sig string) {
 // purpose (or before this restart) and stays that way.
 func (s *Server) RecoverSandboxes(ctx context.Context) {
 	initOf, _ := s.engine.(interface{ HasInit(id string) (bool, bool) })
-	sandboxes, err := s.store.ListAllSandboxes()
+	sandboxes, err := s.store.ListAllSandboxes(ctx)
 	if err != nil {
 		slog.Warn("recover sandboxes: list", "error", err)
 		return
@@ -526,7 +526,7 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 		// sandbox 502s on its first request after an idle stop.
 		if initOf != nil {
 			if has, known := initOf.HasInit(sb.EngineID); known && has != sb.HasInit {
-				s.store.UpdateSandboxHasInit(sb.ID, has)
+				s.store.UpdateSandboxHasInit(detached(ctx), sb.ID, has)
 			}
 		}
 		switch {
@@ -541,11 +541,11 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 			s.lastActivity.Store(sb.EngineID, time.Now())
 			if sb.Status != "running" {
 				slog.Info("sandbox running after restart", "sandbox", sb.Name, "id", sb.ID, "from_status", sb.Status)
-				s.store.UpdateSandboxStatus(sb.ID, "running")
+				s.store.UpdateSandboxStatus(detached(ctx), sb.ID, "running")
 			}
 		case sb.Status == "running":
 			slog.Info("sandbox stopped while the daemon was down", "sandbox", sb.Name, "id", sb.ID)
-			s.store.StopSandboxUnexpected(sb.ID) // marks keep_hot for the startup wake
+			s.store.StopSandboxUnexpected(detached(ctx), sb.ID) // marks keep_hot for the startup wake
 			s.RecordEvent(store.Event{
 				Type: "sandbox.stopped", SandboxID: sb.ID,
 				Meta: map[string]any{"name": sb.Name, "reason": "lost"},
@@ -584,13 +584,13 @@ func (s *Server) StartBackupScheduler(schedules []pkg.BackupSchedule) {
 func (s *Server) runScheduledBackup(ctx context.Context, sched pkg.BackupSchedule) {
 	// Find the volume owner by scanning all users' volumes.
 	// Scheduled backups are admin-configured, so we search across users.
-	users, err := s.store.ListUsers()
+	users, err := s.store.ListUsers(ctx)
 	if err != nil {
 		slog.Error("scheduled backup: list users", "error", err)
 		return
 	}
 	for _, user := range users {
-		vol, err := s.store.GetPersistentVolume(user.ID, sched.Volume)
+		vol, err := s.store.GetPersistentVolume(ctx, user.ID, sched.Volume)
 		if err != nil {
 			continue
 		}
@@ -611,7 +611,7 @@ func (s *Server) runScheduledBackup(ctx context.Context, sched pkg.BackupSchedul
 
 		// Apply retention
 		if sched.Retention > 0 {
-			old, err := s.store.OldestVolumeBackups(user.ID, sched.Volume, sched.Retention)
+			old, err := s.store.OldestVolumeBackups(ctx, user.ID, sched.Volume, sched.Retention)
 			if err != nil {
 				slog.Warn("retention query failed", "error", err)
 				continue
@@ -620,7 +620,7 @@ func (s *Server) runScheduledBackup(ctx context.Context, sched pkg.BackupSchedul
 				if err := s.backupBackend.Delete(ctx, b.S3Key); err != nil {
 					slog.Warn("retention delete from s3 failed", "key", b.S3Key, "error", err)
 				}
-				s.store.DeleteVolumeBackup(user.ID, b.ID)
+				s.store.DeleteVolumeBackup(ctx, user.ID, b.ID)
 				slog.Info("retention: deleted old backup", "backup_id", b.ID, "volume", sched.Volume)
 			}
 		}
@@ -686,7 +686,7 @@ func (s *Server) StartThermalManager(cfg ThermalConfig) error {
 }
 
 func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
-	sandboxes, err := s.store.ListAllSandboxes()
+	sandboxes, err := s.store.ListAllSandboxes(s.ctx)
 	if err != nil {
 		return
 	}
@@ -871,7 +871,7 @@ func (s *Server) stopColdSandbox(sb *store.Sandbox, idle time.Duration) {
 	stopCancel()
 	reason, poweredOffUnclean := uncleanStopReason(stopErr)
 	if stopErr == nil || poweredOffUnclean {
-		s.store.StopSandbox(sb.ID)
+		s.store.StopSandbox(detached(s.ctx), sb.ID)
 	}
 
 	if stopErr != nil && !poweredOffUnclean {
@@ -881,7 +881,7 @@ func (s *Server) stopColdSandbox(sb *store.Sandbox, idle time.Duration) {
 			slog.Error("thermal cold stop failed 3 times — marking unknown",
 				"sandbox", sb.Name, "id", sb.ID, "error", stopErr,
 				"attempts", count)
-			s.store.UpdateSandboxStatus(sb.ID, "unknown")
+			s.store.UpdateSandboxStatus(detached(s.ctx), sb.ID, "unknown")
 			s.resetSnapshotFailures(sb.EngineID)
 		} else {
 			slog.Warn("thermal cold stop failed — will retry",
@@ -947,11 +947,11 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 	// After a successful wake, update store status if it was stale.
 	// This handles: cold→hot (store said "stopped"),
 	// and unknown→hot (store said "unknown" but VM was still alive).
-	if sb, err := s.store.GetSandboxByEngineID(engineID); err == nil {
+	if sb, err := s.store.GetSandboxByEngineID(ctx, engineID); err == nil {
 		if sb.Status != "running" {
 			slog.Info("sandbox recovered",
 				"sandbox", sb.Name, "from_status", sb.Status)
-			s.store.UpdateSandboxStatus(sb.ID, "running")
+			s.store.UpdateSandboxStatus(detached(ctx), sb.ID, "running")
 		}
 		s.RecordEvent(store.Event{
 			Type: "thermal.wake", SandboxID: sb.ID,
@@ -1034,7 +1034,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Hash the incoming token and look up user by hash.
 	hash := sha256Hex(token)
-	user, err := s.store.GetUserByKeyHash(hash)
+	user, err := s.store.GetUserByKeyHash(r.Context(), hash)
 	if err != nil {
 		s.authFailures.Add(1)
 		slog.Warn("auth.failed", "ip", r.RemoteAddr)

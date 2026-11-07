@@ -54,11 +54,11 @@ func setupPorting(t *testing.T) (*httptest.Server, *portingEngine, *store.Store,
 func setupPortingServer(t *testing.T) (*Server, *httptest.Server, *portingEngine, *store.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_test", Name: "test-user", APIKeyHash: sha256Hex(testAPIKey),
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),
@@ -95,7 +95,7 @@ func errorBody(t *testing.T, resp *http.Response) string {
 // break the download, or the client keeps a truncated file as a whole one.
 func TestSnapshotExportFailureReachesTheClient(t *testing.T) {
 	ts, eng, st, _ := setupPorting(t)
-	if err := st.CreateSnapshot(store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "dev-ready",
+	if err := st.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "dev-ready",
 		MemPath: "/x/dev-ready/mem.snap", ManifestJSON: "{}", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestSnapshotImportRegistersAResumableSnapshot(t *testing.T) {
 
 func seedSnapshot(t *testing.T, st *store.Store) {
 	t.Helper()
-	if err := st.CreateSnapshot(store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "job-base",
+	if err := st.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "job-base",
 		MemPath: "/x/job-base/mem.snap", ManifestJSON: `{"type":"memory"}`, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestSnapshotResumeKeepHot(t *testing.T) {
 				t.Fatalf("resume: %d %s", resp.StatusCode, errorBody(t, resp))
 			}
 			resp.Body.Close()
-			sb, err := st.GetSandbox("usr_test", "job")
+			sb, err := st.GetSandbox(t.Context(), "usr_test", "job")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -278,7 +278,7 @@ func TestSnapshotImportRefusals(t *testing.T) {
 		}
 	}
 
-	if err := st.CreateSnapshot(store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "taken",
+	if err := st.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "s1", UserID: "usr_test", Name: "taken",
 		MemPath: filepath.Join(userDir, "taken", "mem.snap"), ManifestJSON: "{}", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -313,13 +313,13 @@ func TestSnapshotImportRefusals(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("refused imports left %v behind", entries)
 	}
-	if snaps, _ := st.ListSnapshots("usr_test"); len(snaps) != 1 {
+	if snaps, _ := st.ListSnapshots(t.Context(), "usr_test"); len(snaps) != 1 {
 		t.Fatalf("snapshots after refusals: %+v", snaps)
 	}
 
 	// At the limit (5 by default), before reading the upload.
 	for _, n := range []string{"a", "b", "c", "d"} {
-		st.CreateSnapshot(store.SnapshotRecord{ID: n, UserID: "usr_test", Name: n, ManifestJSON: "{}", CreatedAt: time.Now()})
+		st.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: n, UserID: "usr_test", Name: n, ManifestJSON: "{}", CreatedAt: time.Now()})
 	}
 	called = false
 	eng.imp = func(io.Reader, string) (engine.SnapshotImport, error) {

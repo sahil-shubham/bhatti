@@ -161,11 +161,11 @@ func (c *cloneEngine) ImportSnapshot(_ context.Context, r io.Reader, dest string
 func setupClone(t *testing.T, maxCPUs, maxMemoryMB int) (*Server, *httptest.Server, *cloneEngine) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateUser(store.User{
+	if err := st.CreateUser(t.Context(), store.User{
 		ID: "usr_test", Name: "test-user", APIKeyHash: sha256Hex(testAPIKey),
 		MaxSandboxes: 50, MaxCPUsPerSandbox: maxCPUs, MaxMemoryMBPerSandbox: maxMemoryMB,
 		SubnetIndex: 1, CreatedAt: time.Now(),
@@ -177,7 +177,7 @@ func setupClone(t *testing.T, maxCPUs, maxMemoryMB int) (*Server, *httptest.Serv
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() { srv.Close(); ts.Close(); st.Close() })
 	expect(t, doReq(t, ts, "POST", "/secrets", map[string]string{"name": "GH_TOKEN", "value": "ghp_real"}), 201, nil)
-	if err := st.CreateImage(store.ImageRecord{ID: "img-browser", UserID: "usr_test", Name: "browser",
+	if err := st.CreateImage(t.Context(), store.ImageRecord{ID: "img-browser", UserID: "usr_test", Name: "browser",
 		FilePath: "/images/browser.ext4", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -315,16 +315,16 @@ func TestFilesystemSnapshotResumeRecordsTheSpecToo(t *testing.T) {
 	if len(resumed.SecretGrants) != 0 {
 		t.Fatalf("a filesystem resume got grants: %+v", resumed.SecretGrants)
 	}
-	if _, err := srv.store.GetSandboxCA(resumed.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), resumed.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a filesystem resume got a CA: %v", err)
 	}
-	if snap, err := srv.store.GetSnapshot("usr_test", "disk"); err != nil || snap.Substitution.CA != nil || len(snap.Substitution.Grants) != 0 {
+	if snap, err := srv.store.GetSnapshot(t.Context(), "usr_test", "disk"); err != nil || snap.Substitution.CA != nil || len(snap.Substitution.Grants) != 0 {
 		t.Fatalf("a filesystem snapshot kept substitution state: %+v, %v", snap, err)
 	}
 
 	// Even a record that holds a CA and grants gives a cold boot nothing: its
 	// fresh guest has neither that CA in its trust store nor the placeholders.
-	if err := srv.store.CreateSnapshot(store.SnapshotRecord{ID: "disk2", UserID: "usr_test", Name: "disk2",
+	if err := srv.store.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "disk2", UserID: "usr_test", Name: "disk2",
 		MemPath: "/x/disk2/mem.snap", ManifestJSON: `{"type":"filesystem","vcpus":1,"mem_mib":512}`, CreatedAt: time.Now(),
 		Substitution: store.SnapshotSubstitution{
 			CA:     &store.SandboxCA{CertPEM: "cert", KeyEnc: []byte("key")},
@@ -334,10 +334,10 @@ func TestFilesystemSnapshotResumeRecordsTheSpecToo(t *testing.T) {
 	}
 	var cold clonedJSON
 	expect(t, doReq(t, ts, "POST", "/snapshots/disk2/resume", map[string]any{"name": "cold"}), 201, &cold)
-	if held, err := srv.store.ListSandboxSecretGrants(cold.ID); err != nil || len(held) != 0 || len(cold.SecretGrants) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), cold.ID); err != nil || len(held) != 0 || len(cold.SecretGrants) != 0 {
 		t.Fatalf("a cold boot inherited grants: %+v %+v, %v", cold.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(cold.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), cold.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a cold boot inherited a CA: %v", err)
 	}
 }
@@ -352,7 +352,7 @@ func TestSnapshotResumeHoldsTheCaps(t *testing.T) {
 		"big-mem": `{"type":"memory","vcpus":1,"mem_mib":8192}`,
 		"at-caps": `{"type":"memory","vcpus":2,"mem_mib":4096}`,
 	} {
-		if err := srv.store.CreateSnapshot(store.SnapshotRecord{ID: "id-" + name, UserID: "usr_test", Name: name,
+		if err := srv.store.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "id-" + name, UserID: "usr_test", Name: name,
 			MemPath: "/x/" + name + "/mem.snap", ManifestJSON: manifest, CreatedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -380,7 +380,7 @@ func TestSnapshotResumeHoldsTheCaps(t *testing.T) {
 	if eng.resumed.snapDir != "" {
 		t.Fatal("the engine resumed a VM over the caps")
 	}
-	if sbs, err := srv.store.ListSandboxes("usr_test"); err != nil || len(sbs) != 0 {
+	if sbs, err := srv.store.ListSandboxes(t.Context(), "usr_test"); err != nil || len(sbs) != 0 {
 		t.Fatalf("refused resumes left sandboxes: %+v, %v", sbs, err)
 	}
 
@@ -398,7 +398,7 @@ func TestForkHoldsTheCaps(t *testing.T) {
 	srv, ts, eng := setupClone(t, 2, 4096)
 	big := engine.SandboxSpec{Name: "src", Image: "browser", CPUs: 4, MemoryMB: 8192}
 	eng.remember("eng-src", big)
-	if err := srv.store.CreateSandbox(store.Sandbox{ID: "src-id", Name: "src", EngineID: "eng-src", Status: "running",
+	if err := srv.store.CreateSandbox(t.Context(), store.Sandbox{ID: "src-id", Name: "src", EngineID: "eng-src", Status: "running",
 		CreatedBy: "usr_test", CreatedAt: time.Now(), CPUs: big.CPUs, MemoryMB: big.MemoryMB, Image: big.Image}); err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +408,7 @@ func TestForkHoldsTheCaps(t *testing.T) {
 		t.Fatalf("fork of an over-cap source = %d, want 400", resp.StatusCode)
 	}
 	resp.Body.Close()
-	if sbs, err := srv.store.ListSandboxes("usr_test"); err != nil || len(sbs) != 1 {
+	if sbs, err := srv.store.ListSandboxes(t.Context(), "usr_test"); err != nil || len(sbs) != 1 {
 		t.Fatalf("the refused fork left sandboxes: %+v, %v", sbs, err)
 	}
 }
@@ -450,11 +450,11 @@ func TestForkInheritsGrants(t *testing.T) {
 	if listed := grantsOf(t, ts); len(listed) != 2 {
 		t.Fatalf("grants listed: %+v, want the source's and the fork's", listed)
 	}
-	srcCA, err := srv.store.GetSandboxCA(src.ID)
+	srcCA, err := srv.store.GetSandboxCA(t.Context(), src.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ca, err := srv.store.GetSandboxCA(child.ID); err != nil || ca.CertPEM != srcCA.CertPEM || !reflect.DeepEqual(ca.KeyEnc, srcCA.KeyEnc) {
+	if ca, err := srv.store.GetSandboxCA(t.Context(), child.ID); err != nil || ca.CertPEM != srcCA.CertPEM || !reflect.DeepEqual(ca.KeyEnc, srcCA.KeyEnc) {
 		t.Fatalf("the fork's CA: %+v, %v; want its source's", ca, err)
 	}
 
@@ -495,7 +495,7 @@ func TestForkOnlyInheritsLiveGrants(t *testing.T) {
 	expect(t, doReq(t, ts, "POST", "/secrets/GH_TOKEN/grants", map[string]any{"sandbox": "src", "hosts": []string{"revoked.example"}}), 201, &revoked)
 	expect(t, doReq(t, ts, "DELETE", "/secrets/grants/"+revoked.ID, nil), 200, nil)
 	past := time.Now().Add(-time.Hour).UTC()
-	if err := srv.store.CreateSecretGrant(store.SecretGrant{ID: "expired", UserID: "usr_test", SecretName: "GH_TOKEN", SandboxID: src.ID,
+	if err := srv.store.CreateSecretGrant(t.Context(), store.SecretGrant{ID: "expired", UserID: "usr_test", SecretName: "GH_TOKEN", SandboxID: src.ID,
 		Hosts: []string{"old.example"}, Placeholder: "bhatti_sec_aaaaaaaaaaaaaaaaaaaaaaaa", CreatedAt: past.Add(-time.Hour), ExpiresAt: &past}); err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestForkOnlyInheritsLiveGrants(t *testing.T) {
 	if len(child.SecretGrants) != 1 || child.SecretGrants[0].Placeholder != src.SecretGrants[0].Placeholder {
 		t.Fatalf("the fork's grants: %+v, want only the live one", child.SecretGrants)
 	}
-	if held, err := srv.store.ListSandboxSecretGrants(child.ID); err != nil || len(held) != 1 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), child.ID); err != nil || len(held) != 1 {
 		t.Fatalf("stored: %+v, %v", held, err)
 	}
 }
@@ -543,7 +543,7 @@ func TestSnapshotResumeInheritsGrantsAfterTheSourceIsGone(t *testing.T) {
 	var revoked grantJSON
 	expect(t, doReq(t, ts, "POST", "/secrets/GH_TOKEN/grants", map[string]any{"sandbox": "src", "hosts": []string{"revoked.example"}}), 201, &revoked)
 	expect(t, doReq(t, ts, "DELETE", "/secrets/grants/"+revoked.ID, nil), 200, nil)
-	srcCA, err := srv.store.GetSandboxCA(src.ID)
+	srcCA, err := srv.store.GetSandboxCA(t.Context(), src.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +553,7 @@ func TestSnapshotResumeInheritsGrantsAfterTheSourceIsGone(t *testing.T) {
 	if left := grantsOf(t, ts); len(left) != 0 {
 		t.Fatalf("control: the destroyed source left grants %+v", left)
 	}
-	if _, err := srv.store.GetSandboxCA(src.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), src.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("control: the destroyed source left its CA: %v", err)
 	}
 
@@ -584,7 +584,7 @@ func TestSnapshotResumeInheritsGrantsAfterTheSourceIsGone(t *testing.T) {
 		}
 
 		// The CA the guest trusts, and a leaf signed by it for a granted host.
-		ca, err := srv.store.GetSandboxCA(c.ID)
+		ca, err := srv.store.GetSandboxCA(t.Context(), c.ID)
 		if err != nil || ca.CertPEM != srcCA.CertPEM || !reflect.DeepEqual(ca.KeyEnc, srcCA.KeyEnc) {
 			t.Fatalf("%s: CA %+v, %v; want the source's", c.Name, ca, err)
 		}
@@ -666,7 +666,7 @@ func TestSnapshotGrantsDoNotOutliveTheirSecret(t *testing.T) {
 	}
 
 	// A kept grant whose secret vanished some other way is skipped; the rest are copied.
-	if err := srv.store.CreateSnapshot(store.SnapshotRecord{ID: "kept", UserID: "usr_test", Name: "kept",
+	if err := srv.store.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "kept", UserID: "usr_test", Name: "kept",
 		MemPath: "/x/kept/mem.snap", ManifestJSON: `{"type":"memory"}`, CreatedAt: time.Now(),
 		Substitution: store.SnapshotSubstitution{Grants: []store.SnapshotGrant{
 			{SecretName: "GONE", Hosts: []string{"api.github.com"}, Placeholder: "bhatti_sec_bbbbbbbbbbbbbbbbbbbbbbbb"},
@@ -682,7 +682,7 @@ func TestSnapshotGrantsDoNotOutliveTheirSecret(t *testing.T) {
 
 	// And so is a fork's.
 	src2 := createBrowser(t, ts, "src2", map[string]any{"secret_grants": ghGrant})
-	if err := srv.store.DeleteSecret("usr_test", "GH_TOKEN"); err != nil {
+	if err := srv.store.DeleteSecret(t.Context(), "usr_test", "GH_TOKEN"); err != nil {
 		t.Fatal(err)
 	}
 	var child clonedJSON
@@ -690,7 +690,7 @@ func TestSnapshotGrantsDoNotOutliveTheirSecret(t *testing.T) {
 	if len(child.SecretGrants) != 0 {
 		t.Fatalf("a fork inherited a grant for a deleted secret: %+v", child.SecretGrants)
 	}
-	if _, err := srv.store.GetSandboxCA(child.ID); err != nil {
+	if _, err := srv.store.GetSandboxCA(t.Context(), child.ID); err != nil {
 		t.Fatalf("the fork's CA: %v", err)
 	}
 }
@@ -704,7 +704,7 @@ func TestSnapshotExportAndImportCarryNoGrants(t *testing.T) {
 	ph := src.SecretGrants[0].Placeholder
 	var snap store.SnapshotRecord
 	expect(t, doReq(t, ts, "POST", "/sandboxes/"+src.ID+"/checkpoint", map[string]any{"name": "base"}), 201, &snap)
-	stored, err := srv.store.GetSnapshot("usr_test", "base")
+	stored, err := srv.store.GetSnapshot(t.Context(), "usr_test", "base")
 	if err != nil || len(stored.Substitution.Grants) != 1 || stored.Substitution.CA == nil {
 		t.Fatalf("control: the snapshot keeps %+v, %v", stored.Substitution, err)
 	}
@@ -737,7 +737,7 @@ func TestSnapshotExportAndImportCarryNoGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(t, iresp, 201, &imported)
-	back, err := srv.store.GetSnapshot("usr_test", "base")
+	back, err := srv.store.GetSnapshot(t.Context(), "usr_test", "base")
 	if err != nil || back.Substitution.CA != nil || len(back.Substitution.Grants) != 0 || back.Source != (store.SnapshotSource{}) {
 		t.Fatalf("the imported snapshot kept %+v, %v", back, err)
 	}
@@ -746,10 +746,10 @@ func TestSnapshotExportAndImportCarryNoGrants(t *testing.T) {
 	if len(clone.SecretGrants) != 0 {
 		t.Fatalf("an imported snapshot resumed with grants: %+v", clone.SecretGrants)
 	}
-	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), clone.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("an imported snapshot resumed with a CA: %v", err)
 	}
-	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), clone.ID); err != nil || len(held) != 0 {
 		t.Fatalf("grants of the resumed import: %+v, %v", held, err)
 	}
 }
@@ -774,7 +774,7 @@ func TestSnapshotAPIHidesWhatItKeeps(t *testing.T) {
 		body("GET", "/snapshots/base", nil),
 		body("GET", "/snapshots", nil),
 	}
-	snap, err := srv.store.GetSnapshot("usr_test", "base")
+	snap, err := srv.store.GetSnapshot(t.Context(), "usr_test", "base")
 	if err != nil || snap.Substitution.CA == nil || len(snap.Substitution.Grants) != 1 {
 		t.Fatalf("control: the snapshot keeps %+v, %v", snap, err)
 	}
@@ -812,7 +812,7 @@ func predatesRecording(t *testing.T, srv *Server, name string) {
 			t.Fatal(err)
 		}
 	}
-	if snap, err := srv.store.GetSnapshot("usr_test", name); err != nil || snap.SourceRecordedAt != nil ||
+	if snap, err := srv.store.GetSnapshot(t.Context(), "usr_test", name); err != nil || snap.SourceRecordedAt != nil ||
 		snap.Source != (store.SnapshotSource{}) || snap.Substitution.CA != nil || len(snap.Substitution.Grants) != 0 {
 		t.Fatalf("control: %q doesn't look like a snapshot from before they were recorded: %+v, %v", name, snap, err)
 	}
@@ -827,7 +827,7 @@ func TestSnapshotFromBeforeRecordingResumesWithItsLiveSource(t *testing.T) {
 	srv, ts, _ := setupClone(t, 8, 16384)
 	src := createBrowser(t, ts, "src", map[string]any{"secret_grants": ghGrant})
 	ph := src.SecretGrants[0].Placeholder
-	srcCA, err := srv.store.GetSandboxCA(src.ID)
+	srcCA, err := srv.store.GetSandboxCA(t.Context(), src.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -853,7 +853,7 @@ func TestSnapshotFromBeforeRecordingResumesWithItsLiveSource(t *testing.T) {
 	if len(byPlaceholder) != 2 || byPlaceholder[ph].ID == "" || byPlaceholder[later.Placeholder].ID == "" {
 		t.Fatalf("the clone's grants %+v, want copies of the source's two", clone.SecretGrants)
 	}
-	if ca, err := srv.store.GetSandboxCA(clone.ID); err != nil || ca.CertPEM != srcCA.CertPEM || !reflect.DeepEqual(ca.KeyEnc, srcCA.KeyEnc) {
+	if ca, err := srv.store.GetSandboxCA(t.Context(), clone.ID); err != nil || ca.CertPEM != srcCA.CertPEM || !reflect.DeepEqual(ca.KeyEnc, srcCA.KeyEnc) {
 		t.Fatalf("the clone's CA: %+v, %v; want the live source's", ca, err)
 	}
 	bc := netdBroker(t, srv)
@@ -871,10 +871,10 @@ func TestSnapshotFromBeforeRecordingResumesWithItsLiveSource(t *testing.T) {
 	if cold.shape() != browserShape {
 		t.Fatalf("the disk-only resume records %+v, want %+v", cold.shape(), browserShape)
 	}
-	if held, err := srv.store.ListSandboxSecretGrants(cold.ID); err != nil || len(held) != 0 || len(cold.SecretGrants) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), cold.ID); err != nil || len(held) != 0 || len(cold.SecretGrants) != 0 {
 		t.Fatalf("a cold boot inherited grants: %+v, %v", held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(cold.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), cold.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a cold boot inherited a CA: %v", err)
 	}
 }
@@ -894,10 +894,10 @@ func TestSnapshotFromBeforeRecordingResumesAfterItsSourceIsGone(t *testing.T) {
 	if want := (shape{CPUs: 4, MemoryMB: 8192}); clone.shape() != want {
 		t.Fatalf("the resume records %+v, want %+v", clone.shape(), want)
 	}
-	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
 		t.Fatalf("grants from nowhere: %+v %+v, %v", clone.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), clone.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a CA from nowhere: %v", err)
 	}
 }
@@ -908,12 +908,12 @@ func TestSnapshotFromBeforeRecordingIgnoresAnotherUsersSandbox(t *testing.T) {
 	srv, ts, _ := setupClone(t, 8, 16384)
 	now := time.Now()
 	for _, err := range []error{
-		srv.store.CreateSandbox(store.Sandbox{ID: "theirs", Name: "theirs", EngineID: "eng-theirs", Status: "running", CreatedBy: "usr_other",
+		srv.store.CreateSandbox(t.Context(), store.Sandbox{ID: "theirs", Name: "theirs", EngineID: "eng-theirs", Status: "running", CreatedBy: "usr_other",
 			CreatedAt: now, Image: "browser", DiskSizeMB: 999, HasInit: true}),
-		srv.store.PutSandboxCA(store.SandboxCA{SandboxID: "theirs", UserID: "usr_other", CertPEM: "cert", KeyEnc: []byte("key")}),
-		srv.store.CreateSecretGrant(store.SecretGrant{ID: "theirs-g", UserID: "usr_other", SecretName: "GH_TOKEN", SandboxID: "theirs",
+		srv.store.PutSandboxCA(t.Context(), store.SandboxCA{SandboxID: "theirs", UserID: "usr_other", CertPEM: "cert", KeyEnc: []byte("key")}),
+		srv.store.CreateSecretGrant(t.Context(), store.SecretGrant{ID: "theirs-g", UserID: "usr_other", SecretName: "GH_TOKEN", SandboxID: "theirs",
 			Hosts: []string{"api.github.com"}, Placeholder: "bhatti_sec_eeeeeeeeeeeeeeeeeeeeeeee", CreatedAt: now}),
-		srv.store.CreateSnapshot(store.SnapshotRecord{ID: "mine", UserID: "usr_test", Name: "mine", SourceSandbox: "theirs",
+		srv.store.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "mine", UserID: "usr_test", Name: "mine", SourceSandbox: "theirs",
 			MemPath: "/x/mine/mem.snap", ManifestJSON: `{"type":"memory","vcpus":1,"mem_mib":1024}`, CreatedAt: now}),
 	} {
 		if err != nil {
@@ -927,10 +927,10 @@ func TestSnapshotFromBeforeRecordingIgnoresAnotherUsersSandbox(t *testing.T) {
 	if want := (shape{CPUs: 1, MemoryMB: 1024}); clone.shape() != want {
 		t.Fatalf("the resume records %+v, want %+v", clone.shape(), want)
 	}
-	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
 		t.Fatalf("another user's grants: %+v %+v, %v", clone.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), clone.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("another user's CA: %v", err)
 	}
 }
@@ -944,7 +944,7 @@ func TestRecordedSnapshotNeverMixesInTheLiveSource(t *testing.T) {
 
 	// Taken with a CA and no grants; the source is granted a secret afterwards.
 	src := createBrowser(t, ts, "src", nil)
-	srcCA, err := srv.store.GetSandboxCA(src.ID)
+	srcCA, err := srv.store.GetSandboxCA(t.Context(), src.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -952,16 +952,16 @@ func TestRecordedSnapshotNeverMixesInTheLiveSource(t *testing.T) {
 	expect(t, doReq(t, ts, "POST", "/secrets/GH_TOKEN/grants", map[string]any{"sandbox": "src", "hosts": []string{"api.github.com"}}), 201, nil)
 	var clone clonedJSON
 	expect(t, doReq(t, ts, "POST", "/snapshots/base/resume", map[string]any{"name": "clone"}), 201, &clone)
-	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
 		t.Fatalf("a grant the source gained after the snapshot reached its clone: %+v %+v, %v", clone.SecretGrants, held, err)
 	}
-	if ca, err := srv.store.GetSandboxCA(clone.ID); err != nil || ca.CertPEM != srcCA.CertPEM {
+	if ca, err := srv.store.GetSandboxCA(t.Context(), clone.ID); err != nil || ca.CertPEM != srcCA.CertPEM {
 		t.Fatalf("the recorded CA: %+v, %v", ca, err)
 	}
 
 	// A record that kept nothing at all, over a source that has a spec, a CA and grants.
 	rich := createBrowser(t, ts, "rich", map[string]any{"secret_grants": ghGrant})
-	if err := srv.store.CreateSnapshot(store.SnapshotRecord{ID: "bare", UserID: "usr_test", Name: "bare", SourceSandbox: rich.ID,
+	if err := srv.store.CreateSnapshot(t.Context(), store.SnapshotRecord{ID: "bare", UserID: "usr_test", Name: "bare", SourceSandbox: rich.ID,
 		MemPath: "/x/bare/mem.snap", ManifestJSON: `{"type":"memory","vcpus":2,"mem_mib":2048}`, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -970,10 +970,10 @@ func TestRecordedSnapshotNeverMixesInTheLiveSource(t *testing.T) {
 	if want := (shape{CPUs: 2, MemoryMB: 2048}); bare.shape() != want {
 		t.Fatalf("the resume records %+v, want %+v: the live source's spec leaked in", bare.shape(), want)
 	}
-	if held, err := srv.store.ListSandboxSecretGrants(bare.ID); err != nil || len(held) != 0 || len(bare.SecretGrants) != 0 {
+	if held, err := srv.store.ListSandboxSecretGrants(t.Context(), bare.ID); err != nil || len(held) != 0 || len(bare.SecretGrants) != 0 {
 		t.Fatalf("the live source's grants leaked in: %+v %+v, %v", bare.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(bare.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), bare.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("the live source's CA leaked in: %v", err)
 	}
 }

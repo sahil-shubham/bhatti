@@ -119,7 +119,7 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID
 	}
 
 	// 4. Lookup + validate TOGETHER — same error for all failure modes.
-	sb, err := s.store.GetSandboxByID(sandboxID)
+	sb, err := s.store.GetSandboxByID(r.Context(), sandboxID)
 	tokenHash := sha256Hex(auth.Token)
 	if err != nil || sb.Status == "destroyed" || sb.ShellTokenHash == "" ||
 		subtle.ConstantTimeCompare([]byte(tokenHash), []byte(sb.ShellTokenHash)) != 1 {
@@ -200,7 +200,7 @@ func (s *Server) handleShellToken(w http.ResponseWriter, r *http.Request, id str
 	case "POST":
 		token := randomHex(32)
 		hash := sha256Hex(token)
-		if err := s.store.SetShellToken(sb.ID, hash); err != nil {
+		if err := s.store.SetShellToken(r.Context(), sb.ID, hash); err != nil {
 			errResp(w, 500, "failed to set shell token")
 			return
 		}
@@ -211,7 +211,7 @@ func (s *Server) handleShellToken(w http.ResponseWriter, r *http.Request, id str
 		})
 
 	case "DELETE":
-		if err := s.store.ClearShellToken(sb.ID); err != nil {
+		if err := s.store.ClearShellToken(r.Context(), sb.ID); err != nil {
 			errResp(w, 500, "failed to revoke shell token")
 			return
 		}

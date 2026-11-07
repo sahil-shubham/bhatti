@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -41,13 +42,13 @@ var userCreateCmd = &cobra.Command{
 			return fmt.Errorf("--name is required")
 		}
 
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
 		apiKey := generateAPIKey()
 		keyHash := sha256HexCLI(apiKey)
 
-		subnetIdx, err := st.NextSubnetIndex()
+		subnetIdx, err := st.NextSubnetIndex(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("subnet index: %w", err)
 		}
@@ -67,13 +68,13 @@ var userCreateCmd = &cobra.Command{
 			CreatedAt:             time.Now(),
 		}
 
-		if err := st.CreateUser(u); err != nil {
+		if err := st.CreateUser(cmd.Context(), u); err != nil {
 			if errors.Is(err, store.ErrConflict) {
 				return fmt.Errorf("user %q already exists", name)
 			}
 			return fmt.Errorf("create user: %w", err)
 		}
-		st.InsertEvents([]store.Event{{
+		st.InsertEvents(cmd.Context(), []store.Event{{
 			Type: "user.created", UserID: userID,
 			Meta: map[string]any{"name": name, "max_sandboxes": maxSandboxes, "subnet_index": subnetIdx},
 		}})
@@ -101,10 +102,10 @@ var userListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List users",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
-		users, err := st.ListUsers()
+		users, err := st.ListUsers(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("list users: %w", err)
 		}
@@ -114,7 +115,7 @@ var userListCmd = &cobra.Command{
 			fmt.Printf("%-12s %-20s %-8s %-6s %-6s %-8s\n",
 				"ID", "NAME", "SANDBOXES", "CPUS", "MEM", "SUBNET")
 			for _, u := range users {
-				count, _ := st.CountUserSandboxes(u.ID)
+				count, _ := st.CountUserSandboxes(cmd.Context(), u.ID)
 				fmt.Printf("%-12s %-20s %d/%-6d %-6d %-6d %-8d\n",
 					u.ID, u.Name, count, u.MaxSandboxes,
 					u.MaxCPUsPerSandbox, u.MaxMemoryMBPerSandbox, u.SubnetIndex)
@@ -133,10 +134,10 @@ var userDeleteCmd = &cobra.Command{
 			return errAborted
 		}
 
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
-		users, _ := st.ListUsers()
+		users, _ := st.ListUsers(cmd.Context())
 		var userID string
 		for _, u := range users {
 			if u.Name == args[0] {
@@ -147,10 +148,10 @@ var userDeleteCmd = &cobra.Command{
 		if userID == "" {
 			return fmt.Errorf("user %q not found", args[0])
 		}
-		if err := st.DeleteUser(userID); err != nil {
+		if err := st.DeleteUser(cmd.Context(), userID); err != nil {
 			return err
 		}
-		st.InsertEvents([]store.Event{{
+		st.InsertEvents(cmd.Context(), []store.Event{{
 			Type: "user.deleted", UserID: userID,
 			Meta: map[string]any{"name": args[0]},
 		}})
@@ -164,10 +165,10 @@ var userRotateKeyCmd = &cobra.Command{
 	Short: "Rotate a user's API key",
 	Args:  exactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
-		users, _ := st.ListUsers()
+		users, _ := st.ListUsers(cmd.Context())
 		var userID string
 		for _, u := range users {
 			if u.Name == args[0] {
@@ -182,10 +183,10 @@ var userRotateKeyCmd = &cobra.Command{
 		newKey := generateAPIKey()
 		newHash := sha256HexCLI(newKey)
 
-		if err := st.RotateUserKey(userID, newHash); err != nil {
+		if err := st.RotateUserKey(cmd.Context(), userID, newHash); err != nil {
 			return err
 		}
-		st.InsertEvents([]store.Event{{
+		st.InsertEvents(cmd.Context(), []store.Event{{
 			Type: "user.key_rotated", UserID: userID,
 			Meta: map[string]any{"name": args[0]},
 		}})
@@ -222,7 +223,7 @@ func init() {
 // On a server, LoadConfig finds /etc/bhatti/config.yaml which has
 // data_dir: /var/lib/bhatti, so the correct state.db is used without
 // any hardcoded fallbacks.
-func openLocalStore() *store.Store {
+func openLocalStore(ctx context.Context) *store.Store {
 	// Check --data-dir flag first
 	dataDir, _ := rootCmd.PersistentFlags().GetString("data-dir")
 
@@ -236,7 +237,7 @@ func openLocalStore() *store.Store {
 	}
 
 	dbPath := filepath.Join(dataDir, "state.db")
-	st, err := store.New(dbPath)
+	st, err := store.New(ctx, dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store %s: %v\n", dbPath, err)
 		os.Exit(1)

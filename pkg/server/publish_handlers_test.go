@@ -148,7 +148,7 @@ func TestDestroyCleanupPublish(t *testing.T) {
 	resp := doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil)
 	resp.Body.Close()
 
-	rules, _ := srv.store.ListPublishRules(sb.ID)
+	rules, _ := srv.store.ListPublishRules(t.Context(), sb.ID)
 	if len(rules) != 0 {
 		t.Fatalf("expected 0 rules after destroy, got %d", len(rules))
 	}
@@ -199,12 +199,12 @@ func TestPublishNonexistentSandbox(t *testing.T) {
 func setupDomainMode(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	keyHash := sha256Hex(testAPIKey)
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_test", Name: "test-user", APIKeyHash: keyHash,
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),

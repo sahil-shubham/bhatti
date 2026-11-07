@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,10 +19,10 @@ import (
 // --- Snapshot export/import: moving a named snapshot to another host ---
 
 // snapshotLimitError is why userID can't have another snapshot, "" if it can.
-func (s *Server) snapshotLimitError(userID string) string {
-	existing, _ := s.store.ListSnapshots(userID)
+func (s *Server) snapshotLimitError(ctx context.Context, userID string) string {
+	existing, _ := s.store.ListSnapshots(ctx, userID)
 	maxSnaps := 5
-	if u, _ := s.store.GetUser(userID); u != nil && u.MaxSnapshots > 0 {
+	if u, _ := s.store.GetUser(ctx, userID); u != nil && u.MaxSnapshots > 0 {
 		maxSnaps = u.MaxSnapshots
 	}
 	if len(existing) >= maxSnaps {
@@ -95,7 +96,7 @@ func (s *Server) handleSnapshotExport(w http.ResponseWriter, r *http.Request, us
 		}
 		includeBase = b
 	}
-	snap, err := s.store.GetSnapshot(user.ID, name)
+	snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
 	if err != nil {
 		errResp(w, 404, err.Error())
 		return
@@ -146,14 +147,14 @@ func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request, us
 	}
 	// Checked before the upload when the name is known; again after it.
 	exists := func(name string) bool {
-		_, err := s.store.GetSnapshot(user.ID, name)
+		_, err := s.store.GetSnapshot(r.Context(), user.ID, name)
 		return err == nil
 	}
 	if name != "" && exists(name) {
 		errResp(w, 409, fmt.Sprintf("snapshot %q already exists", name))
 		return
 	}
-	if msg := s.snapshotLimitError(user.ID); msg != "" {
+	if msg := s.snapshotLimitError(r.Context(), user.ID); msg != "" {
 		errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, msg)
 		return
 	}
@@ -189,7 +190,7 @@ func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 	snap := newSnapshotRecord(user.ID, name, "", finalDir, imp.ManifestJSON)
-	if err := s.store.CreateSnapshot(snap); err != nil {
+	if err := s.store.CreateSnapshot(detached(r.Context()), snap); err != nil {
 		os.RemoveAll(finalDir)
 		if errors.Is(err, store.ErrConflict) {
 			errResp(w, 409, fmt.Sprintf("snapshot %q already exists", name))

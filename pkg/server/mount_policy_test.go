@@ -82,7 +82,7 @@ func TestCreateMountSourcePolicy(t *testing.T) {
 			srv.configPath = tc.config
 			body := map[string]any{"name": "mount-test", "mounts": []map[string]string{{"host_path": tc.source, "guest_path": "/host"}}}
 			if tc.useTemplate {
-				if err := srv.store.CreateTemplate(store.Template{ID: "tpl", Name: "tmpl", CPUs: 1, MemoryMB: 128}); err != nil {
+				if err := srv.store.CreateTemplate(t.Context(), store.Template{ID: "tpl", Name: "tmpl", CPUs: 1, MemoryMB: 128}); err != nil {
 					t.Fatal(err)
 				}
 				body["template_id"] = "tpl"

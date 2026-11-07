@@ -25,7 +25,7 @@ import (
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListTemplates()
+		list, err := s.store.ListTemplates(r.Context())
 		if err != nil {
 			errRespInternal(w, r, "list templates failed", err)
 			return
@@ -53,7 +53,7 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 			t.MemoryMB = 2048
 		}
 		t.CreatedAt = time.Now()
-		if err := s.store.CreateTemplate(t); err != nil {
+		if err := s.store.CreateTemplate(r.Context(), t); err != nil {
 			errRespInternal(w, r, "create template failed", err)
 			return
 		}
@@ -72,14 +72,14 @@ func (s *Server) handleTemplate(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		t, err := s.store.GetTemplate(id)
+		t, err := s.store.GetTemplate(r.Context(), id)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
 		}
 		writeJSON(w, 200, t)
 	case http.MethodDelete:
-		if err := s.store.DeleteTemplate(id); err != nil {
+		if err := s.store.DeleteTemplate(r.Context(), id); err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
@@ -109,7 +109,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListUserSecrets(user.ID)
+		list, err := s.store.ListUserSecrets(r.Context(), user.ID)
 		if err != nil {
 			errRespInternal(w, r, "list secrets failed", err)
 			return
@@ -134,11 +134,11 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 			errResp(w, 500, "encryption failed")
 			return
 		}
-		if err := s.store.SetSecret(user.ID, req.Name, ciphertext); err != nil {
+		if err := s.store.SetSecret(r.Context(), user.ID, req.Name, ciphertext); err != nil {
 			errRespInternal(w, r, "store secret failed", err)
 			return
 		}
-		sr, _ := s.store.GetSecret(user.ID, req.Name)
+		sr, _ := s.store.GetSecret(r.Context(), user.ID, req.Name)
 		writeJSON(w, 201, sr)
 	default:
 		errResp(w, 405, "method not allowed")
@@ -169,13 +169,13 @@ func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodDelete:
-		if err := s.store.DeleteSecret(user.ID, name); err != nil {
+		if err := s.store.DeleteSecret(r.Context(), user.ID, name); err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
 		// A deleted secret takes its grants with it: re-creating the name later
 		// must not quietly revive access granted to the old one.
-		if err := s.store.DeleteSecretGrantsForSecret(user.ID, name); err != nil {
+		if err := s.store.DeleteSecretGrantsForSecret(r.Context(), user.ID, name); err != nil {
 			slog.Warn("secret.grants_cleanup", "secret", name, "error", err)
 		}
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
@@ -191,7 +191,7 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListImages(user.ID)
+		list, err := s.store.ListImages(r.Context(), user.ID)
 		if err != nil {
 			errRespInternal(w, r, "list images failed", err)
 			return
@@ -229,19 +229,19 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		img, err := s.store.GetImage(user.ID, name)
+		img, err := s.store.GetImage(r.Context(), user.ID, name)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, 200, img)
 	case http.MethodDelete:
-		img, err := s.store.GetImage(user.ID, name)
+		img, err := s.store.GetImage(r.Context(), user.ID, name)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
-		if err := s.store.DeleteImage(user.ID, name); err != nil {
+		if err := s.store.DeleteImage(r.Context(), user.ID, name); err != nil {
 			errRespInternal(w, r, "delete image failed", err)
 			return
 		}
@@ -266,7 +266,7 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		list, err := s.store.ListSnapshots(user.ID)
+		list, err := s.store.ListSnapshots(r.Context(), user.ID)
 		if err != nil {
 			errRespInternal(w, r, "list snapshots failed", err)
 			return
@@ -309,19 +309,19 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		snap, err := s.store.GetSnapshot(user.ID, name)
+		snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, 200, snap)
 	case http.MethodDelete:
-		snap, err := s.store.GetSnapshot(user.ID, name)
+		snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
 		}
-		if err := s.store.DeleteSnapshot(user.ID, name); err != nil {
+		if err := s.store.DeleteSnapshot(r.Context(), user.ID, name); err != nil {
 			errRespInternal(w, r, "delete snapshot failed", err)
 			return
 		}
@@ -351,7 +351,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		task, err := s.store.GetTask(id)
+		task, err := s.store.GetTask(r.Context(), id)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
@@ -362,7 +362,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, task)
 	case http.MethodDelete:
-		task, err := s.store.GetTask(id)
+		task, err := s.store.GetTask(r.Context(), id)
 		if err != nil {
 			errResp(w, 404, err.Error())
 			return
@@ -378,7 +378,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 			delete(s.pullCancels, id)
 		}
 		s.pullCancelMu.Unlock()
-		s.store.FailTask(id, "cancelled by user")
+		s.store.FailTask(detached(r.Context()), id, "cancelled by user")
 		writeJSON(w, 200, map[string]string{"status": "cancelled"})
 	default:
 		errResp(w, 405, "method not allowed")
@@ -422,7 +422,7 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	if msg := s.snapshotLimitError(user.ID); msg != "" {
+	if msg := s.snapshotLimitError(r.Context(), user.ID); msg != "" {
 		errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, msg)
 		return
 	}
@@ -466,7 +466,7 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 	// guest, which has neither.
 	snap.Source = store.SnapshotSource{Image: sb.Image, DiskSizeMB: sb.DiskSizeMB, HasInit: sb.HasInit}
 	if req.Type != "filesystem" {
-		sub, err := s.captureSubstitution(user.ID, sb.ID)
+		sub, err := s.captureSubstitution(r.Context(), user.ID, sb.ID)
 		if err != nil {
 			errRespInternal(w, r, "read substitution state failed", err)
 			return
@@ -474,7 +474,7 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		snap.Substitution = sub
 	}
 	sizeMB := snap.SizeMB
-	if err := s.store.CreateSnapshot(snap); err != nil {
+	if err := s.store.CreateSnapshot(detached(r.Context()), snap); err != nil {
 		errRespInternal(w, r, "store snapshot record failed", err)
 		return
 	}
@@ -510,7 +510,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	}
 
 	// Load snapshot from store
-	snap, err := s.store.GetSnapshot(user.ID, snapName)
+	snap, err := s.store.GetSnapshot(r.Context(), user.ID, snapName)
 	if err != nil {
 		errResp(w, 404, err.Error())
 		return
@@ -594,7 +594,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	// their source, the live source (if it still exists). Never both.
 	source, sub, inheritedFrom := snap.Source, snap.Substitution, "snapshot:"+snapName
 	if snap.SourceRecordedAt == nil {
-		source, sub = s.liveSnapshotSource(user.ID, snap.SourceSandbox)
+		source, sub = s.liveSnapshotSource(r.Context(), user.ID, snap.SourceSandbox)
 		inheritedFrom = "sandbox:" + snap.SourceSandbox
 	}
 
@@ -614,7 +614,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 	if memory && len(m.NetPolicy) > 0 && string(m.NetPolicy) != "null" {
 		sb.NetPolicy = m.NetPolicy // the restore runs under the source's egress policy
 	}
-	if err := s.store.CreateSandbox(sb); err != nil {
+	if err := s.store.CreateSandbox(detached(r.Context()), sb); err != nil {
 		s.engine.Destroy(r.Context(), info.EngineID)
 		errRespInternal(w, r, "store sandbox failed", err)
 		return
@@ -624,7 +624,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		// The restored guest trusts its source's CA and holds its placeholders
 		// (they're in the RAM and disk it came back with): give the new sandbox
 		// the same.
-		grants = s.inheritSubstitution(user.ID, sb, inheritedFrom, sub)
+		grants = s.inheritSubstitution(r.Context(), user.ID, sb, inheritedFrom, sub)
 	}
 
 	// Create volume_attachments for volumes in the snapshot manifest.
@@ -632,7 +632,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 		if d.Role != "volume" || d.Name == "" {
 			continue
 		}
-		vol, err := s.store.GetPersistentVolume(user.ID, d.Name)
+		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, d.Name)
 		if err != nil {
 			slog.Warn("snapshot resume: volume not found in store",
 				"volume", d.Name, "sandbox", sbID)
@@ -643,7 +643,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 			mount = "/vol-" + d.Name
 		}
 		if err := s.store.AttachPersistentVolume(
-			user.ID, d.Name, sbID, mount, d.ReadOnly,
+			r.Context(), user.ID, d.Name, sbID, mount, d.ReadOnly,
 		); err != nil {
 			slog.Warn("snapshot resume: attach volume failed",
 				"volume", d.Name, "sandbox", sbID, "error", err)
@@ -694,7 +694,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 	// Check if image already exists with same digest (no-op pull detection).
 	// If the user already has an image with this name from the same OCI ref,
 	// and we can verify the digest hasn't changed, skip the pull.
-	if existing, err := s.store.GetImage(user.ID, req.Name); err == nil {
+	if existing, err := s.store.GetImage(r.Context(), user.ID, req.Name); err == nil {
 		if existing.Source == "oci:"+req.Ref && existing.OCIDigest != "" {
 			// Image exists from same source. Return success without re-pulling.
 			writeJSON(w, 200, map[string]any{
@@ -715,7 +715,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 		ID: taskID, UserID: user.ID, Type: "image_pull",
 		Status: "running", CreatedAt: time.Now(),
 	}
-	s.store.CreateTask(task)
+	s.store.CreateTask(r.Context(), task)
 
 	// Store cancellation context so DELETE /tasks/:id can cancel it
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -739,7 +739,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 
 		var ociOpts []oci.Option
 		ociOpts = append(ociOpts, oci.WithProgress(func(msg string) {
-			s.store.UpdateTaskProgress(taskID, msg)
+			s.store.UpdateTaskProgress(ctx, taskID, msg)
 		}))
 		if req.Auth != "" {
 			parts := strings.SplitN(req.Auth, ":", 2)
@@ -751,7 +751,7 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 		config, err := oci.PullAndConvert(ctx, req.Ref, outputPath, loharPath, ociOpts...)
 		if err != nil {
 			os.Remove(outputPath)
-			s.store.FailTask(taskID, err.Error())
+			s.store.FailTask(detached(ctx), taskID, err.Error())
 			slog.Error("image pull failed", "ref", req.Ref, "user", user.ID, "error", err)
 			s.RecordEvent(store.Event{
 				Type: "image.pull_failed", UserID: user.ID,
@@ -772,16 +772,16 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 			OCIConfigJSON: string(configJSON),
 			CreatedAt:     time.Now(),
 		}
-		if err := s.store.CreateImage(img); err != nil {
+		if err := s.store.CreateImage(detached(ctx), img); err != nil {
 			os.Remove(outputPath)
-			s.store.FailTask(taskID, "store image: "+err.Error())
+			s.store.FailTask(detached(ctx), taskID, "store image: "+err.Error())
 			return
 		}
 
 		resultJSON, _ := json.Marshal(map[string]any{
 			"image": req.Name, "size_mb": sizeMB, "source": req.Ref,
 		})
-		s.store.CompleteTask(taskID, string(resultJSON))
+		s.store.CompleteTask(detached(ctx), taskID, string(resultJSON))
 		slog.Info("image.pulled", "ref", req.Ref, "name", req.Name,
 			"user", user.Name, "size_mb", sizeMB, "digest", config.Digest)
 		s.RecordEvent(store.Event{
@@ -811,7 +811,7 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user 
 		return
 	}
 
-	if _, err := s.store.GetImage(user.ID, name); err == nil {
+	if _, err := s.store.GetImage(r.Context(), user.ID, name); err == nil {
 		errResp(w, 409, fmt.Sprintf("image %q already exists \u2014 delete first", name))
 		return
 	}
@@ -855,7 +855,7 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user 
 		OCIConfigJSON: string(configJSON),
 		CreatedAt:     time.Now(),
 	}
-	if err := s.store.CreateImage(img); err != nil {
+	if err := s.store.CreateImage(detached(r.Context()), img); err != nil {
 		os.Remove(outputPath)
 		errRespInternal(w, r, "store image", err)
 		return
@@ -908,7 +908,7 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Check if image already exists
-	if _, err := s.store.GetImage(user.ID, req.Name); err == nil {
+	if _, err := s.store.GetImage(r.Context(), user.ID, req.Name); err == nil {
 		errResp(w, 409, fmt.Sprintf("image %q already exists — delete first", req.Name))
 		return
 	}
@@ -944,7 +944,7 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, 
 		FilePath: outputPath, SizeMB: sizeMB,
 		CreatedAt: time.Now(),
 	}
-	if err := s.store.CreateImage(img); err != nil {
+	if err := s.store.CreateImage(detached(r.Context()), img); err != nil {
 		os.Remove(outputPath)
 		errRespInternal(w, r, "store image record failed", err)
 		return

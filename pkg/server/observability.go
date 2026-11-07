@@ -48,7 +48,7 @@ func (s *Server) StartMetricsSnapshots() {
 					&prevProxy, &prevProxyErr, &prevProxyWakes, &prevProxyRL,
 					&prevDropped,
 				)
-				if err := s.store.InsertMetricsSnapshot(snap); err != nil {
+				if err := s.store.InsertMetricsSnapshot(s.ctx, snap); err != nil {
 					slog.Error("metrics snapshot failed", "error", err)
 				}
 			}
@@ -106,7 +106,7 @@ func (s *Server) collectSnapshot(
 	}
 
 	// Gauge: sandbox counts by thermal state
-	sandboxes, _ := s.store.ListAllSandboxes()
+	sandboxes, _ := s.store.ListAllSandboxes(s.ctx)
 	snap.SandboxesTotal = len(sandboxes)
 	if te, ok := thermalOf(s.engine); ok {
 		for _, sb := range sandboxes {
@@ -134,7 +134,7 @@ func (s *Server) collectSnapshot(
 	}
 
 	// Gauge: user counts
-	users, _ := s.store.ListUsers()
+	users, _ := s.store.ListUsers(s.ctx)
 	snap.UsersTotal = len(users)
 	userHasSandbox := make(map[string]bool)
 	for _, sb := range sandboxes {
@@ -175,12 +175,12 @@ func (s *Server) StartRetention() {
 			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
-				if n, err := s.store.PurgeOldEvents(90 * 24 * time.Hour); err != nil {
+				if n, err := s.store.PurgeOldEvents(s.ctx, 90*24*time.Hour); err != nil {
 					slog.Warn("event retention failed", "error", err)
 				} else if n > 0 {
 					slog.Info("purged old events", "count", n)
 				}
-				if n, err := s.store.PurgeOldMetricsSnapshots(30 * 24 * time.Hour); err != nil {
+				if n, err := s.store.PurgeOldMetricsSnapshots(s.ctx, 30*24*time.Hour); err != nil {
 					slog.Warn("metrics retention failed", "error", err)
 				} else if n > 0 {
 					slog.Info("purged old metrics snapshots", "count", n)

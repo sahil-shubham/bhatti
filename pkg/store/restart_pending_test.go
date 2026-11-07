@@ -8,7 +8,7 @@ import (
 
 func pendingIDs(t *testing.T, s *Store) []string {
 	t.Helper()
-	list, err := s.ListRestartPending()
+	list, err := s.ListRestartPending(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,17 +26,17 @@ func TestRestartPendingMarker(t *testing.T) {
 	s := testStore(t)
 	mk := func(id string, keepHot bool) {
 		t.Helper()
-		if err := s.CreateSandbox(Sandbox{ID: id, Name: id, EngineID: id, Status: "running", CreatedBy: "u", CreatedAt: time.Now(), KeepHot: keepHot}); err != nil {
+		if err := s.CreateSandbox(t.Context(), Sandbox{ID: id, Name: id, EngineID: id, Status: "running", CreatedBy: "u", CreatedAt: time.Now(), KeepHot: keepHot}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	mk("hot", true)
 	mk("cold", false)
 
-	if err := s.StopSandboxUnexpected("hot"); err != nil {
+	if err := s.StopSandboxUnexpected(t.Context(), "hot"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.StopSandboxUnexpected("cold"); err != nil {
+	if err := s.StopSandboxUnexpected(t.Context(), "cold"); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingIDs(t, s); len(got) != 1 || got[0] != "hot" {
@@ -45,28 +45,28 @@ func TestRestartPendingMarker(t *testing.T) {
 
 	// Reopening the database runs the migrations again and keeps the marker.
 	path := filepath.Join(t.TempDir(), "reopen.db")
-	s2, err := New(path)
+	s2, err := New(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if s2, err = New(path); err != nil {
+	if s2, err = New(t.Context(), path); err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	s2.Close()
 
 	// A status write that is not "stopped" (running again, destroyed) clears it;
 	// writing "stopped" keeps it (the GET handler mirrors engine status).
-	if err := s.UpdateSandboxStatus("hot", "stopped"); err != nil {
+	if err := s.UpdateSandboxStatus(t.Context(), "hot", "stopped"); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingIDs(t, s); len(got) != 1 {
 		t.Fatalf("stopped status write dropped the marker: %v", got)
 	}
-	if err := s.UpdateSandboxStatus("hot", "running"); err != nil {
+	if err := s.UpdateSandboxStatus(t.Context(), "hot", "running"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateSandboxStatus("hot", "stopped"); err != nil {
+	if err := s.UpdateSandboxStatus(t.Context(), "hot", "stopped"); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingIDs(t, s); len(got) != 0 {
@@ -74,8 +74,8 @@ func TestRestartPendingMarker(t *testing.T) {
 	}
 
 	// An owner's stop drops it.
-	s.StopSandboxUnexpected("hot")
-	if err := s.StopSandbox("hot"); err != nil {
+	s.StopSandboxUnexpected(t.Context(), "hot")
+	if err := s.StopSandbox(t.Context(), "hot"); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingIDs(t, s); len(got) != 0 {
@@ -83,11 +83,11 @@ func TestRestartPendingMarker(t *testing.T) {
 	}
 
 	// keep_hot turning off drops it, even if it turns back on.
-	s.StopSandboxUnexpected("hot")
-	if err := s.UpdateSandboxKeepHot("hot", false); err != nil {
+	s.StopSandboxUnexpected(t.Context(), "hot")
+	if err := s.UpdateSandboxKeepHot(t.Context(), "hot", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateSandboxKeepHot("hot", true); err != nil {
+	if err := s.UpdateSandboxKeepHot(t.Context(), "hot", true); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingIDs(t, s); len(got) != 0 {
@@ -95,8 +95,8 @@ func TestRestartPendingMarker(t *testing.T) {
 	}
 
 	// Giving up drops it; a sandbox that is not stopped is never listed.
-	s.StopSandboxUnexpected("hot")
-	if err := s.ClearRestartPending("hot"); err != nil {
+	s.StopSandboxUnexpected(t.Context(), "hot")
+	if err := s.ClearRestartPending(t.Context(), "hot"); err != nil {
 		t.Fatal(err)
 	}
 	if got := pendingIDs(t, s); len(got) != 0 {

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -19,9 +20,9 @@ type ImageRecord struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
-func (s *Store) CreateImage(img ImageRecord) error {
-	_, err := s.db.Exec(
-		`INSERT INTO images (id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at)
+func (s *Store) CreateImage(ctx context.Context, img ImageRecord) error {
+	_, err := s.db.ExecContext(
+		ctx, `INSERT INTO images (id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		img.ID, img.UserID, img.Name, img.Source, img.FilePath,
 		img.SizeMB, img.OCIDigest, img.OCIConfigJSON, img.CreatedAt,
@@ -33,7 +34,7 @@ func (s *Store) CreateImage(img ImageRecord) error {
 // shared with them, else a global admin image (user_id=”). A query that fails
 // ends the search instead of reading as "not there", so it can't fall through
 // to a different image.
-func (s *Store) GetImage(userID, name string) (*ImageRecord, error) {
+func (s *Store) GetImage(ctx context.Context, userID, name string) (*ImageRecord, error) {
 	var img ImageRecord
 	const cols = `id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at`
 	for _, q := range []struct {
@@ -47,7 +48,7 @@ func (s *Store) GetImage(userID, name string) (*ImageRecord, error) {
 		WHERE s.user_id = ? AND i.name = ?`, []any{userID, name}},
 		{`SELECT ` + cols + ` FROM images WHERE user_id = '' AND name = ?`, []any{name}},
 	} {
-		err := s.db.QueryRow(q.sql, q.args...).Scan(&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
+		err := s.db.QueryRowContext(ctx, q.sql, q.args...).Scan(&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
 			&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt)
 		if err == nil {
 			return &img, nil
@@ -60,9 +61,9 @@ func (s *Store) GetImage(userID, name string) (*ImageRecord, error) {
 }
 
 // ListImages returns all images visible to a user (their own + shared + admin).
-func (s *Store) ListImages(userID string) ([]ImageRecord, error) {
-	rows, err := s.db.Query(
-		`SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
+func (s *Store) ListImages(ctx context.Context, userID string) ([]ImageRecord, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
 		 FROM images
 		 WHERE user_id = ?
 		    OR user_id = ''
@@ -85,8 +86,8 @@ func (s *Store) ListImages(userID string) ([]ImageRecord, error) {
 }
 
 // DeleteImage removes an image record.
-func (s *Store) DeleteImage(userID, name string) error {
-	res, err := s.db.Exec(`DELETE FROM images WHERE user_id = ? AND name = ?`, userID, name)
+func (s *Store) DeleteImage(ctx context.Context, userID, name string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM images WHERE user_id = ? AND name = ?`, userID, name)
 	if err != nil {
 		return err
 	}
@@ -100,20 +101,20 @@ func (s *Store) DeleteImage(userID, name string) error {
 // --- Image Sharing ---
 
 // ShareImage grants a user access to an image.
-func (s *Store) ShareImage(imageID, userID string) error {
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO image_shares (image_id, user_id) VALUES (?, ?)`, imageID, userID)
+func (s *Store) ShareImage(ctx context.Context, imageID, userID string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO image_shares (image_id, user_id) VALUES (?, ?)`, imageID, userID)
 	return err
 }
 
 // UnshareImage revokes a user's access to an image.
-func (s *Store) UnshareImage(imageID, userID string) error {
-	_, err := s.db.Exec(`DELETE FROM image_shares WHERE image_id = ? AND user_id = ?`, imageID, userID)
+func (s *Store) UnshareImage(ctx context.Context, imageID, userID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM image_shares WHERE image_id = ? AND user_id = ?`, imageID, userID)
 	return err
 }
 
 // ListImageShares returns user IDs that an image is shared with.
-func (s *Store) ListImageShares(imageID string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT s.user_id, COALESCE(u.name, s.user_id)
+func (s *Store) ListImageShares(ctx context.Context, imageID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT s.user_id, COALESCE(u.name, s.user_id)
 		FROM image_shares s LEFT JOIN users u ON u.id = s.user_id
 		WHERE s.image_id = ?`, imageID)
 	if err != nil {
@@ -132,10 +133,10 @@ func (s *Store) ListImageShares(imageID string) ([]string, error) {
 }
 
 // GetImageByName looks up an image by name regardless of owner.
-func (s *Store) GetImageByName(name string) (*ImageRecord, error) {
+func (s *Store) GetImageByName(ctx context.Context, name string) (*ImageRecord, error) {
 	var img ImageRecord
-	err := s.db.QueryRow(
-		`SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
+	err := s.db.QueryRowContext(
+		ctx, `SELECT id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at
 		 FROM images WHERE name = ? LIMIT 1`, name).Scan(
 		&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
 		&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt)

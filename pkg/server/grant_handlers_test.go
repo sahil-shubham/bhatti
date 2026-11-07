@@ -80,7 +80,7 @@ func TestSandboxGetsItsOwnCA(t *testing.T) {
 	if err != nil || !ca.IsCA {
 		t.Fatalf("boot config CA: %v isCA=%v", err, ca != nil && ca.IsCA)
 	}
-	stored, err := srv.store.GetSandboxCA(sb.ID)
+	stored, err := srv.store.GetSandboxCA(t.Context(), sb.ID)
 	if err != nil || stored.CertPEM != spec.CACert {
 		t.Fatalf("stored CA: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestSandboxGetsItsOwnCA(t *testing.T) {
 	if eng.LastCreateSpec.CACert != "" {
 		t.Fatal("a sandbox without a network got a CA")
 	}
-	if _, err := srv.store.GetSandboxCA(none.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), none.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("CA stored for a sandbox without a network: %v", err)
 	}
 }
@@ -161,7 +161,7 @@ func TestSecretGrantRefusals(t *testing.T) {
 	expect(t, doReq(t, ts, "POST", "/secrets/GH_TOKEN/grants", map[string]any{"sandbox": "offline", "hosts": []string{"api.github.com"}}), 400, nil)
 
 	legacy := createWith(t, ts, map[string]any{"name": "legacy", "net_policy": map[string]any{"default": "public"}})
-	if err := srv.store.DeleteSandboxCA(legacy.ID); err != nil { // as if created before substitution existed
+	if err := srv.store.DeleteSandboxCA(t.Context(), legacy.ID); err != nil { // as if created before substitution existed
 		t.Fatal(err)
 	}
 	expect(t, doReq(t, ts, "POST", "/secrets/GH_TOKEN/grants", map[string]any{"sandbox": "legacy", "hosts": []string{"api.github.com"}}), 409, nil)
@@ -199,7 +199,7 @@ func TestCreateTimeSecretGrant(t *testing.T) {
 	if env["GH_TOKEN"] != g.Placeholder || !gateway.IsPlaceholder(env["GH_TOKEN"]) || env["OTHER"] != "x" {
 		t.Fatalf("guest env %v, want GH_TOKEN = the placeholder %q", env, g.Placeholder)
 	}
-	stored, err := srv.store.GetSandboxSecretGrantByPlaceholder(sb.ID, g.Placeholder)
+	stored, err := srv.store.GetSandboxSecretGrantByPlaceholder(t.Context(), sb.ID, g.Placeholder)
 	if err != nil || stored.SandboxID != sb.ID || stored.SandboxID != eng.LastCreateSpec.SandboxID || len(stored.Hosts) != 2 {
 		t.Fatalf("stored grant %+v err=%v", stored, err)
 	}
@@ -240,7 +240,7 @@ func TestFailedCreateLeavesNoGrants(t *testing.T) {
 	if resp.StatusCode != 500 {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	if grants, _ := srv.store.ListSecretGrants("usr_test"); len(grants) != 0 {
+	if grants, _ := srv.store.ListSecretGrants(t.Context(), "usr_test"); len(grants) != 0 {
 		t.Fatalf("grants outlived the failed create: %+v", grants)
 	}
 }
@@ -253,14 +253,14 @@ func TestDestroyAndSecretDeleteDropGrants(t *testing.T) {
 	a := createWith(t, ts, map[string]any{"name": "a", "net_policy": map[string]any{"default": "public"}, "secret_grants": grant})
 	createWith(t, ts, map[string]any{"name": "b", "net_policy": map[string]any{"default": "public"}, "secret_grants": grant})
 	expect(t, doReq(t, ts, "DELETE", "/sandboxes/"+a.ID, nil), 200, nil)
-	if _, err := srv.store.GetSandboxCA(a.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := srv.store.GetSandboxCA(t.Context(), a.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("CA survived its sandbox: %v", err)
 	}
-	if grants, _ := srv.store.ListSecretGrants("usr_test"); len(grants) != 1 || grants[0].SandboxID == a.ID {
+	if grants, _ := srv.store.ListSecretGrants(t.Context(), "usr_test"); len(grants) != 1 || grants[0].SandboxID == a.ID {
 		t.Fatalf("grants after destroy: %+v", grants)
 	}
 	expect(t, doReq(t, ts, "DELETE", "/secrets/GH_TOKEN", nil), 200, nil)
-	if grants, _ := srv.store.ListSecretGrants("usr_test"); len(grants) != 0 {
+	if grants, _ := srv.store.ListSecretGrants(t.Context(), "usr_test"); len(grants) != 0 {
 		t.Fatalf("grants outlived their secret: %+v", grants)
 	}
 }

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -41,7 +42,7 @@ type Sandbox struct {
 
 const sandboxCols = `id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, stopped_at, keep_hot, COALESCE(shell_token_hash,''), COALESCE(cpus,1), COALESCE(memory_mb,1024), COALESCE(disk_size_mb,0), COALESCE(image,'minimal'), COALESCE(labels,'{}'), COALESCE(net_policy,''), has_init`
 
-func (s *Store) CreateSandbox(sb Sandbox) error {
+func (s *Store) CreateSandbox(ctx context.Context, sb Sandbox) error {
 	if sb.EngineMeta == nil {
 		sb.EngineMeta = json.RawMessage("{}")
 	}
@@ -57,8 +58,8 @@ func (s *Store) CreateSandbox(sb Sandbox) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(
-		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels, net_policy, has_init) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err = s.db.ExecContext(
+		ctx, `INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels, net_policy, has_init) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON, string(sb.NetPolicy), hasInit,
 	)
 	return classify(err)
@@ -79,40 +80,40 @@ func marshalLabels(labels map[string]string) (string, error) {
 
 // GetSandbox returns a sandbox scoped to a user, matching by ID first then by name.
 // Use GetSandboxByID for internal/unscoped access.
-func (s *Store) GetSandbox(userID, idOrName string) (*Sandbox, error) {
+func (s *Store) GetSandbox(ctx context.Context, userID, idOrName string) (*Sandbox, error) {
 	// Try exact ID match first (deterministic, always unique)
-	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE id = ? AND created_by = ?`, idOrName, userID)
+	row := s.db.QueryRowContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE id = ? AND created_by = ?`, idOrName, userID)
 	sb, err := scanSandbox(row)
 	if !errors.Is(err, ErrNotFound) {
 		return sb, err
 	}
 	// Fall back to name match
-	row = s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ?`, idOrName, userID)
+	row = s.db.QueryRowContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ?`, idOrName, userID)
 	return scanSandbox(row)
 }
 
 // GetActiveSandboxByName returns a non-destroyed sandbox by name for a user.
 // Returns ErrNotFound if no active sandbox with that name exists.
-func (s *Store) GetActiveSandboxByName(userID, name string) (*Sandbox, error) {
-	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ? AND status != 'destroyed'`, name, userID)
+func (s *Store) GetActiveSandboxByName(ctx context.Context, userID, name string) (*Sandbox, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ? AND status != 'destroyed'`, name, userID)
 	return scanSandbox(row)
 }
 
 // GetSandboxByID returns a sandbox by ID regardless of owner. For internal use (thermal manager, recovery).
-func (s *Store) GetSandboxByID(id string) (*Sandbox, error) {
-	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE id = ?`, id)
+func (s *Store) GetSandboxByID(ctx context.Context, id string) (*Sandbox, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE id = ?`, id)
 	return scanSandbox(row)
 }
 
 // GetSandboxByEngineID looks up a sandbox by its engine-assigned ID.
-func (s *Store) GetSandboxByEngineID(engineID string) (*Sandbox, error) {
-	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE engine_id = ?`, engineID)
+func (s *Store) GetSandboxByEngineID(ctx context.Context, engineID string) (*Sandbox, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE engine_id = ?`, engineID)
 	return scanSandbox(row)
 }
 
 // ListSandboxes returns sandboxes for a user.
-func (s *Store) ListSandboxes(userID string) ([]Sandbox, error) {
-	rows, err := s.db.Query(`SELECT `+sandboxCols+` FROM sandboxes WHERE created_by = ? ORDER BY created_at DESC`, userID)
+func (s *Store) ListSandboxes(ctx context.Context, userID string) ([]Sandbox, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE created_by = ? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -138,8 +139,8 @@ func (s *Store) ListSandboxes(userID string) ([]Sandbox, error) {
 // is cheaper than rewriting the query with json_extract per filter
 // dimension. If this becomes a bottleneck, the next optimisation is
 // a JSON1 WHERE clause; the wire shape stays the same.
-func (s *Store) ListSandboxesWithFilter(userID string, filter map[string]string) ([]Sandbox, error) {
-	all, err := s.ListSandboxes(userID)
+func (s *Store) ListSandboxesWithFilter(ctx context.Context, userID string, filter map[string]string) ([]Sandbox, error) {
+	all, err := s.ListSandboxes(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +169,8 @@ func labelsMatch(labels, filter map[string]string) bool {
 }
 
 // ListAllSandboxes returns all sandboxes regardless of owner. For internal use (thermal manager, recovery, port scanner).
-func (s *Store) ListAllSandboxes() ([]Sandbox, error) {
-	rows, err := s.db.Query(`SELECT ` + sandboxCols + ` FROM sandboxes ORDER BY created_at DESC`)
+func (s *Store) ListAllSandboxes(ctx context.Context) ([]Sandbox, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -186,21 +187,21 @@ func (s *Store) ListAllSandboxes() ([]Sandbox, error) {
 }
 
 // CountUserSandboxes returns the number of non-destroyed sandboxes for a user.
-func (s *Store) CountUserSandboxes(userID string) (int, error) {
+func (s *Store) CountUserSandboxes(ctx context.Context, userID string) (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM sandboxes WHERE created_by = ? AND status != 'destroyed'`, userID).Scan(&count)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sandboxes WHERE created_by = ? AND status != 'destroyed'`, userID).Scan(&count)
 	return count, err
 }
 
 // UpdateSandboxStatus also drops a pending keep_hot restart unless the new
 // status is "stopped": a sandbox that is running again (or gone) needs none.
-func (s *Store) UpdateSandboxStatus(id, status string) error {
-	_, err := s.db.Exec(`UPDATE sandboxes SET status = ?, restart_pending = CASE WHEN ? = 'stopped' THEN restart_pending ELSE 0 END WHERE id = ?`, status, status, id)
+func (s *Store) UpdateSandboxStatus(ctx context.Context, id, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET status = ?, restart_pending = CASE WHEN ? = 'stopped' THEN restart_pending ELSE 0 END WHERE id = ?`, status, status, id)
 	return err
 }
 
-func (s *Store) UpdateSandboxEngine(id, engineID, ip string) error {
-	_, err := s.db.Exec(`UPDATE sandboxes SET engine_id = ?, ip = ? WHERE id = ?`, engineID, ip, id)
+func (s *Store) UpdateSandboxEngine(ctx context.Context, id, engineID, ip string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET engine_id = ?, ip = ? WHERE id = ?`, engineID, ip, id)
 	return err
 }
 
@@ -209,9 +210,9 @@ func (s *Store) UpdateSandboxEngine(id, engineID, ip string) error {
 // store.go) enforces per-user name uniqueness among non-destroyed sandboxes;
 // a taken name is ErrConflict. ErrNotFound if no row matches the (id, userID)
 // pair — same semantics as DeleteSandbox.
-func (s *Store) RenameSandbox(userID, id, newName string) error {
-	res, err := s.db.Exec(
-		`UPDATE sandboxes SET name = ? WHERE id = ? AND created_by = ?`,
+func (s *Store) RenameSandbox(ctx context.Context, userID, id, newName string) error {
+	res, err := s.db.ExecContext(
+		ctx, `UPDATE sandboxes SET name = ? WHERE id = ? AND created_by = ?`,
 		newName, id, userID,
 	)
 	if err != nil {
@@ -226,23 +227,23 @@ func (s *Store) RenameSandbox(userID, id, newName string) error {
 
 // UpdateSandboxHasInit records whether the sandbox runs an --init command at
 // boot (the engine's boot config is the source of truth).
-func (s *Store) UpdateSandboxHasInit(id string, hasInit bool) error {
+func (s *Store) UpdateSandboxHasInit(ctx context.Context, id string, hasInit bool) error {
 	v := 0
 	if hasInit {
 		v = 1
 	}
-	_, err := s.db.Exec(`UPDATE sandboxes SET has_init = ? WHERE id = ?`, v, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET has_init = ? WHERE id = ?`, v, id)
 	return err
 }
 
 // UpdateSandboxKeepHot also drops a pending restart when keep_hot turns off:
 // the owner no longer wants it kept up.
-func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
+func (s *Store) UpdateSandboxKeepHot(ctx context.Context, id string, keepHot bool) error {
 	v := 0
 	if keepHot {
 		v = 1
 	}
-	_, err := s.db.Exec(`UPDATE sandboxes SET keep_hot = ?, restart_pending = restart_pending * ? WHERE id = ?`, v, v, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET keep_hot = ?, restart_pending = restart_pending * ? WHERE id = ?`, v, v, id)
 	return err
 }
 
@@ -255,16 +256,16 @@ func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
 // Empty set + empty remove is a no-op (still does one round-trip to
 // validate ownership; ErrNotFound if the (id, userID) pair is
 // absent).
-func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, remove []string) error {
-	tx, err := s.db.Begin()
+func (s *Store) UpdateSandboxLabels(ctx context.Context, userID, id string, set map[string]string, remove []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
 	var labelsJSON string
-	err = tx.QueryRow(
-		`SELECT COALESCE(labels, '{}') FROM sandboxes WHERE id = ? AND created_by = ?`,
+	err = tx.QueryRowContext(
+		ctx, `SELECT COALESCE(labels, '{}') FROM sandboxes WHERE id = ? AND created_by = ?`,
 		id, userID,
 	).Scan(&labelsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -291,8 +292,8 @@ func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, re
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`UPDATE sandboxes SET labels = ? WHERE id = ? AND created_by = ?`,
+	if _, err := tx.ExecContext(
+		ctx, `UPDATE sandboxes SET labels = ? WHERE id = ? AND created_by = ?`,
 		out, id, userID,
 	); err != nil {
 		return err
@@ -302,9 +303,9 @@ func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, re
 
 // StopSandbox records a stop the owner asked for (or one already confirmed
 // as deliberate): it also drops any pending keep_hot restart.
-func (s *Store) StopSandbox(id string) error {
+func (s *Store) StopSandbox(ctx context.Context, id string) error {
 	now := time.Now()
-	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'stopped', stopped_at = ?, restart_pending = 0 WHERE id = ?`, now, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET status = 'stopped', stopped_at = ?, restart_pending = 0 WHERE id = ?`, now, id)
 	return err
 }
 
@@ -312,22 +313,22 @@ func (s *Store) StopSandbox(id string) error {
 // went down with the daemon or host. A keep_hot sandbox is marked
 // restart_pending so the next daemon start boots it even if this daemon
 // exits before its restart ran.
-func (s *Store) StopSandboxUnexpected(id string) error {
+func (s *Store) StopSandboxUnexpected(ctx context.Context, id string) error {
 	now := time.Now()
-	_, err := s.db.Exec(`UPDATE sandboxes SET status = 'stopped', stopped_at = ?, restart_pending = keep_hot WHERE id = ?`, now, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET status = 'stopped', stopped_at = ?, restart_pending = keep_hot WHERE id = ?`, now, id)
 	return err
 }
 
 // ClearRestartPending drops the marker: the restart ran, or was given up on.
-func (s *Store) ClearRestartPending(id string) error {
-	_, err := s.db.Exec(`UPDATE sandboxes SET restart_pending = 0 WHERE id = ?`, id)
+func (s *Store) ClearRestartPending(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET restart_pending = 0 WHERE id = ?`, id)
 	return err
 }
 
 // ListRestartPending returns the stopped keep_hot sandboxes that went down
 // without being asked and have not been restarted since.
-func (s *Store) ListRestartPending() ([]Sandbox, error) {
-	rows, err := s.db.Query(`SELECT ` + sandboxCols + ` FROM sandboxes WHERE restart_pending = 1 AND keep_hot = 1 AND status = 'stopped' ORDER BY created_at DESC`)
+func (s *Store) ListRestartPending(ctx context.Context) ([]Sandbox, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sandboxCols+` FROM sandboxes WHERE restart_pending = 1 AND keep_hot = 1 AND status = 'stopped' ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -344,8 +345,8 @@ func (s *Store) ListRestartPending() ([]Sandbox, error) {
 }
 
 // DeleteSandbox removes a sandbox scoped to a user.
-func (s *Store) DeleteSandbox(userID, id string) error {
-	res, err := s.db.Exec(`DELETE FROM sandboxes WHERE id = ? AND created_by = ?`, id, userID)
+func (s *Store) DeleteSandbox(ctx context.Context, userID, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ? AND created_by = ?`, id, userID)
 	if err != nil {
 		return err
 	}
@@ -357,8 +358,8 @@ func (s *Store) DeleteSandbox(userID, id string) error {
 }
 
 // DeleteSandboxByID removes a sandbox by ID regardless of owner. For internal cleanup.
-func (s *Store) DeleteSandboxByID(id string) error {
-	res, err := s.db.Exec(`DELETE FROM sandboxes WHERE id = ?`, id)
+func (s *Store) DeleteSandboxByID(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -396,17 +397,17 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 }
 
 // SetShellToken stores the SHA-256 hash of the shell token.
-func (s *Store) SetShellToken(sandboxID, hash string) error {
-	_, err := s.db.Exec(
-		`UPDATE sandboxes SET shell_token_hash = ? WHERE id = ?`,
+func (s *Store) SetShellToken(ctx context.Context, sandboxID, hash string) error {
+	_, err := s.db.ExecContext(
+		ctx, `UPDATE sandboxes SET shell_token_hash = ? WHERE id = ?`,
 		hash, sandboxID)
 	return err
 }
 
 // ClearShellToken clears the shell token hash (revokes shell access).
-func (s *Store) ClearShellToken(sandboxID string) error {
-	_, err := s.db.Exec(
-		`UPDATE sandboxes SET shell_token_hash = '' WHERE id = ?`,
+func (s *Store) ClearShellToken(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(
+		ctx, `UPDATE sandboxes SET shell_token_hash = '' WHERE id = ?`,
 		sandboxID)
 	return err
 }

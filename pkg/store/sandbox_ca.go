@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -15,11 +16,11 @@ type SandboxCA struct {
 	CreatedAt time.Time
 }
 
-func (s *Store) PutSandboxCA(ca SandboxCA) error {
+func (s *Store) PutSandboxCA(ctx context.Context, ca SandboxCA) error {
 	if ca.CreatedAt.IsZero() {
 		ca.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.db.Exec(`INSERT INTO sandbox_cas (sandbox_id, user_id, cert_pem, key_enc, created_at)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO sandbox_cas (sandbox_id, user_id, cert_pem, key_enc, created_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(sandbox_id) DO UPDATE SET user_id = excluded.user_id,
 		cert_pem = excluded.cert_pem, key_enc = excluded.key_enc, created_at = excluded.created_at`,
@@ -30,9 +31,9 @@ func (s *Store) PutSandboxCA(ca SandboxCA) error {
 	return nil
 }
 
-func (s *Store) GetSandboxCA(sandboxID string) (*SandboxCA, error) {
+func (s *Store) GetSandboxCA(ctx context.Context, sandboxID string) (*SandboxCA, error) {
 	var ca SandboxCA
-	err := s.db.QueryRow(`SELECT sandbox_id, user_id, cert_pem, key_enc, created_at FROM sandbox_cas WHERE sandbox_id = ?`, sandboxID).
+	err := s.db.QueryRowContext(ctx, `SELECT sandbox_id, user_id, cert_pem, key_enc, created_at FROM sandbox_cas WHERE sandbox_id = ?`, sandboxID).
 		Scan(&ca.SandboxID, &ca.UserID, &ca.CertPEM, &ca.KeyEnc, &ca.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("get sandbox CA %q: %w", sandboxID, classify(err))
@@ -41,8 +42,8 @@ func (s *Store) GetSandboxCA(sandboxID string) (*SandboxCA, error) {
 	return &ca, nil
 }
 
-func (s *Store) DeleteSandboxCA(sandboxID string) error {
-	_, err := s.db.Exec(`DELETE FROM sandbox_cas WHERE sandbox_id = ?`, sandboxID)
+func (s *Store) DeleteSandboxCA(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_cas WHERE sandbox_id = ?`, sandboxID)
 	if err != nil {
 		return fmt.Errorf("delete sandbox CA %q: %w", sandboxID, err)
 	}

@@ -239,7 +239,7 @@ func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*se
 	t.Helper()
 	eng := newEngine(t)
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
@@ -247,7 +247,7 @@ func krucibleServer(t *testing.T, newEngine func(*testing.T) engine.Engine) (*se
 
 	const apiKey = "test-token"
 	sum := sha256.Sum256([]byte(apiKey))
-	if err := st.CreateUser(store.User{
+	if err := st.CreateUser(t.Context(), store.User{
 		ID: "usr_test", Name: "test-user", APIKeyHash: hex.EncodeToString(sum[:]),
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),

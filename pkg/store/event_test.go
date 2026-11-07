@@ -7,7 +7,7 @@ import (
 )
 
 func TestInsertAndQueryEvents(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "test.db"))
+	st, err := New(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,12 +26,12 @@ func TestInsertAndQueryEvents(t *testing.T) {
 		{Type: "auth.failed",
 			Meta: map[string]any{"ip": "1.2.3.4"}},
 	}
-	if err := st.InsertEvents(events); err != nil {
+	if err := st.InsertEvents(t.Context(), events); err != nil {
 		t.Fatal(err)
 	}
 
 	// Query all
-	all, err := st.QueryEvents(EventFilter{Limit: 100})
+	all, err := st.QueryEvents(t.Context(), EventFilter{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestInsertAndQueryEvents(t *testing.T) {
 	}
 
 	// Query by exact type
-	sandboxCreated, err := st.QueryEvents(EventFilter{Type: "sandbox.created"})
+	sandboxCreated, err := st.QueryEvents(t.Context(), EventFilter{Type: "sandbox.created"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestInsertAndQueryEvents(t *testing.T) {
 	}
 
 	// Query by prefix type (thermal matches thermal.*)
-	thermal, err := st.QueryEvents(EventFilter{Type: "thermal"})
+	thermal, err := st.QueryEvents(t.Context(), EventFilter{Type: "thermal"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestInsertAndQueryEvents(t *testing.T) {
 	}
 
 	// Query by user
-	alice, err := st.QueryEvents(EventFilter{UserID: "usr_alice"})
+	alice, err := st.QueryEvents(t.Context(), EventFilter{UserID: "usr_alice"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestInsertAndQueryEvents(t *testing.T) {
 	}
 
 	// Query by sandbox_id
-	sb2, err := st.QueryEvents(EventFilter{SandboxID: "sb_2"})
+	sb2, err := st.QueryEvents(t.Context(), EventFilter{SandboxID: "sb_2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestInsertAndQueryEvents(t *testing.T) {
 	}
 
 	// Count
-	count, err := st.CountEvents(EventFilter{Type: "sandbox"})
+	count, err := st.CountEvents(t.Context(), EventFilter{Type: "sandbox"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestInsertAndQueryEvents(t *testing.T) {
 }
 
 func TestMetricsSnapshots(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "test.db"))
+	st, err := New(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,13 +106,13 @@ func TestMetricsSnapshots(t *testing.T) {
 			SandboxesCold:  2,
 			HostLoad1m:     0.5,
 		}
-		if err := st.InsertMetricsSnapshot(snap); err != nil {
+		if err := st.InsertMetricsSnapshot(t.Context(), snap); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// Query all
-	snaps, err := st.QueryMetricsSnapshots(time.Time{}, 0)
+	snaps, err := st.QueryMetricsSnapshots(t.Context(), time.Time{}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestMetricsSnapshots(t *testing.T) {
 	}
 
 	// Sum
-	sums, err := st.SumMetricsSnapshots(time.Time{})
+	sums, err := st.SumMetricsSnapshots(t.Context(), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestMetricsSnapshots(t *testing.T) {
 	}
 
 	// Latest
-	latest, err := st.LatestMetricsSnapshot()
+	latest, err := st.LatestMetricsSnapshot(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,19 +141,19 @@ func TestMetricsSnapshots(t *testing.T) {
 }
 
 func TestRetention(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "test.db"))
+	st, err := New(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
 	// Insert events
-	if err := st.InsertEvents([]Event{
+	if err := st.InsertEvents(t.Context(), []Event{
 		{Type: "sandbox.created", Meta: map[string]any{"name": "test"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.InsertMetricsSnapshot(MetricsSnapshot{APIRequests: 1}); err != nil {
+	if err := st.InsertMetricsSnapshot(t.Context(), MetricsSnapshot{APIRequests: 1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -161,7 +161,7 @@ func TestRetention(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Purge with 0 retention (deletes everything)
-	n, err := st.PurgeOldEvents(0)
+	n, err := st.PurgeOldEvents(t.Context(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestRetention(t *testing.T) {
 		t.Errorf("expected 1 event purged, got %d", n)
 	}
 
-	n, err = st.PurgeOldMetricsSnapshots(0)
+	n, err = st.PurgeOldMetricsSnapshots(t.Context(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestRetention(t *testing.T) {
 	}
 
 	// Verify empty
-	events, _ := st.QueryEvents(EventFilter{Limit: 100})
+	events, _ := st.QueryEvents(t.Context(), EventFilter{Limit: 100})
 	if len(events) != 0 {
 		t.Errorf("expected 0 events after purge, got %d", len(events))
 	}

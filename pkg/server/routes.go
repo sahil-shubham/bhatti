@@ -80,7 +80,7 @@ func isValidMountPath(mount string) bool {
 // Returns nil and writes a 404 error if not found.
 func (s *Server) getUserSandbox(w http.ResponseWriter, r *http.Request, id string) *store.Sandbox {
 	user := UserFromContext(r.Context())
-	sb, err := s.store.GetSandbox(user.ID, id)
+	sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
 	if err != nil {
 		// The CLI passes names through without client-side resolution, so this
 		// message is what a user sees for a typo'd name — name it clearly.

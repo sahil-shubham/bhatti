@@ -18,11 +18,11 @@ import (
 // from then on the two write into different WALs and the database corrupts.
 func TestImageWalkKeepsDaemonStoreLocks(t *testing.T) {
 	if db := os.Getenv("BHATTI_TEST_STORE_WRITER"); db != "" {
-		st, err := store.New(db)
+		st, err := store.New(t.Context(), db)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.CreateUser(store.User{ID: "usr_cli", Name: "cli", APIKeyHash: "cli-hash", SubnetIndex: 2, CreatedAt: time.Now()}); err != nil {
+		if err := st.CreateUser(t.Context(), store.User{ID: "usr_cli", Name: "cli", APIKeyHash: "cli-hash", SubnetIndex: 2, CreatedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		st.Close()
@@ -30,12 +30,12 @@ func TestImageWalkKeepsDaemonStoreLocks(t *testing.T) {
 	}
 	data := t.TempDir()
 	db := filepath.Join(data, "state.db")
-	daemon, err := store.New(db)
+	daemon, err := store.New(t.Context(), db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer daemon.Close()
-	if _, err := daemon.ListUsers(); err != nil {
+	if _, err := daemon.ListUsers(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	writeBase(t, filepath.Join(data, "images", "rootfs-minimal-"+runtime.GOARCH+".ext4"), 1)
@@ -51,7 +51,7 @@ func TestImageWalkKeepsDaemonStoreLocks(t *testing.T) {
 	if _, err := os.Stat(db + "-wal"); err != nil {
 		t.Fatalf("a second process deleted the daemon's live WAL: %v", err)
 	}
-	if _, err := daemon.GetUserByKeyHash("cli-hash"); err != nil {
+	if _, err := daemon.GetUserByKeyHash(t.Context(), "cli-hash"); err != nil {
 		t.Fatalf("daemon cannot see the other process's commit: %v", err)
 	}
 }

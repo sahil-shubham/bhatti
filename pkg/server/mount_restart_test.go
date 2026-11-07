@@ -114,7 +114,7 @@ func TestMountPolicyAdoptedRunningSandboxWarnsAndRecordsEvent(t *testing.T) {
 	// Close drains the asynchronous recorder, making the event query deterministic.
 	srv.events.Close()
 	srv.events = nil
-	events, err := srv.store.QueryEvents(store.EventFilter{SandboxID: sb.ID, Type: "sandbox.mount_policy_violation", Since: time.Now().Add(-time.Minute)})
+	events, err := srv.store.QueryEvents(t.Context(), store.EventFilter{SandboxID: sb.ID, Type: "sandbox.mount_policy_violation", Since: time.Now().Add(-time.Minute)})
 	if err != nil || len(events) != 1 {
 		t.Fatalf("mount violation events = %+v, err=%v", events, err)
 	}

@@ -21,7 +21,7 @@ import (
 // recorder, t.Cleanup wires the close.
 func newTestRecorder(t *testing.T) *EventRecorder {
 	t.Helper()
-	st, err := store.New(filepath.Join(t.TempDir(), "ev.db"))
+	st, err := store.New(t.Context(), filepath.Join(t.TempDir(), "ev.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestSubscribe_CancelClosesChannel(t *testing.T) {
 func TestSubscribe_CloseEventRecorderClosesAllSubs(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 
-	st, err := store.New(filepath.Join(t.TempDir(), "ev.db"))
+	st, err := store.New(t.Context(), filepath.Join(t.TempDir(), "ev.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func TestSubscribe_PersistenceUnaffectedByDisconnectedSubscriber(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "ev.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "ev.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestSubscribe_PersistenceUnaffectedByDisconnectedSubscriber(t *testing.T) {
 	// Close drains pending SQLite writes.
 	rec.Close()
 
-	events, err := st.QueryEvents(store.EventFilter{Limit: total + 10})
+	events, err := st.QueryEvents(t.Context(), store.EventFilter{Limit: total + 10})
 	if err != nil {
 		t.Fatal(err)
 	}

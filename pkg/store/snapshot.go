@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -70,8 +71,8 @@ const snapshotCols = `id, user_id, name, source_sandbox, mem_path, vm_path,
 
 // CreateSnapshot records snap and, with it, what it holds in Source and
 // Substitution, all or nothing.
-func (s *Store) CreateSnapshot(snap SnapshotRecord) error {
-	tx, err := s.db.Begin()
+func (s *Store) CreateSnapshot(ctx context.Context, snap SnapshotRecord) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -80,8 +81,8 @@ func (s *Store) CreateSnapshot(snap SnapshotRecord) error {
 	if snap.Source.HasInit {
 		hasInit = 1
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO snapshots (`+snapshotCols+`)
+	if _, err := tx.ExecContext(
+		ctx, `INSERT INTO snapshots (`+snapshotCols+`)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		snap.ID, snap.UserID, snap.Name, snap.SourceSandbox,
 		snap.MemPath, snap.VMPath, snap.RootfsPath, snap.ConfigPath,
@@ -95,7 +96,7 @@ func (s *Store) CreateSnapshot(snap SnapshotRecord) error {
 		if created.IsZero() {
 			created = time.Now()
 		}
-		if _, err := tx.Exec(`INSERT INTO snapshot_cas (snapshot_id, user_id, cert_pem, key_enc, created_at)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO snapshot_cas (snapshot_id, user_id, cert_pem, key_enc, created_at)
 			VALUES (?, ?, ?, ?, ?)`, snap.ID, snap.UserID, ca.CertPEM, ca.KeyEnc, created.UTC()); err != nil {
 			return fmt.Errorf("record snapshot CA: %w", err)
 		}
@@ -109,7 +110,7 @@ func (s *Store) CreateSnapshot(snap SnapshotRecord) error {
 		if err != nil {
 			return fmt.Errorf("marshal snapshot grant hosts: %w", err)
 		}
-		if _, err := tx.Exec(`INSERT INTO snapshot_grants (snapshot_id, user_id, secret_name, hosts_json, placeholder, expires_at)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO snapshot_grants (snapshot_id, user_id, secret_name, hosts_json, placeholder, expires_at)
 			VALUES (?, ?, ?, ?, ?, ?)`, snap.ID, snap.UserID, g.SecretName, string(hostsJSON), g.Placeholder, utcGrantTime(g.ExpiresAt)); err != nil {
 			return fmt.Errorf("record snapshot grant: %w", err)
 		}
@@ -138,22 +139,22 @@ func scanSnapshot(row scanner) (*SnapshotRecord, error) {
 }
 
 // GetSnapshot retrieves a snapshot by user and name, with its Substitution.
-func (s *Store) GetSnapshot(userID, name string) (*SnapshotRecord, error) {
-	snap, err := scanSnapshot(s.db.QueryRow(
-		`SELECT `+snapshotCols+` FROM snapshots WHERE user_id = ? AND name = ?`, userID, name))
+func (s *Store) GetSnapshot(ctx context.Context, userID, name string) (*SnapshotRecord, error) {
+	snap, err := scanSnapshot(s.db.QueryRowContext(
+		ctx, `SELECT `+snapshotCols+` FROM snapshots WHERE user_id = ? AND name = ?`, userID, name))
 	if err != nil {
 		return nil, noRows(err, "snapshot %q not found", name)
 	}
-	if snap.Substitution, err = s.snapshotSubstitution(snap.ID); err != nil {
+	if snap.Substitution, err = s.snapshotSubstitution(ctx, snap.ID); err != nil {
 		return nil, err
 	}
 	return snap, nil
 }
 
-func (s *Store) snapshotSubstitution(snapshotID string) (SnapshotSubstitution, error) {
+func (s *Store) snapshotSubstitution(ctx context.Context, snapshotID string) (SnapshotSubstitution, error) {
 	var sub SnapshotSubstitution
 	var ca SandboxCA
-	err := s.db.QueryRow(`SELECT user_id, cert_pem, key_enc, created_at FROM snapshot_cas WHERE snapshot_id = ?`, snapshotID).
+	err := s.db.QueryRowContext(ctx, `SELECT user_id, cert_pem, key_enc, created_at FROM snapshot_cas WHERE snapshot_id = ?`, snapshotID).
 		Scan(&ca.UserID, &ca.CertPEM, &ca.KeyEnc, &ca.CreatedAt)
 	switch {
 	case err == nil:
@@ -162,7 +163,7 @@ func (s *Store) snapshotSubstitution(snapshotID string) (SnapshotSubstitution, e
 	case !errors.Is(err, sql.ErrNoRows):
 		return sub, fmt.Errorf("get snapshot CA: %w", err)
 	}
-	rows, err := s.db.Query(`SELECT secret_name, hosts_json, placeholder, expires_at FROM snapshot_grants
+	rows, err := s.db.QueryContext(ctx, `SELECT secret_name, hosts_json, placeholder, expires_at FROM snapshot_grants
 		WHERE snapshot_id = ? ORDER BY secret_name, placeholder`, snapshotID)
 	if err != nil {
 		return sub, fmt.Errorf("get snapshot grants: %w", err)
@@ -191,9 +192,9 @@ func (s *Store) snapshotSubstitution(snapshotID string) (SnapshotSubstitution, e
 }
 
 // ListSnapshots returns all snapshots for a user, without their Substitution.
-func (s *Store) ListSnapshots(userID string) ([]SnapshotRecord, error) {
-	rows, err := s.db.Query(
-		`SELECT `+snapshotCols+` FROM snapshots WHERE user_id = ? ORDER BY created_at DESC`, userID)
+func (s *Store) ListSnapshots(ctx context.Context, userID string) ([]SnapshotRecord, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT `+snapshotCols+` FROM snapshots WHERE user_id = ? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -210,14 +211,14 @@ func (s *Store) ListSnapshots(userID string) ([]SnapshotRecord, error) {
 }
 
 // DeleteSnapshot removes a snapshot record and the CA and grants it kept.
-func (s *Store) DeleteSnapshot(userID, name string) error {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteSnapshot(ctx context.Context, userID, name string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var id string
-	if err := tx.QueryRow(`SELECT id FROM snapshots WHERE user_id = ? AND name = ?`, userID, name).Scan(&id); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM snapshots WHERE user_id = ? AND name = ?`, userID, name).Scan(&id); err != nil {
 		return noRows(err, "snapshot %q not found", name)
 	}
 	for _, stmt := range []string{
@@ -225,7 +226,7 @@ func (s *Store) DeleteSnapshot(userID, name string) error {
 		`DELETE FROM snapshot_grants WHERE snapshot_id = ?`,
 		`DELETE FROM snapshots WHERE id = ?`,
 	} {
-		if _, err := tx.Exec(stmt, id); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
 			return err
 		}
 	}

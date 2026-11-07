@@ -90,7 +90,7 @@ func (s *Server) StartLifecycleEvents() {
 // it backs off, so a daemon that exits mid-backoff leaves the retry to the next
 // start. The restart workers are cancelled and joined by Close.
 func (s *Server) StartKeepHotRecovery() {
-	pending, err := s.store.ListRestartPending()
+	pending, err := s.store.ListRestartPending(s.ctx)
 	if err != nil {
 		slog.Warn("keep-hot recovery: list pending restarts", "error", err)
 		return
@@ -147,10 +147,10 @@ func (s *Server) handleLifecycle(e engine.LifecycleEvent) {
 	var sb *store.Sandbox
 	var err error
 	if e.EngineID != "" {
-		sb, err = s.store.GetSandboxByEngineID(e.EngineID)
+		sb, err = s.store.GetSandboxByEngineID(s.ctx, e.EngineID)
 	}
 	if (e.EngineID == "" || err != nil) && e.SandboxID != "" {
-		sb, err = s.store.GetSandboxByID(e.SandboxID)
+		sb, err = s.store.GetSandboxByID(s.ctx, e.SandboxID)
 	}
 	if err != nil {
 		slog.Warn("engine lifecycle: sandbox lookup failed", "engine_id", e.EngineID, "sandbox_id", e.SandboxID, "error", err)
@@ -168,7 +168,7 @@ func (s *Server) handleLifecycle(e engine.LifecycleEvent) {
 		// exit that wins the race must not be overwritten by the Start worker.
 		gate := s.lockTransition(sb.EngineID)
 		defer s.unlockTransition(sb.EngineID, gate)
-		if err := s.store.StopSandboxUnexpected(sb.ID); err != nil {
+		if err := s.store.StopSandboxUnexpected(detached(s.ctx), sb.ID); err != nil {
 			slog.Error("sandbox exit: persist stopped state", "sandbox_id", sb.ID, "error", err)
 			return
 		}
@@ -271,7 +271,7 @@ func (s *Server) completeRestart(sandboxID, engineID string) {
 	if !s.lifecycle.finishRestart(engineID) || s.ctx.Err() != nil {
 		return
 	}
-	sb, err := s.store.GetSandboxByID(sandboxID)
+	sb, err := s.store.GetSandboxByID(s.ctx, sandboxID)
 	if err == nil && sb.KeepHot && sb.Status == "stopped" {
 		s.scheduleRestart(sb)
 	}
@@ -305,7 +305,7 @@ func (s *Server) restartKeepHot(sandboxID, engineID string, delay time.Duration)
 		if s.lifecycle.restartAborted(engineID) {
 			return // the owner stopped it while the restart was backing off
 		}
-		sb, err := s.store.GetSandboxByID(sandboxID)
+		sb, err := s.store.GetSandboxByID(s.ctx, sandboxID)
 		if err != nil || !sb.KeepHot || sb.Status != "stopped" {
 			return // destroyed, disabled, or already woken by a request
 		}
@@ -329,7 +329,7 @@ func (s *Server) restartKeepHot(sandboxID, engineID string, delay time.Duration)
 				return // the exit event will schedule the next attempt
 			}
 			if statusErr == nil {
-				statusErr = s.store.UpdateSandboxStatus(sb.ID, "running")
+				statusErr = s.store.UpdateSandboxStatus(detached(s.ctx), sb.ID, "running")
 			}
 			if statusErr == nil {
 				s.touchActivity(engineID)
@@ -362,7 +362,7 @@ func (s *Server) restartKeepHot(sandboxID, engineID string, delay time.Duration)
 // VM that cannot boot from being retried on every daemon restart.
 func (s *Server) restartFailed(sb *store.Sandbox, reason string) {
 	slog.Error("sandbox.restart_failed", "sandbox_id", sb.ID, "reason", reason)
-	if err := s.store.ClearRestartPending(sb.ID); err != nil {
+	if err := s.store.ClearRestartPending(detached(s.ctx), sb.ID); err != nil {
 		slog.Warn("sandbox.restart_failed: clear restart marker", "sandbox_id", sb.ID, "error", err)
 	}
 	s.RecordEvent(store.Event{

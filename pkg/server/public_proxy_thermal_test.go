@@ -20,12 +20,12 @@ import (
 func setupPublicProxy(t *testing.T) (*Server, *mockEngine, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.New(filepath.Join(dir, "test.db"))
+	st, err := store.New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	keyHash := sha256Hex(testAPIKey)
-	st.CreateUser(store.User{
+	st.CreateUser(t.Context(), store.User{
 		ID: "usr_test", Name: "test-user", APIKeyHash: keyHash,
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),
@@ -59,7 +59,7 @@ func publishSandbox(t *testing.T, srv *Server, eng *mockEngine, name, alias stri
 		Status: "running", IP: info.IP, CreatedBy: "usr_test",
 		CreatedAt: time.Now(),
 	}
-	if err := srv.store.CreateSandbox(sb); err != nil {
+	if err := srv.store.CreateSandbox(t.Context(), sb); err != nil {
 		t.Fatal(err)
 	}
 	eng.mu.Lock()
@@ -70,7 +70,7 @@ func publishSandbox(t *testing.T, srv *Server, eng *mockEngine, name, alias stri
 		ID: "pub_" + genID(), SandboxID: sb.ID, UserID: "usr_test",
 		Port: port, Alias: alias,
 	}
-	if err := srv.store.CreatePublishRule(rule); err != nil {
+	if err := srv.store.CreatePublishRule(t.Context(), rule); err != nil {
 		t.Fatal(err)
 	}
 	return sb, info.EngineID
@@ -109,10 +109,10 @@ func TestPublicProxyColdWakeUpdatesStore(t *testing.T) {
 	eng.mu.Lock()
 	eng.thermal[eid] = "cold"
 	eng.mu.Unlock()
-	srv.store.StopSandbox(sb.ID)
+	srv.store.StopSandbox(t.Context(), sb.ID)
 
 	// Precondition
-	got, _ := srv.store.GetSandboxByID(sb.ID)
+	got, _ := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if got.Status != "stopped" {
 		t.Fatalf("precondition: expected stopped, got %q", got.Status)
 	}
@@ -120,7 +120,7 @@ func TestPublicProxyColdWakeUpdatesStore(t *testing.T) {
 	hitPublicProxy(t, ts, "cold-wake")
 
 	// Store must be "running" now
-	got, _ = srv.store.GetSandboxByID(sb.ID)
+	got, _ = srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if got.Status != "running" {
 		t.Fatalf("expected store status=running after cold wake via public proxy, got %q", got.Status)
 	}
@@ -201,7 +201,7 @@ func TestPublicProxyColdWakeThermalManaged(t *testing.T) {
 	eng.mu.Lock()
 	eng.thermal[eid] = "cold"
 	eng.mu.Unlock()
-	srv.store.StopSandbox(sb.ID)
+	srv.store.StopSandbox(t.Context(), sb.ID)
 
 	// Wake via public proxy
 	hitPublicProxy(t, ts, "cold-therm")
@@ -258,7 +258,7 @@ func TestPublicProxyColdWakeWithoutInitFailsFast(t *testing.T) {
 	eng.thermal[eid] = "cold"
 	eng.TunnelRefusals = 1 << 20
 	eng.mu.Unlock()
-	srv.store.StopSandbox(sb.ID)
+	srv.store.StopSandbox(t.Context(), sb.ID)
 
 	start := time.Now()
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{}}

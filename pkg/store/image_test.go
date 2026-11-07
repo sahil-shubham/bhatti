@@ -12,17 +12,17 @@ func TestImageShareVisibility(t *testing.T) {
 	img := createTestImage(t, s, "usr_owner", "golden")
 
 	// friend can't see it yet
-	if _, err := s.GetImage("usr_friend", "golden"); err == nil {
+	if _, err := s.GetImage(t.Context(), "usr_friend", "golden"); err == nil {
 		t.Fatal("friend should not see unshared image")
 	}
 
 	// Share it
-	if err := s.ShareImage(img.ID, "usr_friend"); err != nil {
+	if err := s.ShareImage(t.Context(), img.ID, "usr_friend"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now friend can see it
-	got, err := s.GetImage("usr_friend", "golden")
+	got, err := s.GetImage(t.Context(), "usr_friend", "golden")
 	if err != nil {
 		t.Fatalf("friend should see shared image: %v", err)
 	}
@@ -38,15 +38,15 @@ func TestImageShareIsolation(t *testing.T) {
 	createTestUser(t, s, "usr_stranger", "stranger")
 
 	img := createTestImage(t, s, "usr_owner", "private")
-	s.ShareImage(img.ID, "usr_friend")
+	s.ShareImage(t.Context(), img.ID, "usr_friend")
 
 	// friend can see it
-	if _, err := s.GetImage("usr_friend", "private"); err != nil {
+	if _, err := s.GetImage(t.Context(), "usr_friend", "private"); err != nil {
 		t.Fatal("friend should see shared image")
 	}
 
 	// stranger cannot
-	if _, err := s.GetImage("usr_stranger", "private"); err == nil {
+	if _, err := s.GetImage(t.Context(), "usr_stranger", "private"); err == nil {
 		t.Fatal("stranger should NOT see image shared only with friend")
 	}
 }
@@ -57,18 +57,18 @@ func TestImageUnshare(t *testing.T) {
 	createTestUser(t, s, "usr_friend", "friend")
 
 	img := createTestImage(t, s, "usr_owner", "temp-share")
-	s.ShareImage(img.ID, "usr_friend")
+	s.ShareImage(t.Context(), img.ID, "usr_friend")
 
 	// friend sees it
-	if _, err := s.GetImage("usr_friend", "temp-share"); err != nil {
+	if _, err := s.GetImage(t.Context(), "usr_friend", "temp-share"); err != nil {
 		t.Fatal("should see shared image")
 	}
 
 	// Unshare
-	s.UnshareImage(img.ID, "usr_friend")
+	s.UnshareImage(t.Context(), img.ID, "usr_friend")
 
 	// friend no longer sees it
-	if _, err := s.GetImage("usr_friend", "temp-share"); err == nil {
+	if _, err := s.GetImage(t.Context(), "usr_friend", "temp-share"); err == nil {
 		t.Fatal("should not see unshared image")
 	}
 }
@@ -82,11 +82,11 @@ func TestImageShareListImages(t *testing.T) {
 	createTestImage(t, s, "usr_friend", "own-img")
 	createTestImage(t, s, "", "admin-img")
 
-	img, _ := s.GetImageByName("shared-img")
-	s.ShareImage(img.ID, "usr_friend")
+	img, _ := s.GetImageByName(t.Context(), "shared-img")
+	s.ShareImage(t.Context(), img.ID, "usr_friend")
 
 	// friend should see: own-img + shared-img + admin-img
-	list, err := s.ListImages("usr_friend")
+	list, err := s.ListImages(t.Context(), "usr_friend")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,10 +109,10 @@ func TestListImageShares(t *testing.T) {
 	createTestUser(t, s, "usr_b", "bob")
 
 	img := createTestImage(t, s, "usr_owner", "team-img")
-	s.ShareImage(img.ID, "usr_a")
-	s.ShareImage(img.ID, "usr_b")
+	s.ShareImage(t.Context(), img.ID, "usr_a")
+	s.ShareImage(t.Context(), img.ID, "usr_b")
 
-	shares, err := s.ListImageShares(img.ID)
+	shares, err := s.ListImageShares(t.Context(), img.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestGetImageByName(t *testing.T) {
 	s := testStore(t)
 	createTestImage(t, s, "usr_x", "findme")
 
-	img, err := s.GetImageByName("findme")
+	img, err := s.GetImageByName(t.Context(), "findme")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestGetImageByName(t *testing.T) {
 		t.Fatalf("expected findme, got %q", img.Name)
 	}
 
-	_, err = s.GetImageByName("nonexistent")
+	_, err = s.GetImageByName(t.Context(), "nonexistent")
 	if err == nil {
 		t.Fatal("should error on nonexistent image")
 	}
@@ -143,7 +143,7 @@ func TestGetUserByName(t *testing.T) {
 	s := testStore(t)
 	createTestUser(t, s, "usr_test", "testuser")
 
-	u, err := s.GetUserByName("testuser")
+	u, err := s.GetUserByName(t.Context(), "testuser")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestGetUserByName(t *testing.T) {
 		t.Fatalf("expected usr_test, got %q", u.ID)
 	}
 
-	_, err = s.GetUserByName("nobody")
+	_, err = s.GetUserByName(t.Context(), "nobody")
 	if err == nil {
 		t.Fatal("should error on nonexistent user")
 	}

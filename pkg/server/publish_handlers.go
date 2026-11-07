@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -53,11 +54,11 @@ func generateAlias(sandboxName string) string {
 	return alias
 }
 
-func generateUniqueAlias(st *store.Store, sandboxName string) (string, error) {
+func generateUniqueAlias(ctx context.Context, st *store.Store, sandboxName string) (string, error) {
 	// Try up to 4 times (each attempt has a fresh random suffix)
 	for i := 0; i < 4; i++ {
 		candidate := generateAlias(sandboxName)
-		if _, err := st.GetPublishRuleByAlias(candidate); err != nil {
+		if _, err := st.GetPublishRuleByAlias(ctx, candidate); err != nil {
 			return candidate, nil // not taken
 		}
 	}
@@ -114,7 +115,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID
 	alias := req.Alias
 	if alias == "" {
 		var err error
-		alias, err = generateUniqueAlias(s.store, sb.Name)
+		alias, err = generateUniqueAlias(r.Context(), s.store, sb.Name)
 		if err != nil {
 			errResp(w, 500, "alias generation failed")
 			return
@@ -132,10 +133,10 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID
 		Port:      req.Port,
 		Alias:     alias,
 	}
-	if err := s.store.CreatePublishRule(rule); err != nil {
+	if err := s.store.CreatePublishRule(r.Context(), rule); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			// Idempotent: return the existing rule instead of 409
-			existing, lerr := s.store.ListPublishRules(sb.ID)
+			existing, lerr := s.store.ListPublishRules(r.Context(), sb.ID)
 			if lerr == nil {
 				for _, r := range existing {
 					if r.Port == req.Port {
@@ -194,7 +195,7 @@ func (s *Server) handleListPublishRules(w http.ResponseWriter, r *http.Request, 
 	if sb == nil {
 		return
 	}
-	rules, err := s.store.ListPublishRules(sb.ID)
+	rules, err := s.store.ListPublishRules(r.Context(), sb.ID)
 	if err != nil {
 		errResp(w, 500, err.Error())
 		return
@@ -217,8 +218,8 @@ func (s *Server) handleUnpublish(w http.ResponseWriter, r *http.Request, sandbox
 		return
 	}
 	// Look up alias before deleting to invalidate route cache.
-	rules, _ := s.store.ListPublishRules(sb.ID)
-	if err := s.store.DeletePublishRule(user.ID, sb.ID, port); err != nil {
+	rules, _ := s.store.ListPublishRules(r.Context(), sb.ID)
+	if err := s.store.DeletePublishRule(r.Context(), user.ID, sb.ID, port); err != nil {
 		errResp(w, 404, err.Error())
 		return
 	}

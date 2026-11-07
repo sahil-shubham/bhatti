@@ -139,7 +139,7 @@ func TestSandboxTunnelRejectsMissingTokenAndOtherUser(t *testing.T) {
 	srv, ts := setup(t)
 	sb := createSandbox(t, ts, "tunnel-private")
 	url := tunnelURL(ts.URL, sb.ID, "?port=8080")
-	if err := srv.store.CreateUser(store.User{
+	if err := srv.store.CreateUser(t.Context(), store.User{
 		ID: "usr_tunnel_other", Name: "tunnel-other", APIKeyHash: sha256Hex("other-token"),
 		MaxSandboxes: 5, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 2, CreatedAt: time.Now(),

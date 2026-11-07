@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -50,18 +51,18 @@ type VolumeAttachment struct {
 	ReadOnly  bool   `json:"read_only"`
 }
 
-func (s *Store) CreateVolume(name string) error {
-	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO volumes (name, created_at) VALUES (?, ?)`,
+func (s *Store) CreateVolume(ctx context.Context, name string) error {
+	_, err := s.db.ExecContext(
+		ctx, `INSERT OR IGNORE INTO volumes (name, created_at) VALUES (?, ?)`,
 		name, time.Now(),
 	)
 	return err
 }
 
 // GetVolume retrieves a volume by name.
-func (s *Store) GetVolume(name string) (*Volume, error) {
+func (s *Store) GetVolume(ctx context.Context, name string) (*Volume, error) {
 	var v Volume
-	err := s.db.QueryRow(`SELECT name, created_at FROM volumes WHERE name = ?`, name).
+	err := s.db.QueryRowContext(ctx, `SELECT name, created_at FROM volumes WHERE name = ?`, name).
 		Scan(&v.Name, &v.CreatedAt)
 	if err != nil {
 		return nil, noRows(err, "volume %q not found", name)
@@ -70,8 +71,8 @@ func (s *Store) GetVolume(name string) (*Volume, error) {
 }
 
 // ListVolumes returns all tracked volumes.
-func (s *Store) ListVolumes() ([]Volume, error) {
-	rows, err := s.db.Query(`SELECT name, created_at FROM volumes ORDER BY created_at DESC`)
+func (s *Store) ListVolumes(ctx context.Context) ([]Volume, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, created_at FROM volumes ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -88,9 +89,9 @@ func (s *Store) ListVolumes() ([]Volume, error) {
 }
 
 // DeleteVolume removes a volume record. Fails if any sandbox is using it.
-func (s *Store) DeleteVolume(name string) error {
+func (s *Store) DeleteVolume(ctx context.Context, name string) error {
 	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sandbox_volumes WHERE volume_name = ?`, name).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sandbox_volumes WHERE volume_name = ?`, name).Scan(&count); err != nil {
 		return fmt.Errorf("store: count volume mounts: %w", err)
 	}
 	if count < 0 {
@@ -99,7 +100,7 @@ func (s *Store) DeleteVolume(name string) error {
 	if count > 0 {
 		return wrap(ErrInUse, "volume %q is in use by %d sandbox(es)", name, count)
 	}
-	res, err := s.db.Exec(`DELETE FROM volumes WHERE name = ?`, name)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM volumes WHERE name = ?`, name)
 	if err != nil {
 		return err
 	}
@@ -111,22 +112,22 @@ func (s *Store) DeleteVolume(name string) error {
 }
 
 // AttachVolume records a volume mount for a sandbox.
-func (s *Store) AttachVolume(sandboxID, volumeName, target string, readonly bool) error {
+func (s *Store) AttachVolume(ctx context.Context, sandboxID, volumeName, target string, readonly bool) error {
 	ro := 0
 	if readonly {
 		ro = 1
 	}
-	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO sandbox_volumes (sandbox_id, volume_name, target, readonly) VALUES (?, ?, ?, ?)`,
+	_, err := s.db.ExecContext(
+		ctx, `INSERT OR REPLACE INTO sandbox_volumes (sandbox_id, volume_name, target, readonly) VALUES (?, ?, ?, ?)`,
 		sandboxID, volumeName, target, ro,
 	)
 	return err
 }
 
 // GetSandboxVolumes returns all volume mounts for a sandbox.
-func (s *Store) GetSandboxVolumes(sandboxID string) ([]SandboxVolume, error) {
-	rows, err := s.db.Query(
-		`SELECT sandbox_id, volume_name, target, readonly FROM sandbox_volumes WHERE sandbox_id = ?`,
+func (s *Store) GetSandboxVolumes(ctx context.Context, sandboxID string) ([]SandboxVolume, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT sandbox_id, volume_name, target, readonly FROM sandbox_volumes WHERE sandbox_id = ?`,
 		sandboxID,
 	)
 	if err != nil {
@@ -147,16 +148,16 @@ func (s *Store) GetSandboxVolumes(sandboxID string) ([]SandboxVolume, error) {
 }
 
 // DetachVolumes removes all volume mount records for a sandbox (called on destroy).
-func (s *Store) DetachVolumes(sandboxID string) error {
-	_, err := s.db.Exec(`DELETE FROM sandbox_volumes WHERE sandbox_id = ?`, sandboxID)
+func (s *Store) DetachVolumes(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sandbox_volumes WHERE sandbox_id = ?`, sandboxID)
 	return err
 }
 
 // CreatePersistentVolume is not idempotent, for race coordination: a name the
 // user already holds is ErrConflict.
-func (s *Store) CreatePersistentVolume(v PersistentVolume) error {
-	_, err := s.db.Exec(
-		`INSERT INTO volumes_v2 (id, user_id, name, size_mb, file_path, status, created_at)
+func (s *Store) CreatePersistentVolume(ctx context.Context, v PersistentVolume) error {
+	_, err := s.db.ExecContext(
+		ctx, `INSERT INTO volumes_v2 (id, user_id, name, size_mb, file_path, status, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.UserID, v.Name, v.SizeMB, v.FilePath, v.Status, v.CreatedAt,
 	)
@@ -164,18 +165,18 @@ func (s *Store) CreatePersistentVolume(v PersistentVolume) error {
 }
 
 // GetPersistentVolume retrieves a persistent volume by user and name, including attachments.
-func (s *Store) GetPersistentVolume(userID, name string) (*PersistentVolume, error) {
+func (s *Store) GetPersistentVolume(ctx context.Context, userID, name string) (*PersistentVolume, error) {
 	var v PersistentVolume
-	err := s.db.QueryRow(
-		`SELECT id, user_id, name, size_mb, file_path, status, created_at
+	err := s.db.QueryRowContext(
+		ctx, `SELECT id, user_id, name, size_mb, file_path, status, created_at
 		 FROM volumes_v2 WHERE user_id = ? AND name = ?`, userID, name).Scan(
 		&v.ID, &v.UserID, &v.Name, &v.SizeMB, &v.FilePath, &v.Status, &v.CreatedAt,
 	)
 	if err != nil {
 		return nil, noRows(err, "volume %q not found", name)
 	}
-	rows, err := s.db.Query(
-		`SELECT sandbox_id, mount, read_only FROM volume_attachments WHERE volume_id = ?`, v.ID)
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT sandbox_id, mount, read_only FROM volume_attachments WHERE volume_id = ?`, v.ID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list volume attachments: %w", err)
 	}
@@ -197,9 +198,9 @@ func (s *Store) GetPersistentVolume(userID, name string) (*PersistentVolume, err
 
 // PersistentVolumeExists checks only the volume row; attachment scan failures
 // must never make startup mistake an existing volume file for an orphan.
-func (s *Store) PersistentVolumeExists(userID, name string) (bool, error) {
+func (s *Store) PersistentVolumeExists(ctx context.Context, userID, name string) (bool, error) {
 	var one int
-	err := s.db.QueryRow(`SELECT 1 FROM volumes_v2 WHERE user_id = ? AND name = ?`, userID, name).Scan(&one)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM volumes_v2 WHERE user_id = ? AND name = ?`, userID, name).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -210,9 +211,9 @@ func (s *Store) PersistentVolumeExists(userID, name string) (bool, error) {
 }
 
 // ListPersistentVolumes returns all persistent volumes for a user.
-func (s *Store) ListPersistentVolumes(userID string) ([]PersistentVolume, error) {
-	rows, err := s.db.Query(
-		`SELECT id, user_id, name, size_mb, file_path, status, created_at
+func (s *Store) ListPersistentVolumes(ctx context.Context, userID string) ([]PersistentVolume, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT id, user_id, name, size_mb, file_path, status, created_at
 		 FROM volumes_v2 WHERE user_id = ? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -230,22 +231,22 @@ func (s *Store) ListPersistentVolumes(userID string) ([]PersistentVolume, error)
 }
 
 // DeletePersistentVolume removes a persistent volume record. Fails if any attachments exist.
-func (s *Store) DeletePersistentVolume(userID, name string) error {
-	tx, err := s.db.Begin()
+func (s *Store) DeletePersistentVolume(ctx context.Context, userID, name string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
 	var volID string
-	err = tx.QueryRow(`SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
+	err = tx.QueryRowContext(ctx, `SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
 		userID, name).Scan(&volID)
 	if err != nil {
 		return noRows(err, "volume %q not found", name)
 	}
 
 	var count int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ?`, volID).Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ?`, volID).Scan(&count); err != nil {
 		return fmt.Errorf("store: count volume attachments: %w", err)
 	}
 	if count < 0 {
@@ -255,7 +256,7 @@ func (s *Store) DeletePersistentVolume(userID, name string) error {
 		return wrap(ErrVolumeAttached, "volume %q has %d active attachment(s)", name, count)
 	}
 
-	if _, err := tx.Exec(`DELETE FROM volumes_v2 WHERE id = ?`, volID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM volumes_v2 WHERE id = ?`, volID); err != nil {
 		return fmt.Errorf("store: delete persistent volume: %w", err)
 	}
 	return tx.Commit()
@@ -263,7 +264,9 @@ func (s *Store) DeletePersistentVolume(userID, name string) error {
 
 // LockPersistentVolumeAttachments prevents a new guest from attaching while
 // the caller reads attachment rows and clones the volume. It is per volume,
-// not a SQLite write transaction held over a potentially long file copy.
+// not a SQLite write transaction held over a potentially long file copy. It
+// takes no context because it waits on an in-process lock, never on the
+// database.
 func (s *Store) LockPersistentVolumeAttachments(userID, name string) func() {
 	key := userID + "\x00" + name
 	s.volumeGateMu.Lock()
@@ -291,17 +294,17 @@ func (s *Store) LockPersistentVolumeAttachments(userID, name string) func() {
 }
 
 // AttachPersistentVolume attaches a persistent volume to a sandbox with concurrency checks.
-func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, readOnly bool) error {
+func (s *Store) AttachPersistentVolume(ctx context.Context, userID, name, sandboxID, mount string, readOnly bool) error {
 	unlock := s.LockPersistentVolumeAttachments(userID, name)
 	defer unlock()
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
 	var volID, status string
-	err = tx.QueryRow(`SELECT id, status FROM volumes_v2 WHERE user_id = ? AND name = ?`,
+	err = tx.QueryRowContext(ctx, `SELECT id, status FROM volumes_v2 WHERE user_id = ? AND name = ?`,
 		userID, name).Scan(&volID, &status)
 	if err != nil {
 		return noRows(err, "volume %q not found", name)
@@ -311,11 +314,11 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 	}
 
 	var rwCount, roCount int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 0`,
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 0`,
 		volID).Scan(&rwCount); err != nil {
 		return fmt.Errorf("store: count read-write attachments: %w", err)
 	}
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 1`,
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM volume_attachments WHERE volume_id = ? AND read_only = 1`,
 		volID).Scan(&roCount); err != nil {
 		return fmt.Errorf("store: count read-only attachments: %w", err)
 	}
@@ -337,8 +340,8 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 	if readOnly {
 		ro = 1
 	}
-	_, err = tx.Exec(
-		`INSERT INTO volume_attachments (volume_id, sandbox_id, mount, read_only) VALUES (?, ?, ?, ?)`,
+	_, err = tx.ExecContext(
+		ctx, `INSERT INTO volume_attachments (volume_id, sandbox_id, mount, read_only) VALUES (?, ?, ?, ?)`,
 		volID, sandboxID, mount, ro)
 	if err != nil {
 		return classify(err)
@@ -347,36 +350,36 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 }
 
 // DetachPersistentVolume removes a specific volume attachment.
-func (s *Store) DetachPersistentVolume(userID, name, sandboxID string) error {
+func (s *Store) DetachPersistentVolume(ctx context.Context, userID, name, sandboxID string) error {
 	var volID string
-	err := s.db.QueryRow(`SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
 		userID, name).Scan(&volID)
 	if err != nil {
 		return noRows(err, "volume %q not found", name)
 	}
-	_, err = s.db.Exec(
-		`DELETE FROM volume_attachments WHERE volume_id = ? AND sandbox_id = ?`,
+	_, err = s.db.ExecContext(
+		ctx, `DELETE FROM volume_attachments WHERE volume_id = ? AND sandbox_id = ?`,
 		volID, sandboxID)
 	return err
 }
 
 // DetachAllPersistentVolumesForSandbox removes all persistent volume attachments for a sandbox.
-func (s *Store) DetachAllPersistentVolumesForSandbox(sandboxID string) error {
-	_, err := s.db.Exec(`DELETE FROM volume_attachments WHERE sandbox_id = ?`, sandboxID)
+func (s *Store) DetachAllPersistentVolumesForSandbox(ctx context.Context, sandboxID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM volume_attachments WHERE sandbox_id = ?`, sandboxID)
 	return err
 }
 
 // AttachedPersistentVolumesForSandbox returns all persistent volumes attached
 // to a sandbox, with their file paths and mount info. Used during recovery to
 // rebuild the VM's volume list so resume can hard-link them into the jail.
-func (s *Store) AttachedPersistentVolumesForSandbox(sandboxID string) ([]struct {
+func (s *Store) AttachedPersistentVolumesForSandbox(ctx context.Context, sandboxID string) ([]struct {
 	VolumeName string
 	FilePath   string
 	Mount      string
 	ReadOnly   bool
 }, error) {
-	rows, err := s.db.Query(
-		`SELECT v.name, v.file_path, va.mount, va.read_only
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT v.name, v.file_path, va.mount, va.read_only
 		 FROM volume_attachments va
 		 JOIN volumes_v2 v ON v.id = va.volume_id
 		 WHERE va.sandbox_id = ?
@@ -409,8 +412,8 @@ func (s *Store) AttachedPersistentVolumesForSandbox(sandboxID string) ([]struct 
 }
 
 // DetachOrphanedPersistentVolumes removes attachments for destroyed/missing sandboxes.
-func (s *Store) DetachOrphanedPersistentVolumes() (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM volume_attachments
+func (s *Store) DetachOrphanedPersistentVolumes(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM volume_attachments
 		WHERE sandbox_id IN (
 			SELECT va.sandbox_id FROM volume_attachments va
 			LEFT JOIN sandboxes s ON va.sandbox_id = s.id
@@ -425,8 +428,8 @@ func (s *Store) DetachOrphanedPersistentVolumes() (int64, error) {
 }
 
 // UpdatePersistentVolumeSize updates the size_mb field after a resize.
-func (s *Store) UpdatePersistentVolumeSize(userID, name string, sizeMB int) error {
-	res, err := s.db.Exec(`UPDATE volumes_v2 SET size_mb = ? WHERE user_id = ? AND name = ?`,
+func (s *Store) UpdatePersistentVolumeSize(ctx context.Context, userID, name string, sizeMB int) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE volumes_v2 SET size_mb = ? WHERE user_id = ? AND name = ?`,
 		sizeMB, userID, name)
 	if err != nil {
 		return err
@@ -439,16 +442,16 @@ func (s *Store) UpdatePersistentVolumeSize(userID, name string, sizeMB int) erro
 }
 
 // UpdatePersistentVolumeStatus updates the status field (e.g., "creating" → "ready").
-func (s *Store) UpdatePersistentVolumeStatus(userID, name, status string) error {
-	_, err := s.db.Exec(`UPDATE volumes_v2 SET status = ? WHERE user_id = ? AND name = ?`,
+func (s *Store) UpdatePersistentVolumeStatus(ctx context.Context, userID, name, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE volumes_v2 SET status = ? WHERE user_id = ? AND name = ?`,
 		status, userID, name)
 	return err
 }
 
 // UserVolumeStorageUsed returns the total size_mb of all persistent volumes for a user.
-func (s *Store) UserVolumeStorageUsed(userID string) (int, error) {
+func (s *Store) UserVolumeStorageUsed(ctx context.Context, userID string) (int, error) {
 	var total sql.NullInt64
-	if err := s.db.QueryRow(`SELECT SUM(size_mb) FROM volumes_v2 WHERE user_id = ?`, userID).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT SUM(size_mb) FROM volumes_v2 WHERE user_id = ?`, userID).Scan(&total); err != nil {
 		return 0, fmt.Errorf("store: sum volume storage: %w", err)
 	}
 	if total.Valid && (total.Int64 < 0 || int64(int(total.Int64)) != total.Int64) {
@@ -464,21 +467,21 @@ func (s *Store) UserVolumeStorageUsed(userID string) (int, error) {
 // v0.3 Images
 // ==========================================================================
 
-func (s *Store) CreateVolumeBackup(b VolumeBackup) error {
+func (s *Store) CreateVolumeBackup(ctx context.Context, b VolumeBackup) error {
 	if b.ConsistencyMode == "" {
 		b.ConsistencyMode = "unverified"
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO volume_backups (id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at)
+	_, err := s.db.ExecContext(
+		ctx, `INSERT INTO volume_backups (id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		b.ID, b.VolumeName, b.UserID, b.S3Key, b.SizeBytes, b.SHA256, b.ConsistencyMode, b.CreatedAt)
 	return classify(err)
 }
 
 // ListVolumeBackups returns backups for a volume, newest first.
-func (s *Store) ListVolumeBackups(userID, volumeName string) ([]VolumeBackup, error) {
-	rows, err := s.db.Query(
-		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
+func (s *Store) ListVolumeBackups(ctx context.Context, userID, volumeName string) ([]VolumeBackup, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
 		 FROM volume_backups WHERE user_id = ? AND volume_name = ?
 		 ORDER BY created_at DESC`, userID, volumeName)
 	if err != nil {
@@ -497,10 +500,10 @@ func (s *Store) ListVolumeBackups(userID, volumeName string) ([]VolumeBackup, er
 }
 
 // GetVolumeBackup returns a single backup by ID.
-func (s *Store) GetVolumeBackup(userID, backupID string) (*VolumeBackup, error) {
+func (s *Store) GetVolumeBackup(ctx context.Context, userID, backupID string) (*VolumeBackup, error) {
 	var b VolumeBackup
-	err := s.db.QueryRow(
-		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
+	err := s.db.QueryRowContext(
+		ctx, `SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
 		 FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID).Scan(
 		&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.ConsistencyMode, &b.CreatedAt)
 	if err != nil {
@@ -510,15 +513,15 @@ func (s *Store) GetVolumeBackup(userID, backupID string) (*VolumeBackup, error) 
 }
 
 // DeleteVolumeBackup removes a backup record.
-func (s *Store) DeleteVolumeBackup(userID, backupID string) error {
-	_, err := s.db.Exec(`DELETE FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID)
+func (s *Store) DeleteVolumeBackup(ctx context.Context, userID, backupID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID)
 	return err
 }
 
 // OldestVolumeBackups returns the oldest backups beyond the retention count.
-func (s *Store) OldestVolumeBackups(userID, volumeName string, keepCount int) ([]VolumeBackup, error) {
-	rows, err := s.db.Query(
-		`SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
+func (s *Store) OldestVolumeBackups(ctx context.Context, userID, volumeName string, keepCount int) ([]VolumeBackup, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at
 		 FROM volume_backups WHERE user_id = ? AND volume_name = ?
 		 ORDER BY created_at DESC LIMIT -1 OFFSET ?`, userID, volumeName, keepCount)
 	if err != nil {

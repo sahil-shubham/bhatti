@@ -60,7 +60,7 @@ func (s *Server) handleAllPorts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := UserFromContext(r.Context())
-	sandboxes, err := s.store.ListSandboxes(user.ID)
+	sandboxes, err := s.store.ListSandboxes(r.Context(), user.ID)
 	if err != nil {
 		errRespInternal(w, r, "list sandboxes failed", err)
 		return

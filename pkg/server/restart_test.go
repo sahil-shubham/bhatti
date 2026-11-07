@@ -34,7 +34,7 @@ func TestShutdownLeavesSandboxesRunning(t *testing.T) {
 		t.Fatalf("thermal after shutdown %v, want hot and warm as they were", thermal)
 	}
 	for _, eid := range []string{hot, warm} {
-		if sb, err := srv.store.GetSandboxByID(eid); err != nil || sb.Status != "running" {
+		if sb, err := srv.store.GetSandboxByID(t.Context(), eid); err != nil || sb.Status != "running" {
 			t.Fatalf("store after shutdown: %+v (%v), want running", sb, err)
 		}
 	}
@@ -58,7 +58,7 @@ func TestRecoverSandboxesAfterRestart(t *testing.T) {
 	eng.sandboxes[lost].Status = "stopped"
 	eng.thermal[lost] = "cold"
 	eng.mu.Unlock()
-	if err := srv.store.StopSandbox(unrecorded); err != nil { // a start the store missed
+	if err := srv.store.StopSandbox(t.Context(), unrecorded); err != nil { // a start the store missed
 		t.Fatal(err)
 	}
 	for _, eid := range []string{hot, warm, lost, unrecorded} {
@@ -68,7 +68,7 @@ func TestRecoverSandboxesAfterRestart(t *testing.T) {
 	srv.RecoverSandboxes(context.Background())
 
 	for eid, want := range map[string]string{hot: "running", warm: "running", lost: "stopped", unrecorded: "running"} {
-		if sb, err := srv.store.GetSandboxByID(eid); err != nil || sb.Status != want {
+		if sb, err := srv.store.GetSandboxByID(t.Context(), eid); err != nil || sb.Status != want {
 			t.Errorf("%s: store status %+v (%v), want %s", eid, sb, err, want)
 		}
 	}
@@ -80,7 +80,7 @@ func TestRecoverSandboxesAfterRestart(t *testing.T) {
 
 	time.Sleep(20 * time.Millisecond)
 	srv.runThermalCycle(eng, ThermalConfig{WarmTimeout: time.Hour, ColdTimeout: 10 * time.Millisecond})
-	if sb, err := srv.store.GetSandboxByID(warm); err != nil || sb.Status != "stopped" {
+	if sb, err := srv.store.GetSandboxByID(t.Context(), warm); err != nil || sb.Status != "stopped" {
 		t.Fatalf("adopted warm sandbox didn't go cold once idle: %+v (%v)", sb, err)
 	}
 }
@@ -94,7 +94,7 @@ func TestRecoverSandboxesBackfillsHasInit(t *testing.T) {
 	legacy := createRunningBox(t, srv, eng, "legacy-init")
 	plain := createRunningBox(t, srv, eng, "no-init")
 	unknown := createRunningBox(t, srv, eng, "unknown")
-	if err := srv.store.UpdateSandboxHasInit(unknown, true); err != nil {
+	if err := srv.store.UpdateSandboxHasInit(t.Context(), unknown, true); err != nil {
 		t.Fatal(err)
 	}
 	eng.mu.Lock()
@@ -104,7 +104,7 @@ func TestRecoverSandboxesBackfillsHasInit(t *testing.T) {
 	srv.RecoverSandboxes(context.Background())
 
 	for id, want := range map[string]bool{legacy: true, plain: false, unknown: true} {
-		sb, err := srv.store.GetSandboxByID(id)
+		sb, err := srv.store.GetSandboxByID(t.Context(), id)
 		if err != nil || sb.HasInit != want {
 			t.Errorf("%s: has_init %v (%v), want %v", id, sb.HasInit, err, want)
 		}

@@ -66,7 +66,7 @@ type createFileReq struct {
 // checkSandboxQuota answers the request and returns false when user may not add
 // a sandbox. A failed count refuses: read as 0, it would skip the limit.
 func (s *Server) checkSandboxQuota(w http.ResponseWriter, r *http.Request, user *store.User) bool {
-	count, err := s.store.CountUserSandboxes(user.ID)
+	count, err := s.store.CountUserSandboxes(r.Context(), user.ID)
 	if err != nil {
 		errRespInternal(w, r, "count sandboxes failed", err)
 		return false
@@ -103,7 +103,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			errResp(w, 400, err.Error())
 			return
 		}
-		list, err := s.store.ListSandboxesWithFilter(user.ID, labelFilter)
+		list, err := s.store.ListSandboxesWithFilter(r.Context(), user.ID, labelFilter)
 		if err != nil {
 			errRespInternal(w, r, "list sandboxes failed", err)
 			return
@@ -123,7 +123,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		te, hasThermal := thermalOf(s.engine)
 
 		// Published URLs (single query for all user's rules)
-		rules, _ := s.store.ListUserPublishRules(user.ID)
+		rules, _ := s.store.ListUserPublishRules(r.Context(), user.ID)
 		urlsByID := make(map[string][]string)
 		for _, r := range rules {
 			url := publishedURL(r.Alias, s.proxyZone, s.publicProxyAddr)
@@ -232,7 +232,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				errResp(w, 400, fmt.Sprintf("secret grant %q: %v", g.Secret, err))
 				return
 			}
-			if _, err := s.store.GetSecret(user.ID, g.Secret); err != nil {
+			if _, err := s.store.GetSecret(r.Context(), user.ID, g.Secret); err != nil {
 				errResp(w, 400, fmt.Sprintf("secret %q not found", g.Secret))
 				return
 			}
@@ -251,7 +251,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 		if req.TemplateID != "" {
 			// --- Template-based creation (existing behavior) ---
-			tmpl, err := s.store.GetTemplate(req.TemplateID)
+			tmpl, err := s.store.GetTemplate(r.Context(), req.TemplateID)
 			if err != nil {
 				errResp(w, 404, "template not found")
 				return
@@ -272,7 +272,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 						volName = "bhatti-" + name + "-workspace"
 					}
 					if m.AutoCreate {
-						s.store.CreateVolume(volName) // idempotent
+						s.store.CreateVolume(r.Context(), volName) // idempotent
 					}
 					volumes = append(volumes, engine.VolumeMount{
 						Name: volName, Target: m.Target, ReadOnly: m.ReadOnly,
@@ -303,7 +303,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			for _, secretName := range secretNames {
-				ciphertext, err := s.store.GetSecretValue(user.ID, secretName)
+				ciphertext, err := s.store.GetSecretValue(r.Context(), user.ID, secretName)
 				if err != nil {
 					errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
 					return
@@ -377,7 +377,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 			// B15: Resolve secrets from store (same logic as template path)
 			for _, secretName := range req.Secrets {
-				ciphertext, err := s.store.GetSecretValue(user.ID, secretName)
+				ciphertext, err := s.store.GetSecretValue(r.Context(), user.ID, secretName)
 				if err != nil {
 					errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
 					return
@@ -447,7 +447,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		// boot VMs, and one wastes ~3.5s. Callers (e.g. karkhana) no longer
 		// need list→filter→create dance.
 		if spec.Name != "" {
-			existing, err := s.store.GetActiveSandboxByName(user.ID, spec.Name)
+			existing, err := s.store.GetActiveSandboxByName(r.Context(), user.ID, spec.Name)
 			if err == nil {
 				w.Header().Set("X-Bhatti-Existing", "true")
 				writeJSON(w, 200, existing)
@@ -467,7 +467,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var serr error
-			if src, serr = s.store.GetSandbox(user.ID, req.From); serr != nil {
+			if src, serr = s.store.GetSandbox(r.Context(), user.ID, req.From); serr != nil {
 				errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
 				return
 			}
@@ -489,7 +489,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 
 		// v0.3: Resolve image name to file path
 		if req.Image != "" {
-			img, err := s.store.GetImage(user.ID, req.Image)
+			img, err := s.store.GetImage(r.Context(), user.ID, req.Image)
 			if err != nil {
 				errResp(w, 404, fmt.Sprintf("image %q not found", req.Image))
 				return
@@ -515,7 +515,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				existing, err := s.store.GetPersistentVolume(user.ID, vol.Name)
+				existing, err := s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
 				if err != nil && vol.AutoCreate && vol.SizeMB > 0 {
 					// Auto-create: insert store record first with status='creating'
 					volDir := filepath.Join(s.dataDir, "volumes", user.ID)
@@ -527,11 +527,11 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 						Name: vol.Name, SizeMB: vol.SizeMB, FilePath: volPath,
 						Status: "creating", CreatedAt: time.Now(),
 					}
-					createErr := s.store.CreatePersistentVolume(storeVol)
+					createErr := s.store.CreatePersistentVolume(r.Context(), storeVol)
 					if createErr != nil {
 						// UNIQUE violation — another request won the race
 						time.Sleep(500 * time.Millisecond)
-						existing, err = s.store.GetPersistentVolume(user.ID, vol.Name)
+						existing, err = s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
 						if err != nil {
 							errResp(w, 500, fmt.Sprintf("volume %q: race recovery failed", vol.Name))
 							return
@@ -543,11 +543,11 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 					} else {
 						// We won the race. Create the ext4 file.
 						if err := createVolumeFile(volPath, vol.SizeMB); err != nil {
-							s.store.DeletePersistentVolume(user.ID, vol.Name)
+							s.store.DeletePersistentVolume(r.Context(), user.ID, vol.Name)
 							errRespInternal(w, r, "create volume failed", err)
 							return
 						}
-						s.store.UpdatePersistentVolumeStatus(user.ID, vol.Name, "ready")
+						s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, vol.Name, "ready")
 						storeVol.Status = "ready"
 						existing = &storeVol
 					}
@@ -562,7 +562,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 				if vol.ReadOnly {
 					unlock := s.store.LockPersistentVolumeAttachments(user.ID, vol.Name)
 					var checkErr error
-					existing, checkErr = s.store.GetPersistentVolume(user.ID, vol.Name)
+					existing, checkErr = s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
 					if checkErr == nil && existing.FilePath != "" {
 						switch {
 						case len(existing.Attachments) == 0:
@@ -581,16 +581,16 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 					}
 					unlock() // AttachPersistentVolume acquires the gate itself.
 					if checkErr != nil {
-						s.store.DetachAllPersistentVolumesForSandbox(sbID)
+						s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
 						errResp(w, 409, checkErr.Error())
 						return
 					}
 				}
 
 				// Attach (store transaction handles concurrency — re-checks under lock)
-				if err := s.store.AttachPersistentVolume(user.ID, vol.Name, sbID, vol.Mount, vol.ReadOnly); err != nil {
+				if err := s.store.AttachPersistentVolume(r.Context(), user.ID, vol.Name, sbID, vol.Mount, vol.ReadOnly); err != nil {
 					// Rollback previously attached volumes
-					s.store.DetachAllPersistentVolumesForSandbox(sbID)
+					s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
 					errResp(w, 409, err.Error())
 					return
 				}
@@ -621,14 +621,14 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			spec.SandboxID = sbID
 			spec.RequireGuestCA = len(req.SecretGrants) > 0
 			if !req.NetPolicy.NoNetwork() {
-				spec.CACert, err = s.mintSandboxCA(user.ID, sbID, spec.Name)
+				spec.CACert, err = s.mintSandboxCA(r.Context(), user.ID, sbID, spec.Name)
 			}
 			for _, g := range req.SecretGrants {
 				if err != nil {
 					break
 				}
 				var grant store.SecretGrant
-				if grant, err = s.newGrant(user.ID, g.Secret, sbID, grantHostsBySecret[g.Secret], 0); err == nil {
+				if grant, err = s.newGrant(r.Context(), user.ID, g.Secret, sbID, grantHostsBySecret[g.Secret], 0); err == nil {
 					spec.Env[g.Secret] = grant.Placeholder
 					grants = append(grants, grant)
 				}
@@ -647,9 +647,9 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			}
 			// Rollback persistent volume attachments on engine failure
 			if len(resolvedVolumes) > 0 {
-				s.store.DetachAllPersistentVolumesForSandbox(sbID)
+				s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
 			}
-			s.discardSubstitution(sbID)
+			s.discardSubstitution(r.Context(), sbID)
 			errRespInternal(w, r, "sandbox create failed", err)
 			return
 		}
@@ -686,17 +686,17 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		} else if b, merr := json.Marshal(req.NetPolicy); merr == nil {
 			sb.NetPolicy = b
 		}
-		if err := s.store.CreateSandbox(sb); err != nil {
-			s.discardSubstitution(sbID)
+		if err := s.store.CreateSandbox(detached(r.Context()), sb); err != nil {
+			s.discardSubstitution(r.Context(), sbID)
 			// A taken name → name race. Another concurrent request won the
 			// insert. Destroy the VM we just booted and return the winner's
 			// sandbox.
 			if errors.Is(err, store.ErrConflict) && spec.Name != "" {
 				s.engine.Destroy(r.Context(), info.EngineID)
 				if len(resolvedVolumes) > 0 {
-					s.store.DetachAllPersistentVolumesForSandbox(sbID)
+					s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
 				}
-				existing, lookupErr := s.store.GetActiveSandboxByName(user.ID, spec.Name)
+				existing, lookupErr := s.store.GetActiveSandboxByName(r.Context(), user.ID, spec.Name)
 				if lookupErr == nil {
 					w.Header().Set("X-Bhatti-Existing", "true")
 					writeJSON(w, 200, existing)
@@ -705,18 +705,18 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			}
 			s.engine.Destroy(r.Context(), info.EngineID)
 			if len(resolvedVolumes) > 0 {
-				s.store.DetachAllPersistentVolumesForSandbox(sbID)
+				s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
 			}
 			errRespInternal(w, r, "store sandbox failed", err)
 			return
 		}
 		if src != nil {
-			grants = s.inheritFromSandbox(user.ID, src, sb)
+			grants = s.inheritFromSandbox(r.Context(), user.ID, src, sb)
 		}
 
 		// Record volume attachments
 		for _, v := range volumes {
-			s.store.AttachVolume(sbID, v.Name, v.Target, v.ReadOnly)
+			s.store.AttachVolume(r.Context(), sbID, v.Name, v.Target, v.ReadOnly)
 		}
 
 		handlerPhase("db_store_done")
@@ -813,7 +813,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		sb, err := s.store.GetSandbox(user.ID, id)
+		sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
@@ -825,11 +825,11 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			sb.Status = info.Status
 			sb.IP = info.IP
-			s.store.UpdateSandboxStatus(sb.ID, info.Status)
+			s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, info.Status)
 		}
 		writeJSON(w, 200, sb)
 	case http.MethodDelete:
-		sb, err := s.store.GetSandbox(user.ID, id)
+		sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
@@ -843,9 +843,9 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("engine destroy failed, releasing volumes anyway",
 				"sandbox", sb.ID, "error", err)
 		}
-		s.store.DetachVolumes(sb.ID)
-		s.store.DetachAllPersistentVolumesForSandbox(sb.ID) // v0.3 persistent volumes
-		if n, err := s.store.DeletePublishRulesForSandbox(sb.ID); err != nil {
+		s.store.DetachVolumes(detached(r.Context()), sb.ID)
+		s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sb.ID) // v0.3 persistent volumes
+		if n, err := s.store.DeletePublishRulesForSandbox(detached(r.Context()), sb.ID); err != nil {
 			slog.Warn("cleanup publish rules", "sandbox", sb.ID, "error", err)
 		} else if n > 0 {
 			slog.Info("cleaned up publish rules", "sandbox", sb.ID, "count", n)
@@ -853,11 +853,11 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		if s.publicProxy != nil {
 			s.publicProxy.routeCache.InvalidateSandbox(sb.ID)
 		}
-		if err := s.store.DeleteSandbox(user.ID, sb.ID); err != nil {
+		if err := s.store.DeleteSandbox(detached(r.Context()), user.ID, sb.ID); err != nil {
 			errRespInternal(w, r, "delete sandbox failed", err)
 			return
 		}
-		s.discardSubstitution(sb.ID)
+		s.discardSubstitution(r.Context(), sb.ID)
 		slog.Info("sandbox.destroyed", "sandbox_id", sb.ID, "name", sb.Name, "user", user.Name)
 		s.RecordEvent(store.Event{
 			Type: "sandbox.destroyed", UserID: user.ID, SandboxID: sb.ID,
@@ -868,7 +868,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 		})
 		writeJSON(w, 200, map[string]string{"status": "destroyed"})
 	case http.MethodPatch:
-		sb, err := s.store.GetSandbox(user.ID, id)
+		sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
 		if err != nil {
 			errResp(w, 404, "not found")
 			return
@@ -893,7 +893,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 				errResp(w, 400, "invalid sandbox name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
 				return
 			}
-			if err := s.store.RenameSandbox(user.ID, sb.ID, newName); err != nil {
+			if err := s.store.RenameSandbox(r.Context(), user.ID, sb.ID, newName); err != nil {
 				if errors.Is(err, store.ErrConflict) {
 					errResp(w, 409, fmt.Sprintf("name %q is already in use", newName))
 					return
@@ -921,12 +921,12 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 				errResp(w, 400, err.Error())
 				return
 			}
-			if err := s.store.UpdateSandboxLabels(user.ID, sb.ID, req.LabelsAdd, req.LabelsRemove); err != nil {
+			if err := s.store.UpdateSandboxLabels(r.Context(), user.ID, sb.ID, req.LabelsAdd, req.LabelsRemove); err != nil {
 				errRespInternal(w, r, "update labels failed", err)
 				return
 			}
 			// Refresh sb so the response reflects the new labels.
-			if refreshed, err := s.store.GetSandbox(user.ID, sb.ID); err == nil {
+			if refreshed, err := s.store.GetSandbox(r.Context(), user.ID, sb.ID); err == nil {
 				sb = refreshed
 			}
 			slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name,
@@ -942,7 +942,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		if req.KeepHot != nil {
-			if err := s.store.UpdateSandboxKeepHot(sb.ID, *req.KeepHot); err != nil {
+			if err := s.store.UpdateSandboxKeepHot(r.Context(), sb.ID, *req.KeepHot); err != nil {
 				errRespInternal(w, r, "update keep_hot failed", err)
 				return
 			}
@@ -960,7 +960,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				sb.Status = "running"
-				s.store.UpdateSandboxStatus(sb.ID, "running")
+				s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, "running")
 			}
 		}
 		writeJSON(w, 200, sb)
@@ -985,7 +985,7 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 		errRespInternal(w, r, "stop sandbox failed", stopErr)
 		return
 	}
-	s.store.StopSandbox(sb.ID)
+	s.store.StopSandbox(detached(r.Context()), sb.ID)
 	if poweredOffUnclean {
 		s.recordUncleanStop(*sb, reason)
 	}
@@ -994,7 +994,7 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 		Type: "sandbox.stopped", UserID: user.ID, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": "api"},
 	})
-	updated, err := s.store.GetSandboxByID(sb.ID)
+	updated, err := s.store.GetSandboxByID(r.Context(), sb.ID)
 	if err != nil {
 		sb.Status = "stopped"
 		writeJSON(w, 200, sb)
@@ -1029,17 +1029,17 @@ func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id s
 	// engine — e.g. running VMs showing stopped in `bhatti list`.
 	info, err := s.engine.Status(r.Context(), sb.EngineID)
 	if err == nil {
-		s.store.UpdateSandboxStatus(sb.ID, info.Status)
-		s.store.UpdateSandboxEngine(sb.ID, sb.EngineID, info.IP)
+		s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, info.Status)
+		s.store.UpdateSandboxEngine(detached(r.Context()), sb.ID, sb.EngineID, info.IP)
 	} else {
-		s.store.UpdateSandboxStatus(sb.ID, "running")
+		s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, "running")
 	}
 	user := UserFromContext(r.Context())
 	s.RecordEvent(store.Event{
 		Type: "sandbox.started", UserID: user.ID, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": "api"},
 	})
-	updated, err := s.store.GetSandboxByID(sb.ID)
+	updated, err := s.store.GetSandboxByID(r.Context(), sb.ID)
 	if err != nil {
 		// Start succeeded but DB refresh failed — return the original sandbox
 		// with updated status rather than null.

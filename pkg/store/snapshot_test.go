@@ -40,11 +40,11 @@ func TestSnapshotKeepsItsSourceAndSubstitution(t *testing.T) {
 			{SecretName: "API", Hosts: []string{"a.example"}, Placeholder: "ph-a"},
 		},
 	}
-	if err := s.CreateSnapshot(snap); err != nil {
+	if err := s.CreateSnapshot(t.Context(), snap); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetSnapshot("alice", "base")
+	got, err := s.GetSnapshot(t.Context(), "alice", "base")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,19 +67,19 @@ func TestSnapshotKeepsItsSourceAndSubstitution(t *testing.T) {
 		t.Fatalf("grants %+v", grants)
 	}
 
-	list, err := s.ListSnapshots("alice")
+	list, err := s.ListSnapshots(t.Context(), "alice")
 	if err != nil || len(list) != 1 || list[0].Source != snap.Source || list[0].Substitution.CA != nil || len(list[0].Substitution.Grants) != 0 ||
 		list[0].SourceRecordedAt == nil {
 		t.Fatalf("list %+v, %v: want the source spec, its marker and no substitution", list, err)
 	}
 
 	plain := snapshotFixture("s2", "alice", "plain")
-	if err := s.CreateSnapshot(plain); err != nil {
+	if err := s.CreateSnapshot(t.Context(), plain); err != nil {
 		t.Fatal(err)
 	}
 	// One that kept nothing is still one that recorded: the marker, not an
 	// empty record, tells it from a snapshot that predates recording.
-	if got, err := s.GetSnapshot("alice", "plain"); err != nil || got.Source != (SnapshotSource{}) || got.Substitution.CA != nil ||
+	if got, err := s.GetSnapshot(t.Context(), "alice", "plain"); err != nil || got.Source != (SnapshotSource{}) || got.Substitution.CA != nil ||
 		len(got.Substitution.Grants) != 0 || got.SourceRecordedAt == nil {
 		t.Fatalf("a snapshot that kept nothing: %+v, %v", got, err)
 	}
@@ -97,10 +97,10 @@ func TestCreateSnapshotIsAtomic(t *testing.T) {
 			{SecretName: "B", Hosts: []string{"b.example"}, Placeholder: "same"}, // a snapshot can't hold a placeholder twice
 		},
 	}
-	if err := s.CreateSnapshot(snap); err == nil {
+	if err := s.CreateSnapshot(t.Context(), snap); err == nil {
 		t.Fatal("a snapshot with the same placeholder twice was accepted")
 	}
-	if _, err := s.GetSnapshot("alice", "base"); err == nil {
+	if _, err := s.GetSnapshot(t.Context(), "alice", "base"); err == nil {
 		t.Fatal("the snapshot record outlived its failed create")
 	}
 	for _, table := range []string{"snapshots", "snapshot_cas", "snapshot_grants"} {
@@ -110,12 +110,12 @@ func TestCreateSnapshotIsAtomic(t *testing.T) {
 	}
 
 	// A name clash fails on the record, before anything is kept for it.
-	if err := s.CreateSnapshot(snapshotFixture("s2", "alice", "base")); err != nil {
+	if err := s.CreateSnapshot(t.Context(), snapshotFixture("s2", "alice", "base")); err != nil {
 		t.Fatal(err)
 	}
 	dup := snapshotFixture("s3", "alice", "base")
 	dup.Substitution = SnapshotSubstitution{CA: &SandboxCA{CertPEM: "cert", KeyEnc: []byte("key")}}
-	if err := s.CreateSnapshot(dup); !errors.Is(err, ErrConflict) {
+	if err := s.CreateSnapshot(t.Context(), dup); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate name: %v, want ErrConflict", err)
 	}
 	if n := rowCount(t, s, `SELECT COUNT(*) FROM snapshot_cas`); n != 0 {
@@ -133,33 +133,33 @@ func TestDeleteSnapshotDropsWhatItKept(t *testing.T) {
 			CA:     &SandboxCA{CertPEM: "cert-" + id, KeyEnc: []byte("key")},
 			Grants: []SnapshotGrant{{SecretName: "GH_TOKEN", Hosts: []string{"api.github.com"}, Placeholder: "ph-" + id}},
 		}
-		if err := s.CreateSnapshot(snap); err != nil {
+		if err := s.CreateSnapshot(t.Context(), snap); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.DeleteSnapshot("bob", "snap-s1"); err == nil {
+	if err := s.DeleteSnapshot(t.Context(), "bob", "snap-s1"); err == nil {
 		t.Fatal("another user deleted the snapshot")
 	}
-	if err := s.DeleteSnapshot("alice", "snap-s1"); err != nil {
+	if err := s.DeleteSnapshot(t.Context(), "alice", "snap-s1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSnapshot("alice", "snap-s1"); !errors.Is(err, ErrNotFound) {
+	if err := s.DeleteSnapshot(t.Context(), "alice", "snap-s1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete: %v, want ErrNotFound", err)
 	}
 	if n := rowCount(t, s, `SELECT COUNT(*) FROM snapshot_cas WHERE snapshot_id = 's1'`) +
 		rowCount(t, s, `SELECT COUNT(*) FROM snapshot_grants WHERE snapshot_id = 's1'`); n != 0 {
 		t.Fatalf("a deleted snapshot left %d CA/grant rows", n)
 	}
-	got, err := s.GetSnapshot("alice", "snap-s2")
+	got, err := s.GetSnapshot(t.Context(), "alice", "snap-s2")
 	if err != nil || got.Substitution.CA == nil || len(got.Substitution.Grants) != 1 {
 		t.Fatalf("the other snapshot's CA and grants: %+v, %v", got, err)
 	}
 
 	// A new snapshot under the deleted name starts with nothing of the old one.
-	if err := s.CreateSnapshot(snapshotFixture("s3", "alice", "snap-s1")); err != nil {
+	if err := s.CreateSnapshot(t.Context(), snapshotFixture("s3", "alice", "snap-s1")); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := s.GetSnapshot("alice", "snap-s1"); err != nil || got.Substitution.CA != nil || len(got.Substitution.Grants) != 0 {
+	if got, err := s.GetSnapshot(t.Context(), "alice", "snap-s1"); err != nil || got.Substitution.CA != nil || len(got.Substitution.Grants) != 0 {
 		t.Fatalf("a re-created snapshot inherited its predecessor's substitution: %+v, %v", got, err)
 	}
 }
@@ -175,20 +175,20 @@ func TestDeleteSecretGrantsForSecretReachesSnapshots(t *testing.T) {
 			{SecretName: "GH_TOKEN", Hosts: []string{"api.github.com"}, Placeholder: "gh-" + c.id},
 			{SecretName: "OTHER", Hosts: []string{"o.example"}, Placeholder: "o-" + c.id},
 		}}
-		if err := s.CreateSnapshot(snap); err != nil {
+		if err := s.CreateSnapshot(t.Context(), snap); err != nil {
 			t.Fatal(err)
 		}
 	}
 	putGrant(t, s, grantFixture("g1", "alice", "GH_TOKEN", "sb1", "gh-live", time.Now()))
 
-	if err := s.DeleteSecretGrantsForSecret("alice", "GH_TOKEN"); err != nil {
+	if err := s.DeleteSecretGrantsForSecret(t.Context(), "alice", "GH_TOKEN"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSecretGrant("alice", "g1"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSecretGrant(t.Context(), "alice", "g1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("the sandbox's grant survived: %v", err)
 	}
 	names := func(user string) []string {
-		snap, err := s.GetSnapshot(user, "base")
+		snap, err := s.GetSnapshot(t.Context(), user, "base")
 		if err != nil {
 			t.Fatal(err)
 		}

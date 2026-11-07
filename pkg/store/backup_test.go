@@ -11,7 +11,7 @@ import (
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := New(filepath.Join(dir, "test.db"))
+	st, err := New(t.Context(), filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,12 +34,12 @@ func TestVolumeBackupCRUD(t *testing.T) {
 	}
 
 	// Create
-	if err := st.CreateVolumeBackup(b); err != nil {
+	if err := st.CreateVolumeBackup(t.Context(), b); err != nil {
 		t.Fatal("create:", err)
 	}
 
 	// Get
-	got, err := st.GetVolumeBackup("usr_test", "bk_001")
+	got, err := st.GetVolumeBackup(t.Context(), "usr_test", "bk_001")
 	if err != nil {
 		t.Fatal("get:", err)
 	}
@@ -48,7 +48,7 @@ func TestVolumeBackupCRUD(t *testing.T) {
 	}
 
 	// List
-	list, err := st.ListVolumeBackups("usr_test", "workspace")
+	list, err := st.ListVolumeBackups(t.Context(), "usr_test", "workspace")
 	if err != nil {
 		t.Fatal("list:", err)
 	}
@@ -60,10 +60,10 @@ func TestVolumeBackupCRUD(t *testing.T) {
 	}
 
 	// Delete
-	if err := st.DeleteVolumeBackup("usr_test", "bk_001"); err != nil {
+	if err := st.DeleteVolumeBackup(t.Context(), "usr_test", "bk_001"); err != nil {
 		t.Fatal("delete:", err)
 	}
-	list, _ = st.ListVolumeBackups("usr_test", "workspace")
+	list, _ = st.ListVolumeBackups(t.Context(), "usr_test", "workspace")
 	if len(list) != 0 {
 		t.Fatalf("expected 0 backups after delete, got %d", len(list))
 	}
@@ -75,7 +75,7 @@ func TestVolumeBackupListOrder(t *testing.T) {
 	// Create 3 backups with different timestamps
 	for i, ts := range []string{"2026-04-01T01:00:00Z", "2026-04-02T01:00:00Z", "2026-04-03T01:00:00Z"} {
 		created, _ := time.Parse(time.RFC3339, ts)
-		st.CreateVolumeBackup(VolumeBackup{
+		st.CreateVolumeBackup(t.Context(), VolumeBackup{
 			ID:         "bk_" + ts,
 			VolumeName: "data",
 			UserID:     "usr_test",
@@ -85,7 +85,7 @@ func TestVolumeBackupListOrder(t *testing.T) {
 		})
 	}
 
-	list, err := st.ListVolumeBackups("usr_test", "data")
+	list, err := st.ListVolumeBackups(t.Context(), "usr_test", "data")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestVolumeBackupRetention(t *testing.T) {
 	// Create 5 backups
 	for i := 0; i < 5; i++ {
 		created := time.Date(2026, 4, i+1, 3, 0, 0, 0, time.UTC)
-		st.CreateVolumeBackup(VolumeBackup{
+		st.CreateVolumeBackup(t.Context(), VolumeBackup{
 			ID:              fmt.Sprintf("bk_%d", i),
 			VolumeName:      "workspace",
 			UserID:          "usr_test",
@@ -119,7 +119,7 @@ func TestVolumeBackupRetention(t *testing.T) {
 	}
 
 	// Keep 3 → should return 2 oldest
-	old, err := st.OldestVolumeBackups("usr_test", "workspace", 3)
+	old, err := st.OldestVolumeBackups(t.Context(), "usr_test", "workspace", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,29 +142,29 @@ func TestVolumeBackupRetention(t *testing.T) {
 func TestVolumeBackupUserIsolation(t *testing.T) {
 	st := newTestStore(t)
 
-	st.CreateVolumeBackup(VolumeBackup{
+	st.CreateVolumeBackup(t.Context(), VolumeBackup{
 		ID: "bk_a", VolumeName: "vol", UserID: "user_a",
 		S3Key: "key_a", SizeBytes: 100, CreatedAt: time.Now().UTC(),
 	})
-	st.CreateVolumeBackup(VolumeBackup{
+	st.CreateVolumeBackup(t.Context(), VolumeBackup{
 		ID: "bk_b", VolumeName: "vol", UserID: "user_b",
 		S3Key: "key_b", SizeBytes: 100, CreatedAt: time.Now().UTC(),
 	})
 
 	// user_a should only see their backup
-	list, _ := st.ListVolumeBackups("user_a", "vol")
+	list, _ := st.ListVolumeBackups(t.Context(), "user_a", "vol")
 	if len(list) != 1 || list[0].ID != "bk_a" {
 		t.Errorf("user_a: expected [bk_a], got %v", list)
 	}
 
 	// user_b should only see their backup
-	list, _ = st.ListVolumeBackups("user_b", "vol")
+	list, _ = st.ListVolumeBackups(t.Context(), "user_b", "vol")
 	if len(list) != 1 || list[0].ID != "bk_b" {
 		t.Errorf("user_b: expected [bk_b], got %v", list)
 	}
 
 	// user_a can't get user_b's backup
-	_, err := st.GetVolumeBackup("user_a", "bk_b")
+	_, err := st.GetVolumeBackup(t.Context(), "user_a", "bk_b")
 	if err == nil {
 		t.Error("expected error getting other user's backup")
 	}
@@ -175,14 +175,14 @@ func TestStoreOpenClose(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	st, err := New(dbPath)
+	st, err := New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
 
 	// Reopen should work
-	st2, err := New(dbPath)
+	st2, err := New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatal("reopen:", err)
 	}
@@ -195,7 +195,7 @@ func TestStoreOpenClose(t *testing.T) {
 
 func TestVolumeBackupMigrationPreservesHistoricalUnverifiedMode(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "before-backup-mode.db")
-	st, err := New(dbPath)
+	st, err := New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,12 +216,12 @@ func TestVolumeBackupMigrationPreservesHistoricalUnverifiedMode(t *testing.T) {
 	}
 	st.Close()
 
-	st, err = New(dbPath)
+	st, err = New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	got, err := st.GetVolumeBackup("usr", "older")
+	got, err := st.GetVolumeBackup(t.Context(), "usr", "older")
 	if err != nil {
 		t.Fatal(err)
 	}

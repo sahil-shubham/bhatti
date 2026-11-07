@@ -32,7 +32,7 @@ func TestOldAgentForkReturnsConflict(t *testing.T) {
 	if got := errorBody(t, resp); resp.StatusCode != http.StatusConflict || !strings.Contains(got, "older guest agent") || !strings.Contains(got, "recreate it") {
 		t.Fatalf("fork: %d %q, want 409 with recreate guidance", resp.StatusCode, got)
 	}
-	if _, err := srv.store.GetActiveSandboxByName("usr_test", "fork-from-old"); err == nil {
+	if _, err := srv.store.GetActiveSandboxByName(t.Context(), "usr_test", "fork-from-old"); err == nil {
 		t.Fatal("failed fork left a sandbox record")
 	}
 }
@@ -80,7 +80,7 @@ func TestOldAgentSecretGrantReturnsConflictWithoutGrant(t *testing.T) {
 	if got := errorBody(t, resp); resp.StatusCode != http.StatusConflict || !strings.Contains(got, "older guest agent") || !strings.Contains(got, "recreate it") {
 		t.Fatalf("grant: %d %q, want 409 with recreate guidance", resp.StatusCode, got)
 	}
-	if grants, err := srv.store.ListSecretGrants("usr_test"); err != nil || len(grants) != 0 {
+	if grants, err := srv.store.ListSecretGrants(t.Context(), "usr_test"); err != nil || len(grants) != 0 {
 		t.Fatalf("refused grant persisted: %+v, %v", grants, err)
 	}
 
@@ -107,10 +107,10 @@ func TestOldAgentCreateWithGrantOrGrowthLeavesNoSandbox(t *testing.T) {
 			if got := errorBody(t, resp); resp.StatusCode != http.StatusConflict || !strings.Contains(got, "older guest agent") || !strings.Contains(got, "recreate it") {
 				t.Fatalf("create: %d %q, want 409 with recreate guidance", resp.StatusCode, got)
 			}
-			if list, err := srv.store.ListSandboxes("usr_test"); err != nil || len(list) != 0 {
+			if list, err := srv.store.ListSandboxes(t.Context(), "usr_test"); err != nil || len(list) != 0 {
 				t.Fatalf("refused sandbox persisted: %+v, %v", list, err)
 			}
-			if grants, err := srv.store.ListSecretGrants("usr_test"); err != nil || len(grants) != 0 {
+			if grants, err := srv.store.ListSecretGrants(t.Context(), "usr_test"); err != nil || len(grants) != 0 {
 				t.Fatalf("refused create left grants: %+v, %v", grants, err)
 			}
 		})

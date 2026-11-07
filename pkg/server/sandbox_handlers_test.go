@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -213,7 +214,7 @@ func TestPatchSandbox_RenameAndKeepHot(t *testing.T) {
 	}
 
 	// Persistence check
-	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	stored, _ := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if stored.Name != newName || !stored.KeepHot {
 		t.Fatalf("both fields not persisted: name=%q keep_hot=%v", stored.Name, stored.KeepHot)
 	}
@@ -254,13 +255,13 @@ func TestManualWarmStopUncleanResultPersistsEvent(t *testing.T) {
 	if resp.StatusCode != 200 || stopped.Status != "stopped" || stopped.ID != sb.ID {
 		t.Fatalf("manual stop replied %d %+v, want this sandbox stopped", resp.StatusCode, stopped)
 	}
-	stored, err := srv.store.GetSandboxByID(sb.ID)
+	stored, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || stored.Status != "stopped" || eng.ThermalState(sb.EngineID) != "cold" {
 		t.Fatalf("manual power-off diverged from store: %+v, err=%v", stored, err)
 	}
 	srv.events.Close()
 	srv.events = nil
-	events, err := srv.store.QueryEvents(store.EventFilter{SandboxID: sb.ID})
+	events, err := srv.store.QueryEvents(t.Context(), store.EventFilter{SandboxID: sb.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +303,7 @@ func TestStartByName_PersistsStatus(t *testing.T) {
 		t.Fatalf("stop by name: expected 200, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	stored, _ := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if stored.Status != "stopped" {
 		t.Fatalf("after stop: store status = %q, want stopped", stored.Status)
 	}
@@ -313,7 +314,7 @@ func TestStartByName_PersistsStatus(t *testing.T) {
 		t.Fatalf("start by name: expected 200, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	stored, _ = srv.store.GetSandboxByID(sb.ID)
+	stored, _ = srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if stored.Status != "running" {
 		t.Fatalf("after start: store status = %q, want running (regression: #16)",
 			stored.Status)
@@ -327,7 +328,7 @@ func TestGetByName_PersistsStatusRefresh(t *testing.T) {
 
 	// Tamper with the store to simulate drift between store and engine
 	// (e.g. a missed update due to an earlier crash).
-	if err := srv.store.UpdateSandboxStatus(sb.ID, "stopped"); err != nil {
+	if err := srv.store.UpdateSandboxStatus(t.Context(), sb.ID, "stopped"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -337,7 +338,7 @@ func TestGetByName_PersistsStatusRefresh(t *testing.T) {
 		t.Fatalf("get by name: expected 200, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
-	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	stored, _ := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if stored.Status != "running" {
 		t.Fatalf("after GET-by-name refresh: store status = %q, want running (regression: #16)",
 			stored.Status)
@@ -358,7 +359,7 @@ func TestStartByName_RenameThenStartStop(t *testing.T) {
 	// Stop by new name
 	resp = doReq(t, ts, "POST", "/sandboxes/"+newName+"/stop", nil)
 	resp.Body.Close()
-	stored, _ := srv.store.GetSandboxByID(sb.ID)
+	stored, _ := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if stored.Status != "stopped" {
 		t.Fatalf("after stop: %q, want stopped", stored.Status)
 	}
@@ -366,7 +367,7 @@ func TestStartByName_RenameThenStartStop(t *testing.T) {
 	// Start by new name
 	resp = doReq(t, ts, "POST", "/sandboxes/"+newName+"/start", nil)
 	resp.Body.Close()
-	stored, _ = srv.store.GetSandboxByID(sb.ID)
+	stored, _ = srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if stored.Status != "running" {
 		t.Fatalf("after start: %q, want running", stored.Status)
 	}
@@ -384,13 +385,13 @@ func TestKeepHotThermalCycleSkip(t *testing.T) {
 	resp.Body.Close()
 
 	// Verify keep_hot is persisted in store
-	sbStored, _ := srv.store.GetSandboxByID(sb1.ID)
+	sbStored, _ := srv.store.GetSandboxByID(t.Context(), sb1.ID)
 	if !sbStored.KeepHot {
 		t.Fatal("keep_hot not persisted in store")
 	}
 
 	// Verify sb2 is NOT keep_hot
-	sb2Stored, _ := srv.store.GetSandboxByID(sb2.ID)
+	sb2Stored, _ := srv.store.GetSandboxByID(t.Context(), sb2.ID)
 	if sb2Stored.KeepHot {
 		t.Fatal("sb2 should not be keep_hot")
 	}
@@ -420,7 +421,7 @@ func addTemplate(t *testing.T, srv *Server, name string, secrets []string) strin
 		Secrets:   secrets,
 		CreatedAt: time.Now(),
 	}
-	if err := srv.store.CreateTemplate(tmpl); err != nil {
+	if err := srv.store.CreateTemplate(t.Context(), tmpl); err != nil {
 		t.Fatalf("create template: %v", err)
 	}
 	return tmpl.ID
@@ -433,7 +434,7 @@ func addSecret(t *testing.T, srv *Server, userID, name, value string) {
 	if err != nil {
 		t.Fatalf("encrypt %q: %v", name, err)
 	}
-	if err := srv.store.SetSecret(userID, name, ct); err != nil {
+	if err := srv.store.SetSecret(t.Context(), userID, name, ct); err != nil {
 		t.Fatalf("set secret %q: %v", name, err)
 	}
 }
@@ -705,7 +706,7 @@ func TestReadOnlyAttachJournalRepairBlocksReadWriteAttach(t *testing.T) {
 		Status: "ready", FilePath: filepath.Join(commands, "volume.ext4"),
 		CreatedAt: time.Now(),
 	}
-	if err := srv.store.CreatePersistentVolume(vol); err != nil {
+	if err := srv.store.CreatePersistentVolume(t.Context(), vol); err != nil {
 		t.Fatal(err)
 	}
 	sbName := uniqueName(t, "ro-repair")
@@ -755,7 +756,7 @@ func TestReadOnlyAttachJournalRepairBlocksReadWriteAttach(t *testing.T) {
 	rwDone := make(chan error, 1)
 	go func() {
 		close(rwStarted)
-		rwDone <- srv.store.AttachPersistentVolume("usr_test", volName, "competing-rw", "/data", false)
+		rwDone <- srv.store.AttachPersistentVolume(context.Background(), "usr_test", volName, "competing-rw", "/data", false)
 	}()
 	<-rwStarted
 	premature := false
@@ -793,7 +794,7 @@ func TestReadOnlyAttachJournalRepairBlocksReadWriteAttach(t *testing.T) {
 	if ro.status != http.StatusCreated && ro.status != http.StatusConflict {
 		t.Fatalf("RO HTTP attach returned unexpected status %d", ro.status)
 	}
-	updated, err := srv.store.GetPersistentVolume("usr_test", volName)
+	updated, err := srv.store.GetPersistentVolume(t.Context(), "usr_test", volName)
 	if err != nil || len(updated.Attachments) != 1 {
 		t.Fatalf("competing attaches left unexpected volume attachments: %+v, %v", updated, err)
 	}

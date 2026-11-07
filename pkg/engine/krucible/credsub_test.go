@@ -156,7 +156,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 
 	// The daemon's side: a store with the secret, the sandbox's CA and its
 	// grants, and the broker serving it to the owner's netd.
-	st, err := store.New(filepath.Join(t.TempDir(), "state.db"))
+	st, err := store.New(t.Context(), filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 	rand.Read(rb)
 	value := "e2e-" + hex.EncodeToString(rb)
 	for name, v := range map[string]string{"TOKEN": value, "OLD_TOKEN": "revoked-" + value} {
-		if err := st.SetSecret(user, name, []byte(v)); err != nil {
+		if err := st.SetSecret(t.Context(), user, name, []byte(v)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -180,7 +180,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutSandboxCA(store.SandboxCA{SandboxID: sandbox, UserID: user, CertPEM: string(caPEM), KeyEnc: caKey}); err != nil {
+	if err := st.PutSandboxCA(t.Context(), store.SandboxCA{SandboxID: sandbox, UserID: user, CertPEM: string(caPEM), KeyEnc: caKey}); err != nil {
 		t.Fatal(err)
 	}
 	grant := func(id, secret string) string {
@@ -188,7 +188,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.CreateSecretGrant(store.SecretGrant{ID: id, UserID: user, SecretName: secret, SandboxID: sandbox,
+		if err := st.CreateSecretGrant(t.Context(), store.SecretGrant{ID: id, UserID: user, SecretName: secret, SandboxID: sandbox,
 			Hosts: []string{echo}, Placeholder: ph, CreatedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -254,7 +254,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 	}
 
 	// A revoked grant is refused on the next connection.
-	if err := st.RevokeSecretGrant(user, "g-old", time.Now()); err != nil {
+	if err := st.RevokeSecretGrant(t.Context(), user, "g-old", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	out = run("credcheck", "https", "https://"+echo+"/headers", "-H", "Authorization: Bearer $OLD_TOKEN")

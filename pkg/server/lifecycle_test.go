@@ -58,7 +58,7 @@ func TestVMExitStopsSandboxAndColdExecRestarts(t *testing.T) {
 		exit.Meta["signal"] != "killed" || exit.Meta["reason"] != "VMM was OOM-killed" {
 		t.Fatalf("incorrect exit audit event: %+v", exit)
 	}
-	stopped, err := srv.store.GetSandboxByID(sb.ID)
+	stopped, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || stopped.Status != "stopped" || stopped.StoppedAt == nil {
 		t.Fatalf("unexpected persisted status after exit: %+v (%v)", stopped, err)
 	}
@@ -85,12 +85,12 @@ func TestVMExitStopsSandboxAndColdExecRestarts(t *testing.T) {
 	if starts != 1 {
 		t.Fatalf("exec must cold-start stopped VM once, got %d starts", starts)
 	}
-	running, err := srv.store.GetSandboxByID(sb.ID)
+	running, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || running.Status != "running" {
 		t.Fatalf("wake did not update store: %+v (%v)", running, err)
 	}
 	srv.Close()
-	events, err := srv.store.QueryEvents(store.EventFilter{Type: "sandbox.exited", SandboxID: sb.ID})
+	events, err := srv.store.QueryEvents(t.Context(), store.EventFilter{Type: "sandbox.exited", SandboxID: sb.ID})
 	if err != nil || len(events) != 1 || events[0].Meta["reason"] != "VMM was OOM-killed" {
 		t.Fatalf("exit event not persisted on shutdown: %+v (%v)", events, err)
 	}
@@ -109,7 +109,7 @@ func TestVMExitColdStartsViaPublicProxy(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || got.Status != "running" || starts != 1 {
 		t.Fatalf("proxy wake after VM exit: store=%+v, starts=%d, err=%v", got, starts, err)
 	}
@@ -131,11 +131,11 @@ func TestKeepHotExitRestartAndBackoff(t *testing.T) {
 			srv, _ := setup(t)
 			eng := srv.engine.(*mockEngine)
 			id := createRunningBox(t, srv, eng, uniqueName(t, "keep-hot"))
-			sb, err := srv.store.GetSandboxByEngineID(id)
+			sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+			if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 				t.Fatal(err)
 			}
 			eng.StartErr = tc.startError
@@ -158,7 +158,7 @@ func TestKeepHotExitRestartAndBackoff(t *testing.T) {
 			if result.UserID != sb.CreatedBy || result.SandboxID != sb.ID {
 				t.Fatalf("wrong restart event owner: %+v", result)
 			}
-			got, err := srv.store.GetSandboxByID(sb.ID)
+			got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 			if err != nil || got.Status != tc.wantStatus {
 				t.Fatalf("restart status: %+v (%v), want %q", got, err, tc.wantStatus)
 			}
@@ -179,11 +179,11 @@ func TestKeepHotExitDuringStartIsNotLost(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "exit-during-start")
-	sb, err := srv.store.GetSandboxByEngineID(id)
+	sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	srv.lifecycle.now = func() time.Time { return time.Unix(42, 0) }
@@ -219,7 +219,7 @@ func TestKeepHotExitDuringStartIsNotLost(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || got.Status != "running" || starts != 2 {
 		t.Fatalf("second exit must trigger another restart: store=%+v, starts=%d, err=%v", got, starts, err)
 	}
@@ -229,11 +229,11 @@ func TestKeepHotCrashLoopStopsAfterThreeInTenMinutes(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "crash-loop")
-	sb, err := srv.store.GetSandboxByEngineID(id)
+	sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	var now atomic.Int64
@@ -271,7 +271,7 @@ func TestKeepHotCrashLoopStopsAfterThreeInTenMinutes(t *testing.T) {
 	if err := eng.Start(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateSandboxStatus(sb.ID, "running"); err != nil {
+	if err := srv.store.UpdateSandboxStatus(t.Context(), sb.ID, "running"); err != nil {
 		t.Fatal(err)
 	}
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1, Reason: "later crash"})
@@ -285,11 +285,11 @@ func TestKeepHotStartupRecoveryIsJoinedByClose(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "startup-keep-hot")
-	sb, err := srv.store.GetSandboxByEngineID(id)
+	sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := eng.Stop(context.Background(), id); err != nil {
@@ -297,7 +297,7 @@ func TestKeepHotStartupRecoveryIsJoinedByClose(t *testing.T) {
 	}
 	// The VM went down with the daemon: the store still says running.
 	srv.RecoverSandboxes(context.Background())
-	if pending, err := srv.store.ListRestartPending(); err != nil || len(pending) != 1 || pending[0].ID != sb.ID {
+	if pending, err := srv.store.ListRestartPending(t.Context()); err != nil || len(pending) != 1 || pending[0].ID != sb.ID {
 		t.Fatalf("restart-pending set = %+v (%v), want just %s", pending, err, sb.ID)
 	}
 	started := make(chan struct{})
@@ -353,7 +353,7 @@ func runStartupRecovery(t *testing.T, srv *Server) (due []store.Sandbox, logs st
 	slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
 	defer slog.SetDefault(old)
 	srv.RecoverSandboxes(context.Background())
-	due, err := srv.store.ListRestartPending()
+	due, err := srv.store.ListRestartPending(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,11 +392,11 @@ func TestKeepHotStartupWakesOnlyWhatWentDown(t *testing.T) {
 			srv, _ := setup(t)
 			eng := srv.engine.(*mockEngine)
 			id := createRunningBox(t, srv, eng, "golden")
-			sb, err := srv.store.GetSandboxByEngineID(id)
+			sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := srv.store.UpdateSandboxKeepHot(sb.ID, tc.keepHot); err != nil {
+			if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, tc.keepHot); err != nil {
 				t.Fatal(err)
 			}
 			if tc.vmGone {
@@ -406,7 +406,7 @@ func TestKeepHotStartupWakesOnlyWhatWentDown(t *testing.T) {
 				eng.mu.Unlock()
 			}
 			if tc.storedDown {
-				if err := srv.store.StopSandbox(sb.ID); err != nil {
+				if err := srv.store.StopSandbox(t.Context(), sb.ID); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -419,7 +419,7 @@ func TestKeepHotStartupWakesOnlyWhatWentDown(t *testing.T) {
 			if starts != tc.wantStarts {
 				t.Errorf("engine started %d times, want %d", starts, tc.wantStarts)
 			}
-			if got, _ := srv.store.GetSandboxByID(sb.ID); got == nil || got.Status != tc.wantStatus {
+			if got, _ := srv.store.GetSandboxByID(t.Context(), sb.ID); got == nil || got.Status != tc.wantStatus {
 				t.Errorf("store status %+v, want %s", got, tc.wantStatus)
 			}
 			if n := strings.Count(logs, "msg=sandbox.restarted"); n != tc.wantStarts {
@@ -434,7 +434,7 @@ func TestExplicitStopOfKeepHotSurvivesRestart(t *testing.T) {
 	srv, ts := setup(t)
 	eng := srv.engine.(*mockEngine)
 	sb := createSandbox(t, ts, uniqueName(t, "golden"))
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	resp := doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/stop", nil)
@@ -451,7 +451,7 @@ func TestExplicitStopOfKeepHotSurvivesRestart(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || got.Status != "stopped" || starts != 0 || len(lost) != 0 {
 		t.Fatalf("restart after explicit stop: status=%v (%v) starts=%d lost=%d logs=%s", got, err, starts, len(lost), logs)
 	}
@@ -464,7 +464,7 @@ func TestExplicitStopCancelsBackingOffKeepHotRestart(t *testing.T) {
 	srv, ts := setup(t)
 	eng := srv.engine.(*mockEngine)
 	sb := createSandbox(t, ts, uniqueName(t, "crashy"))
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	waiting := make(chan struct{})
@@ -507,7 +507,7 @@ func TestExplicitStopCancelsBackingOffKeepHotRestart(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if err != nil || got.Status != "stopped" || starts != 0 {
 		t.Fatalf("backing-off restart ran after explicit stop: status=%v (%v) starts=%d", got, err, starts)
 	}
@@ -528,7 +528,7 @@ func crashedIntoBackoff(t *testing.T, srv *Server, ts *httptest.Server) store.Sa
 	t.Helper()
 	eng := srv.engine.(*mockEngine)
 	sb := createSandbox(t, ts, uniqueName(t, "crashy"))
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	waiting := make(chan struct{})
@@ -549,7 +549,7 @@ func crashedIntoBackoff(t *testing.T, srv *Server, ts *httptest.Server) store.Sa
 	case <-time.After(3 * time.Second):
 		t.Fatal("restart did not back off")
 	}
-	if pending, err := srv.store.ListRestartPending(); err != nil || len(pending) != 1 || pending[0].ID != sb.ID {
+	if pending, err := srv.store.ListRestartPending(t.Context()); err != nil || len(pending) != 1 || pending[0].ID != sb.ID {
 		t.Fatalf("crashed keep_hot sandbox not marked for restart: %+v (%v)", pending, err)
 	}
 	return sb
@@ -569,11 +569,11 @@ func TestKeepHotCrashRestartSurvivesDaemonRestart(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if len(due) != 1 || starts != 1 || err != nil || got.Status != "running" {
 		t.Fatalf("crashed sandbox not revived: due=%d starts=%d status=%v (%v) logs=%s", len(due), starts, got, err, logs)
 	}
-	if pending, _ := srv.store.ListRestartPending(); len(pending) != 0 {
+	if pending, _ := srv.store.ListRestartPending(t.Context()); len(pending) != 0 {
 		t.Fatalf("marker left after the boot: %+v", pending)
 	}
 }
@@ -583,7 +583,7 @@ func TestKeepHotCrashRestartSurvivesDaemonRestart(t *testing.T) {
 func loseKeepHot(t *testing.T, srv *Server, eng *mockEngine, name string) string {
 	t.Helper()
 	id := createRunningBox(t, srv, eng, name)
-	if err := srv.store.UpdateSandboxKeepHot(id, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), id, true); err != nil {
 		t.Fatal(err)
 	}
 	eng.mu.Lock()
@@ -634,14 +634,14 @@ func TestKeepHotStartupBootRetriesAfterTransientFailure(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(id)
+	got, err := srv.store.GetSandboxByID(t.Context(), id)
 	if len(due) != 1 || starts != 2 || err != nil || got.Status != "running" {
 		t.Fatalf("boot did not recover from a transient failure: due=%d starts=%d status=%v (%v)\n%s", len(due), starts, got, err, logs)
 	}
 	if first, second := <-delays, <-delays; first != 0 || second != restartBackoff[1] {
 		t.Fatalf("retry delays %v, %v; want 0, %v", first, second, restartBackoff[1])
 	}
-	if pending, _ := srv.store.ListRestartPending(); len(pending) != 0 {
+	if pending, _ := srv.store.ListRestartPending(t.Context()); len(pending) != 0 {
 		t.Fatalf("marker left after the boot: %+v", pending)
 	}
 }
@@ -674,7 +674,7 @@ func TestKeepHotStartupBackoffSurvivesDaemonRestart(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if sb, err := srv.store.GetSandboxByID(good); err == nil && sb.Status == "running" {
+		if sb, err := srv.store.GetSandboxByID(t.Context(), good); err == nil && sb.Status == "running" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -692,7 +692,7 @@ func TestKeepHotStartupBackoffSurvivesDaemonRestart(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls - before
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(bad)
+	got, err := srv.store.GetSandboxByID(t.Context(), bad)
 	if len(due) != 1 || due[0].ID != bad || starts != 1 || err != nil || got.Status != "running" {
 		t.Fatalf("next start due=%+v starts=%d status=%v (%v), want only %s booted:\n%s", due, starts, got, err, bad, logs)
 	}
@@ -705,20 +705,20 @@ func TestBackupUncleanStopMarksKeepHotForRestart(t *testing.T) {
 	eng := srv.engine.(*mockEngine)
 	hot := createRunningBox(t, srv, eng, "backup-hot")
 	plain := createRunningBox(t, srv, eng, "backup-plain")
-	if err := srv.store.UpdateSandboxKeepHot(hot, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), hot, true); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{hot, plain} {
-		sb, err := srv.store.GetSandboxByID(id)
+		sb, err := srv.store.GetSandboxByID(t.Context(), id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv.reconcileBackupUncleanStop(sb, &fakeBackupUncleanStop{reason: "guest thaw ACK lost"})
-		if got, _ := srv.store.GetSandboxByID(id); got.Status != "stopped" {
+		srv.reconcileBackupUncleanStop(t.Context(), sb, &fakeBackupUncleanStop{reason: "guest thaw ACK lost"})
+		if got, _ := srv.store.GetSandboxByID(t.Context(), id); got.Status != "stopped" {
 			t.Fatalf("%s: status %s after unclean stop", id, got.Status)
 		}
 	}
-	list, err := srv.store.ListRestartPending()
+	list, err := srv.store.ListRestartPending(t.Context())
 	if err != nil || len(list) != 1 || list[0].ID != hot {
 		t.Fatalf("restart-pending after failed thaw = %+v (%v), want just %s", list, err, hot)
 	}
@@ -742,7 +742,7 @@ func TestExplicitStopDuringBackoffSurvivesDaemonRestart(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if len(due) != 0 || starts != 0 || err != nil || got.Status != "stopped" {
 		t.Fatalf("stopped sandbox came back: due=%d starts=%d status=%v (%v) logs=%s", len(due), starts, got, err, logs)
 	}
@@ -760,7 +760,7 @@ func TestAllowColdDuringBackoffDropsPendingRestart(t *testing.T) {
 		t.Fatalf("patch: %d", resp.StatusCode)
 	}
 	srv.Close()
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -769,7 +769,7 @@ func TestAllowColdDuringBackoffDropsPendingRestart(t *testing.T) {
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
-	got, err := srv.store.GetSandboxByID(sb.ID)
+	got, err := srv.store.GetSandboxByID(t.Context(), sb.ID)
 	if len(due) != 0 || starts != 0 || err != nil || got.Status != "stopped" {
 		t.Fatalf("--allow-cold sandbox came back: due=%d starts=%d status=%v (%v) logs=%s", len(due), starts, got, err, logs)
 	}
@@ -781,11 +781,11 @@ func TestRestartGiveUpClearsPendingRestart(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "broken")
-	sb, err := srv.store.GetSandboxByEngineID(id)
+	sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	eng.StartErr = errors.New("no memory")
@@ -812,7 +812,7 @@ func TestNetworkLostAuditUsesSandboxOwner(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "net-lost")
-	sb, _ := srv.store.GetSandboxByEngineID(id)
+	sb, _ := srv.store.GetSandboxByEngineID(t.Context(), id)
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
 	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
@@ -825,7 +825,7 @@ func TestNetworkLostAuditUsesSandboxOwner(t *testing.T) {
 		t.Fatalf("network loss event = %+v", e)
 	}
 	srv.Close()
-	events, err := srv.store.QueryEvents(store.EventFilter{Type: "sandbox.network_lost", SandboxID: sb.ID})
+	events, err := srv.store.QueryEvents(t.Context(), store.EventFilter{Type: "sandbox.network_lost", SandboxID: sb.ID})
 	if err != nil || len(events) != 1 || events[0].Meta["reason"] != e.Meta["reason"] {
 		t.Fatalf("network event not persisted: %+v (%v)", events, err)
 	}
@@ -835,7 +835,7 @@ func TestRecoveryEventsAreDeliveredWhenHandlerAttaches(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "queued-net-lost")
-	sb, _ := srv.store.GetSandboxByEngineID(id)
+	sb, _ := srv.store.GetSandboxByEngineID(t.Context(), id)
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.NetworkLost, EngineID: id, Reason: "gateway quarantine"})
 	srv.StartEventRecorder()
 	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
@@ -848,11 +848,11 @@ func TestCloseCancelsDelayedKeepHotRestart(t *testing.T) {
 	srv, _ := setup(t)
 	eng := srv.engine.(*mockEngine)
 	id := createRunningBox(t, srv, eng, "cancel-restart")
-	sb, err := srv.store.GetSandboxByEngineID(id)
+	sb, err := srv.store.GetSandboxByEngineID(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateSandboxKeepHot(sb.ID, true); err != nil {
+	if err := srv.store.UpdateSandboxKeepHot(t.Context(), sb.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	waiting := make(chan struct{})
@@ -949,7 +949,7 @@ func TestCloseJoinsEveryServerLoopAndIsIdempotent(t *testing.T) {
 	}
 	srv.Close()
 	srv.RecordEvent(store.Event{Type: "after.close"})
-	events, err := srv.store.QueryEvents(store.EventFilter{Type: "after.close"})
+	events, err := srv.store.QueryEvents(t.Context(), store.EventFilter{Type: "after.close"})
 	if err != nil || len(events) != 0 {
 		t.Fatalf("RecordEvent after Close persisted an event: %+v (%v)", events, err)
 	}

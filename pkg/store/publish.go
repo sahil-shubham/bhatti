@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -17,9 +18,9 @@ type PublishRule struct {
 // CreatePublishRule inserts a new publish rule. Two unique constraints can
 // refuse it and both are ErrConflict: the alias is taken, or the sandbox
 // already publishes the port. The message says which.
-func (s *Store) CreatePublishRule(rule PublishRule) error {
-	_, err := s.db.Exec(
-		`INSERT INTO publish_rules (id, sandbox_id, user_id, port, alias)
+func (s *Store) CreatePublishRule(ctx context.Context, rule PublishRule) error {
+	_, err := s.db.ExecContext(
+		ctx, `INSERT INTO publish_rules (id, sandbox_id, user_id, port, alias)
 		 VALUES (?, ?, ?, ?, ?)`,
 		rule.ID, rule.SandboxID, rule.UserID, rule.Port, rule.Alias,
 	)
@@ -30,7 +31,7 @@ func (s *Store) CreatePublishRule(rule PublishRule) error {
 	// The driver names the violated constraint only in its message text, so
 	// ask the table which one holds.
 	var aliasTaken, portTaken bool
-	s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM publish_rules WHERE alias = ?),
+	s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM publish_rules WHERE alias = ?),
 		EXISTS(SELECT 1 FROM publish_rules WHERE sandbox_id = ? AND port = ?)`,
 		rule.Alias, rule.SandboxID, rule.Port).Scan(&aliasTaken, &portTaken)
 	switch {
@@ -43,10 +44,10 @@ func (s *Store) CreatePublishRule(rule PublishRule) error {
 }
 
 // GetPublishRuleByAlias looks up a publish rule by its public alias.
-func (s *Store) GetPublishRuleByAlias(alias string) (*PublishRule, error) {
+func (s *Store) GetPublishRuleByAlias(ctx context.Context, alias string) (*PublishRule, error) {
 	var r PublishRule
-	err := s.db.QueryRow(
-		`SELECT id, sandbox_id, user_id, port, alias, created_at
+	err := s.db.QueryRowContext(
+		ctx, `SELECT id, sandbox_id, user_id, port, alias, created_at
 		 FROM publish_rules WHERE alias = ?`, alias,
 	).Scan(&r.ID, &r.SandboxID, &r.UserID, &r.Port, &r.Alias, &r.CreatedAt)
 	if err != nil {
@@ -56,9 +57,9 @@ func (s *Store) GetPublishRuleByAlias(alias string) (*PublishRule, error) {
 }
 
 // ListPublishRules returns all publish rules for a sandbox.
-func (s *Store) ListPublishRules(sandboxID string) ([]PublishRule, error) {
-	rows, err := s.db.Query(
-		`SELECT id, sandbox_id, user_id, port, alias, created_at
+func (s *Store) ListPublishRules(ctx context.Context, sandboxID string) ([]PublishRule, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT id, sandbox_id, user_id, port, alias, created_at
 		 FROM publish_rules WHERE sandbox_id = ?`, sandboxID,
 	)
 	if err != nil {
@@ -77,9 +78,9 @@ func (s *Store) ListPublishRules(sandboxID string) ([]PublishRule, error) {
 }
 
 // ListUserPublishRules returns all publish rules for sandboxes owned by a user.
-func (s *Store) ListUserPublishRules(userID string) ([]PublishRule, error) {
-	rows, err := s.db.Query(
-		`SELECT id, sandbox_id, user_id, port, alias, created_at
+func (s *Store) ListUserPublishRules(ctx context.Context, userID string) ([]PublishRule, error) {
+	rows, err := s.db.QueryContext(
+		ctx, `SELECT id, sandbox_id, user_id, port, alias, created_at
 		 FROM publish_rules WHERE user_id = ?`, userID)
 	if err != nil {
 		return nil, err
@@ -97,9 +98,9 @@ func (s *Store) ListUserPublishRules(userID string) ([]PublishRule, error) {
 }
 
 // DeletePublishRule removes a publish rule scoped to user + sandbox + port.
-func (s *Store) DeletePublishRule(userID, sandboxID string, port int) error {
-	res, err := s.db.Exec(
-		`DELETE FROM publish_rules WHERE user_id = ? AND sandbox_id = ? AND port = ?`,
+func (s *Store) DeletePublishRule(ctx context.Context, userID, sandboxID string, port int) error {
+	res, err := s.db.ExecContext(
+		ctx, `DELETE FROM publish_rules WHERE user_id = ? AND sandbox_id = ? AND port = ?`,
 		userID, sandboxID, port,
 	)
 	if err != nil {
@@ -112,8 +113,8 @@ func (s *Store) DeletePublishRule(userID, sandboxID string, port int) error {
 }
 
 // DeletePublishRulesForSandbox removes all publish rules for a sandbox.
-func (s *Store) DeletePublishRulesForSandbox(sandboxID string) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM publish_rules WHERE sandbox_id = ?`, sandboxID)
+func (s *Store) DeletePublishRulesForSandbox(ctx context.Context, sandboxID string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM publish_rules WHERE sandbox_id = ?`, sandboxID)
 	if err != nil {
 		return 0, err
 	}
@@ -121,8 +122,8 @@ func (s *Store) DeletePublishRulesForSandbox(sandboxID string) (int64, error) {
 }
 
 // CleanupOrphanedPublishRules removes rules for destroyed/unknown/missing sandboxes.
-func (s *Store) CleanupOrphanedPublishRules() (int64, error) {
-	res, err := s.db.Exec(`
+func (s *Store) CleanupOrphanedPublishRules(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM publish_rules WHERE sandbox_id NOT IN (
 			SELECT id FROM sandboxes WHERE status NOT IN ('destroyed', 'unknown')
 		)`)

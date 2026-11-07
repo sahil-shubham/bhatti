@@ -64,7 +64,7 @@ func TestMigrateSecretsToV2_FromV1(t *testing.T) {
 	db := openRaw(t)
 	createV1Secrets(t, db)
 
-	didMigrate, err := migrateSecretsToV2(db)
+	didMigrate, err := migrateSecretsToV2(t.Context(), db)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -92,12 +92,12 @@ func TestMigrateSecretsToV2_Idempotent(t *testing.T) {
 	createV1Secrets(t, db)
 
 	// First call: v1 → v2.
-	if didMigrate, err := migrateSecretsToV2(db); err != nil || !didMigrate {
+	if didMigrate, err := migrateSecretsToV2(t.Context(), db); err != nil || !didMigrate {
 		t.Fatalf("first call: didMigrate=%v err=%v", didMigrate, err)
 	}
 
 	// Second call: must be a no-op.
-	didMigrate, err := migrateSecretsToV2(db)
+	didMigrate, err := migrateSecretsToV2(t.Context(), db)
 	if err != nil {
 		t.Fatalf("second call err: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestMigrateSecretsToV2_Idempotent(t *testing.T) {
 	}
 
 	// Third call for good measure.
-	if didMigrate, err := migrateSecretsToV2(db); err != nil || didMigrate {
+	if didMigrate, err := migrateSecretsToV2(t.Context(), db); err != nil || didMigrate {
 		t.Fatalf("third call: didMigrate=%v err=%v (expected false, nil)", didMigrate, err)
 	}
 }
@@ -125,7 +125,7 @@ func TestMigrateSecretsToV2_PreservesData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := migrateSecretsToV2(db); err != nil {
+	if _, err := migrateSecretsToV2(t.Context(), db); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,7 +157,7 @@ func TestMigrateSecretsToV2_FullStorePath(t *testing.T) {
 	dbPath := filepath.Join(dir, "store.db")
 
 	// First boot — migration runs.
-	s1, err := New(dbPath)
+	s1, err := New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatalf("first New: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestMigrateSecretsToV2_FullStorePath(t *testing.T) {
 
 	// Second boot — if the migration re-runs, it drops `secrets` and
 	// renames `secrets_v2`. The marker index would be lost.
-	s2, err := New(dbPath)
+	s2, err := New(t.Context(), dbPath)
 	if err != nil {
 		t.Fatalf("second New: %v", err)
 	}

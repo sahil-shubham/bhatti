@@ -383,20 +383,20 @@ var imageShareCmd = &cobra.Command{
   sudo bhatti image share spc-golden --list`,
 	Args: exactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
 		imageName := args[0]
 		listShares, _ := cmd.Flags().GetBool("list")
 		users, _ := cmd.Flags().GetStringSlice("user")
 
-		img, err := st.GetImageByName(imageName)
+		img, err := st.GetImageByName(cmd.Context(), imageName)
 		if err != nil {
 			return err
 		}
 
 		if listShares {
-			shares, _ := st.ListImageShares(img.ID)
+			shares, _ := st.ListImageShares(cmd.Context(), img.ID)
 			if len(shares) == 0 {
 				fmt.Printf("%s: not shared\n", imageName)
 			} else {
@@ -410,11 +410,11 @@ var imageShareCmd = &cobra.Command{
 		}
 
 		for _, userName := range users {
-			user, err := st.GetUserByName(userName)
+			user, err := st.GetUserByName(cmd.Context(), userName)
 			if err != nil {
 				return err
 			}
-			if err := st.ShareImage(img.ID, user.ID); err != nil {
+			if err := st.ShareImage(cmd.Context(), img.ID, user.ID); err != nil {
 				return fmt.Errorf("share with %q: %w", userName, err)
 			}
 		}
@@ -429,7 +429,7 @@ var imageUnshareCmd = &cobra.Command{
 	Example: `  sudo bhatti image unshare spc-golden --user sumo`,
 	Args: exactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := openLocalStore()
+		st := openLocalStore(cmd.Context())
 		defer st.Close()
 
 		imageName := args[0]
@@ -439,17 +439,17 @@ var imageUnshareCmd = &cobra.Command{
 			return fmt.Errorf("--user required")
 		}
 
-		img, err := st.GetImageByName(imageName)
+		img, err := st.GetImageByName(cmd.Context(), imageName)
 		if err != nil {
 			return err
 		}
 
 		for _, userName := range users {
-			user, err := st.GetUserByName(userName)
+			user, err := st.GetUserByName(cmd.Context(), userName)
 			if err != nil {
 				return err
 			}
-			st.UnshareImage(img.ID, user.ID)
+			st.UnshareImage(cmd.Context(), img.ID, user.ID)
 		}
 		fmt.Printf("unshared %q from: %s\n", imageName, strings.Join(users, ", "))
 		return nil

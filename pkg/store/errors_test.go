@@ -45,7 +45,7 @@ func TestClassifyUniqueViolationIsConflict(t *testing.T) {
 func TestClassifyUniqueIndexViolationIsConflict(t *testing.T) {
 	s := testStore(t)
 	createTestSandbox(t, s, "usr_a", "sb1", "dev")
-	err := s.CreateSandbox(Sandbox{ID: "sb2", Name: "dev", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()})
+	err := s.CreateSandbox(t.Context(), Sandbox{ID: "sb2", Name: "dev", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()})
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("a second live sandbox named dev: %v, want ErrConflict", err)
 	}
@@ -110,10 +110,10 @@ func TestFailedLookupIsNotNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookups := map[string]func() error{
-		"GetPersistentVolume":    func() error { _, err := s.GetPersistentVolume("usr_a", "ws"); return err },
-		"DeletePersistentVolume": func() error { return s.DeletePersistentVolume("usr_a", "ws") },
-		"AttachPersistentVolume": func() error { return s.AttachPersistentVolume("usr_a", "ws", "sb1", "/ws", false) },
-		"DetachPersistentVolume": func() error { return s.DetachPersistentVolume("usr_a", "ws", "sb1") },
+		"GetPersistentVolume":    func() error { _, err := s.GetPersistentVolume(t.Context(), "usr_a", "ws"); return err },
+		"DeletePersistentVolume": func() error { return s.DeletePersistentVolume(t.Context(), "usr_a", "ws") },
+		"AttachPersistentVolume": func() error { return s.AttachPersistentVolume(t.Context(), "usr_a", "ws", "sb1", "/ws", false) },
+		"DetachPersistentVolume": func() error { return s.DetachPersistentVolume(t.Context(), "usr_a", "ws", "sb1") },
 	}
 	for name, call := range lookups {
 		err := call()
@@ -126,7 +126,7 @@ func TestFailedLookupIsNotNotFound(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE images`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetImage("usr_a", "base"); err == nil || errors.Is(err, ErrNotFound) {
+	if _, err := s.GetImage(t.Context(), "usr_a", "base"); err == nil || errors.Is(err, ErrNotFound) {
 		t.Errorf("GetImage with its table gone: %v, want a failure that is not ErrNotFound", err)
 	}
 }
@@ -139,26 +139,28 @@ func TestLookupsAreOwnerScopedNotFound(t *testing.T) {
 	createTestUser(t, s, "usr_b", "bob")
 	createTestSandbox(t, s, "usr_a", "sb1", "dev")
 	createTestVolume(t, s, "usr_a", "ws", 64)
-	if err := s.SetSecret("usr_a", "TOKEN", []byte("v")); err != nil {
+	if err := s.SetSecret(t.Context(), "usr_a", "TOKEN", []byte("v")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreateSnapshot(snapshotFixture("s1", "usr_a", "snap")); err != nil {
+	if err := s.CreateSnapshot(t.Context(), snapshotFixture("s1", "usr_a", "snap")); err != nil {
 		t.Fatal(err)
 	}
 	for name, call := range map[string]func() error{
-		"GetSandbox":             func() error { _, err := s.GetSandbox("usr_b", "dev"); return err },
-		"GetPersistentVolume":    func() error { _, err := s.GetPersistentVolume("usr_b", "ws"); return err },
-		"DeletePersistentVolume": func() error { return s.DeletePersistentVolume("usr_b", "ws") },
-		"GetSecretValue":         func() error { _, err := s.GetSecretValue("usr_b", "TOKEN"); return err },
-		"GetSecret":              func() error { _, err := s.GetSecret("usr_b", "TOKEN"); return err },
-		"DeleteSecret":           func() error { return s.DeleteSecret("usr_b", "TOKEN") },
-		"GetSnapshot":            func() error { _, err := s.GetSnapshot("usr_b", "snap"); return err },
-		"DeleteSnapshot":         func() error { return s.DeleteSnapshot("usr_b", "snap") },
-		"RenameSandbox":          func() error { return s.RenameSandbox("usr_b", "sb1", "mine") },
-		"DeleteSandbox":          func() error { return s.DeleteSandbox("usr_b", "sb1") },
-		"UpdateSandboxLabels":    func() error { return s.UpdateSandboxLabels("usr_b", "sb1", map[string]string{"k": "v"}, nil) },
-		"GetUser (absent)":       func() error { _, err := s.GetUser("nobody"); return err },
-		"GetUserByName (absent)": func() error { _, err := s.GetUserByName("nobody"); return err },
+		"GetSandbox":             func() error { _, err := s.GetSandbox(t.Context(), "usr_b", "dev"); return err },
+		"GetPersistentVolume":    func() error { _, err := s.GetPersistentVolume(t.Context(), "usr_b", "ws"); return err },
+		"DeletePersistentVolume": func() error { return s.DeletePersistentVolume(t.Context(), "usr_b", "ws") },
+		"GetSecretValue":         func() error { _, err := s.GetSecretValue(t.Context(), "usr_b", "TOKEN"); return err },
+		"GetSecret":              func() error { _, err := s.GetSecret(t.Context(), "usr_b", "TOKEN"); return err },
+		"DeleteSecret":           func() error { return s.DeleteSecret(t.Context(), "usr_b", "TOKEN") },
+		"GetSnapshot":            func() error { _, err := s.GetSnapshot(t.Context(), "usr_b", "snap"); return err },
+		"DeleteSnapshot":         func() error { return s.DeleteSnapshot(t.Context(), "usr_b", "snap") },
+		"RenameSandbox":          func() error { return s.RenameSandbox(t.Context(), "usr_b", "sb1", "mine") },
+		"DeleteSandbox":          func() error { return s.DeleteSandbox(t.Context(), "usr_b", "sb1") },
+		"UpdateSandboxLabels": func() error {
+			return s.UpdateSandboxLabels(t.Context(), "usr_b", "sb1", map[string]string{"k": "v"}, nil)
+		},
+		"GetUser (absent)":       func() error { _, err := s.GetUser(t.Context(), "nobody"); return err },
+		"GetUserByName (absent)": func() error { _, err := s.GetUserByName(t.Context(), "nobody"); return err },
 	} {
 		if err := call(); !errors.Is(err, ErrNotFound) {
 			t.Errorf("%s: %v, want ErrNotFound", name, err)
@@ -170,22 +172,22 @@ func TestLookupsAreOwnerScopedNotFound(t *testing.T) {
 // is not there is ErrNotFound, not in use.
 func TestDeleteLegacyVolumeInUse(t *testing.T) {
 	s := testStore(t)
-	if err := s.CreateVolume("data"); err != nil {
+	if err := s.CreateVolume(t.Context(), "data"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AttachVolume("sb1", "data", "/data", false); err != nil {
+	if err := s.AttachVolume(t.Context(), "sb1", "data", "/data", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteVolume("data"); !errors.Is(err, ErrInUse) {
+	if err := s.DeleteVolume(t.Context(), "data"); !errors.Is(err, ErrInUse) {
 		t.Fatalf("delete while a sandbox mounts it: %v, want ErrInUse", err)
 	}
-	if err := s.DeleteVolume("nothing"); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrInUse) {
+	if err := s.DeleteVolume(t.Context(), "nothing"); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrInUse) {
 		t.Fatalf("delete of a volume that is not there: %v, want ErrNotFound only", err)
 	}
-	if err := s.DetachVolumes("sb1"); err != nil {
+	if err := s.DetachVolumes(t.Context(), "sb1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteVolume("data"); err != nil {
+	if err := s.DeleteVolume(t.Context(), "data"); err != nil {
 		t.Fatalf("delete once nothing mounts it: %v", err)
 	}
 }
@@ -202,27 +204,27 @@ func TestVolumeNameIsNeverMistakenForAKind(t *testing.T) {
 			createTestUser(t, s, "usr_a", "alice")
 			createTestSandbox(t, s, "usr_a", "sb1", "dev")
 
-			err := s.DeletePersistentVolume("usr_a", name)
+			err := s.DeletePersistentVolume(t.Context(), "usr_a", name)
 			if !errors.Is(err, ErrNotFound) || errors.Is(err, ErrVolumeAttached) || errors.Is(err, ErrConflict) {
 				t.Fatalf("delete of a volume that is not there: %v, want ErrNotFound only", err)
 			}
 
 			createTestVolume(t, s, "usr_a", name, 64)
-			if err := s.AttachPersistentVolume("usr_a", name, "sb1", "/data", false); err != nil {
+			if err := s.AttachPersistentVolume(t.Context(), "usr_a", name, "sb1", "/data", false); err != nil {
 				t.Fatal(err)
 			}
-			err = s.DeletePersistentVolume("usr_a", name)
+			err = s.DeletePersistentVolume(t.Context(), "usr_a", name)
 			if !errors.Is(err, ErrVolumeAttached) || errors.Is(err, ErrNotFound) {
 				t.Fatalf("delete while attached: %v, want ErrVolumeAttached only", err)
 			}
 
-			if err := s.DetachPersistentVolume("usr_a", name, "sb1"); err != nil {
+			if err := s.DetachPersistentVolume(t.Context(), "usr_a", name, "sb1"); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.DeletePersistentVolume("usr_a", name); err != nil {
+			if err := s.DeletePersistentVolume(t.Context(), "usr_a", name); err != nil {
 				t.Fatalf("delete once detached: %v", err)
 			}
-			if _, err := s.GetPersistentVolume("usr_a", name); !errors.Is(err, ErrNotFound) {
+			if _, err := s.GetPersistentVolume(t.Context(), "usr_a", name); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("the volume outlived its delete: %v", err)
 			}
 		})
@@ -233,7 +235,7 @@ func TestVolumeNameIsNeverMistakenForAKind(t *testing.T) {
 // contract: the store's own kind is.
 func TestNotFoundDoesNotLeakTheDriversSentinel(t *testing.T) {
 	s := testStore(t)
-	_, err := s.GetSandboxByID("nope")
+	_, err := s.GetSandboxByID(t.Context(), "nope")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetSandboxByID: %v, want ErrNotFound", err)
 	}

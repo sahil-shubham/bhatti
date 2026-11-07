@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -29,15 +30,15 @@ type Template struct {
 	CreatedAt  time.Time           `json:"created_at"`
 }
 
-func (s *Store) CreateTemplate(t Template) error {
+func (s *Store) CreateTemplate(ctx context.Context, t Template) error {
 	secretsJSON, _ := json.Marshal(t.Secrets)
 	labelsJSON, _ := json.Marshal(t.Labels)
 	mountsJSON, _ := json.Marshal(t.Mounts)
 	if t.Mounts == nil {
 		mountsJSON = []byte("[]")
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO templates (id, name, engine, image, cpus, memory_mb, disk_size_mb, userdata, secrets_json, labels_json, mounts_json, created_at)
+	_, err := s.db.ExecContext(
+		ctx, `INSERT INTO templates (id, name, engine, image, cpus, memory_mb, disk_size_mb, userdata, secrets_json, labels_json, mounts_json, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Name, t.Engine, t.Image, t.CPUs, t.MemoryMB, t.DiskSizeMB, t.UserData,
 		string(secretsJSON), string(labelsJSON), string(mountsJSON), t.CreatedAt,
@@ -45,13 +46,13 @@ func (s *Store) CreateTemplate(t Template) error {
 	return classify(err)
 }
 
-func (s *Store) GetTemplate(id string) (*Template, error) {
-	row := s.db.QueryRow(`SELECT id, name, engine, image, cpus, memory_mb, disk_size_mb, userdata, secrets_json, labels_json, mounts_json, created_at FROM templates WHERE id = ?`, id)
+func (s *Store) GetTemplate(ctx context.Context, id string) (*Template, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, engine, image, cpus, memory_mb, disk_size_mb, userdata, secrets_json, labels_json, mounts_json, created_at FROM templates WHERE id = ?`, id)
 	return scanTemplate(row)
 }
 
-func (s *Store) ListTemplates() ([]Template, error) {
-	rows, err := s.db.Query(`SELECT id, name, engine, image, cpus, memory_mb, disk_size_mb, userdata, secrets_json, labels_json, mounts_json, created_at FROM templates ORDER BY created_at DESC`)
+func (s *Store) ListTemplates(ctx context.Context) ([]Template, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, engine, image, cpus, memory_mb, disk_size_mb, userdata, secrets_json, labels_json, mounts_json, created_at FROM templates ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +68,8 @@ func (s *Store) ListTemplates() ([]Template, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteTemplate(id string) error {
-	res, err := s.db.Exec(`DELETE FROM templates WHERE id = ?`, id)
+func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM templates WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}

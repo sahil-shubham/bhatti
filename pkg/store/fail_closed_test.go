@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ func TestConcurrentSandboxLabelMerges(t *testing.T) {
 			go func(j int, key string) {
 				defer wg.Done()
 				<-start
-				errs[j] = s.UpdateSandboxLabels("usr_test", "sb1", map[string]string{key: "yes"}, nil)
+				errs[j] = s.UpdateSandboxLabels(context.Background(), "usr_test", "sb1", map[string]string{key: "yes"}, nil)
 			}(j, key)
 		}
 		close(start)
@@ -32,7 +33,7 @@ func TestConcurrentSandboxLabelMerges(t *testing.T) {
 		if errs[0] != nil || errs[1] != nil {
 			t.Fatalf("iteration %d: updates failed: %v, %v", i, errs[0], errs[1])
 		}
-		sb, err := s.GetSandbox("usr_test", "sb1")
+		sb, err := s.GetSandbox(t.Context(), "usr_test", "sb1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -44,7 +45,7 @@ func TestConcurrentSandboxLabelMerges(t *testing.T) {
 
 func TestAttachPersistentVolumeRejectsFailedAttachmentCount(t *testing.T) {
 	s := testStore(t)
-	if err := s.CreatePersistentVolume(PersistentVolume{
+	if err := s.CreatePersistentVolume(t.Context(), PersistentVolume{
 		ID: "vol", UserID: "usr_test", Name: "data", SizeMB: 10,
 		Status: "ready", FilePath: "/tmp/data", CreatedAt: time.Now(),
 	}); err != nil {
@@ -53,7 +54,7 @@ func TestAttachPersistentVolumeRejectsFailedAttachmentCount(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE volume_attachments`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AttachPersistentVolume("usr_test", "data", "sb2", "/data", false); err == nil || !strings.Contains(err.Error(), "count read-write attachments") {
+	if err := s.AttachPersistentVolume(t.Context(), "usr_test", "data", "sb2", "/data", false); err == nil || !strings.Contains(err.Error(), "count read-write attachments") {
 		t.Fatalf("expected RW count failure, got %v", err)
 	}
 }
@@ -63,20 +64,20 @@ func TestNextSubnetIndexRejectsFailedScanAndInvalidIndex(t *testing.T) {
 	if _, err := s.db.Exec(`INSERT INTO users (id, name, api_key_hash, subnet_index) VALUES ('u', 'user', 'key', -1)`); err != nil {
 		t.Fatal(err)
 	}
-	if idx, err := s.NextSubnetIndex(); err == nil || idx != 0 {
+	if idx, err := s.NextSubnetIndex(t.Context()); err == nil || idx != 0 {
 		t.Fatalf("invalid subnet index: got %d, %v", idx, err)
 	}
 	if _, err := s.db.Exec(`DROP TABLE users`); err != nil {
 		t.Fatal(err)
 	}
-	if idx, err := s.NextSubnetIndex(); err == nil || idx != 0 || !strings.Contains(err.Error(), "next subnet index") {
+	if idx, err := s.NextSubnetIndex(t.Context()); err == nil || idx != 0 || !strings.Contains(err.Error(), "next subnet index") {
 		t.Fatalf("failed subnet scan: got %d, %v", idx, err)
 	}
 }
 
 func TestNewRejectsNonDuplicateMigrationError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration.db")
-	s, err := New(path)
+	s, err := New(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +92,7 @@ func TestNewRejectsNonDuplicateMigrationError(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if opened, err := New(path); err == nil || !strings.Contains(err.Error(), "ALTER TABLE sandboxes ADD COLUMN") {
+	if opened, err := New(t.Context(), path); err == nil || !strings.Contains(err.Error(), "ALTER TABLE sandboxes ADD COLUMN") {
 		if opened != nil {
 			opened.Close()
 		}
@@ -101,16 +102,16 @@ func TestNewRejectsNonDuplicateMigrationError(t *testing.T) {
 
 func TestDeleteUserRejectsFailedSandboxCount(t *testing.T) {
 	s := testStore(t)
-	if err := s.CreateUser(User{ID: "usr", Name: "test", APIKeyHash: "key", CreatedAt: time.Now()}); err != nil {
+	if err := s.CreateUser(t.Context(), User{ID: "usr", Name: "test", APIKeyHash: "key", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`DROP TABLE sandboxes`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteUser("usr"); err == nil {
+	if err := s.DeleteUser(t.Context(), "usr"); err == nil {
 		t.Fatal("deleted user despite failed sandbox count")
 	}
-	if _, err := s.GetUser("usr"); err != nil {
+	if _, err := s.GetUser(t.Context(), "usr"); err != nil {
 		t.Fatalf("failed count must leave user intact: %v", err)
 	}
 }
@@ -120,14 +121,14 @@ func TestVolumeStorageRejectsFailedSum(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE volumes_v2`); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.UserVolumeStorageUsed("usr"); err == nil || n != 0 {
+	if n, err := s.UserVolumeStorageUsed(t.Context(), "usr"); err == nil || n != 0 {
 		t.Fatalf("expected quota query error, got %d, %v", n, err)
 	}
 }
 
 func TestGetPersistentVolumeRejectsFailedAttachmentLookup(t *testing.T) {
 	s := testStore(t)
-	if err := s.CreatePersistentVolume(PersistentVolume{
+	if err := s.CreatePersistentVolume(t.Context(), PersistentVolume{
 		ID: "vol", UserID: "usr", Name: "data", SizeMB: 10,
 		Status: "ready", FilePath: "/tmp/data", CreatedAt: time.Now(),
 	}); err != nil {
@@ -136,14 +137,14 @@ func TestGetPersistentVolumeRejectsFailedAttachmentLookup(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE volume_attachments`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetPersistentVolume("usr", "data"); err == nil {
+	if _, err := s.GetPersistentVolume(t.Context(), "usr", "data"); err == nil {
 		t.Fatal("returned empty attachment list after lookup failed")
 	}
 }
 
 func TestDeletePersistentVolumeRejectsFailedAttachmentCount(t *testing.T) {
 	s := testStore(t)
-	if err := s.CreatePersistentVolume(PersistentVolume{
+	if err := s.CreatePersistentVolume(t.Context(), PersistentVolume{
 		ID: "vol", UserID: "usr", Name: "data", SizeMB: 10,
 		Status: "ready", FilePath: "/tmp/data", CreatedAt: time.Now(),
 	}); err != nil {
@@ -152,7 +153,7 @@ func TestDeletePersistentVolumeRejectsFailedAttachmentCount(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE volume_attachments`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeletePersistentVolume("usr", "data"); err == nil {
+	if err := s.DeletePersistentVolume(t.Context(), "usr", "data"); err == nil {
 		t.Fatal("deleted volume despite failed attachment count")
 	}
 	var count int
@@ -163,16 +164,16 @@ func TestDeletePersistentVolumeRejectsFailedAttachmentCount(t *testing.T) {
 
 func TestDeleteVolumeRejectsFailedMountCount(t *testing.T) {
 	s := testStore(t)
-	if err := s.CreateVolume("data"); err != nil {
+	if err := s.CreateVolume(t.Context(), "data"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`DROP TABLE sandbox_volumes`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteVolume("data"); err == nil {
+	if err := s.DeleteVolume(t.Context(), "data"); err == nil {
 		t.Fatal("deleted volume despite failed mount count")
 	}
-	if _, err := s.GetVolume("data"); err != nil {
+	if _, err := s.GetVolume(t.Context(), "data"); err != nil {
 		t.Fatalf("volume must remain after failed count: %v", err)
 	}
 }
@@ -183,7 +184,7 @@ func TestListImageSharesRejectsUnreadableRow(t *testing.T) {
 		INSERT INTO image_shares VALUES ('img', NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ListImageShares("img"); err == nil {
+	if _, err := s.ListImageShares(t.Context(), "img"); err == nil {
 		t.Fatal("returned an empty user ID after its row failed to scan")
 	}
 }

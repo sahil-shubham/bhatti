@@ -78,7 +78,7 @@ type fixture struct {
 // GH_TOKEN, and grants with different fates; user u2 owns one grant of its own.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	st, err := store.New(filepath.Join(t.TempDir(), "state.db"))
+	st, err := store.New(t.Context(), filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,14 +96,14 @@ func newFixture(t *testing.T) *fixture {
 		{ID: "sb2", Name: "other", EngineID: "eng2", Status: "running", CreatedBy: "u1", CreatedAt: now},
 		{ID: "sbx", Name: "dev", EngineID: "engx", Status: "running", CreatedBy: "u2", CreatedAt: now},
 	} {
-		if err := st.CreateSandbox(sb); err != nil {
+		if err := st.CreateSandbox(t.Context(), sb); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := st.SetSecret("u1", "GH_TOKEN", []byte(secretValue)); err != nil {
+	if err := st.SetSecret(t.Context(), "u1", "GH_TOKEN", []byte(secretValue)); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetSecret("u2", "GH_TOKEN", []byte("u2-value")); err != nil {
+	if err := st.SetSecret(t.Context(), "u2", "GH_TOKEN", []byte("u2-value")); err != nil {
 		t.Fatal(err)
 	}
 	certPEM, keyPEM, err := NewSandboxCA("sb1", now)
@@ -112,7 +112,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f.caPEM = certPEM
 	for _, sb := range []string{"sb1", "sb2"} {
-		if err := st.PutSandboxCA(store.SandboxCA{SandboxID: sb, UserID: "u1", CertPEM: string(certPEM), KeyEnc: keyPEM}); err != nil {
+		if err := st.PutSandboxCA(t.Context(), store.SandboxCA{SandboxID: sb, UserID: "u1", CertPEM: string(certPEM), KeyEnc: keyPEM}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -121,7 +121,7 @@ func newFixture(t *testing.T) *fixture {
 	f.grant("expiring", "u1", "sb1", "GH_TOKEN", []string{"api.github.com"}, &soon)
 	f.grant("expired", "u1", "sb2", "GH_TOKEN", []string{"expired.example"}, &past)
 	f.grant("revoked", "u1", "sb2", "GH_TOKEN", []string{"revoked.example"}, nil)
-	if err := st.RevokeSecretGrant("u1", "revoked", now.Add(-time.Second)); err != nil {
+	if err := st.RevokeSecretGrant(t.Context(), "u1", "revoked", now.Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	f.grant("nosecret", "u1", "sb1", "DELETED", []string{"api.github.com"}, nil)
@@ -136,7 +136,7 @@ func (f *fixture) grant(id, user, sandbox, secret string, hosts []string, expire
 		f.t.Fatal(err)
 	}
 	f.ph[id] = ph
-	if err := f.st.CreateSecretGrant(store.SecretGrant{
+	if err := f.st.CreateSecretGrant(context.Background(), store.SecretGrant{
 		ID: id, UserID: user, SecretName: secret, SandboxID: sandbox, Hosts: hosts,
 		Placeholder: ph, CreatedAt: f.clock.Now(), ExpiresAt: expires,
 	}); err != nil {
@@ -356,11 +356,11 @@ func TestReportRecordsDenial(t *testing.T) {
 // from, as a fork or a resumed snapshot does (later than the original).
 func (f *fixture) copyGrant(id, sandbox, from string) {
 	f.t.Helper()
-	src, err := f.st.GetSecretGrant("u1", from)
+	src, err := f.st.GetSecretGrant(context.Background(), "u1", from)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	if err := f.st.CreateSecretGrant(store.SecretGrant{
+	if err := f.st.CreateSecretGrant(context.Background(), store.SecretGrant{
 		ID: id, UserID: src.UserID, SecretName: src.SecretName, SandboxID: sandbox, Hosts: src.Hosts,
 		Placeholder: src.Placeholder, CreatedAt: src.CreatedAt.Add(time.Second), ExpiresAt: src.ExpiresAt,
 	}); err != nil {
@@ -410,7 +410,7 @@ func TestClonePlaceholderResolvesForTheClone(t *testing.T) {
 	if err := cert("eng2"); err != nil {
 		t.Fatalf("the clone's certificate: %v", err)
 	}
-	if err := f.st.RevokeSecretGrant("u1", "clone", f.clock.Now()); err != nil {
+	if err := f.st.RevokeSecretGrant(t.Context(), "u1", "clone", f.clock.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.resolve(c, "sb2", ph, "api.github.com"); refusalReason(err) != "grant revoked" {
