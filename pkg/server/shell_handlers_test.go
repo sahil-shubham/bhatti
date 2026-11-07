@@ -114,6 +114,54 @@ func TestShellWSAuthSuccess(t *testing.T) {
 	}
 }
 
+func TestWebShellEventKeepsOwnerAfterSandboxDeletion(t *testing.T) {
+	srv, ts, sb := setupShellTest(t)
+	srv.StartEventRecorder()
+	var token map[string]string
+	decodeJSON(t, doReq(t, ts, "POST", "/sandboxes/"+sb.ID+"/shell-token", nil), &token)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/_shell/" + sb.ID + "/ws"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	if err := ws.WriteJSON(map[string]string{"type": "auth", "token": token["token"]}); err != nil {
+		t.Fatal(err)
+	}
+	ws.SetReadDeadline(time.Now().Add(eventWait))
+	var connected map[string]any
+	if err := ws.ReadJSON(&connected); err != nil || connected["type"] != "connected" {
+		t.Fatalf("connected = %v, %v", connected, err)
+	}
+	// Wait for the shell to be established, then remove the row without
+	// revoking the session: the deferred event must use its captured owner.
+	if _, _, err := ws.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.DeleteSandbox(t.Context(), sb.CreatedBy, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	ws.Close()
+	deadline := time.After(eventWait)
+	for {
+		changed := srv.events.Changed()
+		events, err := srv.store.EventsAfter(t.Context(), store.EventQuery{
+			UserID: sb.CreatedBy, SandboxID: sb.ID, TypePrefix: "shell.web_session", Limit: 10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) == 1 {
+			return
+		}
+		select {
+		case <-changed:
+		case <-deadline:
+			t.Fatal("owner cannot read the web shell event after sandbox deletion")
+		}
+	}
+}
+
 func TestShellWSBadToken(t *testing.T) {
 	_, ts, sb := setupShellTest(t)
 
@@ -242,7 +290,7 @@ func TestShellHTMLServed(t *testing.T) {
 			if idx < 0 {
 				t.Fatal("no nonce in script-src")
 			}
-			nonce := part[idx+7 : strings.Index(part[idx+7:], "'") + idx+7]
+			nonce := part[idx+7 : strings.Index(part[idx+7:], "'")+idx+7]
 			if !strings.Contains(string(body), "nonce=\""+nonce+"\"") {
 				t.Fatalf("CSP nonce %q not found in HTML script tag", nonce)
 			}

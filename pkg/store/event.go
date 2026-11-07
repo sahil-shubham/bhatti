@@ -48,9 +48,9 @@ type MetricsSnapshot struct {
 
 // InsertEvents inserts a batch of events in a single transaction.
 //
-// An event about a sandbox that names no user is stored as its owner's: the
-// thermal loop, recovery and the web shell act on a sandbox outside any user's
-// request, and an owner reads their events by user (EventsAfter).
+// A producer that knows a sandbox's owner must capture it before buffering:
+// deletion can remove the sandbox before this transaction runs. The lookup is
+// only a fallback for callers that know the sandbox ID but not its owner.
 func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

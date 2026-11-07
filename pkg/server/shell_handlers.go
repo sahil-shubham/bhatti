@@ -121,7 +121,7 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 		slog.Info("shell_close", "sandbox", sb.Name, "sandbox_id", sb.ID,
 			"duration", time.Since(start).Round(time.Second))
 		s.RecordEvent(store.Event{
-			Type: "shell.web_session", SandboxID: sb.ID,
+			Type: "shell.web_session", UserID: sb.CreatedBy, SandboxID: sb.ID,
 			Meta: map[string]any{
 				"sandbox":    sb.Name,
 				"ip":         r.RemoteAddr,

@@ -558,7 +558,7 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 			slog.Info("sandbox stopped while the daemon was down", "sandbox", sb.Name, "id", sb.ID)
 			s.store.StopSandboxUnexpected(detached(ctx), sb.ID) // marks keep_hot for the startup wake
 			s.RecordEvent(store.Event{
-				Type: "sandbox.stopped", SandboxID: sb.ID,
+				Type: "sandbox.stopped", UserID: sb.CreatedBy, SandboxID: sb.ID,
 				Meta: map[string]any{"name": sb.Name, "reason": "lost"},
 			})
 		}
@@ -796,7 +796,7 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 					slog.Info("thermal transition", "sandbox", sb.Name,
 						"from", "hot", "to", "warm", "reason", "force-pause")
 					s.RecordEvent(store.Event{
-						Type: "thermal.force_pause", SandboxID: sb.ID,
+						Type: "thermal.force_pause", UserID: sb.CreatedBy, SandboxID: sb.ID,
 						Meta: map[string]any{"sandbox": sb.Name, "consecutive_failures": count},
 					})
 				}
@@ -830,7 +830,7 @@ func (s *Server) runThermalCycle(te ThermalEngine, cfg ThermalConfig) {
 			slog.Info("thermal transition", "sandbox", sb.Name,
 				"from", "hot", "to", "warm", "idle", idle.Round(time.Second))
 			s.RecordEvent(store.Event{
-				Type: "thermal.pause", SandboxID: sb.ID,
+				Type: "thermal.pause", UserID: sb.CreatedBy, SandboxID: sb.ID,
 				Meta: map[string]any{"sandbox": sb.Name, "idle_s": int(idle.Seconds())},
 			})
 		} else if activity.AttachedSessions > 0 {
@@ -901,7 +901,7 @@ func (s *Server) stopColdSandbox(sb *store.Sandbox, idle time.Duration) {
 		}
 		s.unlockTransition(sb.EngineID, gate)
 		s.RecordEvent(store.Event{
-			Type: "thermal.snapshot_failed", SandboxID: sb.ID,
+			Type: "thermal.snapshot_failed", UserID: sb.CreatedBy, SandboxID: sb.ID,
 			Meta: map[string]any{"sandbox": sb.Name, "error": stopErr.Error(), "attempt": count, "max_attempts": 3},
 		})
 		return
@@ -915,11 +915,11 @@ func (s *Server) stopColdSandbox(sb *store.Sandbox, idle time.Duration) {
 	slog.Info("thermal transition", "sandbox", sb.Name,
 		"from", "warm", "to", "cold", "idle", idle.Round(time.Second))
 	s.RecordEvent(store.Event{
-		Type: "sandbox.stopped", SandboxID: sb.ID,
+		Type: "sandbox.stopped", UserID: sb.CreatedBy, SandboxID: sb.ID,
 		Meta: map[string]any{"name": sb.Name, "reason": "thermal"},
 	})
 	s.RecordEvent(store.Event{
-		Type: "thermal.snapshot", SandboxID: sb.ID,
+		Type: "thermal.snapshot", UserID: sb.CreatedBy, SandboxID: sb.ID,
 		Meta: map[string]any{"sandbox": sb.Name, "idle_s": int(idle.Seconds())},
 	})
 }
@@ -965,7 +965,7 @@ func (s *Server) ensureHot(ctx context.Context, engineID string) error {
 			s.store.UpdateSandboxStatus(detached(ctx), sb.ID, "running")
 		}
 		s.RecordEvent(store.Event{
-			Type: "thermal.wake", SandboxID: sb.ID,
+			Type: "thermal.wake", UserID: sb.CreatedBy, SandboxID: sb.ID,
 			Meta: map[string]any{"sandbox": sb.Name, "from_state": fromState, "wake_ms": wakeMs},
 		})
 	}

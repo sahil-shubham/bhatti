@@ -1,7 +1,9 @@
 package server
 
 import (
+	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,5 +90,78 @@ func TestEventRecorderDropsOnFullBuffer(t *testing.T) {
 	total := persisted + dropped
 	if total != 1100 {
 		t.Errorf("persisted(%d) + dropped(%d) = %d, expected 1100", persisted, dropped, total)
+	}
+}
+
+func TestSandboxEventsKeepOwnerWhenDeletedBeforeFlush(t *testing.T) {
+	for _, operation := range []string{"wake", "pause", "force_pause", "snapshot", "snapshot_failed", "lost"} {
+		t.Run(operation, func(t *testing.T) {
+			srv, ts := setup(t)
+			eng := srv.engine.(*mockEngine)
+			id := createRunningBox(t, srv, eng, operation)
+			sb := findSandbox(t, srv, id)
+			// Hold the recorder before its loop starts so deletion always wins
+			// over the flush, without relying on the 500ms timer.
+			rec := &EventRecorder{
+				store: srv.store, ch: make(chan store.Event, 1000),
+				done: make(chan struct{}), changed: make(chan struct{}),
+			}
+			srv.events = rec
+			flush := sync.OnceFunc(func() {
+				go rec.loop()
+				rec.Close()
+			})
+			defer flush()
+
+			want := []string{"thermal." + operation}
+			switch operation {
+			case "wake":
+				eng.thermal[id] = "warm"
+				if err := srv.ensureHot(t.Context(), id); err != nil {
+					t.Fatal(err)
+				}
+			case "pause", "force_pause":
+				srv.lastActivity.Store(id, time.Now().Add(-time.Hour))
+				var thermal ThermalEngine = eng
+				if operation == "force_pause" {
+					eng.ActivityErr = errors.New("agent unavailable")
+					thermal = &forcePauseTestEngine{mockEngine: eng}
+					srv.engine = thermal.(*forcePauseTestEngine)
+					for range maxThermalFailures - 1 {
+						srv.incrementThermalFails(id)
+					}
+				}
+				srv.runThermalCycle(thermal, ThermalConfig{WarmTimeout: time.Second, ColdTimeout: time.Hour})
+			case "snapshot", "snapshot_failed":
+				if operation == "snapshot_failed" {
+					eng.StopErr = errors.New("snapshot unavailable")
+				} else {
+					want = []string{"sandbox.stopped", "thermal.snapshot"}
+				}
+				srv.stopColdSandbox(sb, time.Hour)
+			case "lost":
+				if err := eng.Stop(t.Context(), id); err != nil {
+					t.Fatal(err)
+				}
+				srv.RecoverSandboxes(t.Context())
+				want = []string{"sandbox.stopped"}
+			}
+			if len(rec.ch) != len(want) {
+				t.Fatalf("queued %d events, want %v", len(rec.ch), want)
+			}
+			if err := srv.store.DeleteSandbox(t.Context(), sb.CreatedBy, sb.ID); err != nil {
+				t.Fatal(err)
+			}
+			flush()
+			got := recordsOf(t, doReq(t, ts, "GET", "/events", nil))
+			if len(got) != len(want) {
+				t.Fatalf("owner sees %v after deletion, want %v", got, want)
+			}
+			for i, record := range got {
+				if record["type"] != want[i] || record["user_id"] != sb.CreatedBy {
+					t.Errorf("event %d = %v, want %s owned by %s", i, record, want[i], sb.CreatedBy)
+				}
+			}
+		})
 	}
 }
