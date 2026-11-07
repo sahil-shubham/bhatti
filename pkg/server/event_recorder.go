@@ -12,9 +12,9 @@ import (
 
 // EventRecorder buffers events and flushes them to SQLite in batches. The
 // events table is the stream: a reader keeps its own cursor into it (see
-// store.EventsAfter) and uses Changed to learn when to look again. A reader
-// that is slow, absent or gone costs the recorder nothing and loses nothing,
-// because what it has not read is still in the table.
+// store.EventsAfter) and uses Changed to learn when to look again. Readers
+// share one periodic live-edge check for external commits; a slow reader holds
+// no recorder buffer because its unread events remain in the table.
 //
 // Record never blocks: when the buffer is full the event is not stored and is
 // counted in Dropped. A recorded event is stored within about 500ms.
@@ -27,9 +27,9 @@ type EventRecorder struct {
 	closed    bool
 	closeOnce sync.Once
 
-	// changed is closed, and replaced by a fresh channel, each time a flush
-	// commits events (litestream's notify). Nothing is ever sent on it, so
-	// no waiter can be too slow for the recorder.
+	// Local flushes and observed external commits close and replace changed.
+	// Nothing is sent on it, so no waiter can be too slow for the recorder.
+	followers atomic.Int64
 	changedMu sync.Mutex
 	changed   chan struct{}
 }
@@ -62,21 +62,21 @@ func (r *EventRecorder) Record(e store.Event) {
 	}
 }
 
-// Changed returns a channel that is closed the next time a flush commits
-// events. A reader takes it before it reads the table, never after: a flush
-// that commits while the reader is mid-read closes the channel it already
-// holds, so waiting on it returns at once and the reader looks again. Taken
-// after the read, that flush would be missed and the reader would sleep on rows
-// it has not seen. tail is that loop, for a reader that wants nothing else.
+// Changed returns a channel closed after a local flush or an observed external
+// commit. Take it before reading the table, never after: otherwise a commit
+// during the read can be missed and the reader sleeps on rows it has not seen.
+// tail also registers its reader for the shared external-commit check.
 func (r *EventRecorder) Changed() <-chan struct{} {
 	r.changedMu.Lock()
 	defer r.changedMu.Unlock()
 	return r.changed
 }
 
-// tail calls read, and again after every flush that commits events, until ctx
-// ends or read fails. read is the reader's look at the table.
+// tail calls read after each observed commit until ctx ends or read fails.
+// Its readers share the loop's periodic check for commits by other processes.
 func (r *EventRecorder) tail(ctx context.Context, read func() error) error {
+	r.followers.Add(1)
+	defer r.followers.Add(-1)
 	for {
 		changed := r.Changed()
 		if err := read(); err != nil {
@@ -137,6 +137,7 @@ func (r *EventRecorder) loop() {
 	defer ticker.Stop()
 
 	var batch []store.Event
+	var observedNewest int64
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -169,6 +170,18 @@ func (r *EventRecorder) loop() {
 			}
 		case <-ticker.C:
 			flush()
+			if r.followers.Load() > 0 {
+				// One indexed MAX seek per tick, shared by all followers. Unlike
+				// data_version it is comparable across pooled connections and
+				// ignores unrelated writes to sandboxes and metrics.
+				newest, err := r.store.NewestEventID(context.Background())
+				if err != nil {
+					slog.Error("events.poll_failed", "error", err)
+				} else if newest != observedNewest {
+					observedNewest = newest
+					r.committed()
+				}
+			}
 		}
 	}
 }

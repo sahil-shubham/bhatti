@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -811,5 +812,25 @@ func TestEventsFilteredFollowDoesNotRevisitScannedHistory(t *testing.T) {
 	records := recordsOf(t, out.Result())
 	if len(records) != 1 || records[0]["type"] != "keep" {
 		t.Fatalf("already-scanned filtered history was revisited after a wake: %v", records)
+	}
+}
+
+func TestEventsFollowDeliversExternalStoreCommits(t *testing.T) {
+	srv, ts := eventsServer(t, true)
+	stream := openFollow(t, ts, testAPIKey, "?follow=1")
+	external, err := store.New(t.Context(), filepath.Join(srv.dataDir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer external.Close()
+	for _, kind := range []string{"user.key_rotated", "user.updated"} {
+		// Local admin commands open their own store, bypassing this server's
+		// recorder and its immediate commit notifications.
+		if err := external.InsertEvents(t.Context(), []store.Event{{Type: kind, UserID: "usr_test"}}); err != nil {
+			t.Fatal(err)
+		}
+		if got := stream.next(); got["type"] != kind {
+			t.Fatalf("external commit delivered %v, want %s", got, kind)
+		}
 	}
 }

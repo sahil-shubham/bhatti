@@ -287,6 +287,14 @@ func (s *Store) EventIDBounds(ctx context.Context) (oldest, newest int64, err er
 	return oldest, newest, err
 }
 
+// NewestEventID checks the live edge with one primary-key seek, independent of
+// the history size. It also observes commits made through other Store handles.
+func (s *Store) NewestEventID(ctx context.Context) (int64, error) {
+	var newest int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM events`).Scan(&newest)
+	return newest, err
+}
+
 // CountEvents returns the count of events matching the filter.
 func (s *Store) CountEvents(ctx context.Context, f EventFilter) (int, error) {
 	f.CountOnly = true

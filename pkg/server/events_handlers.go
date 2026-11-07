@@ -131,7 +131,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !afterGiven && follow {
-		_, newest, err := s.store.EventIDBounds(ctx)
+		newest, err := s.store.NewestEventID(ctx)
 		if err != nil {
 			errRespInternal(w, r, "read event bounds failed", err)
 			return
