@@ -233,13 +233,26 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 		errResp(w, 404, err.Error())
 		return
 	}
+	// An engine whose snapshot disks other disks are layered over removes the
+	// files itself, and refuses while any are: before the record goes, so a
+	// refusal leaves the snapshot whole.
+	snapDir := filepath.Dir(snap.MemPath)
+	removed, err := s.removeSnapshotFiles(r.Context(), snapDir)
+	if errors.Is(err, engine.ErrSnapshotInUse) {
+		errResp(w, 409, err.Error())
+		return
+	}
+	if err != nil {
+		errRespInternal(w, r, "delete snapshot failed", err)
+		return
+	}
 	if err := s.store.DeleteSnapshot(r.Context(), user.ID, name); err != nil {
 		errRespInternal(w, r, "delete snapshot failed", err)
 		return
 	}
-	// Delete snapshot directory
-	snapDir := filepath.Dir(snap.MemPath)
-	os.RemoveAll(snapDir)
+	if !removed {
+		os.RemoveAll(snapDir)
+	}
 	slog.Info("snapshot.deleted", "name", name, "user", user.Name)
 	s.RecordEvent(store.Event{
 		Type: "snapshot.deleted", UserID: user.ID,
