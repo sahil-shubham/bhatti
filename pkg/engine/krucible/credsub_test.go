@@ -248,9 +248,11 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 		if !strings.Contains(out, "STATUS 403") || !strings.Contains(out, "placeholder in "+what) {
 			t.Fatalf("placeholder in the %s not refused:\n%s", what, out)
 		}
-		if !events.has("secret.denied", "TOKEN", "placeholder in "+what) {
-			t.Fatalf("no secret.denied event for the %s", what)
-		}
+		// netd reports a refusal it made itself after answering the guest, so
+		// the event can land after the guest has its 403.
+		waitFor(t, "a secret.denied event for the "+what, func() bool {
+			return events.has("secret.denied", "TOKEN", "placeholder in "+what)
+		})
 	}
 
 	// A revoked grant is refused on the next connection.
