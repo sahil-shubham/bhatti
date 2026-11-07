@@ -129,6 +129,9 @@ func newBlockRootEngine(t *testing.T) engine.Engine {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Runs after the tests' own Destroy cleanups (registered later), so the
+	// node sweeps those start finish before the data dir is removed.
+	t.Cleanup(eng.waitNodeSweep)
 	return eng
 }
 

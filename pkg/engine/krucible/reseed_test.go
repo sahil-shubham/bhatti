@@ -175,6 +175,9 @@ func fakeReseedEngine(t *testing.T, mode string) *Engine {
 		for id := range e.vms {
 			_ = e.Destroy(context.Background(), id)
 		}
+		// Destroying a clone sweeps nodes in the background; let it finish
+		// before the data dir is removed under it.
+		e.waitNodeSweep()
 	})
 	return e
 }
