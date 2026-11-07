@@ -21,250 +21,258 @@ import (
 
 // --- Persistent Volumes (v0.3) ---
 
-func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request) {
+// handleVolumeList serves GET /volumes.
+func (s *Server) handleVolumeList(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-
-	switch r.Method {
-	case http.MethodGet:
-		list, err := s.store.ListPersistentVolumes(r.Context(), user.ID)
-		if err != nil {
-			errRespInternal(w, r, "list volumes failed", err)
-			return
-		}
-		if list == nil {
-			list = []store.PersistentVolume{}
-		}
-		writeJSON(w, 200, list)
-	case http.MethodPost:
-		var req struct {
-			Name   string `json:"name"`
-			SizeMB int    `json:"size_mb"`
-		}
-		if err := readJSON(r, &req); err != nil {
-			errResp(w, 400, "invalid json: "+err.Error())
-			return
-		}
-		if req.Name == "" || req.SizeMB <= 0 {
-			errResp(w, 400, "name and size_mb (> 0) required")
-			return
-		}
-		if !isValidName(req.Name) {
-			errResp(w, 400, "invalid volume name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
-			return
-		}
-
-		// Check quota
-		used, _ := s.store.UserVolumeStorageUsed(r.Context(), user.ID)
-		userObj, _ := s.store.GetUser(r.Context(), user.ID)
-		maxStorage := 20480 // default 20GB
-		if userObj != nil {
-			maxStorage = userObj.MaxVolumeStorageMB
-		}
-		if used+req.SizeMB > maxStorage {
-			errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, fmt.Sprintf("volume storage quota exceeded (%dMB used, %dMB max)", used, maxStorage))
-			return
-		}
-
-		volDir := filepath.Join(s.dataDir, "volumes", user.ID)
-		os.MkdirAll(volDir, 0700)
-		volPath := filepath.Join(volDir, req.Name+".ext4")
-
-		vol := store.PersistentVolume{
-			ID: genID(), UserID: user.ID, Name: req.Name,
-			SizeMB: req.SizeMB, FilePath: volPath,
-			Status: "creating", CreatedAt: time.Now(),
-		}
-		if err := s.store.CreatePersistentVolume(r.Context(), vol); err != nil {
-			if errors.Is(err, store.ErrConflict) {
-				errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
-			} else {
-				errRespInternal(w, r, "create volume failed", err)
-			}
-			return
-		}
-
-		if err := createVolumeFile(volPath, req.SizeMB); err != nil {
-			s.store.DeletePersistentVolume(r.Context(), user.ID, req.Name)
-			errRespInternal(w, r, "create volume file failed", err)
-			return
-		}
-		s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, req.Name, "ready")
-		vol.Status = "ready"
-
-		slog.Info("volume.created", "name", req.Name, "user", user.Name, "size_mb", req.SizeMB)
-		s.RecordEvent(store.Event{
-			Type: "volume.created", UserID: user.ID,
-			Meta: map[string]any{"name": req.Name, "size_mb": req.SizeMB},
-		})
-		writeJSON(w, 201, vol)
-	default:
-		errResp(w, 405, "method not allowed")
-	}
-}
-
-func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) {
-	user := UserFromContext(r.Context())
-	urlPath := strings.TrimPrefix(r.URL.Path, "/volumes/")
-	parts := strings.SplitN(urlPath, "/", 2)
-	name := parts[0]
-
-	if name == "" {
-		errResp(w, 400, "missing volume name")
+	list, err := s.store.ListPersistentVolumes(r.Context(), user.ID)
+	if err != nil {
+		errRespInternal(w, r, "list volumes failed", err)
 		return
 	}
+	if list == nil {
+		list = []store.PersistentVolume{}
+	}
+	writeJSON(w, 200, list)
+}
+
+// handleVolumeCreate serves POST /volumes.
+func (s *Server) handleVolumeCreate(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	var req struct {
+		Name   string `json:"name"`
+		SizeMB int    `json:"size_mb"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Name == "" || req.SizeMB <= 0 {
+		errResp(w, 400, "name and size_mb (> 0) required")
+		return
+	}
+	if !isValidName(req.Name) {
+		errResp(w, 400, "invalid volume name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
+		return
+	}
+
+	// Check quota
+	used, _ := s.store.UserVolumeStorageUsed(r.Context(), user.ID)
+	userObj, _ := s.store.GetUser(r.Context(), user.ID)
+	maxStorage := 20480 // default 20GB
+	if userObj != nil {
+		maxStorage = userObj.MaxVolumeStorageMB
+	}
+	if used+req.SizeMB > maxStorage {
+		errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, fmt.Sprintf("volume storage quota exceeded (%dMB used, %dMB max)", used, maxStorage))
+		return
+	}
+
+	volDir := filepath.Join(s.dataDir, "volumes", user.ID)
+	os.MkdirAll(volDir, 0700)
+	volPath := filepath.Join(volDir, req.Name+".ext4")
+
+	vol := store.PersistentVolume{
+		ID: genID(), UserID: user.ID, Name: req.Name,
+		SizeMB: req.SizeMB, FilePath: volPath,
+		Status: "creating", CreatedAt: time.Now(),
+	}
+	if err := s.store.CreatePersistentVolume(r.Context(), vol); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
+		} else {
+			errRespInternal(w, r, "create volume failed", err)
+		}
+		return
+	}
+
+	if err := createVolumeFile(volPath, req.SizeMB); err != nil {
+		s.store.DeletePersistentVolume(r.Context(), user.ID, req.Name)
+		errRespInternal(w, r, "create volume file failed", err)
+		return
+	}
+	s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, req.Name, "ready")
+	vol.Status = "ready"
+
+	slog.Info("volume.created", "name", req.Name, "user", user.Name, "size_mb", req.SizeMB)
+	s.RecordEvent(store.Event{
+		Type: "volume.created", UserID: user.ID,
+		Meta: map[string]any{"name": req.Name, "size_mb": req.SizeMB},
+	})
+	writeJSON(w, 201, vol)
+}
+
+// requireVolumeName returns the {name} wildcard, answering 400 itself when it
+// is not a valid volume name: the first thing every /volumes/{name} route does.
+func requireVolumeName(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name := r.PathValue("name")
 	if !isValidName(name) {
 		errResp(w, 400, "invalid volume name")
-		return
+		return "", false
 	}
-
-	// Sub-routes: /volumes/{name}/{action}[/{id}]
-	if len(parts) == 2 {
-		sub := parts[1]
-		// Handle /volumes/{name}/backups and /volumes/{name}/backups/{id}
-		if sub == "backups" || strings.HasPrefix(sub, "backups/") {
-			s.handleVolumeBackups(w, r, user, name, strings.TrimPrefix(sub, "backups"))
-			return
-		}
-		switch sub {
-		case "resize":
-			s.handleVolumeResize(w, r, user, name)
-		case "snapshot":
-			s.handleVolumeSnapshot(w, r, user, name)
-		default:
-			errResp(w, 404, "not found")
-		}
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
-		if err != nil {
-			errResp(w, 404, "not found")
-			return
-		}
-		writeJSON(w, 200, vol)
-	case http.MethodDelete:
-		// Check for file path before deleting from store
-		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		if err := s.store.DeletePersistentVolume(r.Context(), user.ID, name); err != nil {
-			switch {
-			case errors.Is(err, store.ErrVolumeAttached):
-				errResp(w, 409, err.Error())
-			case errors.Is(err, store.ErrNotFound):
-				errResp(w, 404, err.Error())
-			default:
-				errRespInternal(w, r, "delete volume failed", err)
-			}
-			return
-		}
-		// Delete file (orphan cleanup on startup handles failures)
-		if vol.FilePath != "" {
-			os.Remove(vol.FilePath)
-		}
-		slog.Info("volume.deleted", "name", name, "user", user.Name)
-		s.RecordEvent(store.Event{
-			Type: "volume.deleted", UserID: user.ID,
-			Meta: map[string]any{"name": name},
-		})
-		writeJSON(w, 200, map[string]string{"status": "deleted"})
-	default:
-		errResp(w, 405, "method not allowed")
-	}
+	return name, true
 }
 
-func (s *Server) handleVolumeBackups(w http.ResponseWriter, r *http.Request, user *store.User, volumeName, subPath string) {
+// requireVolumeBackups is requireVolumeName, then a 501 when no backup backend
+// is configured: the two checks every backup route makes before anything else.
+func (s *Server) requireVolumeBackups(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name, ok := requireVolumeName(w, r)
+	if !ok {
+		return "", false
+	}
 	if s.backupBackend == nil {
 		errResp(w, 501, "backup not configured — add backup section to config.yaml")
+		return "", false
+	}
+	return name, true
+}
+
+// handleVolumeGet serves GET /volumes/{name}.
+func (s *Server) handleVolumeGet(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name, ok := requireVolumeName(w, r)
+	if !ok {
 		return
 	}
-
-	// subPath is "" for /backups, "/{id}" for /backups/{id}, "/restore" for /backups/restore
-	subPath = strings.TrimPrefix(subPath, "/")
-
-	switch {
-	case subPath == "" && r.Method == http.MethodGet:
-		// List backups
-		backups, err := s.store.ListVolumeBackups(r.Context(), user.ID, volumeName)
-		if err != nil {
-			errRespInternal(w, r, "list backups failed", err)
-			return
-		}
-		if backups == nil {
-			backups = []store.VolumeBackup{}
-		}
-		writeJSON(w, 200, backups)
-
-	case subPath == "" && r.Method == http.MethodPost:
-		// Trigger backup
-		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, volumeName)
-		if err != nil {
-			errResp(w, 404, "volume not found")
-			return
-		}
-		result, err := s.performVolumeBackup(r.Context(), user, vol)
-		if err != nil {
-			errRespInternal(w, r, "backup failed", err)
-			return
-		}
-		writeJSON(w, 201, result)
-
-	case subPath == "restore" && r.Method == http.MethodPost:
-		// Restore from backup
-		var req struct {
-			BackupID string `json:"backup_id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BackupID == "" {
-			errResp(w, 400, "missing backup_id")
-			return
-		}
-		vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, volumeName)
-		if err != nil {
-			errResp(w, 404, "volume not found")
-			return
-		}
-		// Volume must be detached
-		if len(vol.Attachments) > 0 {
-			errResp(w, 409, "volume is attached to a sandbox — detach before restoring")
-			return
-		}
-		backup, err := s.store.GetVolumeBackup(r.Context(), user.ID, req.BackupID)
-		if err != nil {
-			errResp(w, 404, "backup not found")
-			return
-		}
-		if err := s.performVolumeRestore(r.Context(), vol, backup); err != nil {
-			errRespInternal(w, r, "restore failed", err)
-			return
-		}
-		s.RecordEvent(store.Event{
-			Type: "volume.restored", UserID: user.ID,
-			Meta: map[string]any{"name": vol.Name, "backup_id": req.BackupID},
-		})
-		writeJSON(w, 200, map[string]string{"status": "restored", "backup_id": req.BackupID})
-
-	case subPath != "" && subPath != "restore" && r.Method == http.MethodDelete:
-		// Delete a backup
-		backupID := subPath
-		b, err := s.store.GetVolumeBackup(r.Context(), user.ID, backupID)
-		if err != nil {
-			errResp(w, 404, "backup not found")
-			return
-		}
-		if err := s.backupBackend.Delete(r.Context(), b.S3Key); err != nil {
-			slog.Warn("s3 delete failed", "key", b.S3Key, "error", err)
-			// Continue — remove from DB even if S3 delete fails
-		}
-		s.store.DeleteVolumeBackup(r.Context(), user.ID, backupID)
-		writeJSON(w, 200, map[string]string{"status": "deleted"})
-
-	default:
-		errResp(w, 405, "method not allowed")
+	vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
 	}
+	writeJSON(w, 200, vol)
+}
+
+// handleVolumeDelete serves DELETE /volumes/{name}.
+func (s *Server) handleVolumeDelete(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name, ok := requireVolumeName(w, r)
+	if !ok {
+		return
+	}
+	// Check for file path before deleting from store
+	vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, name)
+	if err != nil {
+		errResp(w, 404, err.Error())
+		return
+	}
+	if err := s.store.DeletePersistentVolume(r.Context(), user.ID, name); err != nil {
+		switch {
+		case errors.Is(err, store.ErrVolumeAttached):
+			errResp(w, 409, err.Error())
+		case errors.Is(err, store.ErrNotFound):
+			errResp(w, 404, err.Error())
+		default:
+			errRespInternal(w, r, "delete volume failed", err)
+		}
+		return
+	}
+	// Delete file (orphan cleanup on startup handles failures)
+	if vol.FilePath != "" {
+		os.Remove(vol.FilePath)
+	}
+	slog.Info("volume.deleted", "name", name, "user", user.Name)
+	s.RecordEvent(store.Event{
+		Type: "volume.deleted", UserID: user.ID,
+		Meta: map[string]any{"name": name},
+	})
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// handleVolumeBackupList serves GET /volumes/{name}/backups.
+func (s *Server) handleVolumeBackupList(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	volumeName, ok := s.requireVolumeBackups(w, r)
+	if !ok {
+		return
+	}
+	backups, err := s.store.ListVolumeBackups(r.Context(), user.ID, volumeName)
+	if err != nil {
+		errRespInternal(w, r, "list backups failed", err)
+		return
+	}
+	if backups == nil {
+		backups = []store.VolumeBackup{}
+	}
+	writeJSON(w, 200, backups)
+}
+
+// handleVolumeBackupCreate serves POST /volumes/{name}/backups.
+func (s *Server) handleVolumeBackupCreate(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	volumeName, ok := s.requireVolumeBackups(w, r)
+	if !ok {
+		return
+	}
+	vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, volumeName)
+	if err != nil {
+		errResp(w, 404, "volume not found")
+		return
+	}
+	result, err := s.performVolumeBackup(r.Context(), user, vol)
+	if err != nil {
+		errRespInternal(w, r, "backup failed", err)
+		return
+	}
+	writeJSON(w, 201, result)
+}
+
+// handleVolumeBackupRestore serves POST /volumes/{name}/backups/restore.
+func (s *Server) handleVolumeBackupRestore(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	volumeName, ok := s.requireVolumeBackups(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		BackupID string `json:"backup_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BackupID == "" {
+		errResp(w, 400, "missing backup_id")
+		return
+	}
+	vol, err := s.store.GetPersistentVolume(r.Context(), user.ID, volumeName)
+	if err != nil {
+		errResp(w, 404, "volume not found")
+		return
+	}
+	// Volume must be detached
+	if len(vol.Attachments) > 0 {
+		errResp(w, 409, "volume is attached to a sandbox — detach before restoring")
+		return
+	}
+	backup, err := s.store.GetVolumeBackup(r.Context(), user.ID, req.BackupID)
+	if err != nil {
+		errResp(w, 404, "backup not found")
+		return
+	}
+	if err := s.performVolumeRestore(r.Context(), vol, backup); err != nil {
+		errRespInternal(w, r, "restore failed", err)
+		return
+	}
+	s.RecordEvent(store.Event{
+		Type: "volume.restored", UserID: user.ID,
+		Meta: map[string]any{"name": vol.Name, "backup_id": req.BackupID},
+	})
+	writeJSON(w, 200, map[string]string{"status": "restored", "backup_id": req.BackupID})
+}
+
+// handleVolumeBackupDelete serves DELETE /volumes/{name}/backups/{id}.
+func (s *Server) handleVolumeBackupDelete(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	if _, ok := s.requireVolumeBackups(w, r); !ok {
+		return
+	}
+	backupID := r.PathValue("id")
+	b, err := s.store.GetVolumeBackup(r.Context(), user.ID, backupID)
+	if err != nil {
+		errResp(w, 404, "backup not found")
+		return
+	}
+	if err := s.backupBackend.Delete(r.Context(), b.S3Key); err != nil {
+		slog.Warn("s3 delete failed", "key", b.S3Key, "error", err)
+		// Continue — remove from DB even if S3 delete fails
+	}
+	s.store.DeleteVolumeBackup(r.Context(), user.ID, backupID)
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 // volumeBackupEngine holds the VM lifecycle through the local clone even when
@@ -525,13 +533,11 @@ func (s *Server) performVolumeRestore(ctx context.Context, vol *store.Persistent
 	return nil
 }
 
-func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user *store.User, name string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
-	if !isValidName(name) {
-		errResp(w, 400, "invalid volume name")
+// handleVolumeResize serves POST /volumes/{name}/resize.
+func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name, ok := requireVolumeName(w, r)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -578,10 +584,11 @@ func (s *Server) handleVolumeResize(w http.ResponseWriter, r *http.Request, user
 	writeJSON(w, 200, map[string]any{"status": "resized", "size_mb": req.SizeMB})
 }
 
-// handleVolumeSnapshot creates an independent copy of a volume.
-func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, user *store.User, srcName string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
+// handleVolumeSnapshot serves POST /volumes/{name}/snapshot: creates an independent copy of a volume.
+func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	srcName, ok := requireVolumeName(w, r)
+	if !ok {
 		return
 	}
 	var req struct {

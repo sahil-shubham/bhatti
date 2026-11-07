@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
@@ -93,887 +92,834 @@ func checkSandboxSize(w http.ResponseWriter, user *store.User, cpus float64, mem
 	return true
 }
 
-func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
+// handleSandboxList serves GET /sandboxes.
+func (s *Server) handleSandboxList(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
 
-	switch r.Method {
-	case http.MethodGet:
-		labelFilter, err := parseLabelQueryParams(r.URL.Query()["label"])
+	labelFilter, err := parseLabelQueryParams(r.URL.Query()["label"])
+	if err != nil {
+		errResp(w, 400, err.Error())
+		return
+	}
+	list, err := s.store.ListSandboxesWithFilter(r.Context(), user.ID, labelFilter)
+	if err != nil {
+		errRespInternal(w, r, "list sandboxes failed", err)
+		return
+	}
+	if list == nil {
+		list = []store.Sandbox{}
+	}
+
+	// Enrich with thermal state + published URLs
+	type enrichedSandbox struct {
+		store.Sandbox
+		Thermal string   `json:"thermal,omitempty"`
+		URLs    []string `json:"urls,omitempty"`
+	}
+
+	// Thermal state (read-only, no VM interaction)
+	te, hasThermal := thermalOf(s.engine)
+
+	// Published URLs (single query for all user's rules)
+	rules, _ := s.store.ListUserPublishRules(r.Context(), user.ID)
+	urlsByID := make(map[string][]string)
+	for _, r := range rules {
+		url := publishedURL(r.Alias, s.proxyZone, s.publicProxyAddr)
+		urlsByID[r.SandboxID] = append(urlsByID[r.SandboxID], url)
+	}
+
+	enriched := make([]enrichedSandbox, len(list))
+	for i, sb := range list {
+		enriched[i] = enrichedSandbox{Sandbox: sb}
+		if hasThermal && sb.Status == "running" {
+			enriched[i].Thermal = te.ThermalState(sb.EngineID)
+		}
+		if urls, ok := urlsByID[sb.ID]; ok {
+			enriched[i].URLs = urls
+		}
+	}
+	writeJSON(w, 200, enriched)
+}
+
+// handleSandboxCreate serves POST /sandboxes.
+func (s *Server) handleSandboxCreate(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+
+	handlerStart := time.Now()
+	handlerPhase := func(name string) {
+		slog.Debug("create.handler", "phase", name,
+			"elapsed_ms", time.Since(handlerStart).Milliseconds())
+	}
+
+	var req createSandboxReq
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	handlerPhase("request_parsed")
+
+	if req.From != "" && len(req.Mounts) > 0 {
+		errResp(w, 400, "mounts cannot be added to a fork; create a fresh sandbox instead")
+		return
+	}
+	if req.From != "" && req.NetPolicy != nil {
+		errResp(w, http.StatusBadRequest, "a fork inherits the source's net_policy; explicit network overrides are not supported")
+		return
+	}
+	if status, message := s.authorizeMounts(req.Mounts); status != 0 {
+		errResp(w, status, message)
+		return
+	}
+
+	if !s.checkSandboxQuota(w, r, user) {
+		return
+	}
+
+	// Validate sandbox name
+	if req.Name != "" && !isValidName(req.Name) {
+		errResp(w, 400, "invalid sandbox name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
+		return
+	}
+
+	// Validate labels.
+	if err := validateLabels(req.Labels); err != nil {
+		errResp(w, 400, err.Error())
+		return
+	}
+
+	// Resolve posture explicitly before persisting or pushing the policy.
+	// A sibling-only opt-in needs a NIC but must not imply public internet.
+	// Without rules the server default is none unless configured otherwise.
+	np := gateway.NetPolicyWire{}
+	if req.NetPolicy != nil {
+		np = *req.NetPolicy
+	}
+	if np.Default == "" {
+		switch {
+		case np.Siblings == "allow" || len(np.AllowHosts) > 0 || len(np.AllowCIDRs) > 0:
+			np.Default = "deny"
+		case s.defaultEgress != "":
+			np.Default = s.defaultEgress
+		default:
+			np.Default = gateway.PostureNone
+		}
+	}
+	if err := gateway.ValidateWire(np); err != nil {
+		errResp(w, 400, "invalid net_policy: "+err.Error())
+		return
+	}
+	req.NetPolicy = &np
+
+	// Create-time secret grants: checked before anything is built; the
+	// placeholders are minted just before boot.
+	grantHostsBySecret := make(map[string][]string, len(req.SecretGrants))
+	if len(req.SecretGrants) > 0 && req.From != "" {
+		errResp(w, 400, "secret grants can't be injected into a fork (its environment is the source's); it inherits the source's active grants, and `bhatti secret grant` adds more once it exists")
+		return
+	}
+	for _, g := range req.SecretGrants {
+		if g.Secret == "" {
+			errResp(w, 400, "secret grant: secret name required")
+			return
+		}
+		if _, dup := grantHostsBySecret[g.Secret]; dup {
+			errResp(w, 400, fmt.Sprintf("secret %q is granted twice", g.Secret))
+			return
+		}
+		if slices.Contains(req.Secrets, g.Secret) {
+			errResp(w, 400, fmt.Sprintf("secret %q is requested both as a plain secret and as a grant", g.Secret))
+			return
+		}
+		hosts, err := grantHosts(g.Hosts, req.NetPolicy)
 		if err != nil {
-			errResp(w, 400, err.Error())
+			errResp(w, 400, fmt.Sprintf("secret grant %q: %v", g.Secret, err))
 			return
 		}
-		list, err := s.store.ListSandboxesWithFilter(r.Context(), user.ID, labelFilter)
+		if _, err := s.store.GetSecret(r.Context(), user.ID, g.Secret); err != nil {
+			errResp(w, 400, fmt.Sprintf("secret %q not found", g.Secret))
+			return
+		}
+		grantHostsBySecret[g.Secret] = hosts
+	}
+	if len(req.SecretGrants) > 0 {
+		if _, ok := s.engine.(engine.GuestAgentCapabilities); !ok {
+			errResp(w, 501, "engine does not support guest-agent capability checks for secret grants")
+			return
+		}
+	}
+
+	var spec engine.SandboxSpec
+	var templateID string
+	var volumes []engine.VolumeMount
+
+	if req.TemplateID != "" {
+		// --- Template-based creation (existing behavior) ---
+		tmpl, err := s.store.GetTemplate(r.Context(), req.TemplateID)
 		if err != nil {
-			errRespInternal(w, r, "list sandboxes failed", err)
+			errResp(w, 404, "template not found")
 			return
 		}
-		if list == nil {
-			list = []store.Sandbox{}
+		templateID = tmpl.ID
+
+		name := req.Name
+		if name == "" {
+			name = tmpl.Name + "-" + genID()[:6]
 		}
 
-		// Enrich with thermal state + published URLs
-		type enrichedSandbox struct {
-			store.Sandbox
-			Thermal string   `json:"thermal,omitempty"`
-			URLs    []string `json:"urls,omitempty"`
-		}
-
-		// Thermal state (read-only, no VM interaction)
-		te, hasThermal := thermalOf(s.engine)
-
-		// Published URLs (single query for all user's rules)
-		rules, _ := s.store.ListUserPublishRules(r.Context(), user.ID)
-		urlsByID := make(map[string][]string)
-		for _, r := range rules {
-			url := publishedURL(r.Alias, s.proxyZone, s.publicProxyAddr)
-			urlsByID[r.SandboxID] = append(urlsByID[r.SandboxID], url)
-		}
-
-		enriched := make([]enrichedSandbox, len(list))
-		for i, sb := range list {
-			enriched[i] = enrichedSandbox{Sandbox: sb}
-			if hasThermal && sb.Status == "running" {
-				enriched[i].Thermal = te.ThermalState(sb.EngineID)
-			}
-			if urls, ok := urlsByID[sb.ID]; ok {
-				enriched[i].URLs = urls
+		// Resolve volumes: use request volumes if provided, else template defaults
+		volumes = req.Volumes
+		if len(volumes) == 0 && len(tmpl.Mounts) > 0 {
+			for _, m := range tmpl.Mounts {
+				volName := m.VolumeName
+				if volName == "" {
+					volName = "bhatti-" + name + "-workspace"
+				}
+				if m.AutoCreate {
+					s.store.CreateVolume(r.Context(), volName) // idempotent
+				}
+				volumes = append(volumes, engine.VolumeMount{
+					Name: volName, Target: m.Target, ReadOnly: m.ReadOnly,
+				})
 			}
 		}
-		writeJSON(w, 200, enriched)
-	case http.MethodPost:
-		handlerStart := time.Now()
-		handlerPhase := func(name string) {
-			slog.Debug("create.handler", "phase", name,
-				"elapsed_ms", time.Since(handlerStart).Milliseconds())
-		}
 
-		var req createSandboxReq
-		if err := readJSON(r, &req); err != nil {
-			errResp(w, 400, "invalid json: "+err.Error())
-			return
+		// B2: Build env from request env, then add secrets. Secrets are the
+		// union of tmpl.Secrets and req.Secrets (dedup, template names first
+		// for deterministic error ordering). Secrets override env for the
+		// same name, matching the direct-creation branch.
+		env := make(map[string]string)
+		for k, v := range req.Env {
+			env[k] = v
 		}
-		handlerPhase("request_parsed")
-
-		if req.From != "" && len(req.Mounts) > 0 {
-			errResp(w, 400, "mounts cannot be added to a fork; create a fresh sandbox instead")
-			return
-		}
-		if req.From != "" && req.NetPolicy != nil {
-			errResp(w, http.StatusBadRequest, "a fork inherits the source's net_policy; explicit network overrides are not supported")
-			return
-		}
-		if status, message := s.authorizeMounts(req.Mounts); status != 0 {
-			errResp(w, status, message)
-			return
-		}
-
-		if !s.checkSandboxQuota(w, r, user) {
-			return
-		}
-
-		// Validate sandbox name
-		if req.Name != "" && !isValidName(req.Name) {
-			errResp(w, 400, "invalid sandbox name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
-			return
-		}
-
-		// Validate labels.
-		if err := validateLabels(req.Labels); err != nil {
-			errResp(w, 400, err.Error())
-			return
-		}
-
-		// Resolve posture explicitly before persisting or pushing the policy.
-		// A sibling-only opt-in needs a NIC but must not imply public internet.
-		// Without rules the server default is none unless configured otherwise.
-		np := gateway.NetPolicyWire{}
-		if req.NetPolicy != nil {
-			np = *req.NetPolicy
-		}
-		if np.Default == "" {
-			switch {
-			case np.Siblings == "allow" || len(np.AllowHosts) > 0 || len(np.AllowCIDRs) > 0:
-				np.Default = "deny"
-			case s.defaultEgress != "":
-				np.Default = s.defaultEgress
-			default:
-				np.Default = gateway.PostureNone
+		seenSecret := make(map[string]bool, len(tmpl.Secrets)+len(req.Secrets))
+		secretNames := make([]string, 0, len(tmpl.Secrets)+len(req.Secrets))
+		for _, name := range tmpl.Secrets {
+			if !seenSecret[name] {
+				secretNames = append(secretNames, name)
+				seenSecret[name] = true
 			}
 		}
-		if err := gateway.ValidateWire(np); err != nil {
-			errResp(w, 400, "invalid net_policy: "+err.Error())
+		for _, name := range req.Secrets {
+			if !seenSecret[name] {
+				secretNames = append(secretNames, name)
+				seenSecret[name] = true
+			}
+		}
+		for _, secretName := range secretNames {
+			ciphertext, err := s.store.GetSecretValue(r.Context(), user.ID, secretName)
+			if err != nil {
+				errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
+				return
+			}
+			plaintext, err := s.decryptSecret(ciphertext)
+			if err != nil {
+				errResp(w, 500, fmt.Sprintf("decrypt secret %q failed", secretName))
+				return
+			}
+			env[secretName] = string(plaintext)
+		}
+
+		// B2: Resolve files from request (templates have no files of their own).
+		var files map[string]engine.FileSpec
+		if len(req.Files) > 0 {
+			files = make(map[string]engine.FileSpec, len(req.Files))
+			for _, f := range req.Files {
+				if f.GuestPath == "" {
+					errResp(w, 400, "file guest_path required")
+					return
+				}
+				content, err := base64.StdEncoding.DecodeString(f.Content)
+				if err != nil {
+					errResp(w, 400, fmt.Sprintf("file %q: invalid base64 content", f.GuestPath))
+					return
+				}
+				mode := f.Mode
+				if mode == "" {
+					mode = "0644"
+				}
+				files[f.GuestPath] = engine.FileSpec{Content: content, Mode: mode}
+			}
+		}
+
+		// Apply request overrides on template defaults
+		cpus := tmpl.CPUs
+		if req.CPUs > 0 {
+			cpus = req.CPUs
+		}
+		memMB := tmpl.MemoryMB
+		if req.MemoryMB > 0 {
+			memMB = req.MemoryMB
+		}
+
+		spec = engine.SandboxSpec{
+			Name:              name,
+			Image:             tmpl.Image,
+			CPUs:              cpus,
+			MemoryMB:          memMB,
+			DiskSizeMB:        req.DiskSizeMB,
+			Labels:            tmpl.Labels,
+			UserData:          tmpl.UserData,
+			Env:               env,
+			Init:              req.Init,
+			Files:             files,
+			Volumes:           volumes,
+			Mounts:            req.Mounts,
+			PersistentVolumes: req.PersistentVolumes,
+			Hugepages:         req.Hugepages,
+		}
+		// Request image overrides template image
+		if req.Image != "" {
+			spec.Image = req.Image
+		}
+	} else {
+		// --- Direct creation (no template) ---
+		env := req.Env
+		if env == nil {
+			env = make(map[string]string)
+		}
+
+		// B15: Resolve secrets from store (same logic as template path)
+		for _, secretName := range req.Secrets {
+			ciphertext, err := s.store.GetSecretValue(r.Context(), user.ID, secretName)
+			if err != nil {
+				errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
+				return
+			}
+			plaintext, err := s.decryptSecret(ciphertext)
+			if err != nil {
+				errResp(w, 500, fmt.Sprintf("decrypt secret %q failed", secretName))
+				return
+			}
+			env[secretName] = string(plaintext)
+		}
+
+		// B15: Resolve files from request
+		var files map[string]engine.FileSpec
+		if len(req.Files) > 0 {
+			files = make(map[string]engine.FileSpec, len(req.Files))
+			for _, f := range req.Files {
+				if f.GuestPath == "" {
+					errResp(w, 400, "file guest_path required")
+					return
+				}
+				content, err := base64.StdEncoding.DecodeString(f.Content)
+				if err != nil {
+					errResp(w, 400, fmt.Sprintf("file %q: invalid base64 content", f.GuestPath))
+					return
+				}
+				mode := f.Mode
+				if mode == "" {
+					mode = "0644"
+				}
+				files[f.GuestPath] = engine.FileSpec{Content: content, Mode: mode}
+			}
+		}
+
+		spec = engine.SandboxSpec{
+			Name:              req.Name,
+			Image:             req.Image, // user-visible image name; mirror of template branch so inspect/audit show the real image, not the "minimal" fallback
+			CPUs:              req.CPUs,
+			MemoryMB:          req.MemoryMB,
+			DiskSizeMB:        req.DiskSizeMB,
+			Env:               env,
+			Init:              req.Init,
+			Files:             files,
+			NewVolumes:        req.NewVolumes,
+			Volumes:           req.Volumes,
+			Mounts:            req.Mounts,
+			PersistentVolumes: req.PersistentVolumes,
+			Hugepages:         req.Hugepages,
+		}
+		volumes = req.Volumes
+
+		// Apply defaults
+		if spec.CPUs == 0 {
+			spec.CPUs = 1
+		}
+		if spec.MemoryMB == 0 {
+			spec.MemoryMB = 1024
+		}
+		if spec.Name == "" {
+			spec.Name = "sandbox-" + genID()[:6]
+		}
+	}
+
+	// Idempotent create: if a non-destroyed sandbox with this name already
+	// exists, return it with 200 instead of 409. This eliminates the
+	// TOCTOU race where two concurrent creates both pass a check, both
+	// boot VMs, and one wastes ~3.5s. Callers (e.g. karkhana) no longer
+	// need list→filter→create dance.
+	if spec.Name != "" {
+		existing, err := s.store.GetActiveSandboxByName(r.Context(), user.ID, spec.Name)
+		if err == nil {
+			w.Header().Set("X-Bhatti-Existing", "true")
+			writeJSON(w, 200, existing)
 			return
 		}
-		req.NetPolicy = &np
+	}
 
-		// Create-time secret grants: checked before anything is built; the
-		// placeholders are minted just before boot.
-		grantHostsBySecret := make(map[string][]string, len(req.SecretGrants))
-		if len(req.SecretGrants) > 0 && req.From != "" {
-			errResp(w, 400, "secret grants can't be injected into a fork (its environment is the source's); it inherits the source's active grants, and `bhatti secret grant` adds more once it exists")
+	// A fork runs at its source's size, a template at its own: the caps
+	// judge what will actually run, and a cap lowered since the source or
+	// template was made still applies.
+	var src *store.Sandbox // fork source
+	var forker engine.ForkEngine
+	if req.From != "" {
+		var ok bool
+		if forker, ok = s.engine.(engine.ForkEngine); !ok {
+			errResp(w, 501, "engine does not support fork (--from)")
 			return
+		}
+		var serr error
+		if src, serr = s.store.GetSandbox(r.Context(), user.ID, req.From); serr != nil {
+			errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
+			return
+		}
+		// The record matches the forked VM: the source's image, vCPUs and
+		// RAM, and a clone of its disk.
+		spec.Image = src.Image
+		spec.CPUs = src.CPUs
+		spec.MemoryMB = src.MemoryMB
+		spec.DiskSizeMB = src.DiskSizeMB
+	}
+	if !checkSandboxSize(w, user, spec.CPUs, spec.MemoryMB) {
+		return
+	}
+
+	// Set user context for engine-level network isolation
+	spec.UserID = user.ID
+	spec.SubnetIndex = user.SubnetIndex
+	spec.NetPolicy = req.NetPolicy // resolved above: never nil
+
+	// v0.3: Resolve image name to file path
+	if req.Image != "" {
+		img, err := s.store.GetImage(r.Context(), user.ID, req.Image)
+		if err != nil {
+			errResp(w, 404, fmt.Sprintf("image %q not found", req.Image))
+			return
+		}
+		spec.BaseImage = img.FilePath
+	}
+
+	handlerPhase("spec_built")
+
+	// Generate a sandbox ID for volume attachment tracking (before engine.Create)
+	sbID := genID()
+
+	// v0.3: Resolve persistent volumes — reserve in store before VM boots
+	var resolvedVolumes []engine.ResolvedVolume
+	if len(spec.PersistentVolumes) > 0 {
+		for _, vol := range spec.PersistentVolumes {
+			if !isValidName(vol.Name) {
+				errResp(w, 400, fmt.Sprintf("invalid volume name %q", vol.Name))
+				return
+			}
+			if !isValidMountPath(vol.Mount) {
+				errResp(w, 400, fmt.Sprintf("invalid mount path %q: must be absolute, no '..' components, not a system path", vol.Mount))
+				return
+			}
+
+			existing, err := s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
+			if err != nil && vol.AutoCreate && vol.SizeMB > 0 {
+				// Auto-create: insert store record first with status='creating'
+				volDir := filepath.Join(s.dataDir, "volumes", user.ID)
+				os.MkdirAll(volDir, 0700)
+				volPath := filepath.Join(volDir, vol.Name+".ext4")
+
+				storeVol := store.PersistentVolume{
+					ID: genID(), UserID: user.ID,
+					Name: vol.Name, SizeMB: vol.SizeMB, FilePath: volPath,
+					Status: "creating", CreatedAt: time.Now(),
+				}
+				createErr := s.store.CreatePersistentVolume(r.Context(), storeVol)
+				if createErr != nil {
+					// UNIQUE violation — another request won the race
+					time.Sleep(500 * time.Millisecond)
+					existing, err = s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
+					if err != nil {
+						errResp(w, 500, fmt.Sprintf("volume %q: race recovery failed", vol.Name))
+						return
+					}
+					if existing.Status == "creating" {
+						errResp(w, 409, fmt.Sprintf("volume %q is being created by another request, retry", vol.Name))
+						return
+					}
+				} else {
+					// We won the race. Create the ext4 file.
+					if err := createVolumeFile(volPath, vol.SizeMB); err != nil {
+						s.store.DeletePersistentVolume(r.Context(), user.ID, vol.Name)
+						errRespInternal(w, r, "create volume failed", err)
+						return
+					}
+					s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, vol.Name, "ready")
+					storeVol.Status = "ready"
+					existing = &storeVol
+				}
+			} else if err != nil {
+				errResp(w, 404, fmt.Sprintf("volume %q not found", vol.Name))
+				return
+			}
+
+			// The attachment gate must cover both the fresh attachment read
+			// and any journal repair. A backup clone and new RW attachment
+			// take this same gate; neither may overlap e2fsck.
+			if vol.ReadOnly {
+				unlock := s.store.LockPersistentVolumeAttachments(user.ID, vol.Name)
+				var checkErr error
+				existing, checkErr = s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
+				if checkErr == nil && existing.FilePath != "" {
+					switch {
+					case len(existing.Attachments) == 0:
+						// A previously RW-mounted volume may need its journal
+						// replayed before the first RO attachment.
+						if !volumeIsClean(existing.FilePath) {
+							slog.Info("cleaning dirty journal before ro attach", "volume", vol.Name)
+							if out, err := exec.Command("e2fsck", "-f", "-y", existing.FilePath).CombinedOutput(); err != nil {
+								slog.Warn("e2fsck before ro attach failed", "volume", vol.Name, "output", string(out), "error", err)
+							}
+						}
+					case !volumeIsClean(existing.FilePath):
+						// A mounted filesystem must never be repaired in place.
+						checkErr = fmt.Errorf("volume %q has a dirty journal and existing attachments — detach all and retry", vol.Name)
+					}
+				}
+				unlock() // AttachPersistentVolume acquires the gate itself.
+				if checkErr != nil {
+					s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
+					errResp(w, 409, checkErr.Error())
+					return
+				}
+			}
+
+			// Attach (store transaction handles concurrency — re-checks under lock)
+			if err := s.store.AttachPersistentVolume(r.Context(), user.ID, vol.Name, sbID, vol.Mount, vol.ReadOnly); err != nil {
+				// Rollback previously attached volumes
+				s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
+				errResp(w, 409, err.Error())
+				return
+			}
+
+			resolvedVolumes = append(resolvedVolumes, engine.ResolvedVolume{
+				FilePath: existing.FilePath,
+				DriveID:  fmt.Sprintf("vol%d", len(resolvedVolumes)),
+				Name:     vol.Name,
+				Mount:    vol.Mount,
+				ReadOnly: vol.ReadOnly,
+			})
+		}
+		spec.ResolvedVolumes = resolvedVolumes
+	}
+
+	handlerPhase("volumes_resolved")
+	handlerPhase("engine_create_start")
+	var info engine.SandboxInfo
+	var err error
+	var grants []store.SecretGrant // the sandbox's own at boot, or a fork's inherited ones
+	if src != nil {
+		// Fork: clone a running sandbox (memory copy) instead of a fresh boot.
+		info, err = forker.Fork(r.Context(), src.EngineID, spec.Name)
+	} else {
+		// netd names the guest by our ID, so a grant minted now resolves
+		// from the guest's first request. A sandbox with a network gets its
+		// own CA in its trust store, so grants can be added while it runs.
+		spec.SandboxID = sbID
+		spec.RequireGuestCA = len(req.SecretGrants) > 0
+		if !req.NetPolicy.NoNetwork() {
+			spec.CACert, err = s.mintSandboxCA(r.Context(), user.ID, sbID, spec.Name)
 		}
 		for _, g := range req.SecretGrants {
-			if g.Secret == "" {
-				errResp(w, 400, "secret grant: secret name required")
-				return
-			}
-			if _, dup := grantHostsBySecret[g.Secret]; dup {
-				errResp(w, 400, fmt.Sprintf("secret %q is granted twice", g.Secret))
-				return
-			}
-			if slices.Contains(req.Secrets, g.Secret) {
-				errResp(w, 400, fmt.Sprintf("secret %q is requested both as a plain secret and as a grant", g.Secret))
-				return
-			}
-			hosts, err := grantHosts(g.Hosts, req.NetPolicy)
 			if err != nil {
-				errResp(w, 400, fmt.Sprintf("secret grant %q: %v", g.Secret, err))
-				return
+				break
 			}
-			if _, err := s.store.GetSecret(r.Context(), user.ID, g.Secret); err != nil {
-				errResp(w, 400, fmt.Sprintf("secret %q not found", g.Secret))
-				return
-			}
-			grantHostsBySecret[g.Secret] = hosts
-		}
-		if len(req.SecretGrants) > 0 {
-			if _, ok := s.engine.(engine.GuestAgentCapabilities); !ok {
-				errResp(w, 501, "engine does not support guest-agent capability checks for secret grants")
-				return
+			var grant store.SecretGrant
+			if grant, err = s.newGrant(r.Context(), user.ID, g.Secret, sbID, grantHostsBySecret[g.Secret], 0); err == nil {
+				spec.Env[g.Secret] = grant.Placeholder
+				grants = append(grants, grant)
 			}
 		}
-
-		var spec engine.SandboxSpec
-		var templateID string
-		var volumes []engine.VolumeMount
-
-		if req.TemplateID != "" {
-			// --- Template-based creation (existing behavior) ---
-			tmpl, err := s.store.GetTemplate(r.Context(), req.TemplateID)
-			if err != nil {
-				errResp(w, 404, "template not found")
-				return
-			}
-			templateID = tmpl.ID
-
-			name := req.Name
-			if name == "" {
-				name = tmpl.Name + "-" + genID()[:6]
-			}
-
-			// Resolve volumes: use request volumes if provided, else template defaults
-			volumes = req.Volumes
-			if len(volumes) == 0 && len(tmpl.Mounts) > 0 {
-				for _, m := range tmpl.Mounts {
-					volName := m.VolumeName
-					if volName == "" {
-						volName = "bhatti-" + name + "-workspace"
-					}
-					if m.AutoCreate {
-						s.store.CreateVolume(r.Context(), volName) // idempotent
-					}
-					volumes = append(volumes, engine.VolumeMount{
-						Name: volName, Target: m.Target, ReadOnly: m.ReadOnly,
-					})
-				}
-			}
-
-			// B2: Build env from request env, then add secrets. Secrets are the
-			// union of tmpl.Secrets and req.Secrets (dedup, template names first
-			// for deterministic error ordering). Secrets override env for the
-			// same name, matching the direct-creation branch.
-			env := make(map[string]string)
-			for k, v := range req.Env {
-				env[k] = v
-			}
-			seenSecret := make(map[string]bool, len(tmpl.Secrets)+len(req.Secrets))
-			secretNames := make([]string, 0, len(tmpl.Secrets)+len(req.Secrets))
-			for _, name := range tmpl.Secrets {
-				if !seenSecret[name] {
-					secretNames = append(secretNames, name)
-					seenSecret[name] = true
-				}
-			}
-			for _, name := range req.Secrets {
-				if !seenSecret[name] {
-					secretNames = append(secretNames, name)
-					seenSecret[name] = true
-				}
-			}
-			for _, secretName := range secretNames {
-				ciphertext, err := s.store.GetSecretValue(r.Context(), user.ID, secretName)
-				if err != nil {
-					errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
-					return
-				}
-				plaintext, err := s.decryptSecret(ciphertext)
-				if err != nil {
-					errResp(w, 500, fmt.Sprintf("decrypt secret %q failed", secretName))
-					return
-				}
-				env[secretName] = string(plaintext)
-			}
-
-			// B2: Resolve files from request (templates have no files of their own).
-			var files map[string]engine.FileSpec
-			if len(req.Files) > 0 {
-				files = make(map[string]engine.FileSpec, len(req.Files))
-				for _, f := range req.Files {
-					if f.GuestPath == "" {
-						errResp(w, 400, "file guest_path required")
-						return
-					}
-					content, err := base64.StdEncoding.DecodeString(f.Content)
-					if err != nil {
-						errResp(w, 400, fmt.Sprintf("file %q: invalid base64 content", f.GuestPath))
-						return
-					}
-					mode := f.Mode
-					if mode == "" {
-						mode = "0644"
-					}
-					files[f.GuestPath] = engine.FileSpec{Content: content, Mode: mode}
-				}
-			}
-
-			// Apply request overrides on template defaults
-			cpus := tmpl.CPUs
-			if req.CPUs > 0 {
-				cpus = req.CPUs
-			}
-			memMB := tmpl.MemoryMB
-			if req.MemoryMB > 0 {
-				memMB = req.MemoryMB
-			}
-
-			spec = engine.SandboxSpec{
-				Name:              name,
-				Image:             tmpl.Image,
-				CPUs:              cpus,
-				MemoryMB:          memMB,
-				DiskSizeMB:        req.DiskSizeMB,
-				Labels:            tmpl.Labels,
-				UserData:          tmpl.UserData,
-				Env:               env,
-				Init:              req.Init,
-				Files:             files,
-				Volumes:           volumes,
-				Mounts:            req.Mounts,
-				PersistentVolumes: req.PersistentVolumes,
-				Hugepages:         req.Hugepages,
-			}
-			// Request image overrides template image
-			if req.Image != "" {
-				spec.Image = req.Image
-			}
-		} else {
-			// --- Direct creation (no template) ---
-			env := req.Env
-			if env == nil {
-				env = make(map[string]string)
-			}
-
-			// B15: Resolve secrets from store (same logic as template path)
-			for _, secretName := range req.Secrets {
-				ciphertext, err := s.store.GetSecretValue(r.Context(), user.ID, secretName)
-				if err != nil {
-					errResp(w, 400, fmt.Sprintf("secret %q not found", secretName))
-					return
-				}
-				plaintext, err := s.decryptSecret(ciphertext)
-				if err != nil {
-					errResp(w, 500, fmt.Sprintf("decrypt secret %q failed", secretName))
-					return
-				}
-				env[secretName] = string(plaintext)
-			}
-
-			// B15: Resolve files from request
-			var files map[string]engine.FileSpec
-			if len(req.Files) > 0 {
-				files = make(map[string]engine.FileSpec, len(req.Files))
-				for _, f := range req.Files {
-					if f.GuestPath == "" {
-						errResp(w, 400, "file guest_path required")
-						return
-					}
-					content, err := base64.StdEncoding.DecodeString(f.Content)
-					if err != nil {
-						errResp(w, 400, fmt.Sprintf("file %q: invalid base64 content", f.GuestPath))
-						return
-					}
-					mode := f.Mode
-					if mode == "" {
-						mode = "0644"
-					}
-					files[f.GuestPath] = engine.FileSpec{Content: content, Mode: mode}
-				}
-			}
-
-			spec = engine.SandboxSpec{
-				Name:              req.Name,
-				Image:             req.Image, // user-visible image name; mirror of template branch so inspect/audit show the real image, not the "minimal" fallback
-				CPUs:              req.CPUs,
-				MemoryMB:          req.MemoryMB,
-				DiskSizeMB:        req.DiskSizeMB,
-				Env:               env,
-				Init:              req.Init,
-				Files:             files,
-				NewVolumes:        req.NewVolumes,
-				Volumes:           req.Volumes,
-				Mounts:            req.Mounts,
-				PersistentVolumes: req.PersistentVolumes,
-				Hugepages:         req.Hugepages,
-			}
-			volumes = req.Volumes
-
-			// Apply defaults
-			if spec.CPUs == 0 {
-				spec.CPUs = 1
-			}
-			if spec.MemoryMB == 0 {
-				spec.MemoryMB = 1024
-			}
-			if spec.Name == "" {
-				spec.Name = "sandbox-" + genID()[:6]
-			}
+		if err == nil {
+			info, err = s.engine.Create(r.Context(), spec)
 		}
+	}
+	handlerPhase("engine_create_done")
+	if err != nil {
+		if src != nil && errors.Is(err, engine.ErrGuestReseedFailed) {
+			s.RecordEvent(store.Event{
+				Type: "guest.reseed_failed", UserID: user.ID, SandboxID: src.ID,
+				Meta: map[string]any{"operation": "fork", "new_sandbox": spec.Name, "error": err.Error()},
+			})
+		}
+		// Rollback persistent volume attachments on engine failure
+		if len(resolvedVolumes) > 0 {
+			s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
+		}
+		s.discardSubstitution(r.Context(), sbID)
+		errRespInternal(w, r, "sandbox create failed", err)
+		return
+	}
 
-		// Idempotent create: if a non-destroyed sandbox with this name already
-		// exists, return it with 200 instead of 409. This eliminates the
-		// TOCTOU race where two concurrent creates both pass a check, both
-		// boot VMs, and one wastes ~3.5s. Callers (e.g. karkhana) no longer
-		// need list→filter→create dance.
-		if spec.Name != "" {
-			existing, err := s.store.GetActiveSandboxByName(r.Context(), user.ID, spec.Name)
-			if err == nil {
+	// Resolve image name for storage
+	imageName := spec.Image
+	if imageName == "" {
+		imageName = "minimal"
+	}
+
+	sb := store.Sandbox{
+		ID:         sbID,
+		Name:       spec.Name,
+		TemplateID: templateID,
+		EngineID:   info.EngineID,
+		Status:     info.Status,
+		IP:         info.IP,
+		EngineMeta: json.RawMessage("{}"),
+		CreatedBy:  user.ID,
+		CreatedAt:  time.Now(),
+		KeepHot:    req.KeepHot,
+		HasInit:    spec.Init != "",
+		CPUs:       spec.CPUs,
+		MemoryMB:   spec.MemoryMB,
+		DiskSizeMB: spec.DiskSizeMB,
+		Image:      imageName,
+		Labels:     req.Labels,
+	}
+	// The egress policy the sandbox runs under, for checking grants made
+	// later: a fork keeps its source's.
+	if src != nil {
+		sb.NetPolicy = src.NetPolicy
+		sb.HasInit = src.HasInit // the fork carries its source's boot config
+	} else if b, merr := json.Marshal(req.NetPolicy); merr == nil {
+		sb.NetPolicy = b
+	}
+	if err := s.store.CreateSandbox(detached(r.Context()), sb); err != nil {
+		s.discardSubstitution(r.Context(), sbID)
+		// A taken name → name race. Another concurrent request won the
+		// insert. Destroy the VM we just booted and return the winner's
+		// sandbox.
+		if errors.Is(err, store.ErrConflict) && spec.Name != "" {
+			s.engine.Destroy(r.Context(), info.EngineID)
+			if len(resolvedVolumes) > 0 {
+				s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
+			}
+			existing, lookupErr := s.store.GetActiveSandboxByName(r.Context(), user.ID, spec.Name)
+			if lookupErr == nil {
 				w.Header().Set("X-Bhatti-Existing", "true")
 				writeJSON(w, 200, existing)
 				return
 			}
 		}
-
-		// A fork runs at its source's size, a template at its own: the caps
-		// judge what will actually run, and a cap lowered since the source or
-		// template was made still applies.
-		var src *store.Sandbox // fork source
-		var forker engine.ForkEngine
-		if req.From != "" {
-			var ok bool
-			if forker, ok = s.engine.(engine.ForkEngine); !ok {
-				errResp(w, 501, "engine does not support fork (--from)")
-				return
-			}
-			var serr error
-			if src, serr = s.store.GetSandbox(r.Context(), user.ID, req.From); serr != nil {
-				errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
-				return
-			}
-			// The record matches the forked VM: the source's image, vCPUs and
-			// RAM, and a clone of its disk.
-			spec.Image = src.Image
-			spec.CPUs = src.CPUs
-			spec.MemoryMB = src.MemoryMB
-			spec.DiskSizeMB = src.DiskSizeMB
+		s.engine.Destroy(r.Context(), info.EngineID)
+		if len(resolvedVolumes) > 0 {
+			s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
 		}
-		if !checkSandboxSize(w, user, spec.CPUs, spec.MemoryMB) {
-			return
-		}
-
-		// Set user context for engine-level network isolation
-		spec.UserID = user.ID
-		spec.SubnetIndex = user.SubnetIndex
-		spec.NetPolicy = req.NetPolicy // resolved above: never nil
-
-		// v0.3: Resolve image name to file path
-		if req.Image != "" {
-			img, err := s.store.GetImage(r.Context(), user.ID, req.Image)
-			if err != nil {
-				errResp(w, 404, fmt.Sprintf("image %q not found", req.Image))
-				return
-			}
-			spec.BaseImage = img.FilePath
-		}
-
-		handlerPhase("spec_built")
-
-		// Generate a sandbox ID for volume attachment tracking (before engine.Create)
-		sbID := genID()
-
-		// v0.3: Resolve persistent volumes — reserve in store before VM boots
-		var resolvedVolumes []engine.ResolvedVolume
-		if len(spec.PersistentVolumes) > 0 {
-			for _, vol := range spec.PersistentVolumes {
-				if !isValidName(vol.Name) {
-					errResp(w, 400, fmt.Sprintf("invalid volume name %q", vol.Name))
-					return
-				}
-				if !isValidMountPath(vol.Mount) {
-					errResp(w, 400, fmt.Sprintf("invalid mount path %q: must be absolute, no '..' components, not a system path", vol.Mount))
-					return
-				}
-
-				existing, err := s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
-				if err != nil && vol.AutoCreate && vol.SizeMB > 0 {
-					// Auto-create: insert store record first with status='creating'
-					volDir := filepath.Join(s.dataDir, "volumes", user.ID)
-					os.MkdirAll(volDir, 0700)
-					volPath := filepath.Join(volDir, vol.Name+".ext4")
-
-					storeVol := store.PersistentVolume{
-						ID: genID(), UserID: user.ID,
-						Name: vol.Name, SizeMB: vol.SizeMB, FilePath: volPath,
-						Status: "creating", CreatedAt: time.Now(),
-					}
-					createErr := s.store.CreatePersistentVolume(r.Context(), storeVol)
-					if createErr != nil {
-						// UNIQUE violation — another request won the race
-						time.Sleep(500 * time.Millisecond)
-						existing, err = s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
-						if err != nil {
-							errResp(w, 500, fmt.Sprintf("volume %q: race recovery failed", vol.Name))
-							return
-						}
-						if existing.Status == "creating" {
-							errResp(w, 409, fmt.Sprintf("volume %q is being created by another request, retry", vol.Name))
-							return
-						}
-					} else {
-						// We won the race. Create the ext4 file.
-						if err := createVolumeFile(volPath, vol.SizeMB); err != nil {
-							s.store.DeletePersistentVolume(r.Context(), user.ID, vol.Name)
-							errRespInternal(w, r, "create volume failed", err)
-							return
-						}
-						s.store.UpdatePersistentVolumeStatus(r.Context(), user.ID, vol.Name, "ready")
-						storeVol.Status = "ready"
-						existing = &storeVol
-					}
-				} else if err != nil {
-					errResp(w, 404, fmt.Sprintf("volume %q not found", vol.Name))
-					return
-				}
-
-				// The attachment gate must cover both the fresh attachment read
-				// and any journal repair. A backup clone and new RW attachment
-				// take this same gate; neither may overlap e2fsck.
-				if vol.ReadOnly {
-					unlock := s.store.LockPersistentVolumeAttachments(user.ID, vol.Name)
-					var checkErr error
-					existing, checkErr = s.store.GetPersistentVolume(r.Context(), user.ID, vol.Name)
-					if checkErr == nil && existing.FilePath != "" {
-						switch {
-						case len(existing.Attachments) == 0:
-							// A previously RW-mounted volume may need its journal
-							// replayed before the first RO attachment.
-							if !volumeIsClean(existing.FilePath) {
-								slog.Info("cleaning dirty journal before ro attach", "volume", vol.Name)
-								if out, err := exec.Command("e2fsck", "-f", "-y", existing.FilePath).CombinedOutput(); err != nil {
-									slog.Warn("e2fsck before ro attach failed", "volume", vol.Name, "output", string(out), "error", err)
-								}
-							}
-						case !volumeIsClean(existing.FilePath):
-							// A mounted filesystem must never be repaired in place.
-							checkErr = fmt.Errorf("volume %q has a dirty journal and existing attachments — detach all and retry", vol.Name)
-						}
-					}
-					unlock() // AttachPersistentVolume acquires the gate itself.
-					if checkErr != nil {
-						s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
-						errResp(w, 409, checkErr.Error())
-						return
-					}
-				}
-
-				// Attach (store transaction handles concurrency — re-checks under lock)
-				if err := s.store.AttachPersistentVolume(r.Context(), user.ID, vol.Name, sbID, vol.Mount, vol.ReadOnly); err != nil {
-					// Rollback previously attached volumes
-					s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
-					errResp(w, 409, err.Error())
-					return
-				}
-
-				resolvedVolumes = append(resolvedVolumes, engine.ResolvedVolume{
-					FilePath: existing.FilePath,
-					DriveID:  fmt.Sprintf("vol%d", len(resolvedVolumes)),
-					Name:     vol.Name,
-					Mount:    vol.Mount,
-					ReadOnly: vol.ReadOnly,
-				})
-			}
-			spec.ResolvedVolumes = resolvedVolumes
-		}
-
-		handlerPhase("volumes_resolved")
-		handlerPhase("engine_create_start")
-		var info engine.SandboxInfo
-		var err error
-		var grants []store.SecretGrant // the sandbox's own at boot, or a fork's inherited ones
-		if src != nil {
-			// Fork: clone a running sandbox (memory copy) instead of a fresh boot.
-			info, err = forker.Fork(r.Context(), src.EngineID, spec.Name)
-		} else {
-			// netd names the guest by our ID, so a grant minted now resolves
-			// from the guest's first request. A sandbox with a network gets its
-			// own CA in its trust store, so grants can be added while it runs.
-			spec.SandboxID = sbID
-			spec.RequireGuestCA = len(req.SecretGrants) > 0
-			if !req.NetPolicy.NoNetwork() {
-				spec.CACert, err = s.mintSandboxCA(r.Context(), user.ID, sbID, spec.Name)
-			}
-			for _, g := range req.SecretGrants {
-				if err != nil {
-					break
-				}
-				var grant store.SecretGrant
-				if grant, err = s.newGrant(r.Context(), user.ID, g.Secret, sbID, grantHostsBySecret[g.Secret], 0); err == nil {
-					spec.Env[g.Secret] = grant.Placeholder
-					grants = append(grants, grant)
-				}
-			}
-			if err == nil {
-				info, err = s.engine.Create(r.Context(), spec)
-			}
-		}
-		handlerPhase("engine_create_done")
-		if err != nil {
-			if src != nil && errors.Is(err, engine.ErrGuestReseedFailed) {
-				s.RecordEvent(store.Event{
-					Type: "guest.reseed_failed", UserID: user.ID, SandboxID: src.ID,
-					Meta: map[string]any{"operation": "fork", "new_sandbox": spec.Name, "error": err.Error()},
-				})
-			}
-			// Rollback persistent volume attachments on engine failure
-			if len(resolvedVolumes) > 0 {
-				s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
-			}
-			s.discardSubstitution(r.Context(), sbID)
-			errRespInternal(w, r, "sandbox create failed", err)
-			return
-		}
-
-		// Resolve image name for storage
-		imageName := spec.Image
-		if imageName == "" {
-			imageName = "minimal"
-		}
-
-		sb := store.Sandbox{
-			ID:         sbID,
-			Name:       spec.Name,
-			TemplateID: templateID,
-			EngineID:   info.EngineID,
-			Status:     info.Status,
-			IP:         info.IP,
-			EngineMeta: json.RawMessage("{}"),
-			CreatedBy:  user.ID,
-			CreatedAt:  time.Now(),
-			KeepHot:    req.KeepHot,
-			HasInit:    spec.Init != "",
-			CPUs:       spec.CPUs,
-			MemoryMB:   spec.MemoryMB,
-			DiskSizeMB: spec.DiskSizeMB,
-			Image:      imageName,
-			Labels:     req.Labels,
-		}
-		// The egress policy the sandbox runs under, for checking grants made
-		// later: a fork keeps its source's.
-		if src != nil {
-			sb.NetPolicy = src.NetPolicy
-			sb.HasInit = src.HasInit // the fork carries its source's boot config
-		} else if b, merr := json.Marshal(req.NetPolicy); merr == nil {
-			sb.NetPolicy = b
-		}
-		if err := s.store.CreateSandbox(detached(r.Context()), sb); err != nil {
-			s.discardSubstitution(r.Context(), sbID)
-			// A taken name → name race. Another concurrent request won the
-			// insert. Destroy the VM we just booted and return the winner's
-			// sandbox.
-			if errors.Is(err, store.ErrConflict) && spec.Name != "" {
-				s.engine.Destroy(r.Context(), info.EngineID)
-				if len(resolvedVolumes) > 0 {
-					s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
-				}
-				existing, lookupErr := s.store.GetActiveSandboxByName(r.Context(), user.ID, spec.Name)
-				if lookupErr == nil {
-					w.Header().Set("X-Bhatti-Existing", "true")
-					writeJSON(w, 200, existing)
-					return
-				}
-			}
-			s.engine.Destroy(r.Context(), info.EngineID)
-			if len(resolvedVolumes) > 0 {
-				s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sbID)
-			}
-			errRespInternal(w, r, "store sandbox failed", err)
-			return
-		}
-		if src != nil {
-			grants = s.inheritFromSandbox(r.Context(), user.ID, src, sb)
-		}
-
-		// Record volume attachments
-		for _, v := range volumes {
-			s.store.AttachVolume(r.Context(), sbID, v.Name, v.Target, v.ReadOnly)
-		}
-
-		handlerPhase("db_store_done")
-
-		slog.Info("sandbox.created",
-			"sandbox_id", sb.ID, "name", sb.Name, "user", user.Name,
-			"cpus", spec.CPUs, "memory_mb", spec.MemoryMB)
-		s.RecordEvent(store.Event{
-			Type: "sandbox.created", UserID: user.ID, SandboxID: sb.ID,
-			Meta: map[string]any{
-				"name": sb.Name, "cpus": spec.CPUs, "memory_mb": spec.MemoryMB,
-				"image": spec.Image, "template_id": templateID,
-				"keep_hot": req.KeepHot,
-			},
-		})
-		if src != nil && info.GuestReseedUnsupported {
-			s.RecordEvent(store.Event{
-				Type: "guest.reseed_unsupported", UserID: user.ID, SandboxID: sb.ID,
-				Meta: map[string]any{"operation": "fork", "source_sandbox": src.ID},
-			})
-		}
-		inheritedFrom := ""
-		if src != nil {
-			inheritedFrom = "sandbox:" + src.ID
-		}
-		writeJSON(w, 201, createdSandbox{Sandbox: sb, SecretGrants: s.announceGrants(grants, sb.Name, inheritedFrom)})
-	default:
-		errResp(w, 405, "method not allowed")
+		errRespInternal(w, r, "store sandbox failed", err)
+		return
 	}
+	if src != nil {
+		grants = s.inheritFromSandbox(r.Context(), user.ID, src, sb)
+	}
+
+	// Record volume attachments
+	for _, v := range volumes {
+		s.store.AttachVolume(r.Context(), sbID, v.Name, v.Target, v.ReadOnly)
+	}
+
+	handlerPhase("db_store_done")
+
+	slog.Info("sandbox.created",
+		"sandbox_id", sb.ID, "name", sb.Name, "user", user.Name,
+		"cpus", spec.CPUs, "memory_mb", spec.MemoryMB)
+	s.RecordEvent(store.Event{
+		Type: "sandbox.created", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{
+			"name": sb.Name, "cpus": spec.CPUs, "memory_mb": spec.MemoryMB,
+			"image": spec.Image, "template_id": templateID,
+			"keep_hot": req.KeepHot,
+		},
+	})
+	if src != nil && info.GuestReseedUnsupported {
+		s.RecordEvent(store.Event{
+			Type: "guest.reseed_unsupported", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{"operation": "fork", "source_sandbox": src.ID},
+		})
+	}
+	inheritedFrom := ""
+	if src != nil {
+		inheritedFrom = "sandbox:" + src.ID
+	}
+	writeJSON(w, 201, createdSandbox{Sandbox: sb, SecretGrants: s.announceGrants(grants, sb.Name, inheritedFrom)})
 }
 
-func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
-	parts := strings.SplitN(path, "/", 2)
-	id := parts[0]
-
-	if id == "" {
-		errResp(w, 400, "missing sandbox id")
-		return
-	}
-
-	// Sub-routes
-	if len(parts) == 2 {
-		sub := parts[1]
-
-		// Handle proxy/:port/... — sub may be "proxy/4321" or "proxy/4321/some/path"
-		if strings.HasPrefix(sub, "proxy/") {
-			s.handleSandboxProxyRoute(w, r, id, strings.TrimPrefix(sub, "proxy/"))
-			return
-		}
-
-		// Handle publish and publish/:port
-		if sub == "publish" || strings.HasPrefix(sub, "publish/") {
-			s.handleSandboxPublish(w, r, id, strings.TrimPrefix(sub, "publish"))
-			return
-		}
-
-		// Handle exec/ws sub-route for piped sessions
-		if sub == "exec/ws" {
-			s.handleSandboxExecWS(w, r, id)
-			return
-		}
-
-		switch sub {
-		case "stop":
-			s.handleSandboxStop(w, r, id)
-		case "start":
-			s.handleSandboxStart(w, r, id)
-		case "exec":
-			s.handleSandboxExec(w, r, id)
-		case "ports":
-			s.handleSandboxPorts(w, r, id)
-		case "tunnel":
-			s.handleSandboxTunnel(w, r, id)
-		case "ws":
-			s.handleSandboxWS(w, r, id)
-		case "files":
-			s.handleSandboxFiles(w, r, id)
-		case "sessions":
-			s.handleSandboxSessions(w, r, id)
-		case "save-image":
-			s.handleSandboxSaveImage(w, r, id)
-		case "checkpoint":
-			s.handleSandboxCheckpoint(w, r, id)
-		case "shell-token":
-			s.handleShellToken(w, r, id)
-		default:
-			errResp(w, 404, "not found")
-		}
-		return
-	}
-
+// handleSandboxGet serves GET /sandboxes/{id}.
+func (s *Server) handleSandboxGet(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
+	id := r.PathValue("id")
 
-	switch r.Method {
-	case http.MethodGet:
-		sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
-		if err != nil {
-			errResp(w, 404, "not found")
-			return
-		}
-		// Refresh status from engine. Use sb.ID, not the URL path id —
-		// callers can pass a name there and UpdateSandboxStatus keys on
-		// the primary key, so a name would silently update zero rows.
-		info, err := s.engine.Status(r.Context(), sb.EngineID)
-		if err == nil {
-			sb.Status = info.Status
-			sb.IP = info.IP
-			s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, info.Status)
-		}
-		writeJSON(w, 200, sb)
-	case http.MethodDelete:
-		sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
-		if err != nil {
-			errResp(w, 404, "not found")
-			return
-		}
-		// Kill VM first, then release volume DB locks. Destroy() calls
-		// Kill+Wait which guarantees the FC process is dead even if other
-		// cleanup fails — safe to release volumes after.
-		s.closeTunnels(sb.EngineID) // close live WebSocket streams before the guest exits
-		defer s.finishTunnelDestroy(sb.EngineID)
-		if err := s.engine.Destroy(r.Context(), sb.EngineID); err != nil {
-			slog.Warn("engine destroy failed, releasing volumes anyway",
-				"sandbox", sb.ID, "error", err)
-		}
-		s.store.DetachVolumes(detached(r.Context()), sb.ID)
-		s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sb.ID) // v0.3 persistent volumes
-		if n, err := s.store.DeletePublishRulesForSandbox(detached(r.Context()), sb.ID); err != nil {
-			slog.Warn("cleanup publish rules", "sandbox", sb.ID, "error", err)
-		} else if n > 0 {
-			slog.Info("cleaned up publish rules", "sandbox", sb.ID, "count", n)
-		}
-		if s.publicProxy != nil {
-			s.publicProxy.routeCache.InvalidateSandbox(sb.ID)
-		}
-		if err := s.store.DeleteSandbox(detached(r.Context()), user.ID, sb.ID); err != nil {
-			errRespInternal(w, r, "delete sandbox failed", err)
-			return
-		}
-		s.discardSubstitution(r.Context(), sb.ID)
-		slog.Info("sandbox.destroyed", "sandbox_id", sb.ID, "name", sb.Name, "user", user.Name)
-		s.RecordEvent(store.Event{
-			Type: "sandbox.destroyed", UserID: user.ID, SandboxID: sb.ID,
-			Meta: map[string]any{
-				"name":       sb.Name,
-				"lifetime_s": int(time.Since(sb.CreatedAt).Seconds()),
-			},
-		})
-		writeJSON(w, 200, map[string]string{"status": "destroyed"})
-	case http.MethodPatch:
-		sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
-		if err != nil {
-			errResp(w, 404, "not found")
-			return
-		}
-		var req struct {
-			KeepHot      *bool             `json:"keep_hot"`
-			Name         *string           `json:"name"`
-			LabelsAdd    map[string]string `json:"labels_add,omitempty"`
-			LabelsRemove []string          `json:"labels_remove,omitempty"`
-		}
-		if err := readJSON(r, &req); err != nil {
-			errResp(w, 400, "invalid json: "+err.Error())
-			return
-		}
-		// Apply rename first so any subsequent log lines (and the keep_hot
-		// wake path) reference the new name. Each field is independent;
-		// these are sequential DB writes, not a single transaction —
-		// acceptable since there is no consistency invariant between them.
-		if req.Name != nil && *req.Name != sb.Name {
-			newName := *req.Name
-			if !isValidName(newName) {
-				errResp(w, 400, "invalid sandbox name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
-				return
-			}
-			if err := s.store.RenameSandbox(r.Context(), user.ID, sb.ID, newName); err != nil {
-				if errors.Is(err, store.ErrConflict) {
-					errResp(w, 409, fmt.Sprintf("name %q is already in use", newName))
-					return
-				}
-				errRespInternal(w, r, "rename sandbox failed", err)
-				return
-			}
-			oldName := sb.Name
-			sb.Name = newName
-			slog.Info("sandbox.updated",
-				"sandbox_id", sb.ID, "old_name", oldName, "new_name", newName,
-				"user", user.Name)
-			s.RecordEvent(store.Event{
-				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
-				Meta: map[string]any{"old_name": oldName, "new_name": newName},
-			})
-		}
-		// Labels: validate, then merge via UpdateSandboxLabels.
-		if len(req.LabelsAdd) > 0 || len(req.LabelsRemove) > 0 {
-			if err := validateLabels(req.LabelsAdd); err != nil {
-				errResp(w, 400, err.Error())
-				return
-			}
-			if err := validateLabelKeys(req.LabelsRemove); err != nil {
-				errResp(w, 400, err.Error())
-				return
-			}
-			if err := s.store.UpdateSandboxLabels(r.Context(), user.ID, sb.ID, req.LabelsAdd, req.LabelsRemove); err != nil {
-				errRespInternal(w, r, "update labels failed", err)
-				return
-			}
-			// Refresh sb so the response reflects the new labels.
-			if refreshed, err := s.store.GetSandbox(r.Context(), user.ID, sb.ID); err == nil {
-				sb = refreshed
-			}
-			slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name,
-				"labels_added", len(req.LabelsAdd), "labels_removed", len(req.LabelsRemove),
-				"user", user.Name)
-			s.RecordEvent(store.Event{
-				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
-				Meta: map[string]any{
-					"name":           sb.Name,
-					"labels_added":   len(req.LabelsAdd),
-					"labels_removed": len(req.LabelsRemove),
-				},
-			})
-		}
-		if req.KeepHot != nil {
-			if err := s.store.UpdateSandboxKeepHot(r.Context(), sb.ID, *req.KeepHot); err != nil {
-				errRespInternal(w, r, "update keep_hot failed", err)
-				return
-			}
-			sb.KeepHot = *req.KeepHot
-			slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name, "keep_hot", sb.KeepHot, "user", user.Name)
-			s.RecordEvent(store.Event{
-				Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
-				Meta: map[string]any{"name": sb.Name, "keep_hot": sb.KeepHot},
-			})
-
-			// If setting keep_hot=true, wake the sandbox immediately.
-			if *req.KeepHot {
-				if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
-					errRespInternal(w, r, "wake sandbox failed", err)
-					return
-				}
-				sb.Status = "running"
-				s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, "running")
-			}
-		}
-		writeJSON(w, 200, sb)
-	default:
-		errResp(w, 405, "method not allowed")
-	}
-}
-
-func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
+	sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
+	if err != nil {
+		errResp(w, 404, "not found")
 		return
 	}
+	// Refresh status from engine. Use sb.ID, not the URL path id —
+	// callers can pass a name there and UpdateSandboxStatus keys on
+	// the primary key, so a name would silently update zero rows.
+	info, err := s.engine.Status(r.Context(), sb.EngineID)
+	if err == nil {
+		sb.Status = info.Status
+		sb.IP = info.IP
+		s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, info.Status)
+	}
+	writeJSON(w, 200, sb)
+}
+
+// handleSandboxDelete serves DELETE /sandboxes/{id}.
+func (s *Server) handleSandboxDelete(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	id := r.PathValue("id")
+
+	sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+	// Kill VM first, then release volume DB locks. Destroy() calls
+	// Kill+Wait which guarantees the FC process is dead even if other
+	// cleanup fails — safe to release volumes after.
+	s.closeTunnels(sb.EngineID) // close live WebSocket streams before the guest exits
+	defer s.finishTunnelDestroy(sb.EngineID)
+	if err := s.engine.Destroy(r.Context(), sb.EngineID); err != nil {
+		slog.Warn("engine destroy failed, releasing volumes anyway",
+			"sandbox", sb.ID, "error", err)
+	}
+	s.store.DetachVolumes(detached(r.Context()), sb.ID)
+	s.store.DetachAllPersistentVolumesForSandbox(detached(r.Context()), sb.ID) // v0.3 persistent volumes
+	if n, err := s.store.DeletePublishRulesForSandbox(detached(r.Context()), sb.ID); err != nil {
+		slog.Warn("cleanup publish rules", "sandbox", sb.ID, "error", err)
+	} else if n > 0 {
+		slog.Info("cleaned up publish rules", "sandbox", sb.ID, "count", n)
+	}
+	if s.publicProxy != nil {
+		s.publicProxy.routeCache.InvalidateSandbox(sb.ID)
+	}
+	if err := s.store.DeleteSandbox(detached(r.Context()), user.ID, sb.ID); err != nil {
+		errRespInternal(w, r, "delete sandbox failed", err)
+		return
+	}
+	s.discardSubstitution(r.Context(), sb.ID)
+	slog.Info("sandbox.destroyed", "sandbox_id", sb.ID, "name", sb.Name, "user", user.Name)
+	s.RecordEvent(store.Event{
+		Type: "sandbox.destroyed", UserID: user.ID, SandboxID: sb.ID,
+		Meta: map[string]any{
+			"name":       sb.Name,
+			"lifetime_s": int(time.Since(sb.CreatedAt).Seconds()),
+		},
+	})
+	writeJSON(w, 200, map[string]string{"status": "destroyed"})
+}
+
+// handleSandboxPatch serves PATCH /sandboxes/{id}.
+func (s *Server) handleSandboxPatch(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	id := r.PathValue("id")
+
+	sb, err := s.store.GetSandbox(r.Context(), user.ID, id)
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+	var req struct {
+		KeepHot      *bool             `json:"keep_hot"`
+		Name         *string           `json:"name"`
+		LabelsAdd    map[string]string `json:"labels_add,omitempty"`
+		LabelsRemove []string          `json:"labels_remove,omitempty"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	// Apply rename first so any subsequent log lines (and the keep_hot
+	// wake path) reference the new name. Each field is independent;
+	// these are sequential DB writes, not a single transaction —
+	// acceptable since there is no consistency invariant between them.
+	if req.Name != nil && *req.Name != sb.Name {
+		newName := *req.Name
+		if !isValidName(newName) {
+			errResp(w, 400, "invalid sandbox name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
+			return
+		}
+		if err := s.store.RenameSandbox(r.Context(), user.ID, sb.ID, newName); err != nil {
+			if errors.Is(err, store.ErrConflict) {
+				errResp(w, 409, fmt.Sprintf("name %q is already in use", newName))
+				return
+			}
+			errRespInternal(w, r, "rename sandbox failed", err)
+			return
+		}
+		oldName := sb.Name
+		sb.Name = newName
+		slog.Info("sandbox.updated",
+			"sandbox_id", sb.ID, "old_name", oldName, "new_name", newName,
+			"user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{"old_name": oldName, "new_name": newName},
+		})
+	}
+	// Labels: validate, then merge via UpdateSandboxLabels.
+	if len(req.LabelsAdd) > 0 || len(req.LabelsRemove) > 0 {
+		if err := validateLabels(req.LabelsAdd); err != nil {
+			errResp(w, 400, err.Error())
+			return
+		}
+		if err := validateLabelKeys(req.LabelsRemove); err != nil {
+			errResp(w, 400, err.Error())
+			return
+		}
+		if err := s.store.UpdateSandboxLabels(r.Context(), user.ID, sb.ID, req.LabelsAdd, req.LabelsRemove); err != nil {
+			errRespInternal(w, r, "update labels failed", err)
+			return
+		}
+		// Refresh sb so the response reflects the new labels.
+		if refreshed, err := s.store.GetSandbox(r.Context(), user.ID, sb.ID); err == nil {
+			sb = refreshed
+		}
+		slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name,
+			"labels_added", len(req.LabelsAdd), "labels_removed", len(req.LabelsRemove),
+			"user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{
+				"name":           sb.Name,
+				"labels_added":   len(req.LabelsAdd),
+				"labels_removed": len(req.LabelsRemove),
+			},
+		})
+	}
+	if req.KeepHot != nil {
+		if err := s.store.UpdateSandboxKeepHot(r.Context(), sb.ID, *req.KeepHot); err != nil {
+			errRespInternal(w, r, "update keep_hot failed", err)
+			return
+		}
+		sb.KeepHot = *req.KeepHot
+		slog.Info("sandbox.updated", "sandbox_id", sb.ID, "name", sb.Name, "keep_hot", sb.KeepHot, "user", user.Name)
+		s.RecordEvent(store.Event{
+			Type: "sandbox.updated", UserID: user.ID, SandboxID: sb.ID,
+			Meta: map[string]any{"name": sb.Name, "keep_hot": sb.KeepHot},
+		})
+
+		// If setting keep_hot=true, wake the sandbox immediately.
+		if *req.KeepHot {
+			if err := s.ensureHot(r.Context(), sb.EngineID); err != nil {
+				errRespInternal(w, r, "wake sandbox failed", err)
+				return
+			}
+			sb.Status = "running"
+			s.store.UpdateSandboxStatus(detached(r.Context()), sb.ID, "running")
+		}
+	}
+	writeJSON(w, 200, sb)
+}
+
+func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return
@@ -1003,11 +949,8 @@ func (s *Server) handleSandboxStop(w http.ResponseWriter, r *http.Request, id st
 	writeJSON(w, 200, updated)
 }
 
-func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSandboxStart(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return

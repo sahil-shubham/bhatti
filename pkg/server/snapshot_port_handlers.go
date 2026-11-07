@@ -80,13 +80,12 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// handleSnapshotExport streams a named snapshot as an archive another host's
-// POST /snapshots/import takes in. GET /snapshots/:name/export[?include_base=true]
-func (s *Server) handleSnapshotExport(w http.ResponseWriter, r *http.Request, user *store.User, name string) {
-	if r.Method != http.MethodGet {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+// handleSnapshotExport serves GET /snapshots/{name}/export[?include_base=true]:
+// it streams a named snapshot as an archive another host's POST
+// /snapshots/import takes in.
+func (s *Server) handleSnapshotExport(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name := r.PathValue("name")
 	var includeBase bool
 	if v := r.URL.Query().Get("include_base"); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -134,7 +133,8 @@ func (s *Server) handleSnapshotExport(w http.ResponseWriter, r *http.Request, us
 
 // handleSnapshotImport registers a snapshot from an archive an export wrote,
 // under ?name= or the name it was exported with. POST /snapshots/import
-func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request, user *store.User) {
+func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
 	name := r.URL.Query().Get("name")
 	if name != "" && !isValidName(name) {
 		errResp(w, 400, "invalid snapshot name")

@@ -3,7 +3,6 @@ package server
 import (
 	"math"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -186,34 +185,33 @@ func retryAfterSeconds(d time.Duration) int {
 	return max(1, int(math.Ceil(d.Seconds())))
 }
 
-// classifyRequest determines the rate limit class for a request.
-// Tunnel upgrades use the read bucket (60 burst, 1200/min). A browser can
-// connect tens of local ports at once without exhausting the smaller exec
-// bucket, while upgrades still count against the user's general request limit.
-// Destroy is a read: tearing down what you own isn't what the create budget
-// guards, and sharing it made cleanup of a burst of sandboxes fail.
+// rateClasses are the routes that spend a bucket other than the read bucket,
+// keyed by the ServeMux pattern that matched. A route not listed here is a
+// read, which covers tunnel upgrades, destroy and resume among others.
+//
+//   - Tunnel upgrades use the read bucket (60 burst, 1200/min): a browser can
+//     connect tens of local ports at once without exhausting the smaller exec
+//     bucket, while upgrades still count against the user's general request
+//     limit.
+//   - Destroy is a read: tearing down what you own isn't what the create budget
+//     guards, and sharing it made cleanup of a burst of sandboxes fail.
+//   - exec is anything that starts or feeds a guest process: exec, the two
+//     websocket shells, and file writes.
+var rateClasses = map[string]string{
+	"POST /sandboxes":             bucketCreate,
+	"POST /sandboxes/{id}/exec":   bucketExec,
+	"GET /sandboxes/{id}/exec/ws": bucketExec,
+	"GET /sandboxes/{id}/ws":      bucketExec,
+	"PUT /sandboxes/{id}/files":   bucketExec,
+}
+
+// classifyRequest names the bucket r spends from. It goes by the route that
+// matched (r.Pattern, set before the limiter runs), never by looking inside the
+// path: a sandbox is free to be named "ws-1" or "exec-x", and a path that
+// merely contains "/ws" is not a websocket.
 func classifyRequest(r *http.Request) string {
-	path := r.URL.Path
-	if r.Method == http.MethodGet && strings.HasPrefix(path, "/sandboxes/") && strings.HasSuffix(path, "/tunnel") {
-		return bucketRead
+	if class, ok := rateClasses[r.Pattern]; ok {
+		return class
 	}
-
-	// Sandbox creation
-	if r.Method == http.MethodPost && path == "/sandboxes" {
-		return bucketCreate
-	}
-
-	// Exec and write operations
-	if r.Method == http.MethodPost && strings.Contains(path, "/exec") {
-		return bucketExec
-	}
-	if r.Method == http.MethodPut && strings.Contains(path, "/files") {
-		return bucketExec
-	}
-	if strings.Contains(path, "/ws") {
-		return bucketExec
-	}
-
-	// Everything else is a read
 	return bucketRead
 }

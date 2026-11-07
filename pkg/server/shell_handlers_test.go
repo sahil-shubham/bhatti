@@ -457,9 +457,11 @@ func TestShellWSConcurrentLimit(t *testing.T) {
 func TestShellPathTraversal(t *testing.T) {
 	_, ts, _ := setupShellTest(t)
 
-	// path.Clean normalizes traversals BEFORE they reach handleWebShell.
-	// /_shell/../health → /health (served normally, NOT as shell page)
-	// /_shell/sbx_abc/../../../etc/passwd → /etc/passwd (401 auth required)
+	// The mux redirects a non-canonical path to its cleaned form before any
+	// handler runs, and a request needs a key unless the route it cleans to is
+	// public:
+	// /_shell/../health → redirect to /health (served normally, NOT as shell page)
+	// /_shell/sbx_abc/../../../etc/passwd → no route, 401 auth required
 	// The key invariant: traversal never leaks shell HTML for non-shell paths,
 	// and never bypasses auth to reach internal endpoints.
 
@@ -469,7 +471,7 @@ func TestShellPathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	// path.Clean → /health → served as JSON health check. This proves
+	// redirect → /health → served as JSON health check. This proves
 	// traversal escapes the /_shell/ prefix, NOT that it serves shell content.
 	if resp.StatusCode != 200 {
 		t.Fatalf("/_shell/../health: expected 200 (health endpoint), got %d", resp.StatusCode)

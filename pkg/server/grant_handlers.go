@@ -338,11 +338,8 @@ func (s *Server) announceGrants(grants []store.SecretGrant, sandboxName, inherit
 }
 
 // handleSecretGrantCreate: POST /secrets/{name}/grants
-func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request, name string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
 	user := UserFromContext(r.Context())
 	var req struct {
 		Sandbox string   `json:"sandbox"`
@@ -398,10 +395,6 @@ func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request,
 
 // handleSecretGrants: GET /secrets/grants
 func (s *Server) handleSecretGrants(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		errResp(w, 405, "method not allowed")
-		return
-	}
 	user := UserFromContext(r.Context())
 	grants, err := s.store.ListSecretGrants(r.Context(), user.ID)
 	if err != nil {
@@ -423,11 +416,8 @@ func (s *Server) handleSecretGrants(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSecretGrantRevoke: DELETE /secrets/grants/{id}
-func (s *Server) handleSecretGrantRevoke(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodDelete {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSecretGrantRevoke(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	user := UserFromContext(r.Context())
 	g, err := s.store.GetSecretGrant(r.Context(), user.ID, id)
 	if err != nil {

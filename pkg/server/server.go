@@ -1,9 +1,7 @@
 package server
 
 import (
-	"bufio"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -129,7 +125,13 @@ type Server struct {
 	tunnels          map[string]map[*tunnelSession]struct{}
 	tunnelDestroying map[string]int
 
-	// Request counters (read by metrics snapshot goroutine)
+	// API routing: handler is the middleware chain over mux (apiHandler),
+	// public marks by pattern the routes served without a key (its keys are
+	// exactly the registered patterns).
+	handler http.Handler
+	public  map[string]bool
+
+	// Request counters, read by the metrics snapshot goroutine.
 	requestTotal  atomic.Int64
 	requestErrors atomic.Int64
 	authFailures  atomic.Int64
@@ -387,6 +389,7 @@ func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOptio
 		opt(s)
 	}
 	s.routes()
+	s.handler = s.apiHandler()
 	s.startTaskCleanup()
 	return s
 }
@@ -979,21 +982,22 @@ var ServerVersion = "dev"
 // Bump this when making breaking API changes that old CLIs can't handle.
 var MinCLIVersion = ""
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP implements http.Handler: it routes by Host in domain mode, and
+// sends everything for the API through apiHandler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Domain mode: route by Host header BEFORE auth.
-	// Proxy zone subdomains are served unauthenticated.
-	// API host falls through to normal auth flow.
+	// Domain mode: route by Host header before anything API-shaped happens.
+	// Proxy zone subdomains are served unauthenticated, and what they answer is
+	// an app's response, not the API's: it gets no request ID or version
+	// header. The API host and localhost go through the API chain.
 	// Requests on the local unix control socket are API calls by construction
 	// (the CLI sends Host "unix"), so they skip Host routing entirely.
 	if s.proxyZone != "" && !viaUnixSocket(r) {
 		host := stripPort(r.Host)
 
-		// API host and localhost always fall through to auth.
-		// Check BEFORE proxy zone match because api.bhatti.sh also
-		// matches *.bhatti.sh when proxy zone is bhatti.sh.
+		// Check the API host BEFORE the proxy zone match because api.bhatti.sh
+		// also matches *.bhatti.sh when the proxy zone is bhatti.sh.
 		if host == s.apiHost || host == "localhost" || host == "127.0.0.1" {
-			// fall through to auth
+			// an API request
 		} else if strings.HasSuffix(host, "."+s.proxyZone) {
 			alias := strings.TrimSuffix(host, "."+s.proxyZone)
 			if s.publicProxy != nil {
@@ -1007,98 +1011,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// Advertise server version on every API response so CLI clients can
-	// detect when an update is available (push, not pull).
-	w.Header().Set("X-Bhatti-Version", ServerVersion)
-	if MinCLIVersion != "" {
-		w.Header().Set("X-Bhatti-Min-CLI", MinCLIVersion)
-	}
-
-	// Normalize path before any checks to prevent path confusion attacks
-	cleanPath := path.Clean(r.URL.Path)
-
-	// Unauthenticated endpoints (exact match only)
-	if cleanPath == "/health" {
-		s.mux.ServeHTTP(w, r)
-		return
-	}
-
-	// Web shell (unauthenticated — token validated on WebSocket)
-	if strings.HasPrefix(cleanPath, "/_shell/") || cleanPath == "/_shell" {
-		s.handleWebShell(w, r, cleanPath)
-		return
-	}
-
-	// Extract bearer token from Authorization header only.
-	// No query parameter auth — eliminates token-in-URL leakage.
-	authHeader := r.Header.Get("Authorization")
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-	if token == "" || token == authHeader {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authorization required"})
-		return
-	}
-
-	// Hash the incoming token and look up user by hash.
-	hash := sha256Hex(token)
-	user, err := s.store.GetUserByKeyHash(r.Context(), hash)
-	if err != nil {
-		s.authFailures.Add(1)
-		slog.Warn("auth.failed", "ip", r.RemoteAddr)
-		s.RecordEvent(store.Event{
-			Type: "auth.failed",
-			Meta: map[string]any{"ip": r.RemoteAddr},
-		})
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api key"})
-		return
-	}
-
-	// Rate limiting per user. A refusal is logged like any request, naming the
-	// bucket so an operator can tell which budget to raise.
-	if ok, bucket, wait := s.limiter.Allow(user.ID, r); !ok {
-		s.rateLimited.Add(1)
-		secs := retryAfterSeconds(wait)
-		lim := s.limiter.bucketLimits(bucket)
-		slog.Info("request",
-			"method", r.Method,
-			"path", cleanPath,
-			"status", http.StatusTooManyRequests,
-			"user", user.Name,
-			"user_id", user.ID,
-			"rate_limit_bucket", bucket,
-			"retry_after_s", secs,
-		)
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		errRespCode(w, http.StatusTooManyRequests, codeRateLimited, fmt.Sprintf(
-			"rate limit exceeded: %s requests are limited to %g/min with a burst of %g (rate_limits.%s in the server config); retry in %ds",
-			bucket, lim.PerMinute, lim.Burst, bucket, secs))
-		return
-	}
-
-	// Generate request ID and attach user + request ID to context
-	reqID := generateRequestID()
-	ctx := context.WithValue(r.Context(), requestIDKey, reqID)
-	ctx = context.WithValue(ctx, userContextKey, user)
-
-	// Request logging
-	start := time.Now()
-	wrapped := &statusWriter{ResponseWriter: w, status: 200}
-	s.mux.ServeHTTP(wrapped, r.WithContext(ctx))
-
-	s.requestTotal.Add(1)
-	if wrapped.status >= 500 {
-		s.requestErrors.Add(1)
-	}
-
-	slog.Info("request",
-		"request_id", reqID,
-		"method", r.Method,
-		"path", cleanPath,
-		"status", wrapped.status,
-		"duration_ms", time.Since(start).Milliseconds(),
-		"user", user.Name,
-		"user_id", user.ID,
-	)
+	s.handler.ServeHTTP(w, r)
 }
 
 // viaUnixSocket reports whether r arrived on a unix-domain listener (the local
@@ -1106,43 +1019,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func viaUnixSocket(r *http.Request) bool {
 	_, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr)
 	return ok
-}
-
-// statusWriter wraps http.ResponseWriter to capture the status code.
-// It preserves Flusher and Hijacker interfaces for streaming and WebSocket.
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
-}
-
-func (w *statusWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
-	}
-	return nil, nil, fmt.Errorf("hijack not supported")
-}
-
-func generateRequestID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return "req_" + hex.EncodeToString(b)
-}
-
-// RequestIDFromContext extracts the request ID from context.
-func RequestIDFromContext(ctx context.Context) string {
-	id, _ := ctx.Value(requestIDKey).(string)
-	return id
 }
 
 func sha256Hex(s string) string {

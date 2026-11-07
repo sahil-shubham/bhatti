@@ -285,7 +285,7 @@ func TestManualWarmStopUncleanResultPersistsEvent(t *testing.T) {
 //
 // resolveID in the CLI returns names as-is when the name lookup hits, so
 // /sandboxes/<name>/start has the name in the URL. Before this fix,
-// handleSandboxStart and handleSandbox GET passed that URL parameter to
+// handleSandboxStart and handleSandboxGet passed that URL parameter to
 // store methods that key on the primary key (UpdateSandboxStatus,
 // UpdateSandboxEngine, GetSandboxByID). With a name as the
 // key, the UPDATE matches zero rows, returns no error, and silently leaves

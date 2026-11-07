@@ -22,34 +22,6 @@ import (
 //go:embed shell.html
 var shellHTML []byte
 
-// handleWebShell routes /_shell/:id and /_shell/:id/ws.
-func (s *Server) handleWebShell(w http.ResponseWriter, r *http.Request, cleanPath string) {
-	// Handle bare /_shell (path.Clean strips trailing slash)
-	if cleanPath == "/_shell" || cleanPath == "/_shell/" {
-		errResp(w, 404, "not found")
-		return
-	}
-
-	trimmed := strings.TrimPrefix(cleanPath, "/_shell/")
-	parts := strings.SplitN(trimmed, "/", 2)
-	sandboxID := parts[0]
-
-	if sandboxID == "" {
-		errResp(w, 404, "not found")
-		return
-	}
-
-	if len(parts) == 1 || parts[1] == "" {
-		s.serveShellHTML(w, r)
-		return
-	}
-	if parts[1] == "ws" {
-		s.handleShellWS(w, r, sandboxID)
-		return
-	}
-	errResp(w, 404, "not found")
-}
-
 // serveShellHTML serves the embedded xterm.js terminal page.
 // No token validation — the security boundary is the WebSocket.
 func (s *Server) serveShellHTML(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +52,9 @@ func (s *Server) serveShellHTML(w http.ResponseWriter, r *http.Request) {
 // handleShellWS upgrades to WebSocket, validates token via first message,
 // then relays terminal I/O. Security invariant: the handler never leaks
 // sandbox existence to an unauthenticated client.
-func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID string) {
+func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.PathValue("id")
+
 	// 1. Rate limit — per-IP cap on WebSocket connection attempts.
 	ip := r.RemoteAddr
 	if i := strings.LastIndex(ip, ":"); i >= 0 {
@@ -188,39 +162,41 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID
 	wsRelay(conn, term)
 }
 
-// handleShellToken handles POST (generate) and DELETE (revoke) for shell tokens.
-// Authenticated endpoint — sits behind the auth middleware via handleSandbox.
-func (s *Server) handleShellToken(w http.ResponseWriter, r *http.Request, id string) {
-	sb := s.getUserSandbox(w, r, id)
+// handleShellTokenCreate serves POST /sandboxes/{id}/shell-token: mints a new
+// web shell token, replacing any previous one.
+func (s *Server) handleShellTokenCreate(w http.ResponseWriter, r *http.Request) {
+	sb := s.getUserSandbox(w, r, r.PathValue("id"))
 	if sb == nil {
 		return
 	}
 
-	switch r.Method {
-	case "POST":
-		token := randomHex(32)
-		hash := sha256Hex(token)
-		if err := s.store.SetShellToken(r.Context(), sb.ID, hash); err != nil {
-			errResp(w, 500, "failed to set shell token")
-			return
-		}
-		url := fmt.Sprintf("https://%s/_shell/%s#token=%s", s.apiHost, sb.ID, token)
-		writeJSON(w, 200, map[string]string{
-			"token": token,
-			"url":   url,
-		})
-
-	case "DELETE":
-		if err := s.store.ClearShellToken(r.Context(), sb.ID); err != nil {
-			errResp(w, 500, "failed to revoke shell token")
-			return
-		}
-		s.shellSessions.DisconnectAll(sb.ID)
-		w.WriteHeader(204)
-
-	default:
-		errResp(w, 405, "method not allowed")
+	token := randomHex(32)
+	hash := sha256Hex(token)
+	if err := s.store.SetShellToken(r.Context(), sb.ID, hash); err != nil {
+		errResp(w, 500, "failed to set shell token")
+		return
 	}
+	url := fmt.Sprintf("https://%s/_shell/%s#token=%s", s.apiHost, sb.ID, token)
+	writeJSON(w, 200, map[string]string{
+		"token": token,
+		"url":   url,
+	})
+}
+
+// handleShellTokenRevoke serves DELETE /sandboxes/{id}/shell-token: clears the
+// token and disconnects live web shell sessions.
+func (s *Server) handleShellTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	sb := s.getUserSandbox(w, r, r.PathValue("id"))
+	if sb == nil {
+		return
+	}
+
+	if err := s.store.ClearShellToken(r.Context(), sb.ID); err != nil {
+		errResp(w, 500, "failed to revoke shell token")
+		return
+	}
+	s.shellSessions.DisconnectAll(sb.ID)
+	w.WriteHeader(204)
 }
 
 // randomHex returns n random bytes as a hex string (2n chars).

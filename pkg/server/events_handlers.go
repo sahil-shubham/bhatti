@@ -90,10 +90,6 @@ func (s *Server) EndEventStreams() { s.endEventStreams() }
 // caller's own cursor: a slow client only slows its own response, and an event
 // stored while the client was away is delivered when it next reads.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		errResp(w, 405, "method not allowed")
-		return
-	}
 	ctx := r.Context()
 	user := UserFromContext(ctx)
 	params := r.URL.Query()

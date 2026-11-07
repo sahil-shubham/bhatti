@@ -22,71 +22,59 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
-func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		list, err := s.store.ListTemplates(r.Context())
-		if err != nil {
-			errRespInternal(w, r, "list templates failed", err)
-			return
-		}
-		if list == nil {
-			list = []store.Template{}
-		}
-		writeJSON(w, 200, list)
-	case http.MethodPost:
-		var t store.Template
-		if err := readJSON(r, &t); err != nil {
-			errResp(w, 400, "invalid json: "+err.Error())
-			return
-		}
-		if t.ID == "" {
-			t.ID = genID()
-		}
-		if t.Engine == "" {
-			t.Engine = "firecracker"
-		}
-		if t.CPUs == 0 {
-			t.CPUs = 1
-		}
-		if t.MemoryMB == 0 {
-			t.MemoryMB = 2048
-		}
-		t.CreatedAt = time.Now()
-		if err := s.store.CreateTemplate(r.Context(), t); err != nil {
-			errRespInternal(w, r, "create template failed", err)
-			return
-		}
-		writeJSON(w, 201, t)
-	default:
-		errResp(w, 405, "method not allowed")
-	}
-}
-
-func (s *Server) handleTemplate(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/templates/")
-	if id == "" {
-		errResp(w, 400, "missing template id")
+func (s *Server) handleTemplateList(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListTemplates(r.Context())
+	if err != nil {
+		errRespInternal(w, r, "list templates failed", err)
 		return
 	}
-
-	switch r.Method {
-	case http.MethodGet:
-		t, err := s.store.GetTemplate(r.Context(), id)
-		if err != nil {
-			errResp(w, 404, "not found")
-			return
-		}
-		writeJSON(w, 200, t)
-	case http.MethodDelete:
-		if err := s.store.DeleteTemplate(r.Context(), id); err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		writeJSON(w, 200, map[string]string{"status": "deleted"})
-	default:
-		errResp(w, 405, "method not allowed")
+	if list == nil {
+		list = []store.Template{}
 	}
+	writeJSON(w, 200, list)
+}
+
+func (s *Server) handleTemplateCreate(w http.ResponseWriter, r *http.Request) {
+	var t store.Template
+	if err := readJSON(r, &t); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if t.ID == "" {
+		t.ID = genID()
+	}
+	if t.Engine == "" {
+		t.Engine = "firecracker"
+	}
+	if t.CPUs == 0 {
+		t.CPUs = 1
+	}
+	if t.MemoryMB == 0 {
+		t.MemoryMB = 2048
+	}
+	t.CreatedAt = time.Now()
+	if err := s.store.CreateTemplate(r.Context(), t); err != nil {
+		errRespInternal(w, r, "create template failed", err)
+		return
+	}
+	writeJSON(w, 201, t)
+}
+
+func (s *Server) handleTemplateGet(w http.ResponseWriter, r *http.Request) {
+	t, err := s.store.GetTemplate(r.Context(), r.PathValue("id"))
+	if err != nil {
+		errResp(w, 404, "not found")
+		return
+	}
+	writeJSON(w, 200, t)
+}
+
+func (s *Server) handleTemplateDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteTemplate(r.Context(), r.PathValue("id")); err != nil {
+		errResp(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 var upgrader = websocket.Upgrader{
@@ -104,291 +92,202 @@ type createSecretReq struct {
 	Value string `json:"value"`
 }
 
-func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSecretList(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-
-	switch r.Method {
-	case http.MethodGet:
-		list, err := s.store.ListUserSecrets(r.Context(), user.ID)
-		if err != nil {
-			errRespInternal(w, r, "list secrets failed", err)
-			return
-		}
-		if list == nil {
-			list = []store.SecretRecord{}
-		}
-		writeJSON(w, 200, list)
-	case http.MethodPost:
-		var req createSecretReq
-		if err := readJSON(r, &req); err != nil {
-			errResp(w, 400, "invalid json: "+err.Error())
-			return
-		}
-		if req.Name == "" || req.Value == "" {
-			errResp(w, 400, "name and value required")
-			return
-		}
-		// Encrypt the secret value before storing
-		ciphertext, err := s.encryptSecret([]byte(req.Value))
-		if err != nil {
-			errResp(w, 500, "encryption failed")
-			return
-		}
-		if err := s.store.SetSecret(r.Context(), user.ID, req.Name, ciphertext); err != nil {
-			errRespInternal(w, r, "store secret failed", err)
-			return
-		}
-		sr, _ := s.store.GetSecret(r.Context(), user.ID, req.Name)
-		writeJSON(w, 201, sr)
-	default:
-		errResp(w, 405, "method not allowed")
+	list, err := s.store.ListUserSecrets(r.Context(), user.ID)
+	if err != nil {
+		errRespInternal(w, r, "list secrets failed", err)
+		return
 	}
+	if list == nil {
+		list = []store.SecretRecord{}
+	}
+	writeJSON(w, 200, list)
 }
 
-func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSecretCreate(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-	name := strings.TrimPrefix(r.URL.Path, "/secrets/")
+	var req createSecretReq
+	if err := readJSON(r, &req); err != nil {
+		errResp(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.Name == "" || req.Value == "" {
+		errResp(w, 400, "name and value required")
+		return
+	}
+	// Encrypt the secret value before storing
+	ciphertext, err := s.encryptSecret([]byte(req.Value))
+	if err != nil {
+		errResp(w, 500, "encryption failed")
+		return
+	}
+	if err := s.store.SetSecret(r.Context(), user.ID, req.Name, ciphertext); err != nil {
+		errRespInternal(w, r, "store secret failed", err)
+		return
+	}
+	sr, _ := s.store.GetSecret(r.Context(), user.ID, req.Name)
+	writeJSON(w, 201, sr)
+}
+
+// handleSecretDelete serves DELETE /secrets/{name...}; the bare /secrets/ path
+// reaches it with an empty name.
+func (s *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name := r.PathValue("name")
 	if name == "" {
 		errResp(w, 400, "missing secret name")
 		return
 	}
-	// Grants live under /secrets: POST /secrets/{name}/grants mints one (a
-	// secret named "grants" included), GET /secrets/grants lists them,
-	// DELETE /secrets/grants/{id} revokes one.
-	if secret, ok := strings.CutSuffix(name, "/grants"); ok && r.Method == http.MethodPost && secret != "" && !strings.Contains(secret, "/") {
-		s.handleSecretGrantCreate(w, r, secret)
+	if err := s.store.DeleteSecret(r.Context(), user.ID, name); err != nil {
+		errResp(w, 404, err.Error())
 		return
 	}
-	if name == "grants" && r.Method != http.MethodDelete {
-		s.handleSecretGrants(w, r)
-		return
+	// A deleted secret takes its grants with it: re-creating the name later
+	// must not quietly revive access granted to the old one.
+	if err := s.store.DeleteSecretGrantsForSecret(r.Context(), user.ID, name); err != nil {
+		slog.Warn("secret.grants_cleanup", "secret", name, "error", err)
 	}
-	if id, ok := strings.CutPrefix(name, "grants/"); ok && id != "" && !strings.Contains(id, "/") {
-		s.handleSecretGrantRevoke(w, r, id)
-		return
-	}
-	switch r.Method {
-	case http.MethodDelete:
-		if err := s.store.DeleteSecret(r.Context(), user.ID, name); err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		// A deleted secret takes its grants with it: re-creating the name later
-		// must not quietly revive access granted to the old one.
-		if err := s.store.DeleteSecretGrantsForSecret(r.Context(), user.ID, name); err != nil {
-			slog.Warn("secret.grants_cleanup", "secret", name, "error", err)
-		}
-		writeJSON(w, 200, map[string]string{"status": "deleted"})
-	default:
-		errResp(w, 405, "method not allowed")
-	}
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 // --- Images (v0.3) ---
 
-func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleImageList(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-
-	switch r.Method {
-	case http.MethodGet:
-		list, err := s.store.ListImages(r.Context(), user.ID)
-		if err != nil {
-			errRespInternal(w, r, "list images failed", err)
-			return
-		}
-		if list == nil {
-			list = []store.ImageRecord{}
-		}
-		writeJSON(w, 200, list)
-	default:
-		errResp(w, 405, "method not allowed")
+	list, err := s.store.ListImages(r.Context(), user.ID)
+	if err != nil {
+		errRespInternal(w, r, "list images failed", err)
+		return
 	}
+	if list == nil {
+		list = []store.ImageRecord{}
+	}
+	writeJSON(w, 200, list)
 }
 
-func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleImageGet(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-	path := strings.TrimPrefix(r.URL.Path, "/images/")
-	if path == "" {
-		errResp(w, 400, "missing image name")
+	img, err := s.store.GetImage(r.Context(), user.ID, r.PathValue("name"))
+	if err != nil {
+		errResp(w, 404, err.Error())
 		return
 	}
+	writeJSON(w, 200, img)
+}
 
-	// Sub-route: POST /images/pull
-	if path == "pull" {
-		s.handleImagePull(w, r, user)
+func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name := r.PathValue("name")
+	img, err := s.store.GetImage(r.Context(), user.ID, name)
+	if err != nil {
+		errResp(w, 404, err.Error())
 		return
 	}
-
-	// Sub-route: POST /images/import
-	if path == "import" {
-		s.handleImageImport(w, r, user)
+	if err := s.store.DeleteImage(r.Context(), user.ID, name); err != nil {
+		errRespInternal(w, r, "delete image failed", err)
 		return
 	}
-
-	name := path
-
-	switch r.Method {
-	case http.MethodGet:
-		img, err := s.store.GetImage(r.Context(), user.ID, name)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		writeJSON(w, 200, img)
-	case http.MethodDelete:
-		img, err := s.store.GetImage(r.Context(), user.ID, name)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		if err := s.store.DeleteImage(r.Context(), user.ID, name); err != nil {
-			errRespInternal(w, r, "delete image failed", err)
-			return
-		}
-		if img.FilePath != "" {
-			os.Remove(img.FilePath)
-		}
-		slog.Info("image.deleted", "name", name, "user", user.Name)
-		s.RecordEvent(store.Event{
-			Type: "image.deleted", UserID: user.ID,
-			Meta: map[string]any{"name": name},
-		})
-		writeJSON(w, 200, map[string]string{"status": "deleted"})
-	default:
-		errResp(w, 405, "method not allowed")
+	if img.FilePath != "" {
+		os.Remove(img.FilePath)
 	}
+	slog.Info("image.deleted", "name", name, "user", user.Name)
+	s.RecordEvent(store.Event{
+		Type: "image.deleted", UserID: user.ID,
+		Meta: map[string]any{"name": name},
+	})
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 // --- Snapshots (v0.3) ---
 
-func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-
-	switch r.Method {
-	case http.MethodGet:
-		list, err := s.store.ListSnapshots(r.Context(), user.ID)
-		if err != nil {
-			errRespInternal(w, r, "list snapshots failed", err)
-			return
-		}
-		if list == nil {
-			list = []store.SnapshotRecord{}
-		}
-		writeJSON(w, 200, list)
-	default:
-		errResp(w, 405, "method not allowed")
+	list, err := s.store.ListSnapshots(r.Context(), user.ID)
+	if err != nil {
+		errRespInternal(w, r, "list snapshots failed", err)
+		return
 	}
+	if list == nil {
+		list = []store.SnapshotRecord{}
+	}
+	writeJSON(w, 200, list)
 }
 
-func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-	urlPath := strings.TrimPrefix(r.URL.Path, "/snapshots/")
-	parts := strings.SplitN(urlPath, "/", 2)
-	name := parts[0]
+	name := r.PathValue("name")
+	snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
+	if err != nil {
+		errResp(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, snap)
+}
 
-	if name == "" {
-		errResp(w, 400, "missing snapshot name")
+func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	name := r.PathValue("name")
+	snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
+	if err != nil {
+		errResp(w, 404, err.Error())
 		return
 	}
-
-	// Sub-route: POST /snapshots/:name/resume
-	if len(parts) == 2 && parts[1] == "resume" {
-		s.handleSnapshotResume(w, r, user, name)
+	if err := s.store.DeleteSnapshot(r.Context(), user.ID, name); err != nil {
+		errRespInternal(w, r, "delete snapshot failed", err)
 		return
 	}
-	// Sub-route: GET /snapshots/:name/export
-	if len(parts) == 2 && parts[1] == "export" {
-		s.handleSnapshotExport(w, r, user, name)
-		return
-	}
-	// POST /snapshots/import (POST /snapshots/:name is otherwise unused)
-	if len(parts) == 1 && name == "import" && r.Method == http.MethodPost {
-		s.handleSnapshotImport(w, r, user)
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		writeJSON(w, 200, snap)
-	case http.MethodDelete:
-		snap, err := s.store.GetSnapshot(r.Context(), user.ID, name)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		if err := s.store.DeleteSnapshot(r.Context(), user.ID, name); err != nil {
-			errRespInternal(w, r, "delete snapshot failed", err)
-			return
-		}
-		// Delete snapshot directory
-		snapDir := filepath.Dir(snap.MemPath)
-		os.RemoveAll(snapDir)
-		slog.Info("snapshot.deleted", "name", name, "user", user.Name)
-		s.RecordEvent(store.Event{
-			Type: "snapshot.deleted", UserID: user.ID,
-			Meta: map[string]any{"name": name},
-		})
-		writeJSON(w, 200, map[string]string{"status": "deleted"})
-	default:
-		errResp(w, 405, "method not allowed")
-	}
+	// Delete snapshot directory
+	snapDir := filepath.Dir(snap.MemPath)
+	os.RemoveAll(snapDir)
+	slog.Info("snapshot.deleted", "name", name, "user", user.Name)
+	s.RecordEvent(store.Event{
+		Type: "snapshot.deleted", UserID: user.ID,
+		Meta: map[string]any{"name": name},
+	})
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 // --- Tasks (v0.3) ---
 
-func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/tasks/")
-	if id == "" {
-		errResp(w, 400, "missing task id")
+func (s *Server) handleTaskGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	user := UserFromContext(r.Context())
+	task, err := s.store.GetTask(r.Context(), id)
+	if err != nil {
+		errResp(w, 404, err.Error())
 		return
 	}
-	user := UserFromContext(r.Context())
-
-	switch r.Method {
-	case http.MethodGet:
-		task, err := s.store.GetTask(r.Context(), id)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		if task.UserID != user.ID {
-			errResp(w, 404, "not found")
-			return
-		}
-		writeJSON(w, 200, task)
-	case http.MethodDelete:
-		task, err := s.store.GetTask(r.Context(), id)
-		if err != nil {
-			errResp(w, 404, err.Error())
-			return
-		}
-		if task.UserID != user.ID {
-			errResp(w, 404, "not found")
-			return
-		}
-		// Cancel running task via context cancellation
-		s.pullCancelMu.Lock()
-		if cancelFn, ok := s.pullCancels[id]; ok {
-			cancelFn()
-			delete(s.pullCancels, id)
-		}
-		s.pullCancelMu.Unlock()
-		s.store.FailTask(detached(r.Context()), id, "cancelled by user")
-		writeJSON(w, 200, map[string]string{"status": "cancelled"})
-	default:
-		errResp(w, 405, "method not allowed")
+	if task.UserID != user.ID {
+		errResp(w, 404, "not found")
+		return
 	}
+	writeJSON(w, 200, task)
 }
 
-// --- HTTP Reverse Proxy (tunneled through Engine) ---
+func (s *Server) handleTaskDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	user := UserFromContext(r.Context())
+	task, err := s.store.GetTask(r.Context(), id)
+	if err != nil {
+		errResp(w, 404, err.Error())
+		return
+	}
+	if task.UserID != user.ID {
+		errResp(w, 404, "not found")
+		return
+	}
+	// Cancel running task via context cancellation
+	s.pullCancelMu.Lock()
+	if cancelFn, ok := s.pullCancels[id]; ok {
+		cancelFn()
+		delete(s.pullCancels, id)
+	}
+	s.pullCancelMu.Unlock()
+	s.store.FailTask(detached(r.Context()), id, "cancelled by user")
+	writeJSON(w, 200, map[string]string{"status": "cancelled"})
+}
 
-// handleSandboxProxyRoute parses the port from the path and delegates.
-// Path format: ":port" or ":port/rest/of/path"
 type FileEngine interface {
 	FileRead(ctx context.Context, id, path string, w io.Writer, opts ...agent.FileReadOpts) (int64, string, error)
 	FileWrite(ctx context.Context, id, path, mode string, size int64, r io.Reader) error
@@ -396,13 +295,9 @@ type FileEngine interface {
 	FileList(ctx context.Context, id, path string) ([]proto.FileInfo, error)
 }
 
-// --- Sessions ---
-
-func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+// handleSandboxCheckpoint serves POST /sandboxes/{id}/checkpoint.
+func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	user := UserFromContext(r.Context())
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
@@ -490,11 +385,9 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 
 // --- Snapshot Resume ---
 
-func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, user *store.User, snapName string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	snapName := r.PathValue("name")
 
 	var req struct {
 		Name    string `json:"name"`     // new sandbox name
@@ -668,11 +561,8 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 
 // --- Image Pull (async) ---
 
-func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *store.User) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
 	var req struct {
 		Ref  string `json:"ref"`            // e.g. "python:3.12"
 		Name string `json:"name"`           // e.g. "python-3.12"
@@ -796,11 +686,8 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request, user *s
 
 // --- Import Image (tarball → ext4) ---
 
-func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request, user *store.User) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
 
 	name := r.URL.Query().Get("name")
 	if name == "" || !isValidName(name) {
@@ -884,11 +771,8 @@ func (s *Server) loharAvailable(w http.ResponseWriter) bool {
 
 // --- Save Image (sandbox rootfs → image) ---
 
-func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	user := UserFromContext(r.Context())
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {

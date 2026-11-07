@@ -65,36 +65,10 @@ func generateUniqueAlias(ctx context.Context, st *store.Store, sandboxName strin
 	return "", fmt.Errorf("failed to generate unique alias after 4 attempts")
 }
 
-func (s *Server) handleSandboxPublish(w http.ResponseWriter, r *http.Request, id, sub string) {
-	switch r.Method {
-	case "POST":
-		if sub != "" && sub != "/" {
-			errResp(w, 404, "not found")
-			return
-		}
-		s.handlePublish(w, r, id)
-	case "GET":
-		if sub != "" && sub != "/" {
-			errResp(w, 404, "not found")
-			return
-		}
-		s.handleListPublishRules(w, r, id)
-	case "DELETE":
-		portStr := strings.TrimPrefix(sub, "/")
-		port, err := strconv.Atoi(portStr)
-		if err != nil || port < 1 || port > 65535 {
-			errResp(w, 400, "invalid port in path")
-			return
-		}
-		s.handleUnpublish(w, r, id, port)
-	default:
-		errResp(w, 405, "method not allowed")
-	}
-}
-
-func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID string) {
+// handlePublish serves POST /sandboxes/{id}/publish.
+func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
-	sb := s.getUserSandbox(w, r, sandboxID)
+	sb := s.getUserSandbox(w, r, r.PathValue("id"))
 	if sb == nil {
 		return
 	}
@@ -190,8 +164,9 @@ func (s *Server) idleStopWarning(sb *store.Sandbox) string {
 		"port won't be running when the URL wakes it. Start the app from --init (create --init \"...\") or set --keep-hot."
 }
 
-func (s *Server) handleListPublishRules(w http.ResponseWriter, r *http.Request, sandboxID string) {
-	sb := s.getUserSandbox(w, r, sandboxID)
+// handleListPublishRules serves GET /sandboxes/{id}/publish.
+func (s *Server) handleListPublishRules(w http.ResponseWriter, r *http.Request) {
+	sb := s.getUserSandbox(w, r, r.PathValue("id"))
 	if sb == nil {
 		return
 	}
@@ -211,9 +186,15 @@ func (s *Server) handleListPublishRules(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, 200, resp)
 }
 
-func (s *Server) handleUnpublish(w http.ResponseWriter, r *http.Request, sandboxID string, port int) {
+// handleUnpublish serves DELETE /sandboxes/{id}/publish/{port}.
+func (s *Server) handleUnpublish(w http.ResponseWriter, r *http.Request) {
+	port, err := strconv.Atoi(r.PathValue("port"))
+	if err != nil || port < 1 || port > 65535 {
+		errResp(w, 400, "invalid port in path")
+		return
+	}
 	user := UserFromContext(r.Context())
-	sb := s.getUserSandbox(w, r, sandboxID)
+	sb := s.getUserSandbox(w, r, r.PathValue("id"))
 	if sb == nil {
 		return
 	}

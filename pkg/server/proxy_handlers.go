@@ -25,11 +25,8 @@ type portInfo struct {
 	ProxyURL      string `json:"proxy_url"`
 }
 
-func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodGet {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return
@@ -55,10 +52,6 @@ func (s *Server) handleSandboxPorts(w http.ResponseWriter, r *http.Request, id s
 }
 
 func (s *Server) handleAllPorts(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		errResp(w, 405, "method not allowed")
-		return
-	}
 	user := UserFromContext(r.Context())
 	sandboxes, err := s.store.ListSandboxes(r.Context(), user.ID)
 	if err != nil {
@@ -89,7 +82,11 @@ func (s *Server) handleAllPorts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-func (s *Server) handleSandboxProxyRoute(w http.ResponseWriter, r *http.Request, sandboxID, portPath string) {
+// handleSandboxProxyRoute serves ANY /sandboxes/{id}/proxy/{portPath...}: the
+// first segment of portPath is the guest port, the remainder the upstream path.
+func (s *Server) handleSandboxProxyRoute(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.PathValue("id")
+	portPath := r.PathValue("portPath")
 	// Split "4321/some/path" → port=4321, rest="/some/path"
 	portStr := portPath
 	rest := "/"

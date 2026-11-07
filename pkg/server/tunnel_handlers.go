@@ -23,11 +23,8 @@ type tunnelSession struct {
 	cancel context.CancelFunc
 }
 
-func (s *Server) handleSandboxTunnel(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodGet {
-		errResp(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
+func (s *Server) handleSandboxTunnel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return

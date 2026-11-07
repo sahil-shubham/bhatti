@@ -29,11 +29,8 @@ type execReq struct {
 	Sync       bool     `json:"sync,omitempty"`        // flush guest filesystems before EXIT
 }
 
-func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodPost {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSandboxExec(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return
@@ -255,7 +252,8 @@ func (s *Server) handleSandboxExecStream(w http.ResponseWriter, r *http.Request,
 	emit(engine.StreamEvent{Type: "exit", ExitCode: &code})
 }
 
-func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request, id string) {
+func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return
@@ -475,7 +473,8 @@ func wsRelay(conn *websocket.Conn, term engine.TerminalConn) {
 
 // --- Piped Sessions (WebSocket) ---
 
-func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request, id string) {
+func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return
@@ -756,11 +755,8 @@ func pipedWSRelay(conn *websocket.Conn, pc engine.PipedConn, streams *streamSet)
 
 // --- Sessions ---
 
-func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodGet {
-		errResp(w, 405, "method not allowed")
-		return
-	}
+func (s *Server) handleSandboxSessions(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	sb := s.getUserSandbox(w, r, id)
 	if sb == nil {
 		return

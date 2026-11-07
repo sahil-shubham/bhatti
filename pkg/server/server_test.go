@@ -1236,7 +1236,11 @@ func TestRequestHasID(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestClassifyRequest checks the bucket each request spends from. The bucket
+// follows the route that matched, not the words in the path: a sandbox is
+// free to be named "ws-1" or "exec-x".
 func TestClassifyRequest(t *testing.T) {
+	srv, _ := setup(t)
 	tests := []struct {
 		method string
 		path   string
@@ -1244,6 +1248,7 @@ func TestClassifyRequest(t *testing.T) {
 	}{
 		{"POST", "/sandboxes", "create"},
 		{"POST", "/sandboxes/abc/exec", "exec"},
+		{"GET", "/sandboxes/abc/exec/ws", "exec"},
 		{"PUT", "/sandboxes/abc/files?path=/test", "exec"},
 		{"GET", "/sandboxes/abc/ws", "exec"},
 		{"GET", "/sandboxes/abc/tunnel?port=8080", "read"},
@@ -1254,11 +1259,48 @@ func TestClassifyRequest(t *testing.T) {
 		{"DELETE", "/sandboxes/abc", "read"},
 		{"GET", "/templates", "read"},
 		{"POST", "/secrets", "read"},
+
+		// Reads that look like writes.
+		{"GET", "/sandboxes/abc/files?path=/test", "read"},
+		{"HEAD", "/sandboxes/abc/files?path=/test", "read"},
+		{"POST", "/sandboxes/abc/stop", "read"},
+		{"POST", "/sandboxes/abc/start", "read"},
+		{"POST", "/snapshots/abc/resume", "read"},
+		{"GET", "/nowhere", "read"},
+		{"POST", "/sandboxes/abc/exec/ws", "read"}, // wrong method: the router answers 405
+
+		// Whatever a guest app serves under /proxy is a read, even a path that
+		// is spelled like an exec or a websocket.
+		{"POST", "/sandboxes/abc/proxy/8080/api/exec", "read"},
+		{"GET", "/sandboxes/abc/proxy/8080/ws", "read"},
+
+		// Names that contain what used to be matched as substrings of the path.
+		{"GET", "/sandboxes/ws-1", "read"},
+		{"PATCH", "/sandboxes/ws-1", "read"},
+		{"DELETE", "/sandboxes/ws-1", "read"},
+		{"POST", "/sandboxes/ws-1/stop", "read"},
+		{"GET", "/sandboxes/ws-1/ports", "read"},
+		{"GET", "/sandboxes/exec-x", "read"},
+		{"POST", "/sandboxes/exec-x/stop", "read"},
+		{"POST", "/sandboxes/exec-x/start", "read"},
+		{"POST", "/sandboxes/exec-x/checkpoint", "read"},
+		{"GET", "/volumes/ws-data", "read"},
+		{"POST", "/volumes/exec-data/resize", "read"},
+		{"GET", "/images/wsl", "read"},
+		{"DELETE", "/secrets/ws-token", "read"},
+		{"POST", "/secrets/exec-key/grants", "read"},
+		{"GET", "/snapshots/ws-snap/export", "read"},
+
+		// And a route that is an exec keeps its bucket under any name.
+		{"POST", "/sandboxes/ws-1/exec", "exec"},
+		{"POST", "/sandboxes/exec-x/exec", "exec"},
+		{"GET", "/sandboxes/exec-x/ws", "exec"},
+		{"GET", "/sandboxes/ws-1/exec/ws", "exec"},
+		{"PUT", "/sandboxes/files-1/files?path=/x", "exec"},
 	}
 
 	for _, tt := range tests {
-		r, _ := http.NewRequest(tt.method, "http://localhost"+tt.path, nil)
-		got := classifyRequest(r)
+		got := classifyRequest(matchedRequest(t, srv, tt.method, tt.path))
 		if got != tt.want {
 			t.Errorf("%s %s: got %q, want %q", tt.method, tt.path, got, tt.want)
 		}
