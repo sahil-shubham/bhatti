@@ -92,6 +92,7 @@ func newKrucibleEngine(cfg *pkg.Config) (engine.Engine, error) {
 	}
 
 	return krucible.New(krucible.Config{
+		Cgroups:      string(cfg.Cgroups),
 		DataDir:      cfg.DataDir,
 		BaseRootfs:   cfg.KrucibleRootfs,
 		BaseImage:    cfg.KrucibleBaseImage,

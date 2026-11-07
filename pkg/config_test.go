@@ -315,6 +315,57 @@ func TestLoadConfigNoFile(t *testing.T) {
 	}
 }
 
+func TestConfigCgroupsYAML(t *testing.T) {
+	cfg := &Config{}
+	if err := yaml.Unmarshal([]byte("cgroups: systemd\n"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cgroups != CgroupsSystemd {
+		t.Fatalf("Cgroups = %q, want systemd", cfg.Cgroups)
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := &Config{}
+	if err := yaml.Unmarshal(out, back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Cgroups != CgroupsSystemd {
+		t.Fatalf("round-trip Cgroups = %q, want systemd", back.Cgroups)
+	}
+
+	def := &Config{}
+	if err := yaml.Unmarshal([]byte("engine: krucible\n"), def); err != nil {
+		t.Fatal(err)
+	}
+	if def.Cgroups != "" {
+		t.Fatalf("default Cgroups = %q, want empty", def.Cgroups)
+	}
+	data, _ := yaml.Marshal(&Config{})
+	if strings.Contains(string(data), "cgroups") {
+		t.Fatalf("unset cgroups should be omitted:\n%s", data)
+	}
+}
+
+func TestCgroupsModeValidate(t *testing.T) {
+	for _, tc := range []struct {
+		mode CgroupsMode
+		ok   bool
+	}{
+		{"", true}, {"auto", true}, {"systemd", true}, {"none", true},
+		{"Systemd", false}, {"cgroup", false}, {"yes", false},
+	} {
+		err := tc.mode.Validate()
+		if (err == nil) != tc.ok {
+			t.Errorf("Validate(%q) = %v, want ok=%v", tc.mode, err, tc.ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), "cgroups must be auto, systemd or none") {
+			t.Errorf("Validate(%q) error %q doesn't name the key and allowed values", tc.mode, err)
+		}
+	}
+}
+
 // TestRateLimitsValidate: the daemon refuses budgets that could never admit a
 // request instead of starting with an API that answers 429 to everything.
 func TestRateLimitsValidate(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
@@ -33,10 +34,14 @@ func (s *Server) routes() {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{
+	h := map[string]any{
 		"status": "ok",
 		"uptime": time.Since(s.startTime).Round(time.Second).String(),
-	})
+	}
+	if cr, ok := s.engine.(engine.CgroupReporter); ok {
+		h["cgroups"] = cr.CgroupStatus()
+	}
+	writeJSON(w, 200, h)
 }
 
 // --- Templates ---

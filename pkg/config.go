@@ -49,6 +49,14 @@ type Config struct {
 	// RateLimits overrides the per-user API request budgets.
 	RateLimits RateLimits `yaml:"rate_limits,omitempty"`
 
+	// Cgroups selects per-sandbox cgroup placement: "auto" (default) uses
+	// systemd transient units when PID 1 is systemd, cgroup v2 is mounted and
+	// the system bus lets bhatti start units, else "none" with the reason
+	// logged and reported on /health; "systemd" is required: the daemon
+	// refuses to start without it and a failed placement fails the create;
+	// "none" disables placement.
+	Cgroups CgroupsMode `yaml:"cgroups,omitempty"`
+
 	// Krucible-specific (libkrun engine; macOS + Linux)
 	KrucibleVMM         string `yaml:"krucible_vmm"`          // path to the bhatti-vmm helper (default: next to binary / PATH)
 	KrucibleRootfs      string `yaml:"krucible_rootfs"`       // base rootfs dir (with /init.krun=lohar) the block-root base image is built from when krucible_base_image is unset
@@ -95,6 +103,25 @@ func (l RateLimits) Validate() error {
 		}
 	}
 	return nil
+}
+
+// CgroupsMode selects how sandbox helper processes are placed into cgroups.
+type CgroupsMode string
+
+const (
+	CgroupsAuto    CgroupsMode = "auto"
+	CgroupsSystemd CgroupsMode = "systemd"
+	CgroupsNone    CgroupsMode = "none"
+)
+
+// Validate accepts "" (auto) and the three named modes. Matching is
+// case-sensitive so a typo can't silently fall back to a weaker mode.
+func (m CgroupsMode) Validate() error {
+	switch m {
+	case "", CgroupsAuto, CgroupsSystemd, CgroupsNone:
+		return nil
+	}
+	return fmt.Errorf("cgroups must be auto, systemd or none (got %q)", string(m))
 }
 
 // BackupConfig configures volume backup to S3-compatible object storage.

@@ -70,6 +70,10 @@ func runDaemon() {
 		slog.Error("load config", "error", err)
 		os.Exit(1)
 	}
+	if err := cfg.Cgroups.Validate(); err != nil {
+		slog.Error("invalid cgroups", "error", err)
+		os.Exit(1)
+	}
 	if cfg.ConfigPath != "" {
 		slog.Info("config loaded", "path", cfg.ConfigPath)
 	} else {
