@@ -4,7 +4,8 @@
 # Detects platform and existing installation to do the right thing:
 #   Linux / macOS (fresh)  → prompt: CLI or self-hosted server
 #   CLI install            → update the CLI binary
-#   server install         → update all server components
+#   server install         → update all server components; the release is
+#                            downloaded and verified before the daemon is stopped
 # Both Linux (KVM) and macOS (Apple Silicon/HVF) can run the full self-hosted
 # stack; the only per-OS differences are the hypervisor preflight and the
 # service manager (systemd on Linux, launchd on macOS).
@@ -47,6 +48,7 @@ fi
 GITHUB_REPO="sahil-shubham/bhatti"
 DATA_DIR="/var/lib/bhatti"
 CONFIG_DIR="/etc/bhatti"  # tests may point this at a temporary directory after sourcing
+SYSTEMD_UNIT="/etc/systemd/system/bhatti.service"  # likewise
 # Order matters: drives the order in user-facing hints ("outdated on disk:
 # computer, browser" follows ALL_KNOWN_TIERS order, not insertion order).
 ALL_KNOWN_TIERS="minimal browser docker computer"
@@ -156,6 +158,7 @@ _cleanup() {
     rm -f "${BHATTI_STAGE_FILE:-}" 2>/dev/null || true
     rm -f "$DATA_DIR"/images/*.zst.tmp 2>/dev/null || true
     rm -f "$DATA_DIR"/images/bases/.*.tmp* "$DATA_DIR"/images/.rootfs-*.link.tmp.* 2>/dev/null || true
+    discard_staged_update 2>/dev/null || true
     if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
     fi
@@ -318,26 +321,6 @@ download_large() {
     fi
 }
 
-# download_pipe URL CMD... — stream a download into a command (e.g. tar, zstd).
-# Validates that curl succeeds and the pipeline produces output.
-download_pipe() {
-    local url="$1"; shift
-
-    # Use a temp file for curl errors since we're in a pipeline
-    local err_file
-    err_file=$(mktemp)
-
-    if ! curl "${CURL_NET_OPTS[@]}" -fsSL "$url" 2>"$err_file" | "$@"; then
-        local curl_err
-        curl_err=$(cat "$err_file")
-        rm -f "$err_file"
-        die "download + extract failed: $url" \
-            "${curl_err:-pipeline failed}" \
-            "Check your network connection and disk space."
-    fi
-    rm -f "$err_file"
-}
-
 # ── Checksum verification ─────────────────────────────
 
 CHECKSUMS=""
@@ -385,11 +368,11 @@ is_up_to_date() {
 #
 # Why this exists separately from is_up_to_date():
 # Rootfs is the one component where the local file (.ext4) is NOT what the
-# release ships (.ext4.zst). install_rootfs() stores the *compressed*
-# checksum in a .sha256 sidecar after a successful install, and uses that
-# sidecar for its own skip-if-fresh check. The do_server_update() outer
-# gate must use the same predicate, otherwise it can short-circuit before
-# install_rootfs() ever gets a chance to look — which is exactly the bug
+# release ships (.ext4.zst). flip_staged_rootfs() stores the *compressed*
+# checksum in a .sha256 sidecar once a tier is installed, and stage_rootfs()
+# uses that sidecar for its own skip-if-fresh check. The do_server_update()
+# outer gate must use the same predicate, otherwise it can short-circuit before
+# stage_rootfs() ever gets a chance to look — which is exactly the bug
 # that hid stale tier images behind `bhatti update --tiers <X>`.
 all_rootfs_up_to_date() {
     local tier rootfs cks_file expected stored
@@ -646,31 +629,74 @@ ensure_zstd() {
         || die "failed to install zstd" "Install it manually and re-run."
 }
 
-# install_bundle downloads the per-platform v2 runtime bundle
+# ── Staged installs ───────────────────────────────────
+# An install is two halves. stage_* fetches, verifies and unpacks a release into
+# hidden files beside the paths they will replace (same filesystem, so nothing is
+# copied later); commit_bundle and flip_staged_rootfs then put them in place with
+# rename(2). A server update runs every stage_* while the daemon is still serving:
+# a failed download, checksum or unpack aborts with the daemon untouched, and it
+# is stopped only for the checks and renames that follow.
+#
+# Renaming over a path instead of writing into it also keeps running guests
+# intact: their bhatti-vmm, bhatti-netd, libkrun and base image stay mapped from
+# the old inodes, which an in-place overwrite would change under them.
+STAGE_DIR=""       # scratch dir holding the unpacked bundle and the staged runtime
+STAGED_RUNTIME=""  # new runtime tree, inside STAGE_DIR
+STAGED_CLI=""      # new CLI, hidden beside STAGED_CLI_DEST
+STAGED_CLI_DEST=""
+STAGED_ROOTFS=""   # newline-separated "tier<TAB>staged file<TAB>base name<TAB>release sha256"
+
+# discard_staged_update removes whatever stage_* left behind and forgets it.
+# Idempotent, and the EXIT trap runs it, so an aborted update leaves no
+# multi-gigabyte temp files behind.
+discard_staged_update() {
+    local file
+    if [ -n "${STAGED_ROOTFS:-}" ]; then
+        while IFS=$'\t' read -r _ file _; do
+            [ -z "$file" ] || rm -f "$file"
+        done <<< "$STAGED_ROOTFS"
+    fi
+    [ -z "${STAGED_CLI:-}" ] || $SUDO rm -f "$STAGED_CLI" 2>/dev/null || true
+    [ -z "${STAGE_DIR:-}" ] || rm -rf "$STAGE_DIR"
+    STAGE_DIR="" STAGED_RUNTIME="" STAGED_CLI="" STAGED_CLI_DEST="" STAGED_ROOTFS=""
+}
+
+# stage_bundle downloads and verifies the per-platform v2 runtime bundle
 # (bhatti-<ver>-<os>-<arch>.tar.zst = CLI + bhatti-vmm + bhatti-netd + libkrun +
-# lean kernel), verifies it, installs the CLI to /usr/local/bin, and — when the
-# first arg is 1 — lays the krucible runtime under $DATA_DIR/runtime (consumed by
-# generate_config, and sets RUNTIME_DIR). One self-contained bundle IS the v2
-# install; there are no separate vmm/libkrun/kernel assets to chase.
-install_bundle() {
+# lean kernel), stages the CLI beside its destination and — when the first arg
+# is 1 — the krucible runtime that generate_config consumes, ready to be renamed
+# into $DATA_DIR/runtime. One self-contained bundle IS the v2 install; there are
+# no separate vmm/libkrun/kernel assets to chase.
+stage_bundle() {
     local want_runtime="${1:-0}"
     local asset="bhatti-${VERSION}-${OS}-${ARCH}.tar.zst"
     ensure_zstd
 
-    local tmp stage
+    local tmp unpack root dest_dir
     tmp=$(mktemp "${TMPDIR:-/tmp}/bhatti-bundle.XXXXXX") || die "could not create temp file"
     BHATTI_STAGE_FILE="$tmp"
-    stage=$(mktemp -d "${TMPDIR:-/tmp}/bhatti-stage.XXXXXX") || die "could not create temp dir"
+    if [ "$want_runtime" = "1" ]; then
+        # The runtime is renamed into $DATA_DIR/runtime, so it is unpacked there.
+        mkdir -p "$DATA_DIR" || die "could not create ${DATA_DIR}"
+        # An update killed outright (SIGKILL, power loss) can't clean up after
+        # itself; day-old stage dirs are surely not a live update's.
+        find "$DATA_DIR/" -maxdepth 1 -name '.install-stage.*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+        STAGE_DIR=$(mktemp -d "$DATA_DIR/.install-stage.XXXXXX") \
+            || die "could not create a staging directory in ${DATA_DIR}"
+    else
+        STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/bhatti-stage.XXXXXX") || die "could not create temp dir"
+    fi
+    unpack="$STAGE_DIR/unpack"
+    mkdir "$unpack" || die "could not create ${unpack}"
 
     download "${RELEASE_URL}/${asset}" "$tmp"
     verify_checksum "$tmp" "$asset"
-    zstd -dc "$tmp" | tar -xf - -C "$stage" || die "failed to extract ${asset}"
+    # --no-same-owner: the tarball records the CI user's uid, and the root
+    # daemon executes what is unpacked here.
+    zstd -dc "$tmp" | tar --no-same-owner -xf - -C "$unpack" || die "failed to extract ${asset}"
     rm -f "$tmp"
 
-    local root
-    # -mindepth 1 so we don't match $stage itself (it's named bhatti-stage.XXXX,
-    # which also matches bhatti-*) — we want the extracted bhatti-<ver>-... subdir.
-    root=$(find "$stage" -mindepth 1 -maxdepth 1 -type d -name 'bhatti-*' | head -1)
+    root=$(find "$unpack" -mindepth 1 -maxdepth 1 -type d -name 'bhatti-*' | head -1)
     if [ -z "$root" ] || [ ! -x "$root/bin/bhatti" ]; then
         die "unexpected bundle layout (no bin/bhatti in ${asset})"
     fi
@@ -681,117 +707,81 @@ install_bundle() {
     "$root/bin/bhatti" version >/dev/null 2>&1 \
         || die "downloaded bhatti failed to execute (wrong platform or corrupt download)"
 
-    # Install the CLI.
-    local dest="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
-    local dest_dir; dest_dir=$(dirname "$dest")
-    if [ ! -d "$dest_dir" ] || [ ! -w "$dest_dir" ] || { [ -e "$dest" ] && [ ! -w "$dest" ]; }; then
-        need_sudo "install bhatti to ${dest}"
+    # Stage the CLI in its destination directory: replacing it is then one
+    # rename. BHATTI_TEST_BIN_DEST lets the smoke test redirect the install away
+    # from /usr/local/bin so it doesn't clobber a developer's real bhatti.
+    STAGED_CLI_DEST="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
+    dest_dir=$(dirname "$STAGED_CLI_DEST")
+    if [ ! -d "$dest_dir" ] || [ ! -w "$dest_dir" ] || { [ -e "$STAGED_CLI_DEST" ] && [ ! -w "$STAGED_CLI_DEST" ]; }; then
+        need_sudo "install bhatti to ${STAGED_CLI_DEST}"
     else
         SUDO=""
     fi
     [ -d "$dest_dir" ] || $SUDO mkdir -p "$dest_dir"
-    { [ -f "$dest" ] && $SUDO cp "$dest" "${dest}.old" 2>/dev/null; } || true
-    $SUDO install -m 0755 "$root/bin/bhatti" "$dest" || die "failed to install bhatti to ${dest}"
+    # Likewise a staged CLI that a killed update left behind.
+    $SUDO find "$dest_dir/" -maxdepth 1 -name '.bhatti.new.*' -mmin +1440 -exec rm -f {} + 2>/dev/null || true
+    STAGED_CLI="$dest_dir/.bhatti.new.$$"
+    $SUDO install -m 0755 "$root/bin/bhatti" "$STAGED_CLI" \
+        || die "failed to stage bhatti in ${dest_dir}"
 
-    # Runtime (server / local daemon): vmm + netd + libkrun + lean kernel.
     if [ "$want_runtime" = "1" ]; then
+        STAGED_RUNTIME="$STAGE_DIR/runtime"
+        mkdir "$STAGED_RUNTIME" || die "could not create ${STAGED_RUNTIME}"
+        chmod 0755 "$STAGED_RUNTIME"
+        mv "$root/bin" "$root/lib" "$root/kernel" "$STAGED_RUNTIME/" \
+            || die "unexpected bundle layout (need bin/, lib/ and kernel/ in ${asset})"
+        chmod +x "$STAGED_RUNTIME/bin/"* 2>/dev/null || true
+        chmod -R go-w "$STAGED_RUNTIME"
+    else
+        rm -rf "$STAGE_DIR"
+        STAGE_DIR=""
+    fi
+}
+
+# replace_dir NEW DEST puts the directory NEW where DEST is, with two renames.
+# The tree it displaces is parked in STAGE_DIR; discard_staged_update removes it.
+replace_dir() {
+    local new="$1" dest="$2" old
+    old="$STAGE_DIR/replaced.$(basename "$dest")"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        mv "$dest" "$old" || die "could not move ${dest} aside"
+    fi
+    mv "$new" "$dest" || {
+        [ ! -e "$old" ] || mv "$old" "$dest" || true
+        die "could not move ${new} into place at ${dest}"
+    }
+}
+
+# commit_bundle puts what stage_bundle staged in place: the runtime tree, then
+# the CLI, keeping the previous CLI as ${dest}.old for manual rollback. The CLI
+# goes last because it is what installed_bhatti_version reads: an interrupted
+# swap still looks outdated, and the next update redoes it instead of calling
+# itself done.
+commit_bundle() {
+    if [ -n "${STAGED_RUNTIME:-}" ]; then
         RUNTIME_DIR="$DATA_DIR/runtime"
-        rm -rf "$RUNTIME_DIR"
-        mkdir -p "$RUNTIME_DIR"
-        cp -R "$root/bin" "$root/lib" "$root/kernel" "$RUNTIME_DIR/"
-        chmod +x "$RUNTIME_DIR/bin/"* 2>/dev/null || true
-        if [ "$OS" = "darwin" ]; then
-            xattr -dr com.apple.quarantine "$RUNTIME_DIR" 2>/dev/null || true
-        fi
+        replace_dir "$STAGED_RUNTIME" "$RUNTIME_DIR"
+        STAGED_RUNTIME=""
     fi
-    rm -rf "$stage"
+    if [ -n "${STAGED_CLI:-}" ]; then
+        { [ -f "$STAGED_CLI_DEST" ] && $SUDO cp "$STAGED_CLI_DEST" "${STAGED_CLI_DEST}.old" 2>/dev/null; } || true
+        $SUDO mv -f "$STAGED_CLI" "$STAGED_CLI_DEST" \
+            || die "failed to install bhatti to ${STAGED_CLI_DEST}"
+        STAGED_CLI=""
+    fi
 }
 
-install_bhatti_binary() {
-    local binary="bhatti-${OS}-${ARCH}"
-    # BHATTI_TEST_BIN_DEST lets the smoke test redirect the install away
-    # from /usr/local/bin so it doesn't clobber a developer's real bhatti.
-    local dest="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
-    local dest_dir
-    dest_dir=$(dirname "$dest")
-
-    # Stage to a user-writable tmp file. mktemp picks $TMPDIR (per-user
-    # on macOS, /tmp on Linux) — both are guaranteed writable by the
-    # invoking user, which avoids the EACCES we'd hit if we tried to
-    # download straight into a root-owned /usr/local/bin.
-    local tmp
-    tmp=$(mktemp "${TMPDIR:-/tmp}/bhatti.XXXXXX") \
-        || die "could not create temp file"
-    BHATTI_STAGE_FILE="$tmp"  # picked up by _cleanup on exit
-
-    download "${RELEASE_URL}/${binary}" "$tmp"
-    chmod +x "$tmp"
-
-    verify_checksum "$tmp" "$binary"
-
-    # Verify the binary actually executes (catches HTML error pages,
-    # wrong-arch binaries, truncated downloads)
-    if ! "$tmp" version >/dev/null 2>&1; then
-        rm -f "$tmp"
-        die "downloaded binary failed to execute" \
-            "This usually means the download was corrupted or" \
-            "the wrong platform binary was downloaded." \
-            "Expected: ${OS}/${ARCH}"
-    fi
-
-    # macOS: remove quarantine attribute to prevent Gatekeeper dialog
-    if [ "$OS" = "darwin" ]; then
-        xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
-    fi
-
-    # Decide whether we need sudo for the install step. We may need it
-    # for two reasons: dest_dir doesn't exist (Apple Silicon: no
-    # /usr/local/bin by default) or it isn't writable by us.
-    local need_priv=0
-    if [ ! -d "$dest_dir" ]; then
-        need_priv=1
-    elif [ ! -w "$dest_dir" ]; then
-        need_priv=1
-    elif [ -e "$dest" ] && [ ! -w "$dest" ]; then
-        need_priv=1
-    fi
-    if [ "$need_priv" -eq 1 ]; then
-        need_sudo "install bhatti to ${dest}"
-    else
-        SUDO=""
-    fi
-
-    # Apple Silicon Macs don't ship /usr/local/bin; create it if missing.
-    if [ ! -d "$dest_dir" ]; then
-        $SUDO mkdir -p "$dest_dir"
-    fi
-
-    # Backup previous binary for manual rollback
-    if [ -f "$dest" ]; then
-        $SUDO cp "$dest" "${dest}.old" 2>/dev/null || true
-    fi
-
-    # `install(1)` does mode-set + atomic rename in a single call.
-    # It exists on both macOS (BSD) and Linux (GNU coreutils) with
-    # compatible -m semantics. Falls back to cp+mv if absent.
-    if command -v install >/dev/null 2>&1; then
-        $SUDO install -m 0755 "$tmp" "$dest" \
-            || die "failed to install binary to ${dest}"
-    else
-        # cp+chmod fallback for the rare box without install(1).
-        # `if !` instead of A&&B||C so chmod failure also triggers die
-        # — the && || form was a SC2015 footgun even if it happened to
-        # work here (writer's intent isn't obvious to the reader).
-        if ! { $SUDO cp "$tmp" "$dest" && $SUDO chmod 0755 "$dest"; }; then
-            die "failed to install binary to ${dest}"
-        fi
-    fi
-    rm -f "$tmp"
-    BHATTI_STAGE_FILE=""
+# install_bundle is stage + commit, for installs with no daemon to protect
+# (fresh server installs, CLI-only installs).
+install_bundle() {
+    stage_bundle "$@"
+    commit_bundle
+    discard_staged_update
 }
 
-# A refused flip is safe to abort, but an update may have stopped a running
-# daemon first. Bring it back before reporting the failed migration.
+# A refused flip is safe to abort, but an update has stopped a running daemon
+# by now. Refusals come before any swap, so what restarts is the old install,
+# unchanged: bring it back before reporting the failed migration.
 _rootfs_refuse_flip() {
     local reason="$1"
     if [ "${ROOTFS_RESTART_ON_REFUSAL:-false}" = true ]; then
@@ -803,7 +793,10 @@ _rootfs_refuse_flip() {
     die "$reason" "The tier was not flipped."
 }
 
-install_rootfs() {
+# stage_rootfs TIER downloads, verifies and decompresses the tier's image into a
+# hidden file under images/bases/ and queues it for flip_staged_rootfs. Nothing a
+# running daemon or sandbox looks at changes: GC and base lookup skip dotfiles.
+stage_rootfs() {
     local tier="$1"
     local asset="rootfs-${tier}-${ARCH}.ext4.zst"
     local images_dir="$DATA_DIR/images"
@@ -825,7 +818,7 @@ install_rootfs() {
     fi
 
     step_start
-    heading "Installing ${tier} rootfs"
+    heading "Downloading ${tier} rootfs"
 
     # Disk space check: need room for compressed + decompressed
     case "$tier" in
@@ -861,7 +854,7 @@ install_rootfs() {
     # Never decompress through a tier symlink: it could target a backing file
     # still in use by an older sandbox. The dotfile stays invisible to GC.
     local bases_dir="$images_dir/bases" zst_tmp="${rootfs_path}.zst.tmp"
-    local base_tmp base_sha base_name base_path link_tmp bhatti_bin
+    local base_tmp base_sha base_name base_path
     mkdir -p "$bases_dir"
     download_large "${RELEASE_URL}/${asset}" "$zst_tmp"
     verify_checksum "$zst_tmp" "$asset"
@@ -881,40 +874,80 @@ install_rootfs() {
     [[ "$base_sha" =~ ^[0-9a-f]{64}$ ]] || die "could not hash decompressed rootfs"
     base_name="rootfs-${tier}-${ARCH}-${base_sha:0:16}.ext4"
     base_path="$bases_dir/$base_name"
-    if [ -f "$base_path" ]; then
-        rm -f "$base_tmp"
-    elif [ -e "$base_path" ] || [ -L "$base_path" ]; then
+    # An identical base already there is reused as is when flipping; anything
+    # else under that name is not ours to replace.
+    if [ ! -f "$base_path" ] && { [ -e "$base_path" ] || [ -L "$base_path" ]; }; then
         die "refusing non-regular base image at ${base_path}"
-    else
-        # -n also protects an existing base if another installer wins the race.
-        mv -n "$base_tmp" "$base_path"
-        rm -f "$base_tmp"
     fi
 
-    # The installed CLI must rewrite any overlays that still name the tier
-    # path before unlinking that path. A failed migration must never flip it.
-    bhatti_bin="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
+    if [ -n "$STAGED_ROOTFS" ]; then
+        STAGED_ROOTFS="${STAGED_ROOTFS}"$'\n'
+    fi
+    STAGED_ROOTFS="${STAGED_ROOTFS}${tier}"$'\t'"${base_tmp}"$'\t'"${base_name}"$'\t'"${expected}"
+    success "rootfs ${tier} ($(du -h "$base_tmp" | cut -f1), $(step_elapsed))"
+}
+
+# preflight_rootfs_flip [BHATTI] decides whether the staged tiers may go live.
+# It is where an update can still refuse, so it runs before anything is
+# replaced. BHATTI is the CLI that migrates: an update passes the new one it has
+# staged (the installed one may predate `admin migrate-images`); the default is
+# the installed CLI.
+preflight_rootfs_flip() {
+    [ -n "${STAGED_ROOTFS:-}" ] || return 0
+    local bhatti_bin="${1:-${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}}"
+    local tier rootfs_path
+
+    # The CLI must rewrite any overlays that still name the tier path before
+    # that path is unlinked. A failed migration must never flip it.
     "$bhatti_bin" admin migrate-images --data-dir "$DATA_DIR" \
         || _rootfs_refuse_flip "cannot migrate existing rootfs images; inspect the errors above"
-    if [ -e "$rootfs_path" ] && [ ! -L "$rootfs_path" ]; then
-        _rootfs_refuse_flip "refusing to replace non-symlink tier image at ${rootfs_path}"
-    fi
+    while IFS=$'\t' read -r tier _; do
+        rootfs_path="$DATA_DIR/images/rootfs-${tier}-${ARCH}.ext4"
+        if [ -e "$rootfs_path" ] && [ ! -L "$rootfs_path" ]; then
+            _rootfs_refuse_flip "refusing to replace non-symlink tier image at ${rootfs_path}"
+        fi
+    done <<< "$STAGED_ROOTFS"
+}
 
-    link_tmp="$images_dir/.rootfs-${tier}-${ARCH}.link.tmp.$$"
-    ln -s "bases/$base_name" "$link_tmp" || die "could not stage rootfs tier symlink"
-    # GNU -T prevents following a symlink-to-directory; BSD -h does the same.
-    if [ "$(uname -s)" = Darwin ]; then
-        mv -fh "$link_tmp" "$rootfs_path" || die "could not flip rootfs tier symlink"
-    else
-        mv -fT "$link_tmp" "$rootfs_path" || die "could not flip rootfs tier symlink"
-    fi
+# flip_staged_rootfs publishes each staged image as a content-named base and
+# re-points the tier name at it with one rename: the moment new sandboxes start
+# getting the new image. Run it after preflight_rootfs_flip.
+flip_staged_rootfs() {
+    [ -n "${STAGED_ROOTFS:-}" ] || return 0
+    local images_dir="$DATA_DIR/images"
+    local tier file base_name expected rootfs_path base_path link_tmp
+    while IFS=$'\t' read -r tier file base_name expected; do
+        rootfs_path="$images_dir/rootfs-${tier}-${ARCH}.ext4"
+        base_path="$images_dir/bases/$base_name"
+        if [ ! -f "$base_path" ]; then
+            # -n also protects an existing base if another installer wins the race.
+            mv -n "$file" "$base_path" || die "could not publish rootfs base ${base_path}"
+        fi
+        rm -f "$file"
 
-    # Keep the compressed release checksum for the existing skip predicate.
-    if [ -n "$expected" ]; then
-        echo "$expected" > "$checksum_file"
-    fi
+        link_tmp="$images_dir/.rootfs-${tier}-${ARCH}.link.tmp.$$"
+        ln -s "bases/$base_name" "$link_tmp" || die "could not stage rootfs tier symlink"
+        # GNU -T prevents following a symlink-to-directory; BSD -h does the same.
+        if [ "$(uname -s)" = Darwin ]; then
+            mv -fh "$link_tmp" "$rootfs_path" || die "could not flip rootfs tier symlink"
+        else
+            mv -fT "$link_tmp" "$rootfs_path" || die "could not flip rootfs tier symlink"
+        fi
 
-    success "rootfs ${tier} ($(du -h "$bases_dir/$base_name" | cut -f1), $(step_elapsed))"
+        # Keep the compressed release checksum for the existing skip predicate.
+        if [ -n "$expected" ]; then
+            echo "$expected" > "$images_dir/.rootfs-${tier}-${ARCH}.sha256"
+        fi
+    done <<< "$STAGED_ROOTFS"
+    STAGED_ROOTFS=""
+}
+
+# install_rootfs is stage + preflight + flip for one tier, for installs with no
+# daemon to protect.
+install_rootfs() {
+    stage_rootfs "$1"
+    preflight_rootfs_flip
+    flip_staged_rootfs
 }
 
 # Keep the control socket group separate from the Unix accounts created by
@@ -1229,6 +1262,25 @@ start_service() {
     [ "$healthy" = true ]
 }
 
+# service_is_running — the daemon is up under launchd/systemd. OS-aware.
+service_is_running() {
+    if [ "$OS" = "darwin" ]; then
+        launchctl print system/sh.bhatti >/dev/null 2>&1
+    else
+        command -v systemctl >/dev/null 2>&1 && systemctl is-active bhatti >/dev/null 2>&1
+    fi
+}
+
+# stop_service — stop the daemon. Sandboxes keep running: their helpers are
+# detached from it (see KillMode=process in the unit). OS-aware.
+stop_service() {
+    if [ "$OS" = "darwin" ]; then
+        launchctl bootout system /Library/LaunchDaemons/sh.bhatti.plist 2>/dev/null || true
+    else
+        systemctl stop bhatti
+    fi
+}
+
 # prompt_and_install_server — shared by the Linux and macOS fresh-install flows:
 # prompt for a tier (unless BHATTI_TIER is set), then do a self-host install
 # (handling the "all" tiers case). do_server_install is OS-aware.
@@ -1373,7 +1425,7 @@ do_server_install() {
     else
         write_systemd_unit
         if command -v systemctl >/dev/null 2>&1; then
-            cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
+            cp "$DATA_DIR/bhatti.service" "$SYSTEMD_UNIT"
             systemctl daemon-reload
         fi
     fi
@@ -1449,6 +1501,14 @@ do_server_install() {
     fi
 }
 
+# do_server_update refreshes an existing server so that the daemon is down as
+# briefly as possible, and never because a download failed:
+#   1. stage    download, verify and unpack the bundle and every tier image
+#               next to their destinations; the daemon keeps serving
+#   2. stop     only if it was running
+#   3. swap     the refusal checks, then renames into place
+#   4. restart  refreshed unit/plist, restarted as before
+#   5. clean    remove the staging area
 do_server_update() {
     [ "$(id -u)" -eq 0 ] || die "server update requires root" \
                                 "Re-run with:" \
@@ -1482,19 +1542,20 @@ do_server_update() {
     fi
 
     # Check if everything is already up to date.
-    # Non-rootfs components only get a -f existence check here; each
-    # install_*() function does its own checksum-based skip when called.
+    # Non-rootfs components only get a -f existence check here; stage_rootfs()
+    # does its own checksum-based skip when called.
     # Rootfs files MUST go through a checksum check (all_rootfs_up_to_date)
     # because a stale .ext4 from a previous version can satisfy -f and
     # short-circuit `bhatti update --tiers <X>` for that tier — the gate
-    # would skip install_rootfs() before its own skip-check ran.
-    # v2 runtime closure (from `install_bundle 1`): the CLI, the per-VM vmm helper,
+    # would skip stage_rootfs() before its own skip-check ran.
+    # v2 runtime closure (from `stage_bundle 1`): the CLI, the per-VM vmm helper,
     # the per-owner net gateway, libkrun, and the lean kernel. lohar is baked into
     # the rootfs (/init.krun), not a standalone file. (The old FC checks —
     # firecracker/lohar/vmlinux — never matched on v2, so update never short-circuited.)
     local rt="$DATA_DIR/runtime"
+    local bin_dest="${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}"
     local all_present=true
-    [ -f "${BHATTI_TEST_BIN_DEST:-/usr/local/bin/bhatti}" ] || all_present=false
+    [ -f "$bin_dest" ] || all_present=false
     [ -f "$rt/bin/bhatti-vmm" ]                 || all_present=false
     [ -f "$rt/bin/bhatti-netd" ]                || all_present=false
     ls "$rt"/lib/libkrun.* >/dev/null 2>&1      || all_present=false
@@ -1564,29 +1625,37 @@ do_server_update() {
         info "${current} → ${VERSION}"
     fi
 
-    # Stop the service if running (restart after update). OS-aware.
+    # 1. Stage: everything slow or fallible, with the daemon still serving. A
+    # failed download, checksum or unpack stops the update here, daemon untouched.
+    heading "Downloading bhatti ${VERSION} + runtime"
+    stage_bundle 1
+    success "bhatti ${VERSION} + krucible runtime (verified)"
+    for t in $tiers_to_install; do
+        stage_rootfs "$t"
+    done
+
+    # 2. Stop the service if running (restart after update). OS-aware. The tier
+    # migration waits for this: a daemon from before the immutable bases names
+    # the tier path in every overlay it creates, so one created between the
+    # migration and the flip would end up reading the new image.
     local was_running=false
-    if [ "$OS" = "darwin" ]; then
-        if launchctl print system/sh.bhatti >/dev/null 2>&1; then
-            was_running=true
-            heading "Stopping bhatti service"
-            launchctl bootout system /Library/LaunchDaemons/sh.bhatti.plist 2>/dev/null || true
-        fi
-    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active bhatti >/dev/null 2>&1; then
+    if service_is_running; then
         was_running=true
         heading "Stopping bhatti service"
-        systemctl stop bhatti
+        stop_service
     fi
 
-    heading "Installing bhatti ${VERSION} + runtime"
-    install_bundle 1
-    success "bhatti ${VERSION} + krucible runtime"
+    # 3. Swap. The refusal checks come first, before anything is replaced, so a
+    # refusal restarts the old install unchanged. The CLI goes in last and the
+    # tier flip after it: an interrupted swap then leaves the new daemon on the
+    # old images, which every existing sandbox already runs, not the reverse.
     ROOTFS_RESTART_ON_REFUSAL="$was_running"
-
-    for t in $tiers_to_install; do
-        install_rootfs "$t"
-    done
+    preflight_rootfs_flip "$STAGED_CLI"
     ROOTFS_RESTART_ON_REFUSAL=false
+    heading "Installing bhatti ${VERSION} + runtime"
+    commit_bundle
+    flip_staged_rootfs
+    success "bhatti ${VERSION} + krucible runtime"
     if [ "$OS" = "darwin" ]; then
         write_launchd_daemon
     else
@@ -1603,7 +1672,7 @@ do_server_update() {
     # Only the missing socket gid is appended by update_api_security above.
     # admin user is PRESERVED
 
-    # Always refresh the service definition + ensure it's enabled (OS-aware).
+    # 4. Always refresh the service definition + ensure it's enabled (OS-aware).
     if [ "$OS" = "darwin" ]; then
         if [ "$was_running" = true ]; then
             heading "Restarting bhatti service"
@@ -1611,7 +1680,7 @@ do_server_update() {
                 || launchctl load /Library/LaunchDaemons/sh.bhatti.plist 2>/dev/null || true
         fi
     else
-        cp "$DATA_DIR/bhatti.service" /etc/systemd/system/bhatti.service
+        cp "$DATA_DIR/bhatti.service" "$SYSTEMD_UNIT"
         systemctl daemon-reload
         systemctl enable bhatti 2>/dev/null || true
         if [ "$was_running" = true ]; then
@@ -1619,6 +1688,9 @@ do_server_update() {
             systemctl start bhatti
         fi
     fi
+
+    # 5. Clean up: the staging area, and the old runtime parked in it.
+    discard_staged_update
 
     echo ""
     echo "============================================"
@@ -1658,9 +1730,9 @@ do_server_update() {
             echo "  Service enabled. Start with: sudo systemctl start bhatti"
         fi
     fi
-    if [ -f /usr/local/bin/bhatti.old ]; then
+    if [ -f "${bin_dest}.old" ]; then
         echo ""
-        echo "  Rollback: sudo mv /usr/local/bin/bhatti.old /usr/local/bin/bhatti"
+        echo "  Rollback: sudo mv ${bin_dest}.old ${bin_dest}"
     fi
     echo "============================================"
 }

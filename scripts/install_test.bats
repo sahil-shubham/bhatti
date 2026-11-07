@@ -400,16 +400,12 @@ _set_checksums() {
     done
 }
 
-# Exercise the actual installer against a tiny release image and a CLI with
-# only the migration contract. No live data or privileged tools are involved.
-_setup_install_rootfs() {
-    _setup_rootfs_fixture
-    INSTALL_ROOTFS_FIXTURE=1
-    mkdir -p "$DATA_DIR/release" "$DATA_DIR/bin"
-    RELEASE_URL="file://$DATA_DIR/release"
-    BHATTI_TEST_BIN_DEST="$DATA_DIR/bin/bhatti"
-    cat > "$BHATTI_TEST_BIN_DEST" <<'SH'
-#!/bin/bash
+# A stand-in CLI with only the contract the installer relies on: `version`, and
+# `admin migrate-images --data-dir D`, which does what BHATTI_TEST_MIGRATE says
+# (ok: tier files become bases + symlinks; fail: exit non-zero; leave: do nothing).
+_write_fake_bhatti() {
+    { printf '#!/bin/bash\nFAKE_VERSION=%s\n' "${2:-v0.0.0-test}"; cat <<'SH'
+[[ "$1" == version ]] && { echo "bhatti $FAKE_VERSION"; exit 0; }
 [[ "$1" == admin && "$2" == migrate-images && "$3" == --data-dir ]] || exit 90
 [[ "$4" == "$BHATTI_TEST_DATA_DIR" ]] || exit 91
 case "${BHATTI_TEST_MIGRATE:-ok}" in
@@ -429,7 +425,19 @@ for image in "$4"/images/rootfs-*.ext4; do
     ln -s "bases/${name}-${sha}.ext4" "$image"
 done
 SH
-    chmod +x "$BHATTI_TEST_BIN_DEST"
+    } > "$1"
+    chmod +x "$1"
+}
+
+# Exercise the actual installer against a tiny release image and a CLI with
+# only the migration contract. No live data or privileged tools are involved.
+_setup_install_rootfs() {
+    _setup_rootfs_fixture
+    INSTALL_ROOTFS_FIXTURE=1
+    mkdir -p "$DATA_DIR/release" "$DATA_DIR/bin"
+    RELEASE_URL="file://$DATA_DIR/release"
+    BHATTI_TEST_BIN_DEST="$DATA_DIR/bin/bhatti"
+    _write_fake_bhatti "$BHATTI_TEST_BIN_DEST"
     export BHATTI_TEST_BIN_DEST BHATTI_TEST_DATA_DIR="$DATA_DIR"
     BHATTI_TEST_MIGRATE=ok
     export BHATTI_TEST_MIGRATE
@@ -1054,7 +1062,8 @@ EOF
     installed_bhatti_version() { echo v2.0.0; }
     is_firecracker_install() { return 1; }
     ensure_api_group() { API_GROUP_GID=4242; }
-    install_bundle() { echo "unexpected install_bundle" >&2; return 1; }
+    download() { echo "unexpected download" >&2; return 1; }
+    download_large() { echo "unexpected download" >&2; return 1; }
     systemctl() { echo "unexpected systemctl" >&2; return 1; }
 
     run do_server_update
@@ -1067,6 +1076,299 @@ EOF
         echo "loopback listener was incorrectly treated as network-bound: $output" >&2
         return 1
     fi
+}
+
+# ── Staged server update ──────────────────────────────────────────
+# do_server_update against fake release assets. The fetchers copy fixtures and
+# log; systemctl/launchctl only log and snapshot what is installed at the moment
+# the daemon goes down and comes back. So the tests see when the daemon is
+# stopped relative to every fetch, and what was on disk when it was.
+
+# What the installed server looks like right now, as one comparable string.
+_installed_state() {
+    printf 'cli=%s\n' "$("$BHATTI_TEST_BIN_DEST" version)"
+    printf 'vmm=%s\n' "$(cat "$RUNTIME_DIR/bin/bhatti-vmm" 2>/dev/null || echo missing)"
+    printf 'tier=%s\n' "$(readlink "$DATA_DIR/images/rootfs-minimal-arm64.ext4" || echo regular-file)"
+}
+
+# Installed: v2.0.0 (a CLI that predates `admin migrate-images`, the immutable
+# base layout, minimal tier). Released: v2.0.1 with minimal and browser images.
+_update_fixture() {
+    _security_fixture
+    OS="${1:-linux}"
+    EVENTS="$SECURITY_TMP/events"
+    FIXTURES="$SECURITY_TMP/release"
+    mkdir -p "$FIXTURES/.build" "$SECURITY_TMP/bin" "$DATA_DIR/images/bases" "$RUNTIME_DIR/bin" "$RUNTIME_DIR/lib"
+    : > "$EVENTS"
+
+    BHATTI_TEST_BIN_DEST="$SECURITY_TMP/bin/bhatti"
+    printf '#!/bin/bash\n[ "$1" = version ] && echo "bhatti v2.0.0"\n' > "$BHATTI_TEST_BIN_DEST"
+    chmod +x "$BHATTI_TEST_BIN_DEST"
+    printf 'old vmm' > "$RUNTIME_DIR/bin/bhatti-vmm"
+    printf 'old netd' > "$RUNTIME_DIR/bin/bhatti-netd"
+    printf 'old libkrun' > "$RUNTIME_DIR/lib/libkrun.so"
+    printf 'old rootfs' > "$DATA_DIR/images/bases/rootfs-minimal-arm64-0123456789abcdef.ext4"
+    ln -s bases/rootfs-minimal-arm64-0123456789abcdef.ext4 "$DATA_DIR/images/rootfs-minimal-arm64.ext4"
+    printf 'old-release-sha\n' > "$DATA_DIR/images/.rootfs-minimal-arm64.sha256"
+    printf 'engine: krucible\nkrucible_base_image: %s/images/rootfs-minimal-arm64.ext4\n' "$DATA_DIR" > "$CONFIG_DIR/config.yaml"
+
+    VERSION=v2.0.1
+    local dir="bhatti-${VERSION}-${OS}-${ARCH}" tree="$FIXTURES/.build/bhatti-${VERSION}-${OS}-${ARCH}" tier
+    mkdir -p "$tree/bin" "$tree/lib" "$tree/kernel"
+    _write_fake_bhatti "$tree/bin/bhatti" v2.0.1
+    printf 'new vmm' > "$tree/bin/bhatti-vmm"
+    printf 'new netd' > "$tree/bin/bhatti-netd"
+    printf 'new libkrun' > "$tree/lib/libkrun.so"
+    : > "$tree/kernel/Image-lean-new"
+    (cd "$FIXTURES/.build" && COPYFILE_DISABLE=1 tar -cf - "$dir" | zstd -q -o "$FIXTURES/$dir.tar.zst")
+    CHECKSUMS="$(local_sha256 "$FIXTURES/$dir.tar.zst")  $dir.tar.zst"
+    for tier in minimal browser; do
+        printf 'new %s rootfs' "$tier" > "$FIXTURES/.build/rootfs-${tier}-${ARCH}.ext4"
+        zstd -q "$FIXTURES/.build/rootfs-${tier}-${ARCH}.ext4" -o "$FIXTURES/rootfs-${tier}-${ARCH}.ext4.zst"
+        CHECKSUMS="${CHECKSUMS}"$'\n'"$(local_sha256 "$FIXTURES/rootfs-${tier}-${ARCH}.ext4.zst")  rootfs-${tier}-${ARCH}.ext4.zst"
+    done
+
+    export BHATTI_TEST_BIN_DEST BHATTI_TEST_DATA_DIR="$DATA_DIR" BHATTI_TEST_MIGRATE=ok
+    SYSTEMD_UNIT="$SECURITY_TMP/bhatti.service.installed"
+    RELEASE_URL="file://$FIXTURES"
+    SERVICE_ACTIVE_RC=0
+    QUIET=1
+    unset BHATTI_TIERS
+
+    id() { [ "$1" = -u ] && echo 0; }
+    installed_bhatti_version() { echo v2.0.0; }
+    is_firecracker_install() { return 1; }
+    ensure_api_group() { API_GROUP_GID=4242; }
+    update_api_security() { :; }
+    migrate_local_cli_configs() { :; }
+    warn_if_socket_dir_private() { :; }
+    check_disk_space() { :; }
+    download() { printf 'fetch %s\n' "${1##*/}" >> "$EVENTS"; cp "$FIXTURES/${1##*/}" "$2"; }
+    download_large() { download "$@"; }
+    systemctl() {
+        printf 'systemctl %s\n' "$*" >> "$EVENTS"
+        case "$1" in
+            is-active) return "$SERVICE_ACTIVE_RC" ;;
+            stop) _installed_state > "$SECURITY_TMP/at-stop" ;;
+            start) _installed_state > "$SECURITY_TMP/at-start" ;;
+        esac
+        return 0
+    }
+    launchctl() {
+        printf 'launchctl %s\n' "$*" >> "$EVENTS"
+        case "$1" in
+            print) return "$SERVICE_ACTIVE_RC" ;;
+            bootout) _installed_state > "$SECURITY_TMP/at-stop" ;;
+            bootstrap) _installed_state > "$SECURITY_TMP/at-start" ;;
+        esac
+        return 0
+    }
+    write_launchd_daemon() { :; }
+    start_service() { printf 'start_service\n' >> "$EVENTS"; }
+    BEFORE=$(_installed_state)
+}
+
+# The line number of the first event matching the pattern.
+_event_line() { grep -n "$1" "$EVENTS" | head -1 | cut -d: -f1; }
+
+# Nothing but the checksum sidecars may be left hidden or half-written.
+_no_staging_left() {
+    [ -z "$(find "$DATA_DIR" "$SECURITY_TMP/bin" \( -name '.*' ! -name '.rootfs-*.sha256' -o -name '*.tmp' \))" ]
+}
+
+@test "server update fetches and verifies the whole release before it stops the daemon" {
+    _update_fixture linux
+    BHATTI_TIERS=browser   # minimal (configured) + browser
+    ln "$BHATTI_TEST_BIN_DEST" "$SECURITY_TMP/old-cli"
+    ln "$RUNTIME_DIR/bin/bhatti-vmm" "$SECURITY_TMP/old-vmm"
+    ln "$DATA_DIR/images/bases/rootfs-minimal-arm64-0123456789abcdef.ext4" "$SECURITY_TMP/old-base"
+
+    run do_server_update
+    [ "$status" -eq 0 ] || { echo "$output" >&2; return 1; }
+
+    local stop start last_fetch new_sha
+    stop=$(_event_line '^systemctl stop ')
+    start=$(_event_line '^systemctl start ')
+    last_fetch=$(grep -n '^fetch ' "$EVENTS" | tail -1 | cut -d: -f1)
+    [ "$(grep -c '^fetch ' "$EVENTS")" -eq 3 ]
+    [ -n "$stop" ]
+    [ -n "$start" ]
+    [ "$last_fetch" -lt "$stop" ]
+    [ "$stop" -lt "$start" ]
+
+    # While the daemon was still up nothing in place had changed; by the time
+    # it restarted all of it had.
+    [ "$(cat "$SECURITY_TMP/at-stop")" = "$BEFORE" ]
+    new_sha=$(local_sha256 "$FIXTURES/.build/rootfs-minimal-arm64.ext4")
+    grep -qx 'cli=bhatti v2.0.1' "$SECURITY_TMP/at-start"
+    grep -qx 'vmm=new vmm' "$SECURITY_TMP/at-start"
+    grep -qx "tier=bases/rootfs-minimal-arm64-${new_sha:0:16}.ext4" "$SECURITY_TMP/at-start"
+    [ "$(readlink "$DATA_DIR/images/rootfs-browser-arm64.ext4")" = "bases/rootfs-browser-arm64-$(local_sha256 "$FIXTURES/.build/rootfs-browser-arm64.ext4" | cut -c1-16).ext4" ]
+
+    # Replaced by rename: what a running guest has open is untouched, and the
+    # previous CLI is kept for rollback.
+    [ "$("$SECURITY_TMP/old-cli" version)" = "bhatti v2.0.0" ]
+    [ "$(cat "$SECURITY_TMP/old-vmm")" = "old vmm" ]
+    [ "$(cat "$SECURITY_TMP/old-base")" = "old rootfs" ]
+    [ "$("${BHATTI_TEST_BIN_DEST}.old" version)" = "bhatti v2.0.0" ]
+    _no_staging_left
+}
+
+@test "server update: a download that fails after the others succeeded leaves the daemon running and the install untouched" {
+    _update_fixture linux
+    BHATTI_TIERS=browser
+    download_large() {
+        printf 'fetch %s\n' "${1##*/}" >> "$EVENTS"
+        case "$1" in *browser*) die "download failed: $1" ;; esac
+        cp "$FIXTURES/${1##*/}" "$2"
+    }
+
+    run do_server_update
+    [ "$status" -ne 0 ]
+    [ "$(grep -c '^fetch ' "$EVENTS")" -eq 3 ]
+    if grep -q '^systemctl stop' "$EVENTS"; then
+        echo "the daemon was stopped: $(cat "$EVENTS")" >&2
+        return 1
+    fi
+    [ "$(_installed_state)" = "$BEFORE" ]
+}
+
+@test "server update: a checksum mismatch on the last image leaves the daemon running and the install untouched" {
+    _update_fixture linux
+    BHATTI_TIERS=browser
+    CHECKSUMS=$(printf '%s\n' "$CHECKSUMS" | grep -v rootfs-browser; echo "0000000000000000000000000000000000000000000000000000000000000000  rootfs-browser-arm64.ext4.zst")
+
+    run do_server_update
+    [ "$status" -ne 0 ]
+    output_contains "checksum mismatch"
+    [ "$(grep -c '^fetch ' "$EVENTS")" -eq 3 ]
+    if grep -q '^systemctl stop' "$EVENTS"; then
+        echo "the daemon was stopped: $(cat "$EVENTS")" >&2
+        return 1
+    fi
+    [ "$(_installed_state)" = "$BEFORE" ]
+}
+
+@test "server update: a refused tier flip restarts the daemon with the old install still in place" {
+    _update_fixture linux
+    BHATTI_TEST_MIGRATE=fail
+
+    run do_server_update
+    [ "$status" -ne 0 ]
+    local stop restart
+    stop=$(_event_line '^systemctl stop ')
+    restart=$(_event_line '^start_service$')
+    [ -n "$stop" ]
+    [ -n "$restart" ]
+    [ "$stop" -lt "$restart" ]
+    # The refusal comes before anything is replaced, so what restarted is the
+    # install that was running, and its unit was not touched.
+    [ "$(_installed_state)" = "$BEFORE" ]
+    if grep -q 'daemon-reload' "$EVENTS"; then
+        echo "the service definition was refreshed: $(cat "$EVENTS")" >&2
+        return 1
+    fi
+}
+
+@test "server update migrates a legacy tier image only after the daemon is stopped" {
+    _update_fixture linux
+    local tier="$DATA_DIR/images/rootfs-minimal-arm64.ext4" old_sha
+    rm -f "$tier" "$DATA_DIR/images/bases/rootfs-minimal-arm64-0123456789abcdef.ext4"
+    printf 'old rootfs' > "$tier"
+    old_sha=$(local_sha256 "$tier")
+    BEFORE=$(_installed_state)
+
+    run do_server_update
+    [ "$status" -eq 0 ] || { echo "$output" >&2; return 1; }
+    # Still the plain file the daemon had been naming when it was stopped: an
+    # old daemon creating a sandbox in between would name the tier path.
+    [ "$(cat "$SECURITY_TMP/at-stop")" = "$BEFORE" ]
+    grep -qx 'tier=regular-file' "$SECURITY_TMP/at-stop"
+    [ "$(cat "$DATA_DIR/images/bases/rootfs-minimal-arm64-${old_sha:0:16}.ext4")" = "old rootfs" ]
+    [ -L "$tier" ]
+    [ "$(cat "$tier")" = "new minimal rootfs" ]
+}
+
+@test "server update: a daemon that was not running is neither stopped nor started" {
+    _update_fixture linux
+    SERVICE_ACTIVE_RC=3
+
+    run do_server_update
+    [ "$status" -eq 0 ] || { echo "$output" >&2; return 1; }
+    [ "$("$BHATTI_TEST_BIN_DEST" version)" = "bhatti v2.0.1" ]
+    if grep -qE '^systemctl (stop|start) ' "$EVENTS"; then
+        echo "the service was touched: $(cat "$EVENTS")" >&2
+        return 1
+    fi
+    grep -q '^systemctl daemon-reload' "$EVENTS"
+    grep -q '^systemctl enable bhatti' "$EVENTS"
+}
+
+@test "server update on macOS fetches everything before launchctl boots the service out" {
+    _update_fixture darwin
+
+    run do_server_update
+    [ "$status" -eq 0 ] || { echo "$output" >&2; return 1; }
+    local stop start
+    stop=$(_event_line '^launchctl bootout ')
+    start=$(_event_line '^launchctl bootstrap ')
+    [ "$(grep -c '^fetch ' "$EVENTS")" -eq 2 ]
+    [ -n "$stop" ]
+    [ -n "$start" ]
+    [ "$(grep -n '^fetch ' "$EVENTS" | tail -1 | cut -d: -f1)" -lt "$stop" ]
+    [ "$stop" -lt "$start" ]
+    [ "$(cat "$SECURITY_TMP/at-stop")" = "$BEFORE" ]
+    grep -qx 'cli=bhatti v2.0.1' "$SECURITY_TMP/at-start"
+    grep -qx 'vmm=new vmm' "$SECURITY_TMP/at-start"
+    if grep -q '^systemctl' "$EVENTS"; then
+        echo "systemctl on macOS: $(cat "$EVENTS")" >&2
+        return 1
+    fi
+    _no_staging_left
+}
+
+@test "staging drops day-old leftovers of a killed update but leaves fresh ones alone" {
+    _update_fixture linux
+    mkdir -p "$DATA_DIR/.install-stage.dead/unpack" "$DATA_DIR/.install-stage.live/unpack"
+    : > "$SECURITY_TMP/bin/.bhatti.new.dead"
+    : > "$SECURITY_TMP/bin/.bhatti.new.live"
+    touch -t 202001010000 "$DATA_DIR/.install-stage.dead" "$SECURITY_TMP/bin/.bhatti.new.dead"
+
+    stage_bundle 1
+    discard_staged_update
+    [ ! -e "$DATA_DIR/.install-stage.dead" ]
+    [ ! -e "$SECURITY_TMP/bin/.bhatti.new.dead" ]
+    [ -d "$DATA_DIR/.install-stage.live" ]
+    [ -e "$SECURITY_TMP/bin/.bhatti.new.live" ]
+}
+
+@test "discarding a staged update removes every staged file and leaves the install alone" {
+    _update_fixture linux
+    BHATTI_TIERS=browser
+    stage_bundle 1
+    stage_rootfs minimal
+    stage_rootfs browser
+    # Something is staged: hidden files beside the paths they will replace.
+    [ -n "$(find "$DATA_DIR" "$SECURITY_TMP/bin" -name '.*' ! -name '.rootfs-*.sha256')" ]
+
+    discard_staged_update
+    _no_staging_left
+    [ "$(_installed_state)" = "$BEFORE" ]
+}
+
+@test "install_bundle 1 lays the runtime under the data dir and installs the CLI, as a fresh install does" {
+    _update_fixture linux
+    rm -rf "$RUNTIME_DIR" "$BHATTI_TEST_BIN_DEST"
+
+    install_bundle 1
+    [ "$(cat "$RUNTIME_DIR/bin/bhatti-vmm")" = "new vmm" ]
+    [ -x "$RUNTIME_DIR/bin/bhatti-vmm" ]
+    [ -x "$RUNTIME_DIR/bin/bhatti-netd" ]
+    [ -f "$RUNTIME_DIR/lib/libkrun.so" ]
+    [ -f "$RUNTIME_DIR/kernel/Image-lean-new" ]
+    [ "$("$BHATTI_TEST_BIN_DEST" version)" = "bhatti v2.0.1" ]
+    [ ! -e "${BHATTI_TEST_BIN_DEST}.old" ]
+    _no_staging_left
 }
 
 @test "private existing data dir warns instead of changing permissions" {
