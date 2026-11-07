@@ -29,6 +29,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/snapshots/", s.handleSnapshot)
 	s.mux.HandleFunc("/tasks/", s.handleTask)
 	s.mux.HandleFunc("/ports", s.handleAllPorts)
+	s.mux.HandleFunc("/events", s.handleEvents)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

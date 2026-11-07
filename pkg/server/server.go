@@ -137,6 +137,10 @@ type Server struct {
 
 	// Observability
 	events *EventRecorder
+	// eventStreamCtx is what GET /events follow streams run under: it ends with
+	// ctx, and endEventStreams ends it sooner (see EndEventStreams).
+	eventStreamCtx  context.Context
+	endEventStreams context.CancelFunc
 
 	// Public proxy (set via options)
 	proxyZone       string              // e.g. "bhatti.sh"
@@ -358,9 +362,12 @@ func WithBackupBackend(b backup.Backend) ServerOption {
 // containing age.key for secret encryption.
 func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOption) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
+	streamCtx, endStreams := context.WithCancel(ctx)
 	s := &Server{
 		ctx:               ctx,
 		cancel:            cancel,
+		eventStreamCtx:    streamCtx,
+		endEventStreams:   endStreams,
 		engine:            eng,
 		lifecycle:         newServerLifecycle(),
 		store:             st,

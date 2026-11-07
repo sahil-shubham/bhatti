@@ -284,7 +284,10 @@ func runDaemon() {
 	sig := <-sigCh
 	slog.Info("shutting down", "signal", sig)
 
-	// Drain HTTP connections (30s timeout for safety)
+	// Drain HTTP connections (30s timeout for safety). Event streams first: a
+	// follow stream is an active request until it is ended, so each one would
+	// hold the drain for the whole timeout.
+	srv.EndEventStreams()
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutCancel()
 	for _, s := range servers {
