@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
@@ -147,6 +148,11 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	}
 	cctx, ccancel := context.WithTimeout(ctx, limit)
 	defer ccancel()
+	// What the source is held for: from the command that parks it to its
+	// resume. Logged when it ends, so a snapshot or fork that stalls a busy
+	// sandbox shows what the stall was made of.
+	pausedAt := time.Now()
+	var saveDur, flushDur, copyDur time.Duration
 	var stage string
 	if snapType == "filesystem" {
 		if _, err := controlCmd(cctx, vm.CtlSockUDS, "PAUSE"); err != nil {
@@ -168,15 +174,32 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		}
 		stage = s
 		ownDir = true
+		saveDur = time.Since(pausedAt)
 	}
-	defer func() {
+	// The source runs again as soon as its disks are copied, not when the
+	// snapshot is on stable storage: resume is explicit below, and deferred
+	// for every way out before it.
+	resumed := false
+	resume := func() error {
+		if resumed {
+			return nil
+		}
+		resumed = true
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer rcancel()
 		if _, resumeErr := controlCmd(rctx, vm.CtlSockUDS, "RESUME"); resumeErr != nil {
-			err = errors.Join(err, fmt.Errorf("checkpoint: resume: %w", resumeErr))
+			return fmt.Errorf("checkpoint: resume: %w", resumeErr)
+		}
+		vm.syncGuestClock(rctx)
+		slog.Info("krucible.checkpoint.paused", "id", sandboxID, "type", snapType,
+			"paused_ms", time.Since(pausedAt).Milliseconds(), "save_ms", saveDur.Milliseconds(),
+			"flush_ms", flushDur.Milliseconds(), "copy_ms", copyDur.Milliseconds())
+		return nil
+	}
+	defer func() {
+		if rerr := resume(); rerr != nil {
+			err = errors.Join(err, rerr)
 			manifest = nil
-		} else {
-			vm.syncGuestClock(rctx)
 		}
 	}()
 	if stage != "" {
@@ -185,14 +208,29 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 			return nil, fmt.Errorf("checkpoint: save: %w", err)
 		}
 	}
-	// Clone disks at the saved VM's quiescent point. Guest writes cannot
-	// resume until after all clones finish.
-	if err := exec.CommandContext(cctx, "sync").Run(); err != nil {
-		return nil, fmt.Errorf("checkpoint: host sync: %w", err)
+	// Copy disks at the saved VM's quiescent point. Guest writes cannot
+	// resume until after all copies finish. What is copied is flushed first
+	// (a copy that shares blocks, as on a reflinking file system, shares
+	// what is on disk), and only that: a host-wide sync would wait for every
+	// other writer on the host and for the memory image just saved, none of
+	// which a copy needs. The snapshot as a whole is made durable below, with
+	// the source running again.
+	t := time.Now()
+	toCopy := []string{spec.RootDisk}
+	if snapType == "memory" {
+		for _, v := range spec.Volumes {
+			toCopy = append(toCopy, v.Path)
+		}
 	}
+	if err := flushFiles(toCopy...); err != nil {
+		return nil, fmt.Errorf("checkpoint: flush disk: %w", err)
+	}
+	flushDur = time.Since(t)
+	t = time.Now()
 	if err := cloneFile(spec.RootDisk, filepath.Join(finalDir, "rootfs.qcow2")); err != nil {
 		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
 	}
+	copyDur = time.Since(t)
 
 	// Capture the device set (memory snapshots only — the restored RAM's view of
 	// its disks + mounts must stay valid; a filesystem snapshot is disk-only).
@@ -202,6 +240,7 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	var snapMounts []snapMount
 	var snapNet *gateway.NetPolicyWire
 	if snapType == "memory" {
+		t = time.Now()
 		for i, v := range spec.Volumes {
 			file := fmt.Sprintf("vol%d.img", i)
 			if err := cloneFile(v.Path, filepath.Join(finalDir, file)); err != nil {
@@ -209,10 +248,17 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 			}
 			snapVols = append(snapVols, snapVolume{File: file, ReadOnly: v.ReadOnly})
 		}
+		copyDur += time.Since(t)
 		for _, mnt := range spec.Mounts {
 			snapMounts = append(snapMounts, snapMount{HostPath: mnt.HostPath, ReadOnly: mnt.ReadOnly})
 		}
 		snapNet = netPolicy
+	}
+	if rerr := resume(); rerr != nil {
+		return nil, rerr
+	}
+	if err := syncTree(finalDir); err != nil {
+		return nil, fmt.Errorf("checkpoint: sync snapshot: %w", err)
 	}
 	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir, "volumes", len(snapVols), "mounts", len(snapMounts))
 	return krucibleSnapManifest{
@@ -431,4 +477,57 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 		return fmt.Errorf("freeze: copy overlay: %w", err)
 	}
 	return nil
+}
+
+// flushFiles pushes each file's written data to the file system, so a copy
+// that shares blocks with the file shares all of it. It is a flush, not a
+// durability barrier (no drive cache flush: that is syncTree's job, done where
+// it stalls nothing): fsync(2) itself, which Go's File.Sync is not on darwin,
+// where it is F_FULLFSYNC and costs a drive flush each.
+func flushFiles(paths ...string) error {
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		err = syscall.Fsync(int(f.Fd()))
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// syncTree makes the files of dir durable, then dir's entries: what a
+// snapshot is, once it returns, whatever happens to the host next.
+func syncTree(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, de := range entries {
+		if !de.Type().IsRegular() {
+			continue
+		}
+		f, err := os.Open(filepath.Join(dir, de.Name()))
+		if err != nil {
+			return err
+		}
+		err = f.Sync()
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", de.Name(), err)
+		}
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
