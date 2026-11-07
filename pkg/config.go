@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -45,6 +46,9 @@ type Config struct {
 	// "none" (no network device; the default), "deny" (allow-lists only) or "public".
 	DefaultEgress string `yaml:"default_egress,omitempty"`
 
+	// RateLimits overrides the per-user API request budgets.
+	RateLimits RateLimits `yaml:"rate_limits,omitempty"`
+
 	// Krucible-specific (libkrun engine; macOS + Linux)
 	KrucibleVMM         string `yaml:"krucible_vmm"`          // path to the bhatti-vmm helper (default: next to binary / PATH)
 	KrucibleRootfs      string `yaml:"krucible_rootfs"`       // base rootfs dir (with /init.krun=lohar) the block-root base image is built from when krucible_base_image is unset
@@ -58,6 +62,39 @@ type Config struct {
 
 	// Backup to S3-compatible storage
 	Backup *BackupConfig `yaml:"backup,omitempty"`
+}
+
+// RateLimits are per-user token buckets for API requests. They stop runaway
+// loops; how much a sandbox may consume is the quotas' business. A zero field
+// keeps the server default (create 30/min burst 10, exec 600/min burst 30,
+// read 1200/min burst 60).
+type RateLimits struct {
+	Create RateBucket `yaml:"create,omitempty"` // POST /sandboxes: create and fork
+	Exec   RateBucket `yaml:"exec,omitempty"`   // exec, file writes, exec and shell websockets
+	Read   RateBucket `yaml:"read,omitempty"`   // everything else, including destroy and snapshot resume
+}
+
+// RateBucket refills at PerMinute and holds up to Burst requests.
+type RateBucket struct {
+	PerMinute float64 `yaml:"per_minute,omitempty"`
+	Burst     float64 `yaml:"burst,omitempty"`
+}
+
+// Validate rejects budgets that can't admit a request: a bucket holding less
+// than one token never lets one through, and a negative rate never refills.
+func (l RateLimits) Validate() error {
+	for _, b := range []struct {
+		name string
+		RateBucket
+	}{{"create", l.Create}, {"exec", l.Exec}, {"read", l.Read}} {
+		if b.PerMinute < 0 || math.IsNaN(b.PerMinute) || math.IsInf(b.PerMinute, 0) {
+			return fmt.Errorf("rate_limits.%s.per_minute must be a positive number", b.name)
+		}
+		if b.Burst != 0 && (b.Burst < 1 || math.IsNaN(b.Burst) || math.IsInf(b.Burst, 0)) {
+			return fmt.Errorf("rate_limits.%s.burst must be at least 1", b.name)
+		}
+	}
+	return nil
 }
 
 // BackupConfig configures volume backup to S3-compatible object storage.

@@ -61,7 +61,7 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 			maxStorage = userObj.MaxVolumeStorageMB
 		}
 		if used+req.SizeMB > maxStorage {
-			errResp(w, 429, fmt.Sprintf("volume storage quota exceeded (%dMB used, %dMB max)", used, maxStorage))
+			errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, fmt.Sprintf("volume storage quota exceeded (%dMB used, %dMB max)", used, maxStorage))
 			return
 		}
 

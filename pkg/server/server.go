@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -342,6 +343,12 @@ func WithMountRoots(roots, configPaths []string) ServerOption {
 	}
 }
 
+// WithRateLimits sets the per-user request budgets; zero fields keep the
+// defaults. The caller has validated them.
+func WithRateLimits(limits pkg.RateLimits) ServerOption {
+	return func(s *Server) { s.limiter = newRateLimiter(limits) }
+}
+
 // WithBackupBackend sets the S3-compatible backup backend.
 func WithBackupBackend(b backup.Backend) ServerOption {
 	return func(s *Server) { s.backupBackend = b }
@@ -359,7 +366,7 @@ func New(eng engine.Engine, st *store.Store, dataDir string, opts ...ServerOptio
 		store:             st,
 		dataDir:           dataDir,
 		mux:               http.NewServeMux(),
-		limiter:           newRateLimiter(),
+		limiter:           newRateLimiter(pkg.RateLimits{}),
 		startTime:         time.Now(),
 		pullCancels:       make(map[string]context.CancelFunc),
 		tunnels:           make(map[string]map[*tunnelSession]struct{}),
@@ -1039,10 +1046,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate limiting per user
-	if !s.limiter.Allow(user.ID, r) {
+	// Rate limiting per user. A refusal is logged like any request, naming the
+	// bucket so an operator can tell which budget to raise.
+	if ok, bucket, wait := s.limiter.Allow(user.ID, r); !ok {
 		s.rateLimited.Add(1)
-		errResp(w, 429, "rate limit exceeded")
+		secs := retryAfterSeconds(wait)
+		lim := s.limiter.bucketLimits(bucket)
+		slog.Info("request",
+			"method", r.Method,
+			"path", cleanPath,
+			"status", http.StatusTooManyRequests,
+			"user", user.Name,
+			"user_id", user.ID,
+			"rate_limit_bucket", bucket,
+			"retry_after_s", secs,
+		)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		errRespCode(w, http.StatusTooManyRequests, codeRateLimited, fmt.Sprintf(
+			"rate limit exceeded: %s requests are limited to %g/min with a burst of %g (rate_limits.%s in the server config); retry in %ds",
+			bucket, lim.PerMinute, lim.Burst, bucket, secs))
 		return
 	}
 
@@ -1144,4 +1166,20 @@ func readJSON(r *http.Request, v any) error {
 // errResp is a helper for error responses.
 func errResp(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// Machine-readable error codes. A client branches on the code, never on the
+// message.
+const (
+	// codeRateLimited: refused before any handler ran; retrying after
+	// Retry-After is safe for every method.
+	codeRateLimited = "rate_limited"
+	// codeQuotaExceeded: the owner is at a limit; waiting doesn't help, freeing
+	// or raising it does.
+	codeQuotaExceeded = "quota_exceeded"
+)
+
+// errRespCode is errResp with a machine-readable code.
+func errRespCode(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }

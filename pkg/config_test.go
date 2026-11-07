@@ -314,3 +314,27 @@ func TestLoadConfigNoFile(t *testing.T) {
 		t.Errorf("engine=%q, want krucible", cfg.Engine)
 	}
 }
+
+// TestRateLimitsValidate: the daemon refuses budgets that could never admit a
+// request instead of starting with an API that answers 429 to everything.
+func TestRateLimitsValidate(t *testing.T) {
+	for _, tc := range []struct {
+		yaml string
+		ok   bool
+	}{
+		{"", true},
+		{"create: {per_minute: 120}", true},
+		{"exec: {per_minute: 0.5, burst: 1}", true},
+		{"read: {burst: 0.5}", false},
+		{"create: {per_minute: -1}", false},
+		{"exec: {per_minute: .inf}", false},
+	} {
+		var l RateLimits
+		if err := yaml.Unmarshal([]byte(tc.yaml), &l); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Validate(); (err == nil) != tc.ok {
+			t.Errorf("%q: Validate() = %v, want ok=%v", tc.yaml, err, tc.ok)
+		}
+	}
+}

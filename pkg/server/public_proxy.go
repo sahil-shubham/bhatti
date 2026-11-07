@@ -322,7 +322,7 @@ func (h *PublicProxyHandler) proxyToAlias(w http.ResponseWriter, r *http.Request
 	if !h.limiter.Allow(alias, clientIP) {
 		h.rateLimited.Add(1)
 		w.Header().Set("Retry-After", "1")
-		errResp(w, 429, "rate limit exceeded")
+		errRespCode(w, http.StatusTooManyRequests, codeRateLimited, "rate limit exceeded")
 		return
 	}
 

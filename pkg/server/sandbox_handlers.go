@@ -73,7 +73,7 @@ func (s *Server) checkSandboxQuota(w http.ResponseWriter, r *http.Request, user 
 		return false
 	}
 	if count >= user.MaxSandboxes {
-		errResp(w, 429, fmt.Sprintf("sandbox limit reached (%d/%d)", count, user.MaxSandboxes))
+		errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, fmt.Sprintf("sandbox limit reached (%d/%d)", count, user.MaxSandboxes))
 		return false
 	}
 	return true

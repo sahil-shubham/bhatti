@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
@@ -881,15 +883,16 @@ func TestSandboxCountLimit(t *testing.T) {
 		}
 	})
 
-	// 4th should fail
+	// 4th should fail as a quota refusal: no Retry-After, since waiting won't help.
 	resp := alice(t, "POST", "/sandboxes", map[string]any{
 		"name": uniqueName(t, "limit-over"),
 	})
-	if resp.StatusCode != 429 {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 429, got %d: %s", resp.StatusCode, body)
+	var body map[string]string
+	decodeJSON(t, resp, &body)
+	if resp.StatusCode != 429 || body["code"] != codeQuotaExceeded || resp.Header.Get("Retry-After") != "" {
+		t.Fatalf("over the count: %d %v Retry-After=%q, want 429 %s without Retry-After",
+			resp.StatusCode, body, resp.Header.Get("Retry-After"), codeQuotaExceeded)
 	}
-	resp.Body.Close()
 }
 
 func TestSandboxNameValidationHTTP(t *testing.T) {
@@ -1092,29 +1095,41 @@ func TestSecretEncryptDecrypt(t *testing.T) {
 }
 
 func TestRateLimiting(t *testing.T) {
-	_, ts := setup(t)
+	srv, ts := setup(t)
+	srv.limiter = newRateLimiter(pkg.RateLimits{Create: pkg.RateBucket{PerMinute: 1, Burst: 2}})
 
-	// Burst 10 sandbox creates rapidly — the 11th+ should get 429
-	var got429 bool
-	for i := 0; i < 15; i++ {
-		resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{
-			"name": uniqueName(t, fmt.Sprintf("rate-%d", i)),
-		})
-		if resp.StatusCode == 429 {
-			got429 = true
-			resp.Body.Close()
-			break
+	var created []string
+	for i := range 2 {
+		resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{"name": uniqueName(t, fmt.Sprintf("rate-%d", i))})
+		if resp.StatusCode != 201 {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("create %d inside the burst: %d %s", i, resp.StatusCode, body)
 		}
-		if resp.StatusCode == 201 {
-			var sb store.Sandbox
-			decodeJSON(t, resp, &sb)
-			t.Cleanup(func() { doReq(t, ts, "DELETE", "/sandboxes/"+sb.ID, nil) })
+		var sb store.Sandbox
+		decodeJSON(t, resp, &sb)
+		created = append(created, sb.ID)
+	}
+
+	// Past the configured burst: refused as a rate limit, with the wait until
+	// the next token (one a minute) so a client knows when to retry.
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{"name": uniqueName(t, "rate-over")})
+	var body map[string]string
+	decodeJSON(t, resp, &body)
+	retry, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if resp.StatusCode != 429 || body["code"] != codeRateLimited || err != nil || retry < 55 || retry > 60 {
+		t.Fatalf("over the burst: %d %v Retry-After=%q, want 429 %s with ~60s",
+			resp.StatusCode, body, resp.Header.Get("Retry-After"), codeRateLimited)
+	}
+
+	// Destroy doesn't spend the create budget: cleaning up after a burst of
+	// creates must not be throttled by it.
+	for _, id := range created {
+		if resp := doReq(t, ts, "DELETE", "/sandboxes/"+id, nil); resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("destroy with the create budget spent: %d %s", resp.StatusCode, body)
 		} else {
 			resp.Body.Close()
 		}
-	}
-	if !got429 {
-		t.Error("expected at least one 429 after rapid creates")
 	}
 }
 

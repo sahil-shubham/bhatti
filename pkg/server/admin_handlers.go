@@ -423,7 +423,7 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 	}
 
 	if msg := s.snapshotLimitError(user.ID); msg != "" {
-		errResp(w, 429, msg)
+		errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, msg)
 		return
 	}
 

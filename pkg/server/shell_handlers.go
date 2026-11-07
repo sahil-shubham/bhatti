@@ -87,7 +87,8 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request, sandboxID
 		ip = ip[:i] // strip port
 	}
 	if !s.shellLimiter.Allow(ip) {
-		errResp(w, 429, "too many requests")
+		w.Header().Set("Retry-After", "1") // the bucket refills every second
+		errRespCode(w, http.StatusTooManyRequests, codeRateLimited, "too many requests")
 		return
 	}
 

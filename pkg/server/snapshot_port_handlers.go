@@ -155,7 +155,7 @@ func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 	if msg := s.snapshotLimitError(user.ID); msg != "" {
-		errResp(w, 429, msg)
+		errRespCode(w, http.StatusTooManyRequests, codeQuotaExceeded, msg)
 		return
 	}
 

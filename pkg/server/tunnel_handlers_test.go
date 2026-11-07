@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sahil-shubham/bhatti/pkg"
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
@@ -271,13 +272,13 @@ func TestSandboxTunnelRequiresGET(t *testing.T) {
 }
 
 func TestTunnelReadBucketAllowsBrowserBurst(t *testing.T) {
-	limiter := newRateLimiter()
+	limiter := newRateLimiter(pkg.RateLimits{})
 	req, err := http.NewRequest(http.MethodGet, "http://localhost/sandboxes/ws/tunnel?port=8080", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := range 40 {
-		if !limiter.Allow("usr_browser", req) {
+		if ok, _, _ := limiter.Allow("usr_browser", req); !ok {
 			t.Fatalf("request %d in a 40-connection burst was rate limited", i+1)
 		}
 	}

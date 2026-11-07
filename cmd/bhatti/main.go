@@ -202,6 +202,11 @@ func runDaemon() {
 		slog.Error("invalid default_egress (want none, deny or public)", "value", cfg.DefaultEgress)
 		os.Exit(1)
 	}
+	if err := cfg.RateLimits.Validate(); err != nil {
+		slog.Error("invalid rate_limits", "error", err)
+		os.Exit(1)
+	}
+	srvOpts = append(srvOpts, server.WithRateLimits(cfg.RateLimits))
 	srvOpts = append(srvOpts, server.WithMountRoots(cfg.MountRoots, cfg.ConfigPaths))
 	if cfg.Domain != nil {
 		srvOpts = append(srvOpts,
