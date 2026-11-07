@@ -470,8 +470,10 @@ func TestSpawnedGatewayIsPlacedBeforeItListens(t *testing.T) {
 	if u, _ := sd.unit(ps.unit); u.props["CPUWeight"] != uint64(cpuWeightNetd) || u.props["Slice"] != ps.slice() {
 		t.Fatalf("gateway scope properties %v", u.props)
 	}
-	if args, err := procArgs(pid); err == nil && !strings.Contains(strings.Join(args, " "), "--gate-fd 3") {
-		t.Fatalf("netd argv %q", args)
+	// The gate travels in the environment: argv is how every daemon release
+	// recognises its gateway, and must stay what it was before placement.
+	if args, err := procArgs(pid); err == nil && strings.Contains(strings.Join(args, " "), "gate") {
+		t.Fatalf("netd argv %q carries the launch gate", args)
 	}
 }
 

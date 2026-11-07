@@ -19,3 +19,18 @@ func procArgs(pid int) ([]string, error) {
 	}
 	return strings.Split(string(b), "\x00"), nil
 }
+
+// listPIDs returns the pids of the processes running now.
+func listPIDs() ([]int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	pids := make([]int, 0, len(entries))
+	for _, e := range entries {
+		if pid, err := strconv.Atoi(e.Name()); err == nil && pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
+}

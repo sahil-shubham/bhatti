@@ -147,13 +147,14 @@ func TestVMMLaunchGate(t *testing.T) {
 	})
 
 	t.Run("malformed gate descriptor", func(t *testing.T) {
-		cmd, stderr := vmmCmd(t, bin, launchgate.Flag, "nope", missingSpec)
+		cmd, stderr := vmmCmd(t, bin, missingSpec)
+		cmd.Env = append(cmd.Environ(), launchgate.Env+"=nope")
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
 		code, out := finishVMM(t, cmd, stderr)
-		if code == 0 || !strings.Contains(out, "usage: vmm [--gate-fd N]") {
-			t.Fatalf("exit %d, stderr %q: want a usage failure", code, out)
+		if code == 0 || !strings.Contains(out, launchgate.Env) || strings.Contains(out, "read spec") {
+			t.Fatalf("exit %d, stderr %q: want a refusal naming the bad gate before any work", code, out)
 		}
 	})
 }

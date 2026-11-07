@@ -859,8 +859,9 @@ func (e *Engine) adoptNetdScopeLocked(inst *netdInstance) {
 }
 
 // reportOrphanScopes names the scopes systemd holds for bhatti that no recovered
-// sandbox or gateway claims. They are left alone: what runs in one may be a
-// helper whose record was lost, and stopping it would kill a guest.
+// sandbox or gateway claims. A stray helper of a sandbox recorded stopped is
+// gone by now (killStrays); what remains is left alone: it may be a helper
+// whose record was lost, and stopping it would kill a guest.
 func (e *Engine) reportOrphanScopes() {
 	if !e.cg.placing() {
 		return

@@ -886,13 +886,15 @@ func TestStartWithoutPlacementIsPlainStart(t *testing.T) {
 	}
 }
 
-// TestIsHelperRecognisesAGatedHelper: a helper started to be placed carries
-// --gate-fd ahead of its spec and is still told apart from any other process.
+// TestIsHelperRecognisesAGatedHelper: a helper started to be placed has the
+// same argv as any other, `bhatti-vmm <spec>` (its gate is in the
+// environment), so every daemon release, including those before placement,
+// tells it apart from any other process. A rolled-back daemon that didn't
+// would record its sandbox stopped and boot a second VM on the same disks.
 func TestIsHelperRecognisesAGatedHelper(t *testing.T) {
 	spec := filepath.Join(t.TempDir(), "vmspec.json")
 	pid := gatedStandin(t, spec)
-	if !isHelper(pid, spec) {
-		args, _ := procArgs(pid)
+	if args, _ := procArgs(pid); !slices.Equal(args, []string{"bhatti-vmm", spec}) || !isHelper(pid, spec) {
 		t.Fatalf("a gated helper isn't taken for its helper: argv %q", args)
 	}
 	if isHelper(pid, spec+".other") {
@@ -901,4 +903,31 @@ func TestIsHelperRecognisesAGatedHelper(t *testing.T) {
 	if isHelper(adoptee(t), spec) {
 		t.Fatal("sleep taken for a helper")
 	}
+}
+
+// TestRecoveryKillsAStrayHelperOfAStoppedSandbox: a helper still running the
+// spec of a sandbox recorded stopped (a daemon that couldn't recognise it let
+// it run) is killed at recovery, before anything can boot that sandbox again
+// on the same disks. A helper of a sandbox recorded running is left alone.
+func TestRecoveryKillsAStrayHelperOfAStoppedSandbox(t *testing.T) {
+	stoppedDir, runningDir := t.TempDir(), t.TempDir()
+	stray := gatedStandin(t, filepath.Join(stoppedDir, "vmspec.json"))
+	live := gatedStandin(t, filepath.Join(runningDir, "vmspec.json"))
+
+	killStrays([]*VM{
+		{ID: "stopped", SandboxDir: stoppedDir, Status: "stopped"},
+		{ID: "running", SandboxDir: runningDir, Status: "running"},
+	})
+
+	waitFor(t, "the stray to die", func() bool { return !pidAlive(stray) || zombie(stray) })
+	if !pidAlive(live) {
+		t.Fatal("the helper of a running sandbox was killed")
+	}
+}
+
+// zombie reports whether pid has exited but not been reaped: the stand-ins
+// are this test's children, so a killed one lingers until the test reaps it.
+func zombie(pid int) bool {
+	args, err := procArgs(pid)
+	return err == nil && len(args) == 0
 }

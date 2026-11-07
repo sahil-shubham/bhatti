@@ -118,7 +118,7 @@ func fail(format string, args ...any) {
 	os.Exit(1)
 }
 
-const usage = "usage: vmm [--gate-fd N] <spec.json> | vmm capabilities | vmm check-checkpoint <dir>"
+const usage = "usage: vmm <spec.json> | vmm capabilities | vmm check-checkpoint <dir>"
 
 func main() {
 	// The launch gate is the first act, ahead of reading the spec and of
@@ -129,15 +129,16 @@ func main() {
 	// from its first instruction; only this small Go prologue runs ahead of the
 	// placement. The gate applies to whichever command follows, though the
 	// daemon only ever gates the VM run.
-	gateFD, args, err := launchgate.SplitArgs(os.Args[1:])
+	gateFD, err := launchgate.FromEnv()
 	if err != nil {
-		fail("%v\n%s", err, usage)
+		fail("%v", err)
 	}
 	if gateFD >= 0 {
 		if err := launchgate.Wait(gateFD, launchgate.Timeout); err != nil {
 			fail("gate: %v", err)
 		}
 	}
+	args := os.Args[1:]
 
 	// check-checkpoint <dir>: whether this host can restore the checkpoint in
 	// dir, judged by libkrun as a restore would be; exits 1 with the reason.

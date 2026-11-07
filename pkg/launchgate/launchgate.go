@@ -6,9 +6,15 @@
 // moved: a helper that started working at once would charge its first
 // allocations, guest memory above all, to the daemon's cgroup, where they stay
 // even after the move. So the daemon starts the helper with the read end of a
-// pipe as an extra file and a leading `--gate-fd N` argument; the helper's
+// pipe as an extra file, its number in the environment (Env); the helper's
 // first act is Wait, which reads one byte. The daemon writes it once the
 // helper is in its scope and recorded there.
+//
+// The descriptor travels in the environment and not in argv because argv is
+// how every bhatti daemon recognises a running helper (`bhatti-vmm <spec>`),
+// releases from before the gate included: a daemon rolled back to one of them
+// would take a gated helper for a stranger, record its sandbox as stopped and
+// later boot a second VM on the same disks.
 //
 // The gate fails closed. Anything but the byte — the daemon closing the pipe
 // on an error, the daemon dying (the kernel closes its end), a different byte,
@@ -26,10 +32,9 @@ import (
 	"time"
 )
 
-// Flag is the argument that names the gate's file descriptor. Daemon and
-// helpers ship in one bundle, so a helper that doesn't know it is a broken
-// install and fails on the unknown flag.
-const Flag = "--gate-fd"
+// Env names the gate's file descriptor. Daemon and helpers ship in one
+// bundle, so a helper started with it always knows to wait.
+const Env = "BHATTI_LAUNCH_GATE_FD"
 
 // Timeout is how long a helper waits for the byte. The daemon bounds a
 // placement well inside it, so only a daemon that is alive but wedged gets
@@ -88,22 +93,20 @@ func Wait(fd int, timeout time.Duration) error {
 	}
 }
 
-// SplitArgs takes a leading `--gate-fd N` off a helper's arguments (argv
-// without the program name). fd is -1 when the helper was started without a
-// gate. It serves the helper reading its own arguments and the daemon
-// recognising a running helper by its argv.
-func SplitArgs(args []string) (fd int, rest []string, err error) {
-	if len(args) == 0 || args[0] != Flag {
-		return -1, args, nil
+// FromEnv takes the gate's descriptor out of the helper's environment, so
+// nothing the helper starts inherits it. fd is -1 when the helper was started
+// without a gate.
+func FromEnv() (fd int, err error) {
+	v, ok := os.LookupEnv(Env)
+	if !ok {
+		return -1, nil
 	}
-	if len(args) < 2 {
-		return -1, nil, fmt.Errorf("%s needs a file descriptor", Flag)
-	}
-	n, perr := strconv.Atoi(args[1])
+	os.Unsetenv(Env)
+	n, perr := strconv.Atoi(v)
 	if perr != nil || n < 3 {
-		return -1, nil, fmt.Errorf("%s %q: want a descriptor number of 3 or more", Flag, args[1])
+		return -1, fmt.Errorf("%s=%q: want a descriptor number of 3 or more", Env, v)
 	}
-	return n, args[2:], nil
+	return n, nil
 }
 
 // Gate is the daemon's end of the launch gate.
@@ -120,19 +123,19 @@ func New() (*Gate, error) {
 	return &Gate{r: r, w: w}, nil
 }
 
-// Start starts cmd with the gate's read end as its last extra file and
-// `--gate-fd N` ahead of its arguments, then lets go of the daemon's copy of
-// that end. Until Open, the helper it starts can do nothing; Close (or the
-// daemon's death) ends it. On error the gate is still the caller's to Close.
+// Start starts cmd with the gate's read end as its last extra file and its
+// number in Env, then lets go of the daemon's copy of that end. cmd's argv is
+// left as it is. Until Open, the helper it starts can do nothing; Close (or
+// the daemon's death) ends it. On error the gate is still the caller's to
+// Close.
 func (g *Gate) Start(cmd *exec.Cmd) error {
 	fd := 3 + len(cmd.ExtraFiles) // os/exec numbers extra files from 3
 	cmd.ExtraFiles = append(cmd.ExtraFiles, g.r)
-	if len(cmd.Args) == 0 {
-		cmd.Args = []string{cmd.Path}
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ()
 	}
-	args := make([]string, 0, len(cmd.Args)+2)
-	args = append(args, cmd.Args[0], Flag, strconv.Itoa(fd))
-	cmd.Args = append(args, cmd.Args[1:]...)
+	cmd.Env = append(env[:len(env):len(env)], Env+"="+strconv.Itoa(fd))
 	err := cmd.Start()
 	g.r.Close() // the child has its own; ours would only hide the daemon's death from it
 	return err

@@ -127,7 +127,7 @@ func TestNetdLaunchGate(t *testing.T) {
 		defer r.Close()
 		defer w.Close()
 		n := startNetd(t, bin, func(cmd *exec.Cmd) error {
-			cmd.Args = append([]string{cmd.Args[0], launchgate.Flag, "3"}, cmd.Args[1:]...)
+			cmd.Env = append(cmd.Environ(), launchgate.Env+"=3")
 			cmd.ExtraFiles = []*os.File{r}
 			return cmd.Start()
 		})

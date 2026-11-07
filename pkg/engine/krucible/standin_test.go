@@ -16,12 +16,12 @@ import (
 )
 
 // standinEnv makes this test binary stand in for a gated bhatti-vmm when the
-// daemon starts it like one: `<binary> --gate-fd N <spec>`. The process then
-// has exactly the argv recovery recognises a helper by (isHelper), which no
-// shell script or `go test` flag-parsed child can have. Its value says what it
-// does once its gate opens: "vmm" plays the guest's side (fakeReseedVMM), "idle"
-// waits, "hog:<MiB>" touches that much memory first, as a guest does as it
-// boots, then waits.
+// daemon starts it like one: `<binary> <spec>` with its gate in the
+// environment. The process then has exactly the argv recovery recognises a
+// helper by (isHelper), which no shell script or `go test` flag-parsed child
+// can have. Its value says what it does once its gate opens: "vmm" plays the
+// guest's side (fakeReseedVMM), "idle" waits, "hog:<MiB>" touches that much
+// memory first, as a guest does as it boots, then waits.
 const standinEnv = "BHATTI_KRUCIBLE_STANDIN"
 
 // standinStarted is what a stand-in leaves in its sandbox dir the moment its
@@ -30,8 +30,8 @@ const standinStarted = "standin.started"
 
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(standinEnv); mode != "" {
-		if fd, rest, err := launchgate.SplitArgs(os.Args[1:]); err == nil && fd >= 0 && len(rest) == 1 {
-			standinMain(mode, fd, rest[0])
+		if fd, err := launchgate.FromEnv(); err == nil && fd >= 0 && len(os.Args) == 2 {
+			standinMain(mode, fd, os.Args[1])
 		}
 	}
 	os.Exit(m.Run())
@@ -67,8 +67,8 @@ func standinMain(mode string, fd int, spec string) {
 
 // gatedStandin starts this test binary as an idle stand-in for the helper
 // running spec, started the way the daemon starts a placed one (argv
-// [bhatti-vmm --gate-fd 3 spec]) with its gate opened, and returns its pid once
-// it has begun. It is killed when the test ends.
+// [bhatti-vmm spec], its gate in the environment) with its gate opened, and
+// returns its pid once it has begun. It is killed when the test ends.
 func gatedStandin(t *testing.T, spec string) int {
 	t.Helper()
 	g, err := launchgate.New()

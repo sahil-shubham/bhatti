@@ -33,14 +33,14 @@ func TestMain(m *testing.M) {
 // bhatti-netd do, and only then does "work": writes <marker>. A helper whose
 // gate fails records why in <marker>.failed and exits 3.
 //
-//	helper <marker> <timeout>
+//	helper <marker> <timeout>   (gate descriptor in Env)
 func helperMain() {
-	fd, rest, err := SplitArgs(os.Args[1:])
-	if err != nil || fd < 0 || len(rest) != 2 {
-		fmt.Fprintln(os.Stderr, "helper: usage: --gate-fd N <marker> <timeout>", err)
+	fd, err := FromEnv()
+	if err != nil || fd < 0 || len(os.Args) != 3 {
+		fmt.Fprintln(os.Stderr, "helper: usage: "+Env+"=N helper <marker> <timeout>", err)
 		os.Exit(4)
 	}
-	marker, timeout := rest[0], rest[1]
+	marker, timeout := os.Args[1], os.Args[2]
 	d, _ := time.ParseDuration(timeout)
 	if err := Wait(fd, d); err != nil {
 		_ = os.WriteFile(marker+".failed", []byte(err.Error()), 0o600)
@@ -280,32 +280,38 @@ func TestWaitClosesTheDescriptor(t *testing.T) {
 	}
 }
 
-func TestSplitArgs(t *testing.T) {
+func TestFromEnv(t *testing.T) {
 	for _, tc := range []struct {
-		args    []string
+		value   string // "" = unset
 		fd      int
-		rest    []string
 		wantErr bool
 	}{
-		{[]string{"spec.json"}, -1, []string{"spec.json"}, false},
-		{nil, -1, nil, false},
-		{[]string{"--gate-fd", "3", "spec.json"}, 3, []string{"spec.json"}, false},
-		{[]string{"--gate-fd", "7", "--net-uds", "/x"}, 7, []string{"--net-uds", "/x"}, false},
-		{[]string{"--gate-fd"}, -1, nil, true},
-		{[]string{"--gate-fd", "x", "spec.json"}, -1, nil, true},
-		{[]string{"--gate-fd", "2", "spec.json"}, -1, nil, true},                                      // stdio is never the gate
-		{[]string{"spec.json", "--gate-fd", "3"}, -1, []string{"spec.json", "--gate-fd", "3"}, false}, // only a leading flag counts
+		{"", -1, false},
+		{"3", 3, false},
+		{"7", 7, false},
+		{"x", -1, true},
+		{"2", -1, true}, // stdio is never the gate
 	} {
-		fd, rest, err := SplitArgs(tc.args)
-		if (err != nil) != tc.wantErr || fd != tc.fd || (err == nil && !slices.Equal(rest, tc.rest)) {
-			t.Errorf("SplitArgs(%q) = %d, %q, %v; want %d, %q, error=%v", tc.args, fd, rest, err, tc.fd, tc.rest, tc.wantErr)
+		if tc.value == "" {
+			os.Unsetenv(Env)
+		} else {
+			t.Setenv(Env, tc.value)
+		}
+		fd, err := FromEnv()
+		if (err != nil) != tc.wantErr || fd != tc.fd {
+			t.Errorf("FromEnv with %s=%q = %d, %v; want %d, error=%v", Env, tc.value, fd, err, tc.fd, tc.wantErr)
+		}
+		if _, set := os.LookupEnv(Env); set {
+			t.Errorf("FromEnv left %s set: what the helper starts would inherit it", Env)
 		}
 	}
 }
 
-// TestStartNamesTheDescriptor: the helper is told which descriptor holds the
-// gate, and extra files already on the command keep theirs.
-func TestStartNamesTheDescriptor(t *testing.T) {
+// TestStartLeavesArgvAlone: the helper is told which descriptor holds the
+// gate, extra files already on the command keep theirs, and its argv is
+// exactly what it would be without a gate: argv is how every daemon release,
+// including those before the gate, recognises a running helper.
+func TestStartLeavesArgvAlone(t *testing.T) {
 	devnull, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
@@ -326,14 +332,13 @@ func TestStartNamesTheDescriptor(t *testing.T) {
 		if err := g.Start(cmd); err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"true", Flag, tc.want, "spec.json"}
-		if !slices.Equal(cmd.Args, want) || len(cmd.ExtraFiles) != tc.extra+1 {
-			t.Errorf("%d extra files: args %q, %d files; want %q, %d files", tc.extra, cmd.Args, len(cmd.ExtraFiles), want, tc.extra+1)
-		}
 		_ = cmd.Wait()
 		g.Close()
-		if fd, rest, err := SplitArgs(cmd.Args[1:]); err != nil || fd != 3+tc.extra || !slices.Equal(rest, []string{"spec.json"}) {
-			t.Errorf("SplitArgs of what Start wrote: %d %q %v", fd, rest, err)
+		if !slices.Equal(cmd.Args, []string{"true", "spec.json"}) || len(cmd.ExtraFiles) != tc.extra+1 {
+			t.Errorf("%d extra files: args %q, %d files; want the argv unchanged and %d files", tc.extra, cmd.Args, len(cmd.ExtraFiles), tc.extra+1)
+		}
+		if !slices.Contains(cmd.Env, Env+"="+tc.want) {
+			t.Errorf("%d extra files: environment lacks %s=%s", tc.extra, Env, tc.want)
 		}
 	}
 }

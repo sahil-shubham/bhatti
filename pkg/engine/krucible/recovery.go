@@ -14,7 +14,6 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/agent"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
-	"github.com/sahil-shubham/bhatti/pkg/launchgate"
 )
 
 // Recovery makes krucible restart-safe. A daemon's shutdown lets go of its
@@ -209,17 +208,15 @@ func pidAlive(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
-// isHelper reports whether pid is a bhatti-vmm started on spec, its last and
-// only other argument. Once a process exits its pid can be anyone's, so a pid
-// read back from state.json names a helper only together with this. A helper
-// started to be placed in a cgroup also carries --gate-fd N ahead of the spec.
+// isHelper reports whether pid is a bhatti-vmm started on spec, its only
+// argument. Once a process exits its pid can be anyone's, so a pid read back
+// from state.json names a helper only together with this. Every daemon
+// version recognises a helper this way, which is why the launch gate travels
+// in the environment (pkg/launchgate): a daemon rolled back to an older
+// release still knows the helpers this one started.
 func isHelper(pid int, spec string) bool {
 	args, err := procArgs(pid)
-	if err != nil || len(args) < 2 {
-		return false
-	}
-	_, rest, err := launchgate.SplitArgs(args[1:])
-	return err == nil && len(rest) == 1 && rest[0] == spec
+	return err == nil && len(args) == 2 && args[1] == spec
 }
 
 // isNetd reports whether pid is the bhatti-netd serving sock.
@@ -345,6 +342,7 @@ func (e *Engine) recover() {
 		slog.Info("krucible recovered sandbox", "id", vm.ID, "name", vm.Name,
 			"helper", helper, "status", vm.Status, "thermal", vm.Thermal)
 	}
+	killStrays(recovered)
 	// Replay even absent policies: a registered old grant must be replaced by
 	// deny. No helper is allowed to rely on a versionless control socket.
 	for _, vm := range recovered {
@@ -360,6 +358,39 @@ func (e *Engine) recover() {
 		}
 	}
 	e.reportOrphanScopes()
+}
+
+// killStrays kills every helper still running the spec of a sandbox recovered
+// as stopped. Its record has lost track of it: a daemon that couldn't
+// recognise it (one rolled back across a change in how helpers are started,
+// say) recorded the sandbox stopped and let it run. It is no one's to adopt,
+// and the sandbox's next boot would share its disks with it. One /proc scan
+// covers every sandbox.
+func killStrays(recovered []*VM) {
+	stopped := map[string]*VM{}
+	for _, vm := range recovered {
+		if vm.Status == "stopped" {
+			stopped[vm.specPath()] = vm
+		}
+	}
+	if len(stopped) == 0 {
+		return
+	}
+	pids, err := listPIDs()
+	if err != nil {
+		slog.Warn("krucible.recover.stray_scan_failed", "error", err)
+		return
+	}
+	for _, pid := range pids {
+		args, err := procArgs(pid)
+		if err != nil || len(args) != 2 {
+			continue
+		}
+		if vm := stopped[args[1]]; vm != nil {
+			slog.Warn("krucible.recover.stray_helper_killed", "sandbox_id", vm.ID, "pid", pid)
+			killHelper(pid, args[1])
+		}
+	}
 }
 
 // adoptHelper says what the helper a record names is doing: "running" or

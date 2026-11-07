@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/launchgate"
 )
 
 // fakeSystemd is systemd as placement sees it, with the two behaviours placement
@@ -250,14 +251,15 @@ func newTestManager(sd *fakeSystemd) *cgroupManager {
 }
 
 // gatedHelperScript is a stand-in helper with the gate protocol and no hypervisor:
-// `<script> --gate-fd 3 <marker>` reads its gate first, then works (writes
-// <marker>) and stays up. A failed gate leaves <marker>.failed and exit 3.
+// `<script> <marker>`, its gate in the environment, reads its gate first, then
+// works (writes <marker>) and stays up. A failed gate leaves <marker>.failed
+// and exit 3.
 func gatedHelperScript(t *testing.T) string {
 	t.Helper()
 	script := filepath.Join(t.TempDir(), "helper.sh")
 	body := "#!/bin/sh\n" +
-		"marker=$3\n" +
-		"b=$(dd bs=1 count=1 <&3 2>/dev/null)\n" +
+		"marker=$1\n" +
+		"eval \"b=\\$(dd bs=1 count=1 <&${" + launchgate.Env + ":?} 2>/dev/null)\"\n" +
 		"if [ \"$b\" != G ]; then echo \"gate: $b\" > \"$marker.failed\"; exit 3; fi\n" +
 		"echo worked > \"$marker\"\n" +
 		"exec sleep 60\n"

@@ -37,3 +37,18 @@ func procArgs(pid int) ([]string, error) {
 	}
 	return args, nil
 }
+
+// listPIDs returns the pids of the processes running now.
+func listPIDs() ([]int, error) {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil, err
+	}
+	pids := make([]int, 0, len(procs))
+	for _, p := range procs {
+		if pid := int(p.Proc.P_pid); pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
+}
