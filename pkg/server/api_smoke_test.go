@@ -225,4 +225,36 @@ func TestAPISmokeThroughTheChain(t *testing.T) {
 		t.Fatalf("destroyed event = %v", destroyed)
 	}
 	want(do("GET", "/sandboxes/smoke", nil, nil), 404)
+
+	// Every route the run used was counted under its pattern. The websocket is
+	// counted when it ends, which is just after the client saw the close.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, counted := duration(parseMetrics(t, srv.MetricsText()), durationCount, "route", "GET /sandboxes/{id}/exec/ws", "status", "1xx"); counted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the websocket was never counted:\n%s", srv.MetricsText())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	exp := parseMetrics(t, srv.MetricsText())
+	for _, c := range []struct {
+		route, class string
+		want         float64
+	}{
+		{"POST /sandboxes", "2xx", 1},
+		{"POST /sandboxes/{id}/exec", "2xx", 2},
+		{"PUT /sandboxes/{id}/files", "2xx", 1},
+		{"GET /sandboxes/{id}/files", "2xx", 2},
+		{"GET /sandboxes/{id}/files", "4xx", 1},
+		{"HEAD /sandboxes/{id}/files", "2xx", 1},
+		{"DELETE /sandboxes/{id}", "2xx", 1},
+		{"GET /sandboxes/{id}", "4xx", 1},
+		{"GET /sandboxes/{id}/exec/ws", "1xx", 1},
+	} {
+		if got, _ := duration(exp, durationCount, "route", c.route, "status", c.class); got != c.want {
+			t.Errorf("%s %s count = %v, want %v", c.route, c.class, got, c.want)
+		}
+	}
 }

@@ -32,8 +32,9 @@ func api(pattern string, h http.HandlerFunc) route  { return route{pattern, h, f
 func open(pattern string, h http.HandlerFunc) route { return route{pattern, h, true} }
 
 // routeTable is every route the API answers. To add one, add a row: the
-// router, the 405 answers and the request log all key on the pattern, and
-// rateClasses names the rows that don't spend the read bucket.
+// router, the 405 answers, the request log and the duration histogram all key
+// on the pattern, and rateClasses names the rows that don't spend the read
+// bucket.
 //
 // More specific patterns win regardless of order (GET /secrets/grants over
 // DELETE /secrets/{name...}); a pair neither of which is more specific panics
@@ -129,14 +130,18 @@ func (s *Server) routeTable() []route {
 	}
 }
 
-// routes registers the route table and records which patterns are public.
+// routes registers the route table and builds what is keyed on it: which
+// patterns are public, and the duration histogram's series.
 func (s *Server) routes() {
 	table := s.routeTable()
 	s.public = make(map[string]bool, len(table))
-	for _, rt := range table {
+	patterns := make([]string, len(table))
+	for i, rt := range table {
 		s.mux.HandleFunc(rt.pattern, rt.handler)
 		s.public[rt.pattern] = rt.public
+		patterns[i] = rt.pattern
 	}
+	s.reqMetrics = newRequestMetrics(patterns)
 }
 
 // unmatchedRoute is the route label of a request no route matched: a 404, a 405

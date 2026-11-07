@@ -129,14 +129,15 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 
 // matchRoute records in r.Pattern which route will serve the request, before
 // anything acts on it: auth needs to know whether the route is public, the
-// limiter which bucket it spends, the log which route to file it under.
-// Matching on the pattern rather than on the path is what keeps a sandbox named
-// "ws-1" from being treated as a websocket.
+// limiter which bucket it spends, the log and histogram which route to file it
+// under. Matching on the pattern rather than on the path is what keeps a
+// sandbox named "ws-1" from being treated as a websocket.
 //
 // The mux sets r.Pattern again when it dispatches, to the same value. Some
 // redirects it makes name a pattern that is not a registered route (in some Go
 // versions the request's own path with a slash added); that counts as no match,
-// which keeps what auth, the limiter and the log see to the route table.
+// which keeps what auth, the limiter, the log and the metrics see to the route
+// table.
 func (s *Server) matchRoute(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pattern := s.mux.Handler(r)
@@ -215,10 +216,11 @@ func (s *Server) rateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// logRequests writes the `request` line and feeds the request counters, once
-// the handler has returned. A long-lived response (an events stream, an exec
-// stream, a websocket) is therefore logged when it ends and its duration is
-// the connection's life; a websocket is hijacked, so its status is 101.
+// logRequests writes the `request` line, feeds the request counters and the
+// duration histogram, once the handler has returned. A long-lived response
+// (an events stream, an exec stream, a websocket) is therefore logged when it
+// ends and its duration is the connection's life; a websocket is hijacked, so
+// its status is 101.
 //
 // A handler that panics is logged as a 500: the recovery layer, which sits above
 // this one, sends that response once the stack has unwound past here.
@@ -245,6 +247,7 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 			if status >= 500 {
 				s.requestErrors.Add(1)
 			}
+			s.reqMetrics.observe(r.Pattern, status, elapsed)
 			slog.Info("request",
 				"request_id", RequestIDFromContext(r.Context()),
 				"method", r.Method,

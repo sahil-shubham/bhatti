@@ -173,7 +173,11 @@ func TestPanicIsAnswered500WithTheRequestID(t *testing.T) {
 		t.Errorf("request line says status %v for a request answered 500", line["status"])
 	}
 
-	// The 5xx is counted, and the server carries on.
+	// The 5xx is counted under the route, and the server carries on.
+	exp := parseMetrics(t, srv.MetricsText())
+	if got := mustDuration(t, exp, durationCount, "route", "GET /sandboxes/{id}", "status", "5xx"); got != 1 {
+		t.Errorf("GET /sandboxes/{id} 5xx count = %v, want 1", got)
+	}
 	if srv.requestErrors.Load() != 1 {
 		t.Errorf("requestErrors = %d, want 1", srv.requestErrors.Load())
 	}
@@ -450,6 +454,10 @@ func TestUpgradedConnectionIsLoggedWhenItEnds(t *testing.T) {
 	}
 	if d, _ := line["duration_ms"].(float64); d < 100 {
 		t.Errorf("duration_ms = %v, want the session's life (at least 100ms)", line["duration_ms"])
+	}
+	exp := parseMetrics(t, srv.MetricsText())
+	if got := mustDuration(t, exp, durationCount, "route", route, "status", "1xx"); got != 1 {
+		t.Errorf("%s 1xx count = %v, want 1", route, got)
 	}
 }
 

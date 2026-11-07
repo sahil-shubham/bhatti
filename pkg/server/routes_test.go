@@ -78,12 +78,15 @@ func jsonBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]string {
 	return body
 }
 
-// Every row of the route table is reachable by its own method: the sample
+// Every row of the route table is reachable by its own method. The sample
 // request for it is dispatched to that very pattern, not to a catch-all or a
-// sibling. This is what keeps a typo in a pattern, or a route shadowed by a
-// broader one, from passing unnoticed.
+// sibling, and sent through the whole chain it is answered by that route:
+// never the router's 405, and recorded under the pattern rather than as an
+// unmatched request. This is what keeps a typo in a pattern, or a route
+// shadowed by a broader one, from passing unnoticed.
 func TestEveryRouteAnswersItsMethod(t *testing.T) {
 	srv, _ := setup(t)
+	srv.limiter = generousLimits()
 	table := srv.routeTable()
 	if len(table) < 60 {
 		t.Fatalf("route table has %d rows; the API has more than that", len(table))
@@ -106,6 +109,25 @@ func TestEveryRouteAnswersItsMethod(t *testing.T) {
 			if got != rt.pattern {
 				t.Errorf("%s %s is dispatched to %q, want %q", m, path, got, rt.pattern)
 			}
+			if rt.public {
+				continue // no user: neither logged nor counted
+			}
+			// Whatever the handler answers for a sandbox that doesn't exist,
+			// the router has no 405 for a method its table lists.
+			if rec := serveAs(srv, testAPIKey, m, path); rec.Code == http.StatusMethodNotAllowed {
+				t.Errorf("%s %s answered 405 though %s lists it", m, path, rt.pattern)
+			}
+		}
+	}
+
+	exp := parseMetrics(t, srv.MetricsText())
+	counted := map[string]bool{}
+	for _, s := range exp.Family(durationFamily).Samples {
+		counted[s.Labels["route"]] = true
+	}
+	for _, rt := range table {
+		if !rt.public && !counted[rt.pattern] {
+			t.Errorf("a request to %s was not recorded under that pattern", rt.pattern)
 		}
 	}
 }
@@ -347,9 +369,9 @@ func TestSandboxNamedLikeARouteSpendsTheReadBucket(t *testing.T) {
 
 // What the middleware knows about a route comes from the route table. A pattern
 // the mux serves but the table doesn't list (the mux names such patterns in some
-// of its redirects) is no route as far as auth and the limiter are concerned:
-// it is never public.
-func TestPatternsOutsideTheTableAreNeverPublic(t *testing.T) {
+// of its redirects) is no route as far as auth, the limiter and the metrics are
+// concerned: it is never public, and its requests are labelled "unmatched".
+func TestPatternsOutsideTheTableAreNeverPublicOrLabelled(t *testing.T) {
 	srv, _ := setup(t)
 	srv.mux.HandleFunc("GET /extra/{x}", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
@@ -358,6 +380,15 @@ func TestPatternsOutsideTheTableAreNeverPublic(t *testing.T) {
 	}
 	if rec := serveAs(srv, testAPIKey, "GET", "/extra/1"); rec.Code != http.StatusNoContent {
 		t.Fatalf("authenticated GET /extra/1 = %d, want the handler's 204", rec.Code)
+	}
+	exp := parseMetrics(t, srv.MetricsText())
+	for _, s := range exp.Family(durationFamily).Samples {
+		if strings.Contains(s.Labels["route"], "/extra/") {
+			t.Errorf("a pattern outside the table became a label: %v", s.Labels)
+		}
+	}
+	if got := mustDuration(t, exp, durationCount, "route", unmatchedRoute, "status", "2xx"); got != 1 {
+		t.Errorf("unmatched 2xx = %v, want the one request to /extra/1", got)
 	}
 }
 

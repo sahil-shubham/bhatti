@@ -127,11 +127,12 @@ type Server struct {
 
 	// API routing: handler is the middleware chain over mux (apiHandler),
 	// public marks by pattern the routes served without a key (its keys are
-	// exactly the registered patterns).
-	handler http.Handler
-	public  map[string]bool
+	// exactly the registered patterns), reqMetrics times requests per route.
+	handler    http.Handler
+	public     map[string]bool
+	reqMetrics *requestMetrics
 
-	// Request counters, read by the metrics snapshot goroutine.
+	// Request counters, read by the metrics snapshot goroutine and MetricsText.
 	requestTotal  atomic.Int64
 	requestErrors atomic.Int64
 	authFailures  atomic.Int64
