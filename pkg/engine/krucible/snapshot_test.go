@@ -5,6 +5,7 @@ package krucible
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ func TestKrucibleSaveImageRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "saveimg", CPUs: 1, MemoryMB: 512})
+	info, err := eng.Create(ctx, engine.SandboxSpec{Name: "saveimg", UserID: "u1", CPUs: 1, MemoryMB: 512})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -36,13 +37,16 @@ func TestKrucibleSaveImageRoundTrip(t *testing.T) {
 		t.Fatalf("FileWrite marker: %v", err)
 	}
 
-	imgPath := filepath.Join(t.TempDir(), "saved.qcow2")
+	imgPath := filepath.Join(ke.cfg.DataDir, "images", "u1", "saved.qcow2")
+	if err := os.MkdirAll(filepath.Dir(imgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := ke.SaveImage(ctx, info.ID, imgPath); err != nil {
 		t.Fatalf("SaveImage: %v", err)
 	}
 
 	// A fresh sandbox booted from the saved image must see the marker.
-	info2, err := eng.Create(ctx, engine.SandboxSpec{Name: "fromimg", CPUs: 1, MemoryMB: 512, BaseImage: imgPath})
+	info2, err := eng.Create(ctx, engine.SandboxSpec{Name: "fromimg", UserID: "u1", CPUs: 1, MemoryMB: 512, BaseImage: imgPath})
 	if err != nil {
 		t.Fatalf("Create from saved image: %v", err)
 	}

@@ -440,32 +440,33 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 		return fail(err)
 	}
 	p.Rules = append(p.Rules, VMMRule{spec.RootDisk, vmmRWFile})
-	// backs lets the helper read the files the qcow2 disk at path backs
-	// onto, through the whole chain. The helper may write a disk's header, so
-	// what the header names is taken only from where this host keeps images,
-	// or from what the daemon itself put in the chain when it made the disk
-	// (spec.Backing): a rewritten header can't point the next launch at any
-	// other file.
-	backs := func(what, path string) error {
-		chain, err := backingChain(path)
-		if err != nil {
-			return err
+	// Only the daemon's format record can make a disk's bytes a header. Each
+	// pointer is compared before its target is opened, so a rewritten header
+	// cannot expand the helper's policy.
+	backs := func(what, path, format string, recorded []diskLayer) error {
+		if err := validateRecordedDisk(path, format, recorded); err != nil {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		chain := recorded
+		if chain == nil {
+			var err error
+			chain, err = e.legacyDiskChain(vm, path, format)
+			if err != nil {
+				return fmt.Errorf("%s: %w", what, err)
+			}
 		}
 		for _, b := range chain {
-			if !e.vmmBaseAllowed(vm, b) && !slices.Contains(spec.Backing, b) {
-				return fmt.Errorf("%s backs onto %s, which isn't an image of this host's", what, b)
-			}
 			if e.dropVMM {
-				if err := e.vmmReadable(b); err != nil {
+				if err := e.vmmReadable(b.Path); err != nil {
 					return err
 				}
 			}
-			p.Rules = append(p.Rules, VMMRule{b, vmmReadFile})
+			p.Rules = append(p.Rules, VMMRule{b.Path, vmmReadFile})
 		}
 		return nil
 	}
 	if spec.RootDiskFormat == "qcow2" {
-		if err := backs("root disk", spec.RootDisk); err != nil {
+		if err := backs("root disk", spec.RootDisk, spec.RootDiskFormat, spec.Backing); err != nil {
 			return fail(err)
 		}
 	}
@@ -513,7 +514,7 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 			}
 			p.Rules = append(p.Rules, VMMRule{v.Path, access})
 			if v.Format == "qcow2" {
-				if err := backs("volume "+v.BlockID, v.Path); err != nil {
+				if err := backs("volume "+v.BlockID, v.Path, v.Format, v.Backing); err != nil {
 					return fail(err)
 				}
 			}
@@ -590,6 +591,155 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 	return spec, policy, cleanup, nil
 }
 
+// validateRecordedDisk never follows a pointer until it has matched the
+// daemon's path AND format. In particular a raw terminal's bytes are opaque.
+func validateRecordedDisk(path, format string, recorded []diskLayer) error {
+	if format == "" {
+		format = "raw"
+	}
+	if format != "raw" && format != "qcow2" {
+		return fmt.Errorf("%s: unsupported disk format %q", path, format)
+	}
+	if format == "raw" {
+		if len(recorded) != 0 {
+			return fmt.Errorf("%s: raw disk has recorded backing", path)
+		}
+		return nil
+	}
+	// nil is reserved for VM records predating typed chains. A snapshot with
+	// an explicit format supplies an exact (possibly empty) nonnil chain.
+	if recorded == nil {
+		return nil
+	}
+	if len(recorded) > maxChainDepth {
+		return fmt.Errorf("%s: recorded chain deeper than %d", path, maxChainDepth)
+	}
+	for i := 0; ; i++ {
+		next, err := qcow2BackingPath(path)
+		if err != nil {
+			return err
+		}
+		nextFormat, err := qcow2BackingFormat(path)
+		if err != nil {
+			return err
+		}
+		if next == "" {
+			if i != len(recorded) {
+				return fmt.Errorf("%s: backing chain is shorter than the recorded chain", path)
+			}
+			return nil
+		}
+		if i == len(recorded) || next != recorded[i].Path || nextFormat != recorded[i].Format {
+			return fmt.Errorf("%s: backing %s (%s) does not match the daemon-recorded chain", path, next, nextFormat)
+		}
+		switch nextFormat {
+		case "raw":
+			if i+1 != len(recorded) {
+				return fmt.Errorf("%s: recorded raw backing has ancestors", next)
+			}
+			return nil
+		case "qcow2":
+			path = next
+		default:
+			return fmt.Errorf("%s: unsupported recorded backing format %q", next, nextFormat)
+		}
+	}
+}
+
+func (e *Engine) validateDiskBacking(vm *VM, spec VMSpec) error {
+	if err := validateRecordedDisk(spec.RootDisk, spec.RootDiskFormat, spec.Backing); err != nil {
+		return fmt.Errorf("root disk: %w", err)
+	}
+	if spec.RootDiskFormat == "qcow2" && spec.Backing == nil {
+		if _, err := e.legacyDiskChain(vm, spec.RootDisk, spec.RootDiskFormat); err != nil {
+			return fmt.Errorf("root disk: %w", err)
+		}
+	}
+	for _, v := range spec.Volumes {
+		if err := validateRecordedDisk(v.Path, v.Format, v.Backing); err != nil {
+			return fmt.Errorf("volume %s: %w", v.BlockID, err)
+		}
+		if v.Format == "qcow2" && v.Backing == nil {
+			if _, err := e.legacyDiskChain(vm, v.Path, v.Format); err != nil {
+				return fmt.Errorf("volume %s: %w", v.BlockID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// A pre-upgrade VM can lack typed chains. Capture establishes a temporary
+// authorized baseline before pausing, then compares against it while paused;
+// otherwise a change between the two checks could become trusted metadata.
+func (e *Engine) captureDiskBacking(vm *VM, spec *VMSpec) error {
+	// Unlike an absent snapshot manifest, the VM contract's empty format
+	// already means raw; it is not permission to inspect guest bytes.
+	if spec.RootDiskFormat == "" {
+		spec.RootDiskFormat = "raw"
+	}
+	if spec.RootDiskFormat == "qcow2" && spec.Backing == nil {
+		chain, err := e.legacyDiskChain(vm, spec.RootDisk, spec.RootDiskFormat)
+		if err != nil {
+			return err
+		}
+		spec.Backing = chain
+	}
+	copied := false
+	for i, v := range spec.Volumes {
+		if v.Format != "qcow2" || v.Backing != nil {
+			continue
+		}
+		chain, err := e.legacyDiskChain(vm, v.Path, v.Format)
+		if err != nil {
+			return err
+		}
+		if !copied {
+			spec.Volumes = slices.Clone(spec.Volumes)
+			copied = true
+		}
+		spec.Volumes[i].Backing = chain
+	}
+	return e.validateDiskBacking(vm, *spec)
+}
+
+// Legacy inference is a compatibility read, never a new trust record. The
+// authorizer runs before a named file can be opened or sniffed.
+func (e *Engine) legacyDiskChain(vm *VM, path, format string) ([]diskLayer, error) {
+	owned, err := ownedNodeKeys(e.cfg.DataDir, vm.UserID)
+	if err != nil {
+		return nil, err
+	}
+	return readDiskChain(path, format, func(next string) error {
+		return e.authorizedBacking(vm, next, owned)
+	})
+}
+
+func (e *Engine) validateSnapshotBacking(vm *VM, spec VMSpec) error {
+	if _, err := e.legacyDiskChain(vm, spec.RootDisk, spec.RootDiskFormat); err != nil {
+		return fmt.Errorf("root disk: %w", err)
+	}
+	for _, v := range spec.Volumes {
+		if _, err := e.legacyDiskChain(vm, v.Path, v.Format); err != nil {
+			return fmt.Errorf("volume %s: %w", v.BlockID, err)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) authorizedBacking(vm *VM, path string, owned map[fileKey]bool) error {
+	if e.vmmBaseAllowed(vm, path) {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if key, ok := keyOf(fi); ok && owned[key] {
+		return nil
+	}
+	return fmt.Errorf("backs onto %s, which isn't an authorized image or this owner's snapshot node", path)
+}
+
 // vmmBaseAllowed reports whether a helper may read the image at path because
 // its root disk backs onto it: one this host keeps for sandboxes — under
 // <DataDir>/images (directly, a shared base, or one of the sandbox owner's
@@ -617,35 +767,6 @@ func (e *Engine) vmmBaseAllowed(vm *VM, path string) bool {
 	}
 	first, _, nested := strings.Cut(rel, string(filepath.Separator))
 	return !nested || first == "bases" || (vm.UserID != "" && first == vm.UserID)
-}
-
-// backingChain lists the files the image at path backs onto, nearest first,
-// as libkrun's qcow2 driver finds them: a relative name is relative to the
-// image that holds it. A root disk of the deepest chain nodes.go admits
-// (maxChainDepth images) names one fewer qcow2 file and its raw base, so a
-// chain of maxChainDepth files is complete, and one more is refused.
-func backingChain(path string) ([]string, error) {
-	var chain []string
-	for {
-		if !isQcow2(path) {
-			return chain, nil
-		}
-		name, err := qcow2Backing(path)
-		if err != nil {
-			return nil, err
-		}
-		if name == "" {
-			return chain, nil
-		}
-		if len(chain) == maxChainDepth {
-			return nil, fmt.Errorf("%s: backing chain deeper than %d", path, maxChainDepth)
-		}
-		if !filepath.IsAbs(name) {
-			name = filepath.Join(filepath.Dir(path), name)
-		}
-		chain = append(chain, name)
-		path = name
-	}
 }
 
 // linkInto hard-links src at dst, replacing what's there, and returns dst —

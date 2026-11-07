@@ -28,9 +28,13 @@ type krucibleSnapManifest struct {
 	Vcpus       uint8  `json:"vcpus"`
 	MemMiB      uint32 `json:"mem_mib"`
 	DiskFile    string `json:"disk_file"`
+	DiskFormat  string `json:"disk_format,omitempty"`
 	ConfigFile  string `json:"config_file"`
 	Token       string `json:"token"`
 	KernelImage string `json:"kernel_image,omitempty"`
+	// Backing comes only from the source's validated, daemon-recorded chain.
+	// The local manifest is authoritative; an archive rebuilds this list.
+	Backing []diskLayer `json:"backing"`
 
 	// Device set (so a restore/fork reproduces it — a memory restore's RAM view of
 	// its disks/mounts must stay valid). Mounts are re-bound to the same host dirs;
@@ -54,8 +58,10 @@ type snapMount struct {
 // snapVolume records a frozen data volume: its file within the snapshot dir +
 // read-only flag. The guest mount path lives in the captured config drive.
 type snapVolume struct {
-	File     string `json:"file"`
-	ReadOnly bool   `json:"read_only"`
+	File     string      `json:"file"`
+	Format   string      `json:"format,omitempty"`
+	Backing  []diskLayer `json:"backing"`
+	ReadOnly bool        `json:"read_only"`
 }
 
 // Checkpoint captures a named, sandbox-independent snapshot (the server's
@@ -120,6 +126,9 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
+	if err := e.captureDiskBacking(vm, &spec); err != nil {
+		return nil, fmt.Errorf("checkpoint: source disk backing: %w", err)
+	}
 
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		return nil, fmt.Errorf("checkpoint: snapshot parent: %w", err)
@@ -202,6 +211,12 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 			manifest = nil
 		}
 	}()
+	if err := e.validateDiskBacking(vm, spec); err != nil {
+		if stage != "" {
+			_ = os.RemoveAll(stage)
+		}
+		return nil, fmt.Errorf("checkpoint: paused source disk backing: %w", err)
+	}
 	if stage != "" {
 		if err := e.takeSave(stage, finalDir); err != nil {
 			_ = os.RemoveAll(stage)
@@ -231,6 +246,13 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
 	}
 	copyDur = time.Since(t)
+	// Trust the source's recorded chain, not a header the helper can rewrite.
+	// Validate the daemon-owned copy so a change during the copy cannot turn
+	// a captured disk into authority to read another sandbox's node.
+	if err := e.validateDiskBacking(vm, VMSpec{RootDisk: filepath.Join(finalDir, "rootfs.qcow2"),
+		RootDiskFormat: spec.RootDiskFormat, Backing: spec.Backing}); err != nil {
+		return nil, fmt.Errorf("checkpoint: captured root disk: %w", err)
+	}
 
 	// Capture the device set (memory snapshots only — the restored RAM's view of
 	// its disks + mounts must stay valid; a filesystem snapshot is disk-only).
@@ -246,7 +268,15 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 			if err := cloneFile(v.Path, filepath.Join(finalDir, file)); err != nil {
 				return nil, fmt.Errorf("checkpoint: copy volume %d: %w", i, err)
 			}
-			snapVols = append(snapVols, snapVolume{File: file, ReadOnly: v.ReadOnly})
+			if err := e.validateDiskBacking(vm, VMSpec{RootDisk: filepath.Join(finalDir, file),
+				RootDiskFormat: v.Format, Backing: v.Backing}); err != nil {
+				return nil, fmt.Errorf("checkpoint: captured volume %d: %w", i, err)
+			}
+			format := v.Format
+			if format == "" {
+				format = "raw"
+			}
+			snapVols = append(snapVols, snapVolume{File: file, Format: format, Backing: v.Backing, ReadOnly: v.ReadOnly})
 		}
 		copyDur += time.Since(t)
 		for _, mnt := range spec.Mounts {
@@ -257,17 +287,21 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 	if rerr := resume(); rerr != nil {
 		return nil, rerr
 	}
+	m := krucibleSnapManifest{
+		Arch: hostSnapshotArch(), Type: snapType,
+		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
+		DiskFile: "rootfs.qcow2", DiskFormat: spec.RootDiskFormat, ConfigFile: "config.ext4",
+		Token: token, KernelImage: spec.KernelImage, Backing: spec.Backing,
+		Mounts: snapMounts, Volumes: snapVols, NetPolicy: snapNet,
+	}
+	if err := writeSnapshotManifest(finalDir, m); err != nil {
+		return nil, fmt.Errorf("checkpoint: manifest: %w", err)
+	}
 	if err := syncTree(finalDir); err != nil {
 		return nil, fmt.Errorf("checkpoint: sync snapshot: %w", err)
 	}
 	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir, "volumes", len(snapVols), "mounts", len(snapMounts))
-	return krucibleSnapManifest{
-		Arch: hostSnapshotArch(), Type: snapType,
-		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
-		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
-		Token: token, KernelImage: spec.KernelImage,
-		Mounts: snapMounts, Volumes: snapVols, NetPolicy: snapNet,
-	}, nil
+	return m, nil
 }
 
 // ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
@@ -290,19 +324,112 @@ func (e *Engine) ResumeFromManifestJSON(ctx context.Context, snapDir string, man
 // (a fork's staging copy), so a disk that can't be layered over is moved
 // rather than copied again.
 func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte, newName, ownerUserID string, own bool) (engine.SandboxInfo, error) {
-	var m krucibleSnapManifest
-	if err := json.Unmarshal(manifestJSON, &m); err != nil {
-		return engine.SandboxInfo{}, fmt.Errorf("parse snapshot manifest: %w", err)
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("resume: lock nodes: %w", err)
+	}
+	defer unlock()
+	m, local, err := readSnapshotManifest(snapDir)
+	if err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("read snapshot manifest: %w", err)
+	}
+	if !local {
+		if err := json.Unmarshal(manifestJSON, &m); err != nil {
+			return engine.SandboxInfo{}, fmt.Errorf("parse snapshot manifest: %w", err)
+		}
+		// Old API records never recorded verified backing provenance.
+		m.Backing = nil
+		for i := range m.Volumes {
+			m.Volumes[i].Backing = nil
+		}
+	}
+	m.normalize()
+	if _, err := archiveSnapshotFiles(m); err != nil {
+		return engine.SandboxInfo{}, err
 	}
 	if m.Arch != "" && m.Arch != hostSnapshotArch() {
 		return engine.SandboxInfo{}, fmt.Errorf("snapshot arch %q != host %q (cross-arch restore not supported)", m.Arch, hostSnapshotArch())
 	}
-	diskFile, configFile := m.DiskFile, m.ConfigFile
-	if diskFile == "" {
-		diskFile = "rootfs.qcow2"
+	source := VMSpec{RootDisk: filepath.Join(snapDir, m.DiskFile), RootDiskFormat: m.DiskFormat, Backing: m.Backing}
+	owner := &VM{UserID: ownerUserID}
+	if local {
+		if m.DiskFormat != "raw" && m.DiskFormat != "qcow2" {
+			return engine.SandboxInfo{}, fmt.Errorf("snapshot: missing or invalid recorded root format %q", m.DiskFormat)
+		}
+		if source.Backing == nil {
+			source.Backing = []diskLayer{}
+		}
+	} else {
+		// No local record means no format or path from the API record can
+		// authorize a backing file. Infer only after checking each target.
+		chain, err := e.legacyDiskChain(owner, source.RootDisk, "")
+		if err != nil {
+			return engine.SandboxInfo{}, fmt.Errorf("snapshot backing: %w", err)
+		}
+		source.RootDiskFormat = "raw"
+		if isQcow2(source.RootDisk) {
+			source.RootDiskFormat = "qcow2"
+		}
+		source.Backing = chain
 	}
-	if configFile == "" {
-		configFile = "config.ext4"
+	for i := range m.Volumes {
+		v := &m.Volumes[i]
+		path := filepath.Join(snapDir, v.File)
+		if local {
+			if v.Format != "raw" && v.Format != "qcow2" {
+				return engine.SandboxInfo{}, fmt.Errorf("snapshot volume %s: missing or invalid recorded format %q", v.File, v.Format)
+			}
+			if v.Backing == nil {
+				v.Backing = []diskLayer{}
+			}
+		} else {
+			chain, err := e.legacyDiskChain(owner, path, "")
+			if err != nil {
+				return engine.SandboxInfo{}, fmt.Errorf("snapshot volume %s backing: %w", v.File, err)
+			}
+			v.Format = "raw"
+			if isQcow2(path) {
+				v.Format = "qcow2"
+			}
+			v.Backing = chain
+		}
+		source.Volumes = append(source.Volumes, VMVolume{Path: path, Format: v.Format, Backing: v.Backing})
+	}
+	if !local {
+		stage := ""
+		defer func() {
+			if stage != "" {
+				_ = os.RemoveAll(stage)
+				e.scheduleNodeSweep()
+			}
+		}()
+		normalize := func(path, format string, chain []diskLayer) (string, []diskLayer, error) {
+			if err := validateRecordedDisk(path, format, chain); err == nil {
+				return path, chain, nil
+			}
+			if stage == "" {
+				var err error
+				stage, err = os.MkdirTemp(e.cfg.DataDir, "legacy-resume-")
+				if err != nil {
+					return "", nil, err
+				}
+			}
+			return e.normalizeLegacyDisk(stage, path, format, chain)
+		}
+		source.RootDisk, source.Backing, err = normalize(source.RootDisk, source.RootDiskFormat, source.Backing)
+		if err != nil {
+			return engine.SandboxInfo{}, fmt.Errorf("normalize legacy root: %w", err)
+		}
+		for i := range source.Volumes {
+			v := &source.Volumes[i]
+			v.Path, v.Backing, err = normalize(v.Path, v.Format, v.Backing)
+			if err != nil {
+				return engine.SandboxInfo{}, fmt.Errorf("normalize legacy volume %d: %w", i, err)
+			}
+		}
+	}
+	if err := e.validateDiskBacking(owner, source); err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("snapshot backing: %w", err)
 	}
 	spec := engine.SandboxSpec{
 		Name:     newName,
@@ -310,7 +437,8 @@ func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte
 		MemoryMB: int(m.MemMiB),
 		UserID:   ownerUserID, // join the owner's shared netd
 	}
-	opts := createOpts{nodeDisk: filepath.Join(snapDir, diskFile), ownDisks: own}
+	opts := createOpts{nodeDisk: source.RootDisk, nodeFormat: source.RootDiskFormat,
+		nodeOwned: own || source.RootDisk != filepath.Join(snapDir, m.DiskFile)}
 	if m.Type == "filesystem" {
 		// Disk-only snapshot: cold-boot a fresh sandbox from the frozen disk
 		// (new identity/config, no RAM restore).
@@ -323,8 +451,9 @@ func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte
 	// refused at checkpoint (virtio-fs can't be restored), so m.Mounts is
 	// empty here.
 	spec.NetPolicy = m.NetPolicy
-	for _, v := range m.Volumes {
-		opts.restoreVolumes = append(opts.restoreVolumes, restoreVol{path: filepath.Join(snapDir, v.File), readOnly: v.ReadOnly})
+	for i, v := range source.Volumes {
+		opts.restoreVolumes = append(opts.restoreVolumes, restoreVol{path: v.Path, format: v.Format,
+			owned: own || v.Path != filepath.Join(snapDir, m.Volumes[i].File), readOnly: m.Volumes[i].ReadOnly})
 	}
 	opts.snapshotDir = snapDir
 	opts.forcedToken = m.Token
@@ -368,6 +497,15 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (info engi
 			return engine.SandboxInfo{}, fmt.Errorf("fork: %w", err)
 		}
 	}
+
+	// The exclusive sweeper may remove fork stages left by a dead daemon.
+	// Keep this stage live until its disks have been handed to the child and
+	// its other hard links removed, even between checkpoint and resume.
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("fork: lock nodes: %w", err)
+	}
+	defer unlock()
 
 	tmp, err := os.MkdirTemp(e.cfg.DataDir, "fork-")
 	if err != nil {
@@ -447,6 +585,10 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 	// helper can't be killed mid-copy.
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
+	spec := vm.baseSpec
+	if err := e.captureDiskBacking(vm, &spec); err != nil {
+		return fmt.Errorf("freeze: source disk backing: %w", err)
+	}
 
 	// 1. Flush guest page cache → device.
 	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -467,14 +609,27 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 			vm.syncGuestClock(rctx)
 		}
 	}()
+	if err := e.validateDiskBacking(vm, spec); err != nil {
+		return fmt.Errorf("freeze: paused source disk backing: %w", err)
+	}
 
 	// 3. Flush host page cache so the on-disk overlay reflects all writes.
 	_ = exec.CommandContext(pauseCtx, "sync").Run()
 
 	// 4. Copy the overlay (reflink where the host FS supports it; else a copy —
 	// the overlay is a small delta).
-	if err := cloneFile(vm.baseSpec.RootDisk, dst); err != nil {
+	if err := cloneFile(spec.RootDisk, dst); err != nil {
 		return fmt.Errorf("freeze: copy overlay: %w", err)
+	}
+	if err := e.validateDiskBacking(vm, VMSpec{RootDisk: dst,
+		RootDiskFormat: spec.RootDiskFormat, Backing: spec.Backing}); err != nil {
+		_ = os.Remove(dst)
+		return fmt.Errorf("freeze: captured root disk: %w", err)
+	}
+	if err := e.recordNodeMetadata(dst, spec.RootDiskFormat, spec.Backing); err != nil {
+		_ = os.Remove(dst)
+		_ = os.Remove(nodeMetadataPath(dst))
+		return fmt.Errorf("freeze: record image backing: %w", err)
 	}
 	return nil
 }

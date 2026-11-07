@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,8 +29,8 @@ func readArchiveManifestFrom(archive []byte) (archiveManifest, error) {
 	return readArchiveManifest(tar.NewReader(zr))
 }
 
-// layeredSnapshot is a disk-only snapshot of a sandbox that was itself
-// resumed from a snapshot, with a volume it restored: its root disk is layered
+// layeredSnapshot is a memory snapshot of a sandbox that was itself resumed
+// from a snapshot, with a volume it restored: its root disk is layered
 // over a node, which is over the base, and its volume over a raw node.
 func layeredSnapshot(t *testing.T) (f *nodeFixture, dir string, m krucibleSnapManifest) {
 	t.Helper()
@@ -42,10 +44,10 @@ func layeredSnapshot(t *testing.T) (f *nodeFixture, dir string, m krucibleSnapMa
 		t.Fatal(err)
 	}
 	var spec VMSpec
-	if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{{path: filepath.Join(first, "vol0.img")}}, false); err != nil {
+	if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "raw"}}); err != nil {
 		t.Fatal(err)
 	}
-	root, _, _, err := f.e.prepareNodeRoot(sb, filepath.Join(first, "rootfs.qcow2"), false)
+	root, _, _, err := f.e.prepareNodeRoot(sb, filepath.Join(first, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +64,19 @@ func layeredSnapshot(t *testing.T) (f *nodeFixture, dir string, m krucibleSnapMa
 	if err := cloneFile(spec.Volumes[0].Path, filepath.Join(dir, "vol0.img")); err != nil {
 		t.Fatal(err)
 	}
+	writeFile(t, filepath.Join(dir, checkpointFile), []byte("KRUNCKPT checkpoint"))
+	writeFile(t, filepath.Join(dir, memoryFile), make([]byte, 8192))
 	m = krucibleSnapManifest{
-		Arch: hostSnapshotArch(), Type: "filesystem", Vcpus: 1, MemMiB: 64,
-		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
-		Volumes: []snapVolume{{File: "vol0.img"}},
+		Arch: hostSnapshotArch(), Type: "memory", Vcpus: 1, MemMiB: 64,
+		DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", ConfigFile: "config.ext4",
+		Volumes: []snapVolume{{File: "vol0.img", Format: "qcow2"}},
 	}
+	captured := VMSpec{RootDisk: filepath.Join(dir, m.DiskFile), RootDiskFormat: m.DiskFormat,
+		Volumes: []VMVolume{{Path: filepath.Join(dir, "vol0.img"), Format: "qcow2"}}}
+	if err := f.e.recordDiskBacking(&captured); err != nil {
+		t.Fatal(err)
+	}
+	m.Backing, m.Volumes[0].Backing = captured.Backing, captured.Volumes[0].Backing
 	return f, dir, m
 }
 
@@ -89,7 +99,7 @@ func TestLayeredSnapshotMovesToAnotherHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	if imp.Type != "filesystem" {
+	if imp.Type != "memory" {
 		t.Fatalf("imported %+v", imp)
 	}
 	if left, _ := filepath.Glob(filepath.Join(dest, "layer-*")); len(left) != 0 {
@@ -131,10 +141,15 @@ func TestLayeredSnapshotMovesToAnotherHost(t *testing.T) {
 	// what is layered over it keeps it from being deleted.
 	sb := filepath.Join(b.cfg.DataDir, "sandboxes", "x")
 	os.MkdirAll(sb, 0o700)
-	root, _, _, err := b.prepareNodeRoot(sb, filepath.Join(dest, "rootfs.qcow2"), false)
+	root, _, _, err := b.prepareNodeRoot(sb, filepath.Join(dest, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+	if err := b.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord(vmRecord{ID: "x", UserID: "u1", SandboxDir: sb, BaseSpec: spec})
 	if d, err := chainDepth(root); err != nil || d != 3 {
 		t.Fatalf("depth %d, %v; the resumed root, the imported disk and its node make three", d, err)
 	}
@@ -219,5 +234,906 @@ func TestImportRefusesLayersThatDontHangFromTheSnapshot(t *testing.T) {
 	}
 	if len(am.Layers) != 2 || !strings.HasPrefix(am.Layers[0].Name, archiveLayerPrefix) {
 		t.Fatalf("layers %+v", am.Layers)
+	}
+}
+
+func plannedLayeredArchive(t *testing.T, e *Engine, dir string, m krucibleSnapManifest) (archiveManifest, []archiveEntry) {
+	t.Helper()
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	am, paths, err := e.planExport(dir, raw, engine.SnapshotExport{Name: "layered", IncludeBase: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]archiveEntry, len(paths))
+	for i, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries[i] = archiveEntry{am.Files[i].Name, data}
+	}
+	return am, entries
+}
+
+func replaceLayeredEntry(t *testing.T, am *archiveManifest, entries []archiveEntry, name string, data []byte) {
+	t.Helper()
+	for i := range entries {
+		if entries[i].name == name {
+			entries[i].data = data
+			am.Files[i].Size = int64(len(data))
+			return
+		}
+	}
+	t.Fatalf("no archive entry %s", name)
+}
+
+func overlayArchiveBytes(t *testing.T, backing, format string) []byte {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "overlay.qcow2")
+	if err := createQcow2OverlayOn(path, backing, format, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func archiveEntryBytes(t *testing.T, entries []archiveEntry, name string) []byte {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.name == name {
+			return bytes.Clone(entry.data)
+		}
+	}
+	t.Fatalf("no archive entry %s", name)
+	return nil
+}
+
+func setArchiveBackingFormat(data []byte, format string) {
+	binary.BigEndian.PutUint32(data[qcow2HeaderLen+4:], uint32(len(format)))
+	clear(data[qcow2HeaderLen+8 : qcow2HeaderLen+16])
+	copy(data[qcow2HeaderLen+8:], format)
+}
+
+func TestLayeredImportRejectsIncompleteDiskGraphs(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	cases := map[string]func(*archiveManifest, []archiveEntry) []archiveEntry{
+		"unlisted qcow2 volume tail": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			volume := archiveEntryBytes(t, entries, "vol0.img")
+			setArchiveBackingFormat(volume, "qcow2")
+			replaceLayeredEntry(t, am, entries, "vol0.img", volume)
+			tail := overlayArchiveBytes(t, filepath.Join(t.TempDir(), "private.img"), "raw")
+			replaceLayeredEntry(t, am, entries, "layer-2.img", tail)
+			return entries
+		},
+		"raw header above another qcow2 dependency": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			root := archiveEntryBytes(t, entries, "rootfs.qcow2")
+			setArchiveBackingFormat(root, "raw")
+			replaceLayeredEntry(t, am, entries, "rootfs.qcow2", root)
+			return entries
+		},
+		"qcow2 header above the raw base": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			layer := archiveEntryBytes(t, entries, "layer-1.img")
+			setArchiveBackingFormat(layer, "qcow2")
+			replaceLayeredEntry(t, am, entries, "layer-1.img", layer)
+			return entries
+		},
+		"unsupported backing format": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			root := archiveEntryBytes(t, entries, "rootfs.qcow2")
+			setArchiveBackingFormat(root, "vmdk")
+			replaceLayeredEntry(t, am, entries, "rootfs.qcow2", root)
+			return entries
+		},
+		"duplicate backing format": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			root := archiveEntryBytes(t, entries, "rootfs.qcow2")
+			off := binary.BigEndian.Uint64(root[8:])
+			size := binary.BigEndian.Uint32(root[16:])
+			copy(root[256:], root[off:off+uint64(size)])
+			binary.BigEndian.PutUint64(root[8:], 256)
+			binary.BigEndian.PutUint32(root[120:], qcow2ExtBackingFmt)
+			binary.BigEndian.PutUint32(root[124:], 3)
+			copy(root[128:], "raw")
+			clear(root[131:144])
+			replaceLayeredEntry(t, am, entries, "rootfs.qcow2", root)
+			return entries
+		},
+		"external data file feature": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			root := archiveEntryBytes(t, entries, "rootfs.qcow2")
+			binary.BigEndian.PutUint64(root[72:], 1<<2)
+			replaceLayeredEntry(t, am, entries, "rootfs.qcow2", root)
+			return entries
+		},
+		"external data file extension": func(am *archiveManifest, entries []archiveEntry) []archiveEntry {
+			root := archiveEntryBytes(t, entries, "rootfs.qcow2")
+			binary.BigEndian.PutUint32(root[qcow2HeaderLen:], 0x44415441)
+			replaceLayeredEntry(t, am, entries, "rootfs.qcow2", root)
+			return entries
+		},
+	}
+	for name, damage := range cases {
+		t.Run(name, func(t *testing.T) {
+			am, entries := plannedLayeredArchive(t, f.e, dir, m)
+			entries = damage(&am, entries)
+			b := portableEngine(t, "", "exit 0")
+			dest, _, err := importArchive(b, craftArchive(t, am, entries))
+			if !errors.Is(err, engine.ErrBadSnapshotArchive) {
+				t.Fatalf("import: %v; want a bad archive", err)
+			}
+			mustNotExist(t, dest)
+			if nodes, err := os.ReadDir(nodesDir(b.cfg.DataDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			} else if len(nodes) != 0 {
+				t.Fatalf("refused archive published nodes: %v", nodes)
+			}
+			mustNotExist(t, basesDir(b.cfg.DataDir))
+		})
+	}
+}
+
+func TestLayeredImportRollsBackPublishedNodes(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	am, entries := plannedLayeredArchive(t, f.e, dir, m)
+	// The extensions leave room for an archive-relative name, but not a
+	// node-store path. Failure must roll back the already published lower node.
+	root := overlayArchiveBytes(t, "x", "qcow2")
+	binary.BigEndian.PutUint32(root[20:], 9)
+	clear(root[120:512])
+	binary.BigEndian.PutUint32(root[120:], 0x12345678)
+	binary.BigEndian.PutUint32(root[124:], 344)
+	binary.BigEndian.PutUint64(root[8:], 480)
+	binary.BigEndian.PutUint32(root[16:], 1)
+	root[480] = 'x'
+	replaceLayeredEntry(t, &am, entries, "rootfs.qcow2", root)
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, craftArchive(t, am, entries))
+	if err == nil || !strings.Contains(err.Error(), "doesn't fit the qcow2 header") {
+		t.Fatalf("expected a failed header rewrite, got %v", err)
+	}
+	mustNotExist(t, dest)
+	if nodes, err := os.ReadDir(nodesDir(b.cfg.DataDir)); err != nil {
+		t.Fatal(err)
+	} else if len(nodes) != 0 {
+		t.Fatalf("failed import left nodes: %v", nodes)
+	}
+	mustNotExist(t, basesDir(b.cfg.DataDir))
+}
+
+func TestLayeredSnapshotPreservesRawQcow2Magic(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	volumeNode := backingOf(t, filepath.Join(dir, "vol0.img"))
+	secret := filepath.Join(f.data, "private.img")
+	writeFile(t, secret, []byte("not a disk dependency"))
+	f.write(volumeNode, 0, overlayArchiveBytes(t, secret, "raw"))
+	want := fileSum(t, volumeNode)
+	if err := writeSnapshotManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, exportArchive(t, f.e, dir, m, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := backingChain(filepath.Join(dest, "vol0.img"))
+	if err != nil || len(chain) != 1 {
+		t.Fatalf("a raw node's contents became a backing dependency: %v, %v", chain, err)
+	}
+	if fileSum(t, chain[0]) != want {
+		t.Fatal("raw volume bytes were rewritten as a qcow2 header")
+	}
+}
+
+func TestLayeredSnapshotImportsIndependentNodes(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	wantRoot, err := os.ReadFile(backingOf(t, filepath.Join(dir, "rootfs.qcow2")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVolume := fileSum(t, backingOf(t, filepath.Join(dir, "vol0.img")))
+	archive := exportArchive(t, f.e, dir, m, true)
+	if err := os.RemoveAll(f.data); err != nil {
+		t.Fatal(err)
+	}
+	b := portableEngine(t, "", "exit 0")
+	var roots, volumes, destinations []string
+	for _, name := range []string{"first", "second"} {
+		dest := filepath.Join(b.cfg.DataDir, "snapshots", name)
+		if _, err := b.ImportSnapshot(context.Background(), bytes.NewReader(archive), dest); err != nil {
+			t.Fatal(err)
+		}
+		destinations = append(destinations, dest)
+		root := backingOf(t, filepath.Join(dest, "rootfs.qcow2"))
+		volume := backingOf(t, filepath.Join(dest, "vol0.img"))
+		roots, volumes = append(roots, root), append(volumes, volume)
+		gotRoot, err := os.ReadFile(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotRoot[qcow2ClusterSize:], wantRoot[qcow2ClusterSize:]) || fileSum(t, volume) != wantVolume {
+			t.Fatal("an imported chain lost its source's disk data")
+		}
+	}
+	if roots[0] == roots[1] || volumes[0] == volumes[1] {
+		t.Fatalf("independent imports reused mutable node paths: roots %v, volumes %v", roots, volumes)
+	}
+	if err := b.RemoveSnapshot(context.Background(), destinations[0]); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{roots[0], volumes[0]} {
+		mustNotExist(t, path)
+	}
+	for _, path := range []string{roots[1], volumes[1]} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("deleting the first import broke the second's chain: %v", err)
+		}
+	}
+}
+
+func TestArchiveRejectsLayerNamespaceCycles(t *testing.T) {
+	e := portableEngine(t, "", "exit 0")
+	am := archiveManifest{
+		Format: archiveFormat, Arch: hostSnapshotArch(),
+		Snapshot: krucibleSnapManifest{Type: "filesystem", DiskFile: "layer-2.img", DiskFormat: "qcow2", Vcpus: 1, MemMiB: 64},
+		Layers: []archiveLayer{
+			{Name: "layer-1.img", Format: "qcow2", Over: "layer-2.img"},
+			{Name: "layer-2.img", Format: "qcow2", Over: "layer-1.img"},
+		},
+	}
+	if _, err := e.admitArchive(&am); !errors.Is(err, engine.ErrBadSnapshotArchive) {
+		t.Fatalf("a disk/layer name collision was admitted: %v", err)
+	}
+}
+
+func TestArchiveRejectsExcessiveChainDepth(t *testing.T) {
+	e := portableEngine(t, "", "exit 0")
+	am := archiveManifest{
+		Format: archiveFormat, Arch: hostSnapshotArch(),
+		Snapshot: krucibleSnapManifest{Type: "filesystem", DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", Vcpus: 1, MemMiB: 64},
+		Files:    []archiveFile{{Name: "rootfs.qcow2"}},
+	}
+	over := am.Snapshot.DiskFile
+	for i := 0; i <= maxChainDepth; i++ {
+		name := fmt.Sprintf("layer-%d.img", i+1)
+		am.Layers = append(am.Layers, archiveLayer{Name: name, Format: "qcow2", Over: over})
+		am.Files = append(am.Files, archiveFile{Name: name})
+		over = name
+	}
+	if _, err := e.admitArchive(&am); !errors.Is(err, engine.ErrBadSnapshotArchive) {
+		t.Fatalf("an over-depth chain was admitted: %v", err)
+	}
+}
+
+func TestFilesystemArchiveRefusesVolumeDeviceSet(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	am, entries := plannedLayeredArchive(t, f.e, dir, m)
+	m.Type, am.Snapshot.Type = "filesystem", "filesystem"
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	if err := f.e.ExportSnapshot(context.Background(), &archive, dir, raw, engine.SnapshotExport{}); err == nil || archive.Len() != 0 {
+		t.Fatalf("export silently kept unrestorable volumes: %v, %d bytes", err, archive.Len())
+	}
+	am.Files, entries = am.Files[2:], entries[2:]
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, craftArchive(t, am, entries))
+	if !errors.Is(err, engine.ErrBadSnapshotArchive) {
+		t.Fatalf("import silently kept unrestorable volumes: %v", err)
+	}
+	mustNotExist(t, dest)
+}
+
+func TestLayeredArchiveRebuildsMultipleGenerations(t *testing.T) {
+	f, first, m := layeredSnapshot(t)
+	root := f.resume("next", first)
+	var spec VMSpec
+	if err := f.e.layerRestoredVolumes(filepath.Dir(root), &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "qcow2"}}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(f.data, "snapshots", "u1", "third")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []struct{ src, name string }{
+		{root, "rootfs.qcow2"},
+		{spec.Volumes[0].Path, "vol0.img"},
+		{filepath.Join(first, checkpointFile), checkpointFile},
+		{filepath.Join(first, memoryFile), memoryFile},
+	} {
+		if err := cloneFile(file.src, filepath.Join(dir, file.name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, exportArchive(t, f.e, dir, m, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, disk := range []struct {
+		name  string
+		depth int
+	}{{"rootfs.qcow2", 3}, {"vol0.img", 2}} {
+		source, err := backingChain(filepath.Join(dir, disk.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain, err := backingChain(filepath.Join(dest, disk.name))
+		if err != nil || len(chain) != disk.depth {
+			t.Fatalf("%s: chain %v, %v; want %d backing files", disk.name, chain, err, disk.depth)
+		}
+		if len(source) != len(chain) {
+			t.Fatalf("%s lost a layer: source %v, imported %v", disk.name, source, chain)
+		}
+		for i, path := range chain {
+			if !within(b.cfg.DataDir, path) {
+				t.Fatalf("%s retained an exporting-host path %s", disk.name, path)
+			}
+			want, err := os.ReadFile(source[i])
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if isQcow2(source[i]) {
+				want, got = want[qcow2ClusterSize:], got[qcow2ClusterSize:]
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("%s layer %d changed disk data", disk.name, i)
+			}
+		}
+	}
+}
+
+func TestArchiveRejectsExcessiveQcow2Depth(t *testing.T) {
+	am := archiveManifest{
+		Format: archiveFormat, Arch: hostSnapshotArch(),
+		Snapshot: krucibleSnapManifest{Type: "filesystem", DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", Vcpus: 1, MemMiB: 64},
+	}
+	var entries []archiveEntry
+	over := ""
+	for i := 0; i <= maxChainDepth; i++ {
+		name := "rootfs.qcow2"
+		if i != 0 {
+			name = fmt.Sprintf("layer-%d.img", i)
+			am.Layers = append(am.Layers, archiveLayer{Name: name, Format: "qcow2", Over: over})
+		}
+		data := overlayArchiveBytes(t, "/source-host/disk.img", "qcow2")
+		if i == maxChainDepth {
+			clear(data[8:20])
+		}
+		am.Files = append(am.Files, archiveFile{Name: name, Size: int64(len(data))})
+		entries = append(entries, archiveEntry{name, data})
+		over = name
+	}
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, craftArchive(t, am, entries))
+	if !errors.Is(err, engine.ErrBadSnapshotArchive) {
+		t.Fatalf("nine qcow2 images were admitted under the eight-image cap: %v", err)
+	}
+	mustNotExist(t, dest)
+	if nodes := nodeEntries(t, b.cfg.DataDir); len(nodes) != 0 {
+		t.Fatalf("over-depth archive published nodes: %v", nodes)
+	}
+}
+
+func TestLayeredImportRollsBackWhenBasePublicationFails(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	b := portableEngine(t, "", "exit 0")
+	sum := fileSum(t, f.base)
+	stem := keptBaseStem.FindStringSubmatch(filepath.Base(f.base))[1]
+	squatter := filepath.Join(basesDir(b.cfg.DataDir), baseName(stem, sum))
+	original := writeBase(t, squatter, 17)
+	dest, _, err := importArchive(b, exportArchive(t, f.e, dir, m, true))
+	if err == nil || !strings.Contains(err.Error(), "already holds another image") {
+		t.Fatalf("base collision wasn't refused: %v", err)
+	}
+	mustNotExist(t, dest)
+	if nodes := nodeEntries(t, b.cfg.DataDir); len(nodes) != 0 {
+		t.Fatalf("base publication failure left nodes: %v", nodes)
+	}
+	got, err := os.ReadFile(squatter)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("a failed import replaced an existing base: %v", err)
+	}
+}
+
+func TestArchivePreservesExplicitRawVolumeWithQcow2Magic(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	volume := filepath.Join(dir, "vol0.img")
+	writeFile(t, volume, overlayArchiveBytes(t, filepath.Join(f.data, "private.img"), "raw"))
+	m.Volumes[0].Format = "raw"
+	want := fileSum(t, volume)
+	archive := exportArchive(t, f.e, dir, m, true)
+	am, err := readArchiveManifestFrom(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(am.Layers) != 1 {
+		t.Fatalf("raw volume bytes became archive dependencies: %+v", am.Layers)
+	}
+	b := portableEngine(t, "", "exit 0")
+	dest, imp, err := importArchive(b, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var imported krucibleSnapManifest
+	if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+		t.Fatal(err)
+	}
+	if len(imported.Volumes) != 1 || imported.Volumes[0].Format != "raw" {
+		t.Fatalf("the import lost the source volume's raw intent: %+v", imported.Volumes)
+	}
+	if fileSum(t, filepath.Join(dest, "vol0.img")) != want {
+		t.Fatal("raw guest bytes were repointed as a qcow2 header")
+	}
+}
+
+func TestArchiveRejectsUnknownVolumeFormat(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	am, entries := plannedLayeredArchive(t, f.e, dir, m)
+	am.Snapshot.Volumes[0].Format = "vmdk"
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, craftArchive(t, am, entries))
+	if !errors.Is(err, engine.ErrBadSnapshotArchive) {
+		t.Fatalf("unsupported volume dependency format was admitted: %v", err)
+	}
+	mustNotExist(t, dest)
+}
+
+func TestLayeredArchiveAllowsLegacyVolumeFormats(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	m.Volumes[0].Format = ""
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, exportArchive(t, f.e, dir, m, true))
+	if err != nil {
+		t.Fatalf("legacy snapshot volume without explicit format: %v", err)
+	}
+	chain, err := backingChain(filepath.Join(dest, "vol0.img"))
+	if err != nil || len(chain) != 1 || !within(nodesDir(b.cfg.DataDir), chain[0]) {
+		t.Fatalf("legacy volume's chain wasn't rebuilt: %v, %v", chain, err)
+	}
+}
+
+func setArchiveBackingPath(t *testing.T, data []byte, path string) {
+	t.Helper()
+	off := binary.BigEndian.Uint64(data[8:])
+	size := binary.BigEndian.Uint32(data[16:])
+	if off == 0 || off+uint64(max(int(size), len(path))) >= qcow2ClusterSize {
+		t.Fatal("archive fixture has no room for its poisoned backing path")
+	}
+	clear(data[off : off+uint64(size)])
+	copy(data[off:], path)
+	binary.BigEndian.PutUint32(data[16:], uint32(len(path)))
+}
+
+func TestLayeredImportDiscardsSourceHostBackingPaths(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	am, entries := plannedLayeredArchive(t, f.e, dir, m)
+	poisoned := map[string]string{
+		"rootfs.qcow2": "/missing-source-host/private-root.qcow2",
+		"layer-1.img":  "../../missing-source-host/private-base.img",
+		"vol0.img":     "/missing-source-host/private-volume.img",
+	}
+	for name, path := range poisoned {
+		data := archiveEntryBytes(t, entries, name)
+		setArchiveBackingPath(t, data, path)
+		replaceLayeredEntry(t, &am, entries, name, data)
+	}
+	b := portableEngine(t, "", "exit 0")
+	hostPath := filepath.Join(b.cfg.DataDir, "private", "not-a-disk.img")
+	writeFile(t, hostPath, []byte("an import must not open this host path"))
+	am.Snapshot.Backing = []diskLayer{{Path: hostPath, Format: "vmdk"}}
+	am.Snapshot.Volumes[0].Backing = []diskLayer{{Path: hostPath, Format: "qcow2"}}
+	dest, imp, err := importArchive(b, craftArchive(t, am, entries))
+	if err != nil {
+		t.Fatalf("source-host paths were followed instead of the archive graph: %v", err)
+	}
+	var imported krucibleSnapManifest
+	if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported.DiskFormat != "qcow2" || len(imported.Backing) != 2 ||
+		imported.Backing[0].Format != "qcow2" || imported.Backing[1].Format != "raw" ||
+		len(imported.Volumes) != 1 || imported.Volumes[0].Format != "qcow2" ||
+		len(imported.Volumes[0].Backing) != 1 || imported.Volumes[0].Backing[0].Format != "raw" {
+		t.Fatalf("the rebuilt per-disk metadata lost the graph's formats: %+v", imported)
+	}
+	for _, layer := range append(imported.Backing, imported.Volumes[0].Backing...) {
+		if !within(b.cfg.DataDir, layer.Path) || layer.Path == hostPath {
+			t.Fatalf("incoming backing lists became local authority: %+v", layer)
+		}
+	}
+	for _, path := range []string{filepath.Join(dest, imported.DiskFile), imported.Backing[0].Path, filepath.Join(dest, imported.Volumes[0].File)} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, source := range poisoned {
+			if bytes.Contains(data, []byte(source)) {
+				t.Fatalf("%s retained the incoming host backing path %s", path, source)
+			}
+		}
+	}
+	local, found, err := readSnapshotManifest(dest)
+	if err != nil || !found {
+		t.Fatalf("successful import did not publish a daemon-owned manifest: %v, %v", found, err)
+	}
+	localJSON, err := json.Marshal(local)
+	if err != nil || !bytes.Equal(localJSON, imp.ManifestJSON) {
+		t.Fatalf("the local manifest differs from the imported metadata: %s, %v", localJSON, err)
+	}
+}
+
+func TestSnapshotExportUsesLocalDiskMetadata(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	if err := writeSnapshotManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	sqlite := m
+	sqlite.DiskFile, sqlite.DiskFormat = "../private.img", "raw"
+	sqlite.Backing = []diskLayer{{Path: "/not-authorized-by-sqlite", Format: "raw"}}
+	sqlite.Volumes = []snapVolume{{File: "../private-volume.img", Format: "raw"}}
+	raw, err := json.Marshal(sqlite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	am, paths, err := f.e.planExport(dir, raw, engine.SnapshotExport{IncludeBase: true})
+	if err != nil {
+		t.Fatalf("SQLite overrode the local manifest: %v", err)
+	}
+	if am.Snapshot.DiskFile != m.DiskFile || am.Snapshot.DiskFormat != "qcow2" ||
+		len(am.Layers) != 2 || am.Layers[0].Format != "qcow2" || am.Layers[1].Format != "raw" ||
+		len(am.Snapshot.Backing) != 0 || len(am.Snapshot.Volumes[0].Backing) != 0 {
+		t.Fatalf("export did not use and sanitize the local per-disk metadata: %+v", am)
+	}
+	for _, path := range paths {
+		if strings.Contains(path, "private") || strings.Contains(path, "not-authorized") {
+			t.Fatalf("SQLite added an archive source: %s", path)
+		}
+	}
+}
+
+func TestTrustedArchivePreservesRawDisksWithQcow2Magic(t *testing.T) {
+	f := newNodeFixture(t)
+	dir := filepath.Join(f.data, "snapshots", "u1", "raw")
+	hostPath := filepath.Join(f.data, "private", "never-open.img")
+	payload := overlayArchiveBytes(t, hostPath, "raw")
+	binary.BigEndian.PutUint64(payload[72:], 1<<2)
+	for _, name := range []string{"root.img", "vol0.img"} {
+		writeFile(t, filepath.Join(dir, name), payload)
+	}
+	writeFile(t, filepath.Join(dir, checkpointFile), []byte("KRUNCKPT checkpoint"))
+	writeFile(t, filepath.Join(dir, memoryFile), make([]byte, 8192))
+	m := krucibleSnapManifest{
+		Arch: hostSnapshotArch(), Type: "memory", Vcpus: 1, MemMiB: 64,
+		DiskFile: "root.img", DiskFormat: "raw",
+		Volumes: []snapVolume{{File: "vol0.img", Format: "raw"}},
+	}
+	if err := writeSnapshotManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	archive := exportArchive(t, f.e, dir, m, true)
+	am, err := readArchiveManifestFrom(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if am.Snapshot.DiskFormat != "raw" || am.Base != nil || len(am.Layers) != 0 {
+		t.Fatalf("raw payload bytes became archive metadata: %+v", am)
+	}
+	b := portableEngine(t, "", "exit 0")
+	dest, imp, err := importArchive(b, archive)
+	if err != nil {
+		t.Fatalf("raw disk payload was parsed as a qcow2 header: %v", err)
+	}
+	var imported krucibleSnapManifest
+	if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported.DiskFormat != "raw" || len(imported.Backing) != 0 ||
+		imported.Volumes[0].Format != "raw" || len(imported.Volumes[0].Backing) != 0 {
+		t.Fatalf("raw disks gained backing authority: %+v", imported)
+	}
+	for _, name := range []string{"root.img", "vol0.img"} {
+		got, err := os.ReadFile(filepath.Join(dest, name))
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("%s's raw guest bytes were rewritten: %v", name, err)
+		}
+	}
+}
+
+func TestLegacyExportRejectsSQLiteBackingAuthority(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	foreignSnapshot := f.snapshot("u2", "private", f.freshRoot("foreign"))
+	foreign, err := f.e.nodeLink(filepath.Join(foreignSnapshot, "rootfs.qcow2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(f.data, "private", "unreadable-tail.img")
+	if err := setQcow2Backing(foreign, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := setQcow2Backing(filepath.Join(dir, m.DiskFile), foreign); err != nil {
+		t.Fatal(err)
+	}
+	m.Type, m.DiskFormat, m.Volumes = "filesystem", "", nil
+	m.Backing = []diskLayer{{Path: foreign, Format: "qcow2"}, {Path: secret, Format: "raw"}}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	err = f.e.ExportSnapshot(context.Background(), &archive, dir, raw, engine.SnapshotExport{IncludeBase: true})
+	if err == nil || archive.Len() != 0 || !strings.Contains(err.Error(), foreign) || strings.Contains(err.Error(), secret) {
+		t.Fatalf("legacy export did not authorize the next layer before opening it: %v, %d bytes", err, archive.Len())
+	}
+}
+
+func TestArchiveRequiresExplicitDiskAndLayerFormats(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	cases := map[string]func(*archiveManifest){
+		"root missing":   func(am *archiveManifest) { am.Snapshot.DiskFormat = "" },
+		"root unknown":   func(am *archiveManifest) { am.Snapshot.DiskFormat = "vmdk" },
+		"volume missing": func(am *archiveManifest) { am.Snapshot.Volumes[0].Format = "" },
+		"layer missing":  func(am *archiveManifest) { am.Layers[0].Format = "" },
+		"layer unknown":  func(am *archiveManifest) { am.Layers[0].Format = "vmdk" },
+	}
+	for name, damage := range cases {
+		t.Run(name, func(t *testing.T) {
+			am, entries := plannedLayeredArchive(t, f.e, dir, m)
+			damage(&am)
+			b := portableEngine(t, "", "exit 0")
+			dest, _, err := importArchive(b, craftArchive(t, am, entries))
+			if !errors.Is(err, engine.ErrBadSnapshotArchive) {
+				t.Fatalf("import admitted an untyped archive dependency: %v", err)
+			}
+			mustNotExist(t, dest)
+		})
+	}
+}
+
+func TestLegacyArchiveUsesParentFormatsWithoutProbingRawLayers(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			f, dir, m := layeredSnapshot(t)
+			am, entries := plannedLayeredArchive(t, f.e, dir, m)
+			am.Format, am.Snapshot.DiskFormat, am.Snapshot.Volumes[0].Format = version, "", ""
+			for i := range am.Layers {
+				am.Layers[i].Format = ""
+			}
+			raw := overlayArchiveBytes(t, "/private-host-file.img", "raw")
+			binary.BigEndian.PutUint64(raw[72:], 1<<2)
+			replaceLayeredEntry(t, &am, entries, "layer-2.img", raw)
+			b := portableEngine(t, "", "exit 0")
+			dest, imp, err := importArchive(b, craftArchive(t, am, entries))
+			if err != nil {
+				t.Fatalf("legacy parent formats were not preserved: %v", err)
+			}
+			var imported krucibleSnapManifest
+			if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+				t.Fatal(err)
+			}
+			volume := imported.Volumes[0]
+			if imported.DiskFormat != "qcow2" || volume.Format != "qcow2" ||
+				len(volume.Backing) != 1 || volume.Backing[0].Format != "raw" {
+				t.Fatalf("legacy formats were not made explicit: %+v", imported)
+			}
+			got, err := os.ReadFile(volume.Backing[0].Path)
+			if err != nil || !bytes.Equal(got, raw) {
+				t.Fatalf("raw legacy layer was parsed or rewritten: %v", err)
+			}
+			local, found, err := readSnapshotManifest(dest)
+			if err != nil || !found || local.Volumes[0].Backing[0].Format != "raw" {
+				t.Fatalf("legacy import did not publish explicit local formats: %+v, %v", local, err)
+			}
+		})
+	}
+}
+
+func TestLegacyArchiveRejectsAmbiguousLayerFormat(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	am, entries := plannedLayeredArchive(t, f.e, dir, m)
+	am.Format, am.Snapshot.DiskFormat = 2, ""
+	for i := range am.Layers {
+		am.Layers[i].Format = ""
+	}
+	root := archiveEntryBytes(t, entries, "rootfs.qcow2")
+	binary.BigEndian.PutUint32(root[qcow2HeaderLen:], 0)
+	replaceLayeredEntry(t, &am, entries, "rootfs.qcow2", root)
+	b := portableEngine(t, "", "exit 0")
+	dest, _, err := importArchive(b, craftArchive(t, am, entries))
+	if !errors.Is(err, engine.ErrBadSnapshotArchive) || !strings.Contains(err.Error(), "no explicit backing format") {
+		t.Fatalf("an ambiguous legacy layer was inferred from its payload: %v", err)
+	}
+	mustNotExist(t, dest)
+}
+
+func TestTrustedExportRejectsUnrecordedBacking(t *testing.T) {
+	for _, disk := range []string{"root", "volume"} {
+		t.Run(disk, func(t *testing.T) {
+			f, dir, m := layeredSnapshot(t)
+			if disk == "root" {
+				m.Backing = nil
+			} else {
+				m.Volumes[0].Backing = nil
+			}
+			if err := writeSnapshotManifest(dir, m); err != nil {
+				t.Fatal(err)
+			}
+			var archive bytes.Buffer
+			err := f.e.ExportSnapshot(context.Background(), &archive, dir, nil, engine.SnapshotExport{IncludeBase: true})
+			if err == nil || archive.Len() != 0 {
+				t.Fatalf("explicit local format fell back to header-derived backing: %v, %d bytes", err, archive.Len())
+			}
+		})
+	}
+}
+
+func TestLayeredImportRebuildsLinksFromGraph(t *testing.T) {
+	cases := []string{"missing root link", "missing layer link", "missing volume link", "unlisted terminal host path", "unlisted volume backing"}
+	for _, damage := range cases {
+		t.Run(damage, func(t *testing.T) {
+			f, dir, m := layeredSnapshot(t)
+			am, entries := plannedLayeredArchive(t, f.e, dir, m)
+			rootDepth, volumeDepth := 2, 1
+			switch damage {
+			case "missing root link", "missing layer link", "missing volume link":
+				name := map[string]string{
+					"missing root link": "rootfs.qcow2", "missing layer link": "layer-1.img", "missing volume link": "vol0.img",
+				}[damage]
+				data := archiveEntryBytes(t, entries, name)
+				clear(data[8:20])
+				replaceLayeredEntry(t, &am, entries, name, data)
+			case "unlisted terminal host path":
+				am.Base = nil
+				am.Files, entries = am.Files[:len(am.Files)-1], entries[:len(entries)-1]
+				rootDepth = 1
+				data := archiveEntryBytes(t, entries, "layer-1.img")
+				setArchiveBackingPath(t, data, "/source-host/private-terminal.img")
+				replaceLayeredEntry(t, &am, entries, "layer-1.img", data)
+			case "unlisted volume backing":
+				am.Layers = am.Layers[:1]
+				for i, entry := range entries {
+					if entry.name == "layer-2.img" {
+						am.Files = append(am.Files[:i], am.Files[i+1:]...)
+						entries = append(entries[:i], entries[i+1:]...)
+						break
+					}
+				}
+				volumeDepth = 0
+			}
+			b := portableEngine(t, "", "exit 0")
+			dest, imp, err := importArchive(b, craftArchive(t, am, entries))
+			if err != nil {
+				t.Fatalf("incoming header references overrode the archive graph: %v", err)
+			}
+			var imported krucibleSnapManifest
+			if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+				t.Fatal(err)
+			}
+			if len(imported.Backing) != rootDepth || len(imported.Volumes[0].Backing) != volumeDepth {
+				t.Fatalf("import did not rebuild exactly the declared chains: %+v", imported)
+			}
+			if damage == "unlisted terminal host path" {
+				terminal := imported.Backing[0].Path
+				backing, err := qcow2Backing(terminal)
+				if err != nil || backing != "" {
+					t.Fatalf("terminal qcow2 layer kept a host reference: %s, %v", backing, err)
+				}
+				data, err := os.ReadFile(terminal)
+				if err != nil || bytes.Contains(data, []byte("/source-host/private-terminal.img")) {
+					t.Fatalf("terminal source-host backing path was not erased: %v", err)
+				}
+			}
+			if damage == "unlisted volume backing" {
+				backing, err := qcow2Backing(filepath.Join(dest, imported.Volumes[0].File))
+				if err != nil || backing != "" {
+					t.Fatalf("standalone qcow2 volume kept a host reference: %s, %v", backing, err)
+				}
+			}
+		})
+	}
+}
+
+func TestArchiveRebuildsMissingHeaderFormatsFromMetadata(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	am, entries := plannedLayeredArchive(t, f.e, dir, m)
+	for _, name := range []string{"rootfs.qcow2", "layer-1.img", "vol0.img"} {
+		data := archiveEntryBytes(t, entries, name)
+		binary.BigEndian.PutUint32(data[qcow2HeaderLen:], 0)
+		replaceLayeredEntry(t, &am, entries, name, data)
+	}
+	raw := overlayArchiveBytes(t, "/private-host-file.img", "raw")
+	binary.BigEndian.PutUint64(raw[72:], 1<<2)
+	replaceLayeredEntry(t, &am, entries, "layer-2.img", raw)
+	b := portableEngine(t, "", "exit 0")
+	dest, imp, err := importArchive(b, craftArchive(t, am, entries))
+	if err != nil {
+		t.Fatalf("explicit graph formats were not rebuilt: %v", err)
+	}
+	var imported krucibleSnapManifest
+	if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct{ path, format string }{
+		{filepath.Join(dest, imported.DiskFile), "qcow2"},
+		{imported.Backing[0].Path, "raw"},
+		{filepath.Join(dest, imported.Volumes[0].File), "raw"},
+	} {
+		if got, err := qcow2BackingFormat(check.path); err != nil || got != check.format {
+			t.Fatalf("%s's rebuilt backing format is %q, %v; want %s", check.path, got, err, check.format)
+		}
+	}
+	got, err := os.ReadFile(imported.Volumes[0].Backing[0].Path)
+	if err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("the raw layer was probed or rewritten: %v", err)
+	}
+}
+
+func TestLegacyExportRebuildsMissingHeaderFormats(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	for _, path := range []string{filepath.Join(dir, m.DiskFile), m.Backing[0].Path, filepath.Join(dir, m.Volumes[0].File)} {
+		f.write(path, qcow2HeaderLen, make([]byte, 8))
+	}
+	b := portableEngine(t, "", "exit 0")
+	dest, imp, err := importArchive(b, exportArchive(t, f.e, dir, m, true))
+	if err != nil {
+		t.Fatalf("authorized legacy inference produced an unimportable archive: %v", err)
+	}
+	var imported krucibleSnapManifest
+	if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+		t.Fatal(err)
+	}
+	if imported.DiskFormat != "qcow2" || len(imported.Backing) != 2 ||
+		imported.Backing[0].Format != "qcow2" || imported.Backing[1].Format != "raw" ||
+		len(imported.Volumes[0].Backing) != 1 || imported.Volumes[0].Backing[0].Format != "raw" {
+		t.Fatalf("legacy formats were not recorded in the rebuilt graph: %+v", imported)
+	}
+	if got, err := qcow2BackingFormat(filepath.Join(dest, imported.DiskFile)); err != nil || got != "qcow2" {
+		t.Fatalf("the imported root still requires format probing: %q, %v", got, err)
+	}
+}
+
+func TestLegacyArchiveDefaultsStandaloneVolumesToRaw(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			f, dir, m := layeredSnapshot(t)
+			am, entries := plannedLayeredArchive(t, f.e, dir, m)
+			am.Format, am.Snapshot.DiskFormat, am.Snapshot.Volumes[0].Format = version, "", ""
+			am.Layers = am.Layers[:1]
+			am.Layers[0].Format = ""
+			for i, entry := range entries {
+				if entry.name == "layer-2.img" {
+					am.Files = append(am.Files[:i], am.Files[i+1:]...)
+					entries = append(entries[:i], entries[i+1:]...)
+					break
+				}
+			}
+			raw := overlayArchiveBytes(t, "/private-host-file.img", "raw")
+			binary.BigEndian.PutUint64(raw[72:], 1<<2)
+			replaceLayeredEntry(t, &am, entries, "vol0.img", raw)
+			b := portableEngine(t, "", "exit 0")
+			dest, imp, err := importArchive(b, craftArchive(t, am, entries))
+			if err != nil {
+				t.Fatalf("legacy raw-volume default was replaced by payload probing: %v", err)
+			}
+			var imported krucibleSnapManifest
+			if err := json.Unmarshal(imp.ManifestJSON, &imported); err != nil {
+				t.Fatal(err)
+			}
+			if imported.Volumes[0].Format != "raw" || len(imported.Volumes[0].Backing) != 0 {
+				t.Fatalf("legacy standalone volume gained backing authority: %+v", imported.Volumes[0])
+			}
+			got, err := os.ReadFile(filepath.Join(dest, imported.Volumes[0].File))
+			if err != nil || !bytes.Equal(got, raw) {
+				t.Fatalf("legacy raw guest bytes changed: %v", err)
+			}
+		})
 	}
 }

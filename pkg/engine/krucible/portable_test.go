@@ -80,10 +80,14 @@ func writeFile(t *testing.T, path string, data []byte) {
 // fakeSnapshot lays out a snapshot directory as Checkpoint leaves one: for a
 // memory snapshot a checkpoint and a sparse RAM image, then a root overlay
 // over base holding the sandbox's writes, and a data volume.
-func fakeSnapshot(t *testing.T, base, typ string) (string, krucibleSnapManifest) {
+func fakeSnapshot(t *testing.T, e *Engine, base, typ string) (string, krucibleSnapManifest) {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "dev-ready")
-	if err := os.Mkdir(dir, 0o700); err != nil {
+	parent := filepath.Join(e.cfg.DataDir, "snapshots", "u1")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(parent, "dev-ready-")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if typ == "memory" {
@@ -113,14 +117,14 @@ func fakeSnapshot(t *testing.T, base, typ string) (string, krucibleSnapManifest)
 	}
 	f.WriteAt([]byte("what the sandbox wrote"), 5*qcow2ClusterSize)
 	f.Close()
-	writeFile(t, filepath.Join(dir, "vol0.img"), bytes.Repeat([]byte("volume"), 300_000))
 	m := krucibleSnapManifest{
 		Arch: hostSnapshotArch(), Type: typ, Vcpus: 2, MemMiB: 64,
-		DiskFile: "rootfs.qcow2", ConfigFile: "config.ext4",
+		DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", ConfigFile: "config.ext4",
 		Token: "agent-token", KernelImage: "/opt/bhatti/vmlinux",
-		Volumes: []snapVolume{{File: "vol0.img", ReadOnly: true}},
 	}
 	if typ == "memory" {
+		writeFile(t, filepath.Join(dir, "vol0.img"), bytes.Repeat([]byte("volume"), 300_000))
+		m.Volumes = []snapVolume{{File: "vol0.img", Format: "raw", ReadOnly: true}}
 		m.NetPolicy = &gateway.NetPolicyWire{Default: "deny", AllowHosts: []string{"api.example.com"}}
 	}
 	return dir, m
@@ -167,7 +171,7 @@ func TestSnapshotMovesToAnotherHost(t *testing.T) {
 	baseA := filepath.Join(t.TempDir(), "images", "rootfs-minimal-amd64.ext4")
 	data := writeBase(t, baseA, 1)
 	a := portableEngine(t, baseA, "exit 0")
-	dir, m := fakeSnapshot(t, baseA, "memory")
+	dir, m := fakeSnapshot(t, a, baseA, "memory")
 	archive := exportArchive(t, a, dir, m, false)
 
 	b := portableEngine(t, "", "exit 0")
@@ -244,7 +248,7 @@ func TestSnapshotImportNeedsTheBaseImage(t *testing.T) {
 	writeBase(t, baseA, 1)
 	sum := fileSum(t, baseA)
 	a := portableEngine(t, baseA, "exit 0")
-	dir, m := fakeSnapshot(t, baseA, "filesystem")
+	dir, m := fakeSnapshot(t, a, baseA, "filesystem")
 	without := exportArchive(t, a, dir, m, false)
 
 	other := filepath.Join(t.TempDir(), "rootfs.ext4")
@@ -291,7 +295,7 @@ func TestSnapshotImportNamesTheBaseNotTheTier(t *testing.T) {
 	baseA := filepath.Join(t.TempDir(), "rootfs-minimal-amd64.ext4")
 	data := writeBase(t, baseA, 1)
 	a := portableEngine(t, baseA, "exit 0")
-	dir, m := fakeSnapshot(t, baseA, "filesystem")
+	dir, m := fakeSnapshot(t, a, baseA, "filesystem")
 
 	b := portableEngine(t, "", "exit 0")
 	tier := filepath.Join(b.cfg.DataDir, "images", "rootfs-minimal-amd64.ext4")
@@ -368,7 +372,7 @@ func smallArchive(t *testing.T, base string) (archiveManifest, []archiveEntry) {
 	entries := []archiveEntry{{checkpointFile, ckpt}, {memoryFile, make([]byte, 8192)}, {"rootfs.qcow2", diskData}}
 	am := archiveManifest{
 		Format: archiveFormat, Name: "small", OS: runtime.GOOS, Arch: hostSnapshotArch(),
-		Snapshot: krucibleSnapManifest{Arch: hostSnapshotArch(), Type: "memory", Vcpus: 1, MemMiB: 1, DiskFile: "rootfs.qcow2", Token: "t"},
+		Snapshot: krucibleSnapManifest{Arch: hostSnapshotArch(), Type: "memory", Vcpus: 1, MemMiB: 1, DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", Token: "t"},
 		Base:     &archiveBase{SHA256: fileSum(t, base), Size: fi.Size(), Name: "rootfs.ext4"},
 	}
 	for _, e := range entries {
@@ -395,7 +399,7 @@ func TestSnapshotImportRefusesDamagedArchives(t *testing.T) {
 		os.RemoveAll(dest)
 	}
 
-	dir, m := fakeSnapshot(t, base, "memory")
+	dir, m := fakeSnapshot(t, e, base, "memory")
 	real := exportArchive(t, e, dir, m, false)
 	flipped := corruptPayload(t, real)
 	badChecksum := bytes.Clone(real) // the contents are intact; the frame checksum isn't
@@ -438,7 +442,7 @@ func TestSnapshotImportRefusesDamagedArchives(t *testing.T) {
 			return en
 		},
 		"unknown format": func(am *archiveManifest, en []archiveEntry) []archiveEntry {
-			am.Format = 2
+			am.Format = archiveFormat + 1
 			return en
 		},
 		"bad egress policy": func(am *archiveManifest, en []archiveEntry) []archiveEntry {
@@ -539,7 +543,7 @@ func TestSnapshotImportRefusesHostsThatCantRunIt(t *testing.T) {
 			t.Fatalf("got %v", err)
 		}
 		// A disk-only snapshot cold-boots: no checkpoint support needed.
-		dir, m := fakeSnapshot(t, base, "filesystem")
+		dir, m := fakeSnapshot(t, e, base, "filesystem")
 		if _, _, err := importArchive(e, exportArchive(t, e, dir, m, false)); err != nil {
 			t.Fatalf("filesystem snapshot: %v", err)
 		}
@@ -720,21 +724,126 @@ func TestSnapshotExportRefusesBeforeWriting(t *testing.T) {
 		"checkpoint missing": func(t *testing.T, dir string, _ *krucibleSnapManifest) {
 			os.Remove(filepath.Join(dir, checkpointFile))
 		},
-		"volume over a backing file": func(t *testing.T, dir string, _ *krucibleSnapManifest) {
+		"volume over a backing file": func(t *testing.T, dir string, m *krucibleSnapManifest) {
 			if err := createQcow2Overlay(filepath.Join(dir, "vol0.img"), base, 1<<20); err != nil {
 				t.Fatal(err)
 			}
+			m.Volumes[0].Format = "qcow2"
+		},
+		"root path traversal": func(t *testing.T, dir string, m *krucibleSnapManifest) {
+			outside := filepath.Join(filepath.Dir(dir), "escape.qcow2")
+			if err := cloneFile(filepath.Join(dir, m.DiskFile), outside); err != nil {
+				t.Fatal(err)
+			}
+			m.DiskFile = "../escape.qcow2"
+		},
+		"root shadows a layer": func(t *testing.T, dir string, m *krucibleSnapManifest) {
+			if err := cloneFile(filepath.Join(dir, m.DiskFile), filepath.Join(dir, "layer-2.img")); err != nil {
+				t.Fatal(err)
+			}
+			m.DiskFile = "layer-2.img"
+		},
+		"unknown volume format": func(_ *testing.T, _ string, m *krucibleSnapManifest) {
+			m.Volumes[0].Format = "vmdk"
 		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
-			dir, m := fakeSnapshot(t, base, "memory")
+			dir, m := fakeSnapshot(t, e, base, "memory")
 			mutate(t, dir, &m)
 			raw, _ := json.Marshal(m)
 			var buf bytes.Buffer
 			err := e.ExportSnapshot(context.Background(), &buf, dir, raw, engine.SnapshotExport{Name: "x"})
 			if err == nil || buf.Len() != 0 {
 				t.Fatalf("export: err=%v after writing %d bytes; want an error before any", err, buf.Len())
+			}
+		})
+	}
+}
+
+func TestConfineLaunchKeepsRawBackingOpaque(t *testing.T) {
+	f := newNodeFixture(t)
+	raw := filepath.Join(f.data, "snapshots", "u1", "volume", "vol0.img")
+	secret := filepath.Join(f.data, "private", "secret.img")
+	writeFile(t, secret, []byte("not a backing disk"))
+	writeFile(t, raw, overlayArchiveBytes(t, secret, "raw"))
+	node, err := f.e.nodeLink(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := f.freshRoot("a")
+	volume := filepath.Join(filepath.Dir(root), "volume.qcow2")
+	if err := createQcow2Overlay(volume, node, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	vm := &VM{ID: "a", UserID: "u1", SandboxDir: filepath.Dir(root), SockDir: filepath.Join(f.data, "sock")}
+	spec := VMSpec{
+		RootDisk: root, RootDiskFormat: "qcow2", Backing: []diskLayer{{Path: f.base, Format: "raw"}},
+		Volumes: []VMVolume{{BlockID: "vol0", Path: volume, Format: "qcow2", Backing: []diskLayer{{Path: node, Format: "raw"}}}},
+	}
+	_, policy, cleanup, err := f.e.confineLaunch(vm, spec, filepath.Join(vm.SandboxDir, "vmspec.json"))
+	if err != nil {
+		t.Fatalf("raw guest data was treated as a qcow2 dependency: %v", err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("path 4 "+node+"\x00")) || bytes.Contains(data, []byte(secret)) {
+		t.Fatalf("policy followed the raw node's data instead of its declared format: %q", data)
+	}
+}
+
+func TestCapturedDisksKeepTheirSourcesBackingAuthority(t *testing.T) {
+	for _, attack := range []string{"root", "volume"} {
+		t.Run(attack, func(t *testing.T) {
+			f, dir, _ := layeredSnapshot(t)
+			spec := VMSpec{
+				RootDisk: filepath.Join(dir, "rootfs.qcow2"), RootDiskFormat: "qcow2",
+				Volumes: []VMVolume{{BlockID: "vol0", Path: filepath.Join(dir, "vol0.img"), Format: "qcow2"}},
+			}
+			var err error
+			if err = f.e.recordDiskBacking(&spec); err != nil {
+				t.Fatal(err)
+			}
+			vm := &VM{ID: "source", UserID: "u1", SandboxDir: dir}
+			if err := f.e.validateDiskBacking(vm, spec); err != nil {
+				t.Fatalf("unchanged source chain was refused: %v", err)
+			}
+			var foreign string
+			if attack == "root" {
+				foreign, err = f.e.nodeLink(filepath.Join(f.snapshot("u2", "private", f.freshRoot("foreign")), "rootfs.qcow2"))
+			} else {
+				raw := filepath.Join(f.data, "snapshots", "u2", "private", "vol0.img")
+				writeFile(t, raw, bytes.Repeat([]byte("private volume"), 4096))
+				foreign, err = f.e.nodeLink(raw)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := spec.RootDisk
+			if attack == "volume" {
+				path = spec.Volumes[0].Path
+			}
+			if err := setQcow2Backing(path, foreign); err != nil {
+				t.Fatal(err)
+			}
+			captured := spec
+			captured.Volumes = slices.Clone(spec.Volumes)
+			copies := t.TempDir()
+			captured.RootDisk = filepath.Join(copies, "rootfs.qcow2")
+			if err := cloneFile(spec.RootDisk, captured.RootDisk); err != nil {
+				t.Fatal(err)
+			}
+			for i, volume := range spec.Volumes {
+				captured.Volumes[i].Path = filepath.Join(copies, "vol"+strconv.Itoa(i)+".img")
+				if err := cloneFile(volume.Path, captured.Volumes[i].Path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.e.validateDiskBacking(vm, captured); err == nil || !strings.Contains(err.Error(), foreign) {
+				t.Fatalf("capture laundered a different tenant's %s node into trusted backing: %v", attack, err)
 			}
 		})
 	}

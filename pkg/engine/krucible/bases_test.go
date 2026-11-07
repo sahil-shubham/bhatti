@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -92,6 +93,12 @@ func TestMigrateImagesKeepsDisksOnTheirBase(t *testing.T) {
 	writeBase(t, other, 3)
 	onOther := filepath.Join(data, "sandboxes", "s3", "root.qcow2")
 	overlayOn(t, onOther, other, 3<<20)
+	record, err := json.Marshal(vmRecord{ID: "s3", UserID: "u1", SandboxDir: filepath.Dir(onOther),
+		BaseSpec: VMSpec{RootDisk: onOther, RootDiskFormat: "qcow2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, stateFilePath(filepath.Dir(onOther)), record)
 
 	m, err := MigrateImages(data)
 	if err != nil {
@@ -221,7 +228,13 @@ func TestGCImagesKeepsWhatIsNamed(t *testing.T) {
 	chainBase := base("base-dddddddddddddddd.ext4", 4)
 	node := filepath.Join(bases, "node-eeeeeeeeeeeeeeee.ext4")
 	overlayOn(t, node, chainBase, 3<<20)
-	overlayOn(t, filepath.Join(data, "snapshots", "u1", "snap", "rootfs.qcow2"), node, 3<<20)
+	snapshotRoot := filepath.Join(data, "snapshots", "u1", "snap", "rootfs.qcow2")
+	if err := os.MkdirAll(filepath.Dir(snapshotRoot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := createQcow2OverlayOn(snapshotRoot, node, "qcow2", 3<<20); err != nil {
+		t.Fatal(err)
+	}
 	configured := base("rootfs-docker-amd64-ffffffffffffffff.ext4", 5)
 	writing := base(".rootfs-minimal-amd64.ext4.tmp.123", 6)
 	unused := base("rootfs-minimal-amd64-0000000000000000.ext4", 7)
@@ -292,7 +305,7 @@ func TestNewRootNamesTheBaseNotTheTier(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		root, format, got, err := e.prepareRootDisk(dir, spec)
+		root, format, got, _, err := e.prepareRootDisk(dir, spec)
 		if err != nil {
 			t.Fatal(err)
 		}

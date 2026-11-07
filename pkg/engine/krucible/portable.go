@@ -9,21 +9,24 @@ package krucible
 //	bhatti-snapshot.json  the archive manifest (archiveManifest)
 //	checkpoint.bin        memory snapshots: VM state, checked against this
 //	memory.bin            host before the large files arrive; guest RAM
-//	<disk file>           the root disk, a qcow2 overlay
+//	<disk file>           the root disk in its recorded format
 //	<volume files>        frozen data volumes
 //	layer-<n>.img         the nodes the disks are layered over (nodes.go)
 //	base.img              the overlay's base image, with IncludeBase
 //
 // A disk the sandbox wrote since it was resumed holds only that: what it was
 // layered over is a node, which arrives as an entry of its own, and an import
-// links it into the node store and re-points the header above it. The root disk
-// and its layers only hold what was written; the rest comes from its raw base
+// links it into the node store and re-points the header above it. A qcow2 root
+// disk and its layers hold what was written; the rest may come from a raw base
 // image, which the manifest identifies by content (sha256). An importing host
 // uses its own copy of that base when it has one, wherever it lives;
 // otherwise the base must travel in the archive, and is kept under
 // <DataDir>/images/bases/ for every snapshot that needs it. Integrity rests on
 // zstd's frame checksum, checked by reading the stream to its end, plus the
 // sha256 of checkpoint.bin (checked before it is used) and of the base.
+// Every disk dependency and format is recorded in the archive metadata.
+// Incoming backing paths are replaced by that graph before any node or base
+// is kept. Raw payloads stay opaque so guest bytes cannot choose a disk driver.
 
 import (
 	"archive/tar"
@@ -31,6 +34,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,7 +59,7 @@ import (
 )
 
 const (
-	archiveFormat       = 1
+	archiveFormat       = 3
 	archiveManifestFile = "bhatti-snapshot.json"
 	archiveBaseFile     = "base.img"
 	checkpointFile      = "checkpoint.bin"
@@ -104,7 +108,8 @@ type archiveBase struct {
 // archiveLayer is an image that another entry's header names as its backing
 // file, and so has to be put where that header will find it.
 type archiveLayer struct {
-	Name string `json:"name"` // its entry
+	Name   string `json:"name"` // its entry
+	Format string `json:"format"`
 	// Over is the entry whose header names this one: a disk of the snapshot,
 	// or the layer above it. An entry names at most one.
 	Over string `json:"over"`
@@ -140,6 +145,37 @@ func snapshotFiles(m krucibleSnapManifest) []string {
 	return names
 }
 
+func archiveSnapshotFiles(m krucibleSnapManifest) ([]string, error) {
+	if m.Type != "memory" && m.Type != "filesystem" {
+		return nil, badArchive("unknown snapshot type %q", m.Type)
+	}
+	if m.Type == "filesystem" && len(m.Volumes) != 0 {
+		return nil, badArchive("a filesystem snapshot has no saved volume device set")
+	}
+	if m.DiskFormat != "" && m.DiskFormat != "raw" && m.DiskFormat != "qcow2" {
+		return nil, badArchive("root disk has unsupported format %q", m.DiskFormat)
+	}
+	for _, v := range m.Volumes {
+		if v.Format != "" && v.Format != "raw" && v.Format != "qcow2" {
+			return nil, badArchive("volume %s has unsupported format %q", v.File, v.Format)
+		}
+	}
+	names := snapshotFiles(m)
+	diskAt := 0
+	if m.Type == "memory" {
+		diskAt = 2
+	}
+	for i, name := range names {
+		reserved := name == archiveManifestFile || name == archiveBaseFile || name == snapshotManifestFile ||
+			strings.HasPrefix(name, archiveLayerPrefix) ||
+			(i >= diskAt && (name == checkpointFile || name == memoryFile))
+		if !archiveFileName.MatchString(name) || reserved || slices.Index(names, name) != i {
+			return nil, badArchive("bad file name %q", name)
+		}
+	}
+	return names, nil
+}
+
 // normalize fills the defaults ResumeFromManifestJSON applies, so both ends
 // of an export agree on the files.
 func (m *krucibleSnapManifest) normalize() {
@@ -153,7 +189,7 @@ func (m *krucibleSnapManifest) normalize() {
 
 // ExportSnapshot implements engine.SnapshotPorter.
 func (e *Engine) ExportSnapshot(ctx context.Context, w io.Writer, snapDir string, manifestJSON []byte, opts engine.SnapshotExport) error {
-	am, paths, err := planExport(e.cfg.DataDir, snapDir, manifestJSON, opts)
+	am, paths, err := e.planExport(snapDir, manifestJSON, opts)
 	if err != nil {
 		return err
 	}
@@ -172,14 +208,79 @@ func (e *Engine) ExportSnapshot(ctx context.Context, w io.Writer, snapDir string
 
 // planExport checks the snapshot can be exported and lists its files, before
 // anything is written.
-func planExport(dataDir, snapDir string, manifestJSON []byte, opts engine.SnapshotExport) (archiveManifest, []string, error) {
-	var m krucibleSnapManifest
-	if err := json.Unmarshal(manifestJSON, &m); err != nil {
-		return archiveManifest{}, nil, fmt.Errorf("export: parse snapshot manifest: %w", err)
+func (e *Engine) planExport(snapDir string, manifestJSON []byte, opts engine.SnapshotExport) (archiveManifest, []string, error) {
+	m, found, err := readSnapshotManifest(snapDir)
+	if err != nil {
+		return archiveManifest{}, nil, fmt.Errorf("export: read local snapshot manifest: %w", err)
+	}
+	if !found {
+		if err := json.Unmarshal(manifestJSON, &m); err != nil {
+			return archiveManifest{}, nil, fmt.Errorf("export: parse snapshot manifest: %w", err)
+		}
+		m.Backing = nil
+		for i := range m.Volumes {
+			m.Volumes[i].Backing = nil
+		}
 	}
 	m.normalize()
+	names, err := archiveSnapshotFiles(m)
+	if err != nil {
+		return archiveManifest{}, nil, fmt.Errorf("export: %w", err)
+	}
 	if len(m.Mounts) > 0 {
 		return archiveManifest{}, nil, fmt.Errorf("%w: the snapshot binds host directories (--mount), which another host doesn't have", engine.ErrNotSupported)
+	}
+	owner, err := snapshotExportOwner(e.cfg.DataDir, snapDir)
+	if err != nil {
+		return archiveManifest{}, nil, fmt.Errorf("export: %w", err)
+	}
+	vm := &VM{UserID: owner, SandboxDir: snapDir}
+	var owned map[fileKey]bool
+	resolve := func(name, format string, backing []diskLayer) (string, []diskLayer, error) {
+		path := filepath.Join(snapDir, name)
+		if found && format != "" {
+			if backing == nil {
+				backing = []diskLayer{}
+			}
+			if err := e.validateDiskBacking(vm, VMSpec{RootDisk: path, RootDiskFormat: format, Backing: backing}); err != nil {
+				return "", nil, err
+			}
+			return format, backing, nil
+		}
+		if owned == nil {
+			var err error
+			owned, err = ownedNodeKeys(e.cfg.DataDir, owner)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+		authorize := func(next string) error {
+			if err := e.authorizedBacking(vm, next, owned); err != nil {
+				return fmt.Errorf("%w: %v", engine.ErrNotSupported, err)
+			}
+			return nil
+		}
+		if format == "raw" {
+			return format, nil, authorize(path)
+		}
+		chain, err := readDiskChain(path, "", authorize)
+		if err != nil {
+			return "", nil, err
+		}
+		format = "qcow2"
+		if len(chain) == 0 && !maybeQcow2(path) {
+			format = "raw"
+		}
+		return format, chain, err
+	}
+	if m.DiskFormat, m.Backing, err = resolve(m.DiskFile, m.DiskFormat, m.Backing); err != nil {
+		return archiveManifest{}, nil, fmt.Errorf("export: root disk: %w", err)
+	}
+	for i := range m.Volumes {
+		v := &m.Volumes[i]
+		if v.Format, v.Backing, err = resolve(v.File, v.Format, v.Backing); err != nil {
+			return archiveManifest{}, nil, fmt.Errorf("export: volume %s: %w", v.File, err)
+		}
 	}
 	if m.Arch == "" {
 		m.Arch = hostSnapshotArch()
@@ -204,7 +305,7 @@ func planExport(dataDir, snapDir string, manifestJSON []byte, opts engine.Snapsh
 		paths = append(paths, path)
 		return nil
 	}
-	for _, name := range snapshotFiles(m) {
+	for _, name := range names {
 		path := filepath.Join(snapDir, name)
 		var sum string
 		if name == checkpointFile {
@@ -218,50 +319,32 @@ func planExport(dataDir, snapDir string, manifestJSON []byte, opts engine.Snapsh
 			return archiveManifest{}, nil, err
 		}
 	}
-	// A disk layered over nodes (a resumed sandbox's, or a volume it restored)
-	// needs them too: each is an entry of its own, which the importing host
-	// links into its node store. They have to be this host's nodes: any other
-	// backing file is a path this snapshot has no way to carry.
-	nodes := nodesDir(dataDir)
-	var layerFiles []string // the files of am.Layers, in order
-	layer := func(over, path string) string {
+	nodes := nodesDir(e.cfg.DataDir)
+	var layerFiles []string
+	layer := func(over string, member diskLayer) string {
 		name := fmt.Sprintf("%s%d.img", archiveLayerPrefix, len(am.Layers)+1)
-		am.Layers = append(am.Layers, archiveLayer{Name: name, Over: over})
-		layerFiles = append(layerFiles, path)
+		am.Layers = append(am.Layers, archiveLayer{Name: name, Format: member.Format, Over: over})
+		layerFiles = append(layerFiles, member.Path)
 		return name
 	}
-	// The root disk's chain runs through nodes, then ends at the raw base the
-	// manifest identifies by content, or at a node with no backing at all.
-	chain, err := backingChain(filepath.Join(snapDir, m.DiskFile))
-	if err != nil {
-		return archiveManifest{}, nil, fmt.Errorf("export: root disk: %w", err)
-	}
 	var base string
-	over := m.DiskFile // the entry whose header names the next member
-	for _, member := range chain {
-		if !isQcow2(member) {
-			base = member
+	over := m.DiskFile
+	for _, member := range m.Backing {
+		if member.Format == "raw" && !within(nodes, member.Path) {
+			base = member.Path
 			break
 		}
-		if !within(nodes, member) {
-			return archiveManifest{}, nil, fmt.Errorf("%w: the root disk is layered over %q, which isn't one of this host's snapshot disks", engine.ErrNotSupported, member)
+		if !within(nodes, member.Path) {
+			return archiveManifest{}, nil, fmt.Errorf("%w: the root disk is layered over %q, which isn't one of this host's snapshot disks", engine.ErrNotSupported, member.Path)
 		}
 		over = layer(over, member)
 	}
 	baseOver := over
 	for _, v := range m.Volumes {
-		path := filepath.Join(snapDir, v.File)
-		if !isQcow2(path) {
-			continue
-		}
-		chain, err := backingChain(path)
-		if err != nil {
-			return archiveManifest{}, nil, fmt.Errorf("export: volume %s: %w", v.File, err)
-		}
 		over := v.File
-		for _, member := range chain {
-			if !within(nodes, member) {
-				return archiveManifest{}, nil, fmt.Errorf("%w: volume %s is a qcow2 overlay over %q, which isn't one of this host's snapshot disks; only standalone volumes and volumes over snapshot disks can be exported", engine.ErrNotSupported, v.File, member)
+		for _, member := range v.Backing {
+			if !within(nodes, member.Path) {
+				return archiveManifest{}, nil, fmt.Errorf("%w: volume %s is a qcow2 overlay over %q, which isn't one of this host's snapshot disks; only standalone volumes and volumes over snapshot disks can be exported", engine.ErrNotSupported, v.File, member.Path)
 			}
 			over = layer(over, member)
 		}
@@ -287,11 +370,47 @@ func planExport(dataDir, snapDir string, manifestJSON []byte, opts engine.Snapsh
 	return am, paths, nil
 }
 
+func snapshotExportOwner(dataDir, snapDir string) (string, error) {
+	snapshots, err := filepath.Abs(filepath.Join(dataDir, "snapshots"))
+	if err != nil {
+		return "", err
+	}
+	path, err := filepath.Abs(snapDir)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(snapshots, path)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 2 || parts[0] == ".." || !archiveFileName.MatchString(parts[0]) || !archiveFileName.MatchString(parts[1]) {
+		return "", nil
+	}
+	// A snapshots/ mount may be shared, but a tenant or snapshot symlink
+	// cannot transfer another tenant's authority to its lexical owner.
+	for _, dir := range []string{filepath.Join(snapshots, parts[0]), path} {
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return "", err
+		}
+		if !fi.IsDir() {
+			return "", fmt.Errorf("snapshot directory %s is not a real directory", dir)
+		}
+	}
+	return parts[0], nil
+}
+
 // portableManifest strips host-local secrets and paths but retains the exact
 // network policy, including the sibling opt-in, across export and import.
 func portableManifest(m krucibleSnapManifest) krucibleSnapManifest {
 	m.KernelImage = ""
 	m.Mounts = nil
+	m.Backing = nil
+	m.Volumes = slices.Clone(m.Volumes)
+	for i := range m.Volumes {
+		m.Volumes[i].Backing = nil
+	}
 	if m.Type != "memory" {
 		m.Token = "" // a cold boot mints its own
 	}
@@ -402,9 +521,19 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 	if err := os.Mkdir(destDir, 0o700); err != nil {
 		return imp, fmt.Errorf("import: %w", err)
 	}
+	var adopted []string
 	defer func() {
 		if err != nil {
 			os.RemoveAll(destDir)
+			// Received entries have fresh identities: these links belong only
+			// to this failed import, never to another snapshot.
+			for _, node := range adopted {
+				if cleanupErr := removeNodeMetadata(node); cleanupErr != nil {
+					err = errors.Join(err, fmt.Errorf("import: remove node metadata: %w", cleanupErr))
+					continue
+				}
+				os.Remove(node)
+			}
 		}
 	}()
 	buf := make([]byte, archiveBufSize)
@@ -439,19 +568,177 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 		return imp, badArchive("%v", err)
 	}
 
-	if am.Base != nil && base == "" {
-		if base, err = e.keepBase(filepath.Join(destDir, archiveBaseFile), am.Base.SHA256, am.Base.Name); err != nil {
+	if err := validateArchiveDisks(destDir, &am); err != nil {
+		return imp, err
+	}
+	needBase := am.Base != nil && base == ""
+	if needBase {
+		base = e.keptBasePath(am.Base.SHA256, am.Base.Name)
+	}
+	if adopted, err = e.rebuildChains(destDir, &am, base); err != nil {
+		return imp, err
+	}
+	if needBase {
+		if _, err := e.keepBase(filepath.Join(destDir, archiveBaseFile), am.Base.SHA256, am.Base.Name); err != nil {
 			return imp, err
 		}
 	}
-	if err := e.rebuildChains(destDir, &am, base); err != nil {
-		return imp, err
+	localSpec := VMSpec{
+		RootDisk: filepath.Join(destDir, am.Snapshot.DiskFile), RootDiskFormat: am.Snapshot.DiskFormat,
+		Backing: am.Snapshot.Backing, Volumes: make([]VMVolume, len(am.Snapshot.Volumes)),
+	}
+	for i, v := range am.Snapshot.Volumes {
+		localSpec.Volumes[i] = VMVolume{
+			Path: filepath.Join(destDir, v.File), Format: v.Format, ReadOnly: v.ReadOnly, Backing: v.Backing,
+		}
+	}
+	if err := e.validateDiskBacking(&VM{}, localSpec); err != nil {
+		return imp, fmt.Errorf("import: validate rebuilt disk backing: %w", err)
 	}
 	manifestJSON, err := json.Marshal(am.Snapshot)
 	if err != nil {
 		return imp, fmt.Errorf("import: %w", err)
 	}
+	if err := writeSnapshotManifest(destDir, am.Snapshot); err != nil {
+		return imp, fmt.Errorf("import: write local snapshot manifest: %w", err)
+	}
 	return engine.SnapshotImport{Name: am.Name, Type: am.Snapshot.Type, ManifestJSON: manifestJSON}, nil
+}
+
+// Only extracted entries are inspected and normalized. Archive metadata, not
+// the presence or contents of incoming header paths, defines every dependency.
+func validateArchiveDisks(dir string, am *archiveManifest) error {
+	below := make(map[string]*archiveLayer, len(am.Layers))
+	for i := range am.Layers {
+		l := &am.Layers[i]
+		below[l.Over] = l
+	}
+	baseOver := ""
+	if am.Base != nil {
+		baseOver = cmp.Or(am.Base.Over, am.Snapshot.DiskFile)
+	}
+	for i := 0; i <= len(am.Snapshot.Volumes); i++ {
+		disk := snapVolume{File: am.Snapshot.DiskFile, Format: am.Snapshot.DiskFormat}
+		if i > 0 {
+			disk = am.Snapshot.Volumes[i-1]
+		}
+		format := disk.Format
+		for cur, depth := disk.File, 0; ; {
+			next := below[cur]
+			hasBase := cur == baseOver
+			if format == "raw" {
+				if next != nil || hasBase {
+					return badArchive("%s is raw but has a backing dependency", cur)
+				}
+				break
+			}
+			depth++
+			if depth > maxChainDepth {
+				return badArchive("%s has more than %d qcow2 images", disk.File, maxChainDepth)
+			}
+			path := filepath.Join(dir, cur)
+			backingFormat, err := qcow2BackingFormat(path)
+			if err != nil {
+				return badArchive("%s: %v", cur, err)
+			}
+			if next == nil && !hasBase {
+				if err := rewriteArchiveBacking(path, "", "", backingFormat); err != nil {
+					return badArchive("%s: %v", cur, err)
+				}
+				break
+			}
+			expected := "raw"
+			if next != nil {
+				// Older archives recorded a layer's format only in its
+				// qcow2 parent. Never probe the layer's guest-controlled bytes.
+				if next.Format == "" {
+					if backingFormat == "" {
+						return badArchive("%s has no explicit backing format or archive layer format", cur)
+					}
+					next.Format = backingFormat
+				}
+				expected = next.Format
+			}
+			if backingFormat != "" && backingFormat != expected {
+				return badArchive("%s names its backing as %s, but the archive records %s", cur, backingFormat, expected)
+			}
+			backing := archiveBaseFile
+			if next != nil {
+				backing = next.Name
+			}
+			if err := rewriteArchiveBacking(path, backing, expected, backingFormat); err != nil {
+				return badArchive("%s: %v", cur, err)
+			}
+			if next == nil {
+				break
+			}
+			cur, format = next.Name, next.Format
+		}
+	}
+	return nil
+}
+
+// Extracted qcow2 headers are staging data, not provenance. Replacing their
+// references before publication prevents either a missing link or a terminal
+// source-host path from changing the archive graph; explicit formats prevent
+// the eventual reader from probing raw guest bytes.
+func rewriteArchiveBacking(path, backing, format, headerFormat string) error {
+	if len(backing) > qcow2MaxBackingName || (backing != "" && format != "raw" && format != "qcow2") {
+		return fmt.Errorf("invalid archive backing reference")
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ref, err := readQcow2BackingRef(f)
+	if err != nil {
+		return err
+	}
+	if backing == "" && ref.offset == 0 && ref.size == 0 {
+		return nil
+	}
+	var offset, extensionsEnd int64
+	if backing != "" {
+		extensionsEnd, err = qcow2ExtensionsEnd(f, ref.cluster)
+		if err != nil {
+			return err
+		}
+		offset = extensionsEnd
+		if headerFormat == "" {
+			offset += 16
+		}
+		if offset+int64(len(backing)) > ref.cluster {
+			return fmt.Errorf("backing name %q doesn't fit the qcow2 header", backing)
+		}
+	}
+	if ref.offset != 0 && ref.size != 0 {
+		var zero [qcow2MaxBackingName]byte
+		if _, err := f.WriteAt(zero[:ref.size], ref.offset); err != nil {
+			return err
+		}
+	}
+	var pointer [12]byte
+	if backing != "" {
+		if headerFormat == "" {
+			var extension [24]byte
+			binary.BigEndian.PutUint32(extension[:], qcow2ExtBackingFmt)
+			binary.BigEndian.PutUint32(extension[4:], uint32(len(format)))
+			copy(extension[8:], format)
+			if _, err := f.WriteAt(extension[:], extensionsEnd-8); err != nil {
+				return err
+			}
+		}
+		if _, err := f.WriteAt([]byte(backing), offset); err != nil {
+			return err
+		}
+		binary.BigEndian.PutUint64(pointer[:], uint64(offset))
+		binary.BigEndian.PutUint32(pointer[8:], uint32(len(backing)))
+	}
+	if _, err := f.WriteAt(pointer[:], 8); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // rebuildChains makes each of the snapshot's disks name what is on this host:
@@ -460,62 +747,70 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 // a header is rewritten before the file is linked into the store, and a node
 // is never changed once it is there. Each layer's file in destDir is gone
 // afterwards: the store holds it, and the disk above names it.
-func (e *Engine) rebuildChains(destDir string, am *archiveManifest, base string) error {
-	below := map[string]string{}
+func (e *Engine) rebuildChains(destDir string, am *archiveManifest, base string) (nodes []string, err error) {
+	below := make(map[string]archiveLayer, len(am.Layers))
 	for _, l := range am.Layers {
-		below[l.Over] = l.Name
+		below[l.Over] = l
 	}
 	baseOver := ""
 	if am.Base != nil {
 		baseOver = cmp.Or(am.Base.Over, am.Snapshot.DiskFile)
 	}
-	disks := []string{am.Snapshot.DiskFile}
-	for _, v := range am.Snapshot.Volumes {
-		disks = append(disks, v.File)
-	}
-	for _, disk := range disks {
-		chain := []string{disk} // entries, the disk first
-		for cur := disk; ; {
+	for disk := 0; disk <= len(am.Snapshot.Volumes); disk++ {
+		name, format := am.Snapshot.DiskFile, am.Snapshot.DiskFormat
+		record := &am.Snapshot.Backing
+		if disk > 0 {
+			v := &am.Snapshot.Volumes[disk-1]
+			name, format, record = v.File, v.Format, &v.Backing
+		}
+		chain := []diskLayer{{Path: name, Format: format}}
+		for cur := name; ; {
 			next, ok := below[cur]
 			if !ok {
 				break
 			}
-			chain = append(chain, next)
-			cur = next
+			chain = append(chain, diskLayer{Path: next.Name, Format: next.Format})
+			cur = next.Name
 		}
+		hasBase := chain[len(chain)-1].Path == baseOver
 		for i := len(chain) - 1; i >= 0; i-- {
-			path := filepath.Join(destDir, chain[i])
-			if chain[i] == baseOver {
-				cur, err := qcow2Backing(path)
-				if err != nil || cur == "" {
-					return badArchive("%s: no qcow2 backing file (%v)", chain[i], err)
-				}
-				if cur != base {
-					if err := setQcow2Backing(path, base); err != nil {
-						return fmt.Errorf("import: %w", err)
-					}
+			path := filepath.Join(destDir, chain[i].Path)
+			var backing string
+			if i+1 < len(chain) {
+				backing = chain[i+1].Path
+			} else if hasBase {
+				backing = base
+			}
+			if backing != "" {
+				if err := setQcow2Backing(path, backing); err != nil {
+					return nodes, fmt.Errorf("import: %w", err)
 				}
 			}
 			if i == 0 {
 				break
 			}
-			node, err := e.adoptNode(path)
+			dependencies := make([]diskLayer, len(chain)-i-1)
+			copy(dependencies, chain[i+1:])
+			if hasBase {
+				dependencies = append(dependencies, diskLayer{Path: base, Format: "raw"})
+			}
+			node, err := e.adoptNode(path, chain[i].Format, dependencies)
 			if err != nil {
-				return fmt.Errorf("import: %w", err)
+				return nodes, fmt.Errorf("import: %w", err)
 			}
-			above := filepath.Join(destDir, chain[i-1])
-			if cur, err := qcow2Backing(above); err != nil || cur == "" {
-				return badArchive("%s: no qcow2 backing file (%v)", chain[i-1], err)
-			}
-			if err := setQcow2Backing(above, node); err != nil {
-				return fmt.Errorf("import: %w", err)
-			}
+			nodes = append(nodes, node)
 			if err := os.Remove(path); err != nil {
-				return fmt.Errorf("import: %w", err)
+				return nodes, fmt.Errorf("import: %w", err)
 			}
+			chain[i].Path = node
+		}
+		*record = make([]diskLayer, len(chain)-1)
+		copy(*record, chain[1:])
+		if hasBase {
+			*record = append(*record, diskLayer{Path: base, Format: "raw"})
 		}
 	}
-	return nil
+	return nodes, nil
 }
 
 func readArchiveManifest(tr *tar.Reader) (archiveManifest, error) {
@@ -540,10 +835,22 @@ func readArchiveManifest(tr *tar.Reader) (archiveManifest, error) {
 // alone, and returns the files that must follow it. It fills in the defaults
 // the manifest leaves out.
 func (e *Engine) admitArchive(am *archiveManifest) ([]archiveFile, error) {
-	if am.Format != archiveFormat {
-		return nil, badArchive("archive format %d (this bhatti reads format %d)", am.Format, archiveFormat)
+	if am.Format < 1 || am.Format > archiveFormat {
+		return nil, badArchive("archive format %d (this bhatti reads formats 1 through %d)", am.Format, archiveFormat)
 	}
 	m := &am.Snapshot
+	// An archive supplies disks, not authority over paths on the importing
+	// host. Only the validated, rebuilt graph can populate the local record.
+	m.Backing = nil
+	for i := range m.Volumes {
+		m.Volumes[i].Backing = nil
+	}
+	if m.DiskFormat == "" {
+		if am.Format == archiveFormat {
+			return nil, badArchive("root disk has no format")
+		}
+		m.DiskFormat = "qcow2"
+	}
 	m.normalize()
 	if host := hostSnapshotArch(); am.Arch != host || (m.Arch != "" && m.Arch != host) {
 		return nil, incompatible("it was taken on %s; this host is %s", am.Arch, host)
@@ -568,12 +875,9 @@ func (e *Engine) admitArchive(am *archiveManifest) ([]archiveFile, error) {
 			return nil, badArchive("%v", err)
 		}
 	}
-	names := snapshotFiles(*m)
-	for i, name := range names {
-		reserved := name == archiveManifestFile || name == archiveBaseFile
-		if !archiveFileName.MatchString(name) || reserved || slices.Index(names, name) != i {
-			return nil, badArchive("bad file name %q", name)
-		}
+	names, err := archiveSnapshotFiles(*m)
+	if err != nil {
+		return nil, err
 	}
 	// Layers follow the snapshot's own files, named in order. A header names
 	// one backing file, so no two layers hang from the same entry, and every
@@ -585,6 +889,9 @@ func (e *Engine) admitArchive(am *archiveManifest) ([]archiveFile, error) {
 	}
 	isLayer := map[string]bool{}
 	for i, l := range am.Layers {
+		if l.Format != "raw" && l.Format != "qcow2" && !(am.Format < archiveFormat && l.Format == "") {
+			return nil, badArchive("layer %s has unsupported format %q", l.Name, l.Format)
+		}
 		if want := fmt.Sprintf("%s%d.img", archiveLayerPrefix, i+1); l.Name != want {
 			return nil, badArchive("layer %d is named %q; expected %s", i+1, l.Name, want)
 		}
@@ -598,14 +905,33 @@ func (e *Engine) admitArchive(am *archiveManifest) ([]archiveFile, error) {
 		}
 		below[l.Over] = l.Name
 	}
+	for i := range m.Volumes {
+		v := &m.Volumes[i]
+		if v.Format != "" {
+			continue
+		}
+		if am.Format == archiveFormat {
+			return nil, badArchive("volume %s has no format", v.File)
+		}
+		// Legacy exporters omitted the raw-volume default; only a declared
+		// dependency establishes that an untyped volume was an overlay.
+		v.Format = "raw"
+		if _, layered := below[v.File]; layered {
+			v.Format = "qcow2"
+		}
+	}
 	reached := 0
 	for d := range disks {
-		for cur := d; ; reached++ {
+		for cur, depth := d, 0; ; reached++ {
 			next, ok := below[cur]
 			if !ok {
 				break
 			}
 			cur = next
+			depth++
+			if depth > maxChainDepth {
+				return nil, badArchive("%s has a backing chain deeper than %d", d, maxChainDepth)
+			}
 		}
 	}
 	if reached != len(am.Layers) {
@@ -812,6 +1138,14 @@ func (e *Engine) findBase(b *archiveBase) (string, error) {
 // rootfs-minimal-amd64-0123456789abcdef.ext4).
 var keptBaseStem = regexp.MustCompile(`^([a-z0-9][a-z0-9._-]{0,62}?)(-[0-9a-f]{16})?(\.ext4|\.img)?$`)
 
+func (e *Engine) keptBasePath(sum, name string) string {
+	stem := "base"
+	if m := keptBaseStem.FindStringSubmatch(name); m != nil {
+		stem = m[1]
+	}
+	return filepath.Join(basesDir(e.cfg.DataDir), baseName(stem, sum))
+}
+
 // keepBase moves a base image that arrived in an archive (already checked
 // against sum, its sha256) into the bases directory, where later imports find
 // it. A base there is never replaced: one already under the name is used if it
@@ -821,11 +1155,7 @@ func (e *Engine) keepBase(src, sum, name string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("import: %w", err)
 	}
-	stem := "base"
-	if m := keptBaseStem.FindStringSubmatch(name); m != nil {
-		stem = m[1]
-	}
-	dst := filepath.Join(dir, baseName(stem, sum))
+	dst := e.keptBasePath(sum, name)
 	// Readable like an installed base: sandboxes' VMMs open it read-only.
 	if err := os.Chmod(src, 0o644); err != nil {
 		return "", fmt.Errorf("import: %w", err)

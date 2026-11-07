@@ -285,10 +285,9 @@ func qcow2BackingPath(path string) (string, error) {
 	return name, nil
 }
 
-// walkImages calls fn for every qcow2 image (link=false) and every symlink
-// (link=true) under dataDir, except under bases/: a base is only ever
-// reached through what names it. A file it can't read goes to fn as an
-// image, whose header fn then fails to read: it might be one.
+// walkImages supplies explicit qcow2 images and legacy candidates to migration.
+// Raw inode aliases are excluded before any magic probe: guest data must not
+// be rewritten just because it resembles an old overlay header.
 //
 // Files directly in dataDir are never images, and are never opened: they
 // are the daemon's own state, state.db and its WAL and shm among them. A
@@ -297,12 +296,25 @@ func qcow2BackingPath(path string) (string, error) {
 // SQLite locks, and the next process to open the database (any `bhatti user`
 // command) would take itself for the only one and delete the live WAL.
 func walkImages(dataDir string, fn func(path string, link bool) error) error {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return err
+	}
+	catalog, err := readDiskCatalog(dataDir)
+	if err != nil {
+		return err
+	}
+	legacySnapshots := map[string]string{}
+	for _, r := range catalog.roots {
+		if r.legacy && within(filepath.Join(dataDir, "snapshots"), r.path) {
+			legacySnapshots[r.path] = r.owner
+		}
+	}
+	owners := map[string]map[fileKey]bool{}
+	e := &Engine{cfg: Config{DataDir: dataDir}}
 	skip := basesDir(dataDir)
 	return filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// Gone between being listed and being read: a sandbox destroyed, or
-			// an installer removing its staging area, while this walk runs.
-			// What no longer exists needs no migrating.
 			if errors.Is(err, fs.ErrNotExist) && path != dataDir {
 				return nil
 			}
@@ -314,11 +326,54 @@ func walkImages(dataDir string, fn func(path string, link bool) error) error {
 				return filepath.SkipDir
 			}
 			return nil
-		case filepath.Dir(path) == filepath.Clean(dataDir):
+		case filepath.Dir(path) == dataDir:
 			return nil
 		case d.Type()&fs.ModeSymlink != 0:
 			return fn(path, true)
-		case d.Type().IsRegular() && maybeQcow2(path):
+		case !d.Type().IsRegular(), strings.HasPrefix(d.Name(), "."):
+			return nil
+		}
+		fi, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if k, ok := keyOf(fi); ok {
+			if m, found := catalog.metadata[k]; found {
+				if m.format == "raw" {
+					return nil
+				}
+				return fn(path, false)
+			}
+		}
+		if !within(filepath.Join(dataDir, "images"), path) &&
+			!within(filepath.Join(dataDir, "sandboxes"), path) &&
+			!within(filepath.Join(dataDir, "snapshots"), path) {
+			return nil
+		}
+		if within(filepath.Join(dataDir, "sandboxes"), path) && filepath.Base(path) != "root.qcow2" {
+			return nil
+		}
+		if within(filepath.Join(dataDir, "snapshots"), path) {
+			owner, ok := legacySnapshots[path]
+			if !ok {
+				return nil
+			}
+			owned, ok := owners[owner]
+			if !ok {
+				owned, err = ownedNodeKeys(dataDir, owner)
+				if err != nil {
+					return err
+				}
+				owners[owner] = owned
+			}
+			if err := e.authorizedBacking(&VM{UserID: owner}, path, owned); err != nil {
+				return err
+			}
+		}
+		if maybeQcow2(path) {
 			return fn(path, false)
 		}
 		return nil
@@ -354,15 +409,10 @@ func keyOf(fi os.FileInfo) (fileKey, bool) {
 	return fileKey{uint64(st.Dev), uint64(st.Ino)}, true
 }
 
-// GCImages removes the bases under dataDir/images/bases that nothing names:
-// no tier name or other symlink under dataDir leads to one, no qcow2 image
-// under dataDir reaches it through its chain of backing files, and it isn't
-// one of keep (the configured base image). A qcow2 image it can't read stops
-// it before anything is removed, since that image might name any base.
-// Dotfiles (an install or import still writing) are never removed. With
-// dryRun it only reports what it would remove. It sweeps the node store
-// (nodes.go) first and reports what it removed there too: a node nothing
-// needs would otherwise keep naming the base under it.
+// GCImages removes bases that no recorded disk, tier name, symlink or keep
+// entry reaches. It uses the same metadata graph as node GC: raw guest bytes
+// cannot pin an arbitrary base by resembling a qcow2 header.
+// Dotfiles (an install or import still writing) are never removed.
 func GCImages(dataDir string, keep []string, dryRun bool) (removed []string, err error) {
 	unlock, err := lockBases(dataDir, true)
 	if err != nil {
@@ -393,31 +443,14 @@ func GCImages(dataDir string, keep []string, dryRun bool) (removed []string, err
 	for _, t := range tiers {
 		mark(t)
 	}
-	err = walkImages(dataDir, func(path string, link bool) error {
-		if link {
-			mark(path)
-			return nil
-		}
-		seen := map[string]bool{}
-		for cur := path; !seen[cur]; {
-			seen[cur] = true
-			backing, err := qcow2BackingPath(cur)
-			if err != nil {
-				return fmt.Errorf("%s: %w (an image GC can't read might name any base)", cur, err)
-			}
-			if backing == "" {
-				break
-			}
-			mark(backing)
-			if !isQcow2(backing) {
-				break
-			}
-			cur = backing
-		}
-		return nil
-	})
+	refs, err := diskRefs(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("gc images: %w", err)
+	}
+	for key, holders := range refs {
+		if len(holders) != 0 {
+			used[key] = true
+		}
 	}
 
 	dir := basesDir(dataDir)

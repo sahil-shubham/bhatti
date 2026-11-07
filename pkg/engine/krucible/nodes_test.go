@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -44,6 +45,11 @@ func (f *nodeFixture) freshRoot(id string) string {
 	if err := createQcow2Overlay(root, f.base, uint64(f.size)); err != nil {
 		f.t.Fatal(err)
 	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		f.t.Fatal(err)
+	}
+	writeRecord(vmRecord{ID: id, UserID: "u1", SandboxDir: filepath.Dir(root), BaseSpec: spec})
 	return root
 }
 
@@ -73,6 +79,15 @@ func (f *nodeFixture) snapshot(user, name, root string) string {
 	if err := cloneFile(root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
 		f.t.Fatal(err)
 	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := writeSnapshotManifest(dir, krucibleSnapManifest{
+		DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", Backing: spec.Backing,
+	}); err != nil {
+		f.t.Fatal(err)
+	}
 	return dir
 }
 
@@ -84,10 +99,15 @@ func (f *nodeFixture) resume(id, snapDir string) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	root, _, _, err := f.e.prepareNodeRoot(dir, filepath.Join(snapDir, "rootfs.qcow2"), false)
+	root, format, _, err := f.e.prepareNodeRoot(dir, filepath.Join(snapDir, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: format}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		f.t.Fatal(err)
+	}
+	writeRecord(vmRecord{ID: id, UserID: filepath.Base(filepath.Dir(snapDir)), SandboxDir: dir, BaseSpec: spec})
 	return root
 }
 
@@ -111,6 +131,9 @@ func nodeEntries(t *testing.T, data string) []string {
 	}
 	var names []string
 	for _, de := range entries {
+		if strings.HasPrefix(de.Name(), ".") && strings.HasSuffix(de.Name(), ".img.json") {
+			continue
+		}
 		names = append(names, de.Name())
 	}
 	return names
@@ -402,8 +425,8 @@ func TestSweepNodesFollowsWhatHoldsThem(t *testing.T) {
 	_ = r2
 }
 
-// TestSweepNodesCascades: with the last disk gone, a chain of nodes goes in
-// one call, deepest-held last.
+// The last sandbox is the only managed root of the whole chain: one sweep
+// must release every unheld node, not leave its parents for later runs.
 func TestSweepNodesCascades(t *testing.T) {
 	f := newNodeFixture(t)
 	root := f.freshRoot("gen0")
@@ -494,7 +517,7 @@ func TestLayerOnCopiesWhereItCannotLayer(t *testing.T) {
 
 	dst := filepath.Join(f.data, "sandboxes", "copy", "root.qcow2")
 	os.MkdirAll(filepath.Dir(dst), 0o700)
-	if err := f.e.layerOn(dst, disk, false); err != nil {
+	if _, err := f.e.layerOn(dst, disk, false, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(dst); !bytes.Equal(got, want) {
@@ -506,7 +529,7 @@ func TestLayerOnCopiesWhereItCannotLayer(t *testing.T) {
 
 	moved := filepath.Join(f.data, "sandboxes", "moved", "root.qcow2")
 	os.MkdirAll(filepath.Dir(moved), 0o700)
-	if err := f.e.layerOn(moved, disk, true); err != nil {
+	if _, err := f.e.layerOn(moved, disk, true, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(disk); !errors.Is(err, os.ErrNotExist) {
@@ -539,10 +562,10 @@ func TestRestoredVolumesAreOverlays(t *testing.T) {
 	os.MkdirAll(sb, 0o700)
 	spec := VMSpec{}
 	err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{
-		{path: filepath.Join(snap, "vol0.img")},
-		{path: filepath.Join(snap, "vol1.img"), readOnly: true},
-		{path: filepath.Join(snap, "vol2.img")},
-	}, false)
+		{path: filepath.Join(snap, "vol0.img"), format: "raw"},
+		{path: filepath.Join(snap, "vol1.img"), format: "raw", readOnly: true},
+		{path: filepath.Join(snap, "vol2.img"), format: "raw"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,11 +596,24 @@ func TestRestoredVolumesAreOverlays(t *testing.T) {
 	if got, _ := os.ReadFile(spec.Volumes[2].Path); !bytes.Equal(got, vols["vol2.img"]) {
 		t.Fatal("the copied volume's contents changed")
 	}
-	// The backing list the launch checks is every file named, not images.
+	// Each device owns its complete chain, including the raw base.
 	spec.RootDisk, spec.RootDiskFormat = f.freshRoot("a"), "qcow2"
-	backing, err := f.e.diskBacking(spec)
-	if err != nil || len(backing) != 2 {
-		t.Fatalf("backing = %v, %v; want the two volume nodes and not the base under images/", backing, err)
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Backing) != 1 || spec.Backing[0] != (diskLayer{Path: f.base, Format: "raw"}) {
+		t.Fatalf("root backing = %v, want only its raw base", spec.Backing)
+	}
+	for i, v := range spec.Volumes {
+		if i == 2 {
+			if len(v.Backing) != 0 {
+				t.Fatalf("raw fallback volume has backing %v", v.Backing)
+			}
+			continue
+		}
+		if len(v.Backing) != 1 || v.Backing[0].Format != "raw" || v.Backing[0].Path != backingOf(t, v.Path) {
+			t.Fatalf("volume %d backing = %v, want its raw node", i, v.Backing)
+		}
 	}
 }
 
@@ -650,7 +686,7 @@ func TestConfineLaunchTrustsOnlyTheBackingTheDaemonRecorded(t *testing.T) {
 	if _, err := launch(spec); err == nil || !strings.Contains(err.Error(), node) {
 		t.Fatalf("a node nobody recorded was admitted: %v", err)
 	}
-	spec.Backing = []string{node}
+	spec.Backing = []diskLayer{{Path: node, Format: "qcow2"}, {Path: f.base, Format: "raw"}}
 	policy, err := launch(spec)
 	if err != nil {
 		t.Fatalf("a recorded node was refused: %v", err)
@@ -681,7 +717,7 @@ func TestConfineLaunchReadiesAVolumesChain(t *testing.T) {
 	sb := filepath.Join(f.data, "sandboxes", "a")
 	os.MkdirAll(sb, 0o700)
 	spec := VMSpec{RootDisk: f.freshRoot("a"), RootDiskFormat: "qcow2"}
-	if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{{path: filepath.Join(snap, "vol0.img")}}, false); err != nil {
+	if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{{path: filepath.Join(snap, "vol0.img"), format: "raw"}}); err != nil {
 		t.Fatal(err)
 	}
 	node := backingOf(t, spec.Volumes[0].Path)
@@ -693,9 +729,8 @@ func TestConfineLaunchReadiesAVolumesChain(t *testing.T) {
 	if cleanup != nil {
 		cleanup()
 	}
-	var err2 error
-	if spec.Backing, err2 = f.e.diskBacking(spec); err2 != nil {
-		t.Fatal(err2)
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
 	}
 	_, policy, cleanup, err := f.e.confineLaunch(vm, spec, filepath.Join(sb, "vmspec.json"))
 	if err != nil {
@@ -733,5 +768,1488 @@ func TestRemoveSnapshotGivesUpWhenItsCallerDoes(t *testing.T) {
 	release()
 	if err := f.e.RemoveSnapshot(context.Background(), snap); err != nil {
 		t.Fatalf("remove once the lock is free: %v", err)
+	}
+}
+
+func TestLayerOnPreservesRelativeBacking(t *testing.T) {
+	for _, name := range []string{"copy", "move", "capped-copy", "capped-move"} {
+		t.Run(name, func(t *testing.T) {
+			f := newNodeFixture(t)
+			root := f.freshRoot("src")
+			if strings.HasPrefix(name, "capped-") {
+				for gen := 1; gen < maxChainDepth; gen++ {
+					id := string(rune('a' + gen))
+					root = f.resume("gen-"+id, f.snapshot("u1", "gen-"+id, root))
+				}
+			}
+			snap := f.snapshot("u1", "relative", root)
+			src := filepath.Join(snap, "rootfs.qcow2")
+			backing := backingOf(t, src)
+			relative, err := filepath.Rel(filepath.Dir(src), backing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := setQcow2Backing(src, relative); err != nil {
+				t.Fatal(err)
+			}
+			f.write(src, 5*qcow2ClusterSize, []byte("only this layer is copied"))
+			before, err := os.ReadFile(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			depth, err := chainDepth(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(f.data, "sandboxes", "new", "root.qcow2")
+			if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			own := strings.HasSuffix(name, "move")
+			if _, err := f.e.layerOn(dst, src, own, "qcow2"); err != nil {
+				t.Fatal(err)
+			}
+			if got := backingOf(t, dst); got != backing {
+				t.Fatalf("relocated layer names %q, want its original backing %q", got, backing)
+			}
+			if got, err := chainDepth(dst); err != nil || got != depth {
+				t.Fatalf("relocated depth = %d, %v; want %d", got, err, depth)
+			}
+			after, err := os.ReadFile(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before[qcow2ClusterSize:], after[qcow2ClusterSize:]) {
+				t.Fatal("relocating the header changed the copied layer's data")
+			}
+			if own {
+				if _, err := os.Stat(src); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("owned source was not moved: %v", err)
+				}
+			} else if got, err := os.ReadFile(src); err != nil || !bytes.Equal(got, before) {
+				t.Fatalf("rebasing the new disk changed the frozen source: %v", err)
+			}
+		})
+	}
+}
+
+func TestLayerOnRejectsAlreadyOverDepthSource(t *testing.T) {
+	f := newNodeFixture(t)
+	src := f.freshRoot("src")
+	dir := filepath.Join(f.data, "snapshots", "u1", "too-deep")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for gen := range maxChainDepth {
+		next := filepath.Join(dir, string(rune('a'+gen))+".qcow2")
+		if err := createQcow2OverlayOn(next, src, "qcow2", uint64(f.size)); err != nil {
+			t.Fatal(err)
+		}
+		src = next
+	}
+	dst := filepath.Join(f.data, "sandboxes", "new", "root.qcow2")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.layerOn(dst, src, false, "qcow2"); err == nil || !strings.Contains(err.Error(), "deeper than") {
+		t.Fatalf("an over-depth source produced another over-depth disk: %v", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rejected source left a destination: %v", err)
+	}
+}
+
+func TestNodeLinkPublishesNameBeforeReturning(t *testing.T) {
+	f := newNodeFixture(t)
+	snap := f.snapshot("u1", "golden", f.freshRoot("src"))
+	src := filepath.Join(snap, "rootfs.qcow2")
+	fi, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, ok := keyOf(fi)
+	if !ok {
+		t.Fatal("no file identity")
+	}
+	node := filepath.Join(nodesDir(f.data), nodeName(k))
+	dst := filepath.Join(f.data, "sandboxes", "new", "root.qcow2")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldSync := syncNodeDir
+	t.Cleanup(func() { syncNodeDir = oldSync })
+	syncs := 0
+	syncNodeDir = func(dir string) {
+		syncs++
+		if dir != nodesDir(f.data) {
+			t.Fatalf("synced %s, not the node directory", dir)
+		}
+		if have, err := os.Stat(node); err != nil || !os.SameFile(fi, have) {
+			t.Fatalf("the publication barrier ran before the link existed: %v", err)
+		}
+		if syncs == 1 {
+			if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the overlay was published before its backing name: %v", err)
+			}
+		}
+	}
+	if _, err := f.e.layerOn(dst, src, false, "qcow2"); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 1 {
+		t.Fatalf("nodeLink returned without its publication barrier: %d barriers", syncs)
+	}
+	// A second publisher can observe the link before the first publisher's
+	// barrier. Seeing EEXIST is not proof that the name is already durable.
+	if got, err := f.e.nodeLink(src); err != nil || got != node || syncs != 2 {
+		t.Fatalf("reused link was not published: %s, %v, %d barriers", got, err, syncs)
+	}
+}
+
+func TestSweepNodesFollowsSymlinkRoots(t *testing.T) {
+	for _, kind := range []string{"data-dir", "disk-file", "disk-dir", "node-file", "node-dir", "store-dir"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newNodeFixture(t)
+			snap := f.snapshot("u1", "golden", f.freshRoot("src"))
+			root := f.resume("a", snap)
+			node := backingOf(t, root)
+			if err := os.RemoveAll(snap); err != nil {
+				t.Fatal(err)
+			}
+			data := f.data
+			holders := []string{filepath.Dir(root)}
+			switch kind {
+			case "data-dir":
+				data = filepath.Join(t.TempDir(), "data")
+				if err := os.Symlink(f.data, data); err != nil {
+					t.Fatal(err)
+				}
+			case "disk-file":
+				outside := filepath.Join(t.TempDir(), "root.qcow2")
+				if err := os.Rename(root, outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, root); err != nil {
+					t.Fatal(err)
+				}
+				holders = append(holders, outside)
+			case "disk-dir":
+				outside := filepath.Join(t.TempDir(), "sandbox")
+				if err := os.Rename(filepath.Dir(root), outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Dir(root)); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(outside, "loop")); err != nil {
+					t.Fatal(err)
+				}
+				holders = append(holders, outside)
+			case "node-file":
+				if err := os.Remove(root); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(node, root); err != nil {
+					t.Fatal(err)
+				}
+			case "node-dir":
+				if err := os.Remove(root); err != nil {
+					t.Fatal(err)
+				}
+				alias := filepath.Join(f.data, "images", "linked-nodes")
+				if err := os.Symlink(nodesDir(f.data), alias); err != nil {
+					t.Fatal(err)
+				}
+				holders = append(holders, alias)
+			case "store-dir":
+				outside := filepath.Join(t.TempDir(), "nodes")
+				if err := os.Rename(nodesDir(f.data), outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, nodesDir(f.data)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if removed, err := SweepNodes(data, false); err != nil || len(removed) != 0 {
+				t.Fatalf("swept the node through a live %s root: %v, %v", kind, removed, err)
+			}
+			if _, err := os.Stat(node); err != nil {
+				t.Fatalf("the in-use node name was deleted: %v", err)
+			}
+			for _, holder := range holders {
+				if err := os.RemoveAll(holder); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if removed, err := SweepNodes(data, false); err != nil || len(removed) != 1 {
+				t.Fatalf("node was not reclaimed after the linked root went: %v, %v", removed, err)
+			}
+		})
+	}
+}
+
+func TestSweepNodesFollowsRawNodeSymlink(t *testing.T) {
+	f := newNodeFixture(t)
+	src := filepath.Join(f.data, "snapshots", "u1", "raw", "vol0.img")
+	writeFile(t, src, bytes.Repeat([]byte{1}, 1<<20))
+	node, err := f.e.nodeLink(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.recordNodeMetadata(node, "raw", []diskLayer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(f.data, "images", "raw.img")
+	if err := os.Symlink(node, alias); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+		t.Fatalf("a raw node still named by an image was removed: %v, %v", removed, err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 {
+		t.Fatalf("the unlinked raw image's node remained: %v, %v", removed, err)
+	}
+}
+
+func TestSweepNodesFollowsPersistedExternalDisks(t *testing.T) {
+	f := newNodeFixture(t)
+	snap := f.snapshot("u1", "with-volumes", f.freshRoot("src"))
+	root := f.resume("a", snap)
+	outside := t.TempDir()
+	externalRoot := filepath.Join(outside, "root.qcow2")
+	if err := os.Rename(root, externalRoot); err != nil {
+		t.Fatal(err)
+	}
+	volume := filepath.Join(snap, "vol0.img")
+	writeFile(t, volume, bytes.Repeat([]byte("volume"), 1<<18))
+	externalVol := filepath.Join(outside, "volume.qcow2")
+	if _, err := f.e.layerOn(externalVol, volume, false, "raw"); err != nil {
+		t.Fatal(err)
+	}
+	sb := filepath.Dir(root)
+	spec := VMSpec{
+		RootDisk: externalRoot, RootDiskFormat: "qcow2",
+		Volumes: []VMVolume{{Path: externalVol, Format: "qcow2"}},
+	}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord(vmRecord{ID: "a", UserID: "u1", SandboxDir: sb, Status: "stopped", BaseSpec: spec})
+	if _, err := os.Stat(stateFilePath(sb)); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Engine{cfg: f.e.cfg}
+	if err := restarted.RemoveSnapshot(context.Background(), snap); !errors.Is(err, engine.ErrSnapshotInUse) ||
+		!strings.Contains(err.Error(), "1 sandbox,") {
+		t.Fatalf("external disks of a recovered sandbox were not counted: %v", err)
+	}
+	if err := os.RemoveAll(snap); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+		t.Fatalf("swept nodes an external disk still names: %v, %v", removed, err)
+	}
+	for _, disk := range []string{externalRoot, externalVol} {
+		if _, err := backingChain(disk); err != nil {
+			t.Fatalf("external disk lost its chain: %v", err)
+		}
+	}
+	if err := os.RemoveAll(sb); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(outside); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 2 {
+		t.Fatalf("external disks' nodes were not reclaimed: %v, %v", removed, err)
+	}
+}
+
+func TestSweepNodesFollowsPersistedRawNode(t *testing.T) {
+	for _, disk := range []string{"root", "volume"} {
+		t.Run(disk, func(t *testing.T) {
+			f := newNodeFixture(t)
+			src := filepath.Join(f.data, "snapshots", "u1", "raw", "vol0.img")
+			writeFile(t, src, bytes.Repeat([]byte{7}, 1<<20))
+			node, err := f.e.nodeLink(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(src); err != nil {
+				t.Fatal(err)
+			}
+			sb := filepath.Join(f.data, "sandboxes", "raw")
+			if err := os.MkdirAll(sb, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			spec := VMSpec{RootDisk: node, RootDiskFormat: "raw"}
+			if disk == "volume" {
+				spec = VMSpec{RootDisk: f.freshRoot("raw"), RootDiskFormat: "qcow2",
+					Volumes: []VMVolume{{Path: node, Format: "raw"}}}
+			}
+			if err := f.e.recordDiskBacking(&spec); err != nil {
+				t.Fatal(err)
+			}
+			writeRecord(vmRecord{ID: "raw", SandboxDir: sb, BaseSpec: spec})
+			if _, err := os.Stat(stateFilePath(sb)); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+				t.Fatalf("removed a node directly attached as a raw %s: %v, %v", disk, removed, err)
+			}
+			if err := os.RemoveAll(sb); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 {
+				t.Fatalf("raw node survived the last persisted root: %v, %v", removed, err)
+			}
+		})
+	}
+}
+
+func TestSweepNodesReclaimsUnreachableCyclesAndDamagedNodes(t *testing.T) {
+	for _, kind := range []string{"cycle", "damaged"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newNodeFixture(t)
+			aSnap := f.snapshot("u1", "a", f.freshRoot("src"))
+			a, err := f.e.nodeLink(filepath.Join(aSnap, "rootfs.qcow2"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantRemoved := 1
+			if kind == "cycle" {
+				bSnap := f.snapshot("u1", "b", f.freshRoot("other"))
+				b, err := f.e.nodeLink(filepath.Join(bSnap, "rootfs.qcow2"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := setQcow2Backing(a, b); err != nil {
+					t.Fatal(err)
+				}
+				if err := setQcow2Backing(b, a); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.RemoveAll(bSnap); err != nil {
+					t.Fatal(err)
+				}
+				wantRemoved++
+			} else if err := os.WriteFile(a, []byte("QFI\xfb\x00\x00\x00\x03"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.RemoveAll(aSnap); err != nil {
+				t.Fatal(err)
+			}
+			root := filepath.Join(f.data, "sandboxes", "live", "root.qcow2")
+			if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := createQcow2OverlayOn(root, a, "qcow2", uint64(f.size)); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err == nil || len(removed) != 0 {
+				t.Fatalf("an unreadable live chain was not protected: %v, %v", removed, err)
+			}
+			if err := os.RemoveAll(filepath.Dir(root)); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != wantRemoved {
+				t.Fatalf("the orphan %s still pins nodes forever: %v, %v", kind, removed, err)
+			}
+		})
+	}
+}
+
+func TestSweepNodesTreatsExplicitRawQFIAsData(t *testing.T) {
+	f := newNodeFixture(t)
+	deadSnap := f.snapshot("u1", "dead", f.freshRoot("src"))
+	dead, err := f.e.nodeLink(filepath.Join(deadSnap, "rootfs.qcow2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawSrc := filepath.Join(f.data, "snapshots", "u1", "raw", "vol0.img")
+	if err := os.MkdirAll(filepath.Dir(rawSrc), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A valid qcow2 header in a raw volume is guest data, including this
+	// pointer. It must not keep an unrelated node alive.
+	if err := createQcow2OverlayOn(rawSrc, dead, "qcow2", uint64(f.size)); err != nil {
+		t.Fatal(err)
+	}
+	rawNode, err := f.e.nodeLink(rawSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(deadSnap); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(rawSrc); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(f.data, "sandboxes", "raw", "root.qcow2")
+	if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := createQcow2OverlayOn(root, rawNode, "raw", uint64(f.size)); err != nil {
+		t.Fatal(err)
+	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord(vmRecord{ID: "raw", UserID: "u1", SandboxDir: filepath.Dir(root), BaseSpec: spec})
+	if depth, err := chainDepth(root); err != nil || depth != 1 {
+		t.Fatalf("raw payload was counted as a qcow2 layer: %d, %v", depth, err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != dead {
+		t.Fatalf("raw data's fake backing kept an orphan alive: %v, %v", removed, err)
+	}
+	if _, err := os.Stat(rawNode); err != nil {
+		t.Fatalf("the explicit-raw node was swept: %v", err)
+	}
+	if err := os.RemoveAll(filepath.Dir(root)); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != rawNode {
+		t.Fatalf("raw node was not reclaimed: %v, %v", removed, err)
+	}
+}
+
+func TestSweepNodesReclaimsCrashedStages(t *testing.T) {
+	f := newNodeFixture(t)
+	src := f.freshRoot("src")
+	stage, err := os.MkdirTemp(f.data, "fork-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := filepath.Join(stage, "snap")
+	if err := os.Mkdir(snap, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(snap, "rootfs.qcow2")
+	if err := cloneFile(src, disk); err != nil {
+		t.Fatal(err)
+	}
+	sb := filepath.Join(f.data, "sandboxes", "child")
+	if err := os.MkdirAll(sb, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, format, _, err := f.e.prepareNodeRoot(sb, disk, true, "qcow2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: format}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord(vmRecord{ID: "child", UserID: "u1", SandboxDir: sb, BaseSpec: spec})
+	if err := writeSnapshotManifest(snap, krucibleSnapManifest{DiskFile: "rootfs.qcow2"}); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(snap, ".manifest-123"), []byte("interrupted metadata write"))
+	adopt, err := os.CreateTemp(nodesDir(f.data), ".adopt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adopt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloneFile(src, adopt.Name()); err != nil {
+		t.Fatal(err)
+	}
+	adoptedNode, err := f.e.nodeLink(adopt.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.recordNodeMetadata(adoptedNode, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}}); err != nil {
+		t.Fatal(err)
+	}
+	untouched := []string{
+		filepath.Join(f.data, "fork-manual", "snap", "rootfs.qcow2"),
+		filepath.Join(f.data, "fork-123", "notes.txt"),
+		filepath.Join(nodesDir(f.data), ".adopt-manual"),
+	}
+	for _, path := range untouched {
+		writeFile(t, path, []byte("not an engine stage"))
+	}
+	linkedStage := filepath.Join(f.data, "fork-456", "snap")
+	if err := os.MkdirAll(linkedStage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "keep")
+	writeFile(t, outside, []byte("outside the stage"))
+	if err := os.Symlink(outside, filepath.Join(linkedStage, "rootfs.qcow2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SweepNodes(f.data, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{stage, adopt.Name()} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("dry run removed stage %s: %v", path, err)
+		}
+	}
+	removed, err := SweepNodes(f.data, false)
+	if err != nil || len(removed) != 1 || removed[0] != adoptedNode {
+		t.Fatalf("crashed stages pinned nodes: %v, %v", removed, err)
+	}
+	for _, path := range []string{stage, adopt.Name()} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("crashed stage %s survived: %v", path, err)
+		}
+	}
+	for _, path := range append(untouched, outside, linkedStage) {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("sweep removed an unrecognized stage shape %s: %v", path, err)
+		}
+	}
+	if _, err := backingChain(root); err != nil {
+		t.Fatalf("cleaning a fork's stage broke its child: %v", err)
+	}
+	if err := os.RemoveAll(sb); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 {
+		t.Fatalf("the fork's last node was not reclaimed: %v, %v", removed, err)
+	}
+}
+
+func TestReadDiskChainAuthorizesBeforeOpeningBacking(t *testing.T) {
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, "blocked.img")
+	writeFile(t, blocked, []byte("QFI\xfb"))
+	top := filepath.Join(dir, "top.qcow2")
+	if err := createQcow2OverlayOn(top, blocked, "qcow2", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	denied := errors.New("backing not owned")
+	_, err := readDiskChain(top, "qcow2", func(path string) error {
+		if path != blocked {
+			t.Fatalf("unexpected backing authorization for %s", path)
+		}
+		return denied
+	})
+	if !errors.Is(err, denied) {
+		t.Fatalf("unowned backing was opened before authorization: %v", err)
+	}
+	chain, err := readDiskChain(top, "raw", func(string) error {
+		t.Fatal("raw contents requested backing authorization")
+		return denied
+	})
+	if err != nil || len(chain) != 0 {
+		t.Fatalf("raw disk acquired a backing chain: %v, %v", chain, err)
+	}
+}
+
+func TestRecordDiskBackingKeepsRawDisksOpaque(t *testing.T) {
+	f := newNodeFixture(t)
+	raw := filepath.Join(f.data, "volumes", "u1", "raw.img")
+	if err := os.MkdirAll(filepath.Dir(raw), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := createQcow2OverlayOn(raw, filepath.Join(f.data, "missing.img"), "qcow2", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	spec := VMSpec{RootDisk: raw, RootDiskFormat: "raw",
+		Volumes: []VMVolume{{BlockID: "vol0", Path: raw, Format: "raw"}}}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatalf("raw guest payload was interpreted: %v", err)
+	}
+	if len(spec.Backing) != 0 || len(spec.Volumes[0].Backing) != 0 {
+		t.Fatalf("raw disks acquired backing: root=%v volume=%v", spec.Backing, spec.Volumes[0].Backing)
+	}
+	standalone := filepath.Join(f.data, "standalone.qcow2")
+	if err := createQcow2OverlayOn(standalone, f.base, "raw", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	f.write(standalone, 8, make([]byte, 12))
+	spec = VMSpec{RootDisk: standalone, RootDiskFormat: "qcow2"}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.Backing == nil || len(spec.Backing) != 0 {
+		t.Fatalf("verified standalone disk lost its metadata marker: %v", spec.Backing)
+	}
+}
+
+func TestRawSnapshotPayloadCannotAddDiskReferences(t *testing.T) {
+	for _, device := range []string{"root", "volume"} {
+		t.Run(device, func(t *testing.T) {
+			f := newNodeFixture(t)
+			target := f.snapshot("u2", "private", f.freshRoot("target"))
+			dead, err := f.e.nodeLink(filepath.Join(target, "rootfs.qcow2"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(f.data, "snapshots", "u1", "raw")
+			m := krucibleSnapManifest{DiskFile: "rootfs.qcow2", DiskFormat: "raw"}
+			name := m.DiskFile
+			if device == "volume" {
+				dir = f.snapshot("u1", "raw", f.freshRoot("holder"))
+				var found bool
+				m, found, err = readSnapshotManifest(dir)
+				if err != nil || !found {
+					t.Fatalf("read fixture manifest: %v, %v", found, err)
+				}
+				name = "vol0.img"
+				m.Volumes = []snapVolume{{File: name, Format: "raw"}}
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			raw := filepath.Join(dir, name)
+			if err := createQcow2OverlayOn(raw, dead, "qcow2", 1<<20); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeSnapshotManifest(dir, m); err != nil {
+				t.Fatal(err)
+			}
+			rawNode, err := f.e.nodeLink(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.e.recordNodeMetadata(rawNode, "raw", []diskLayer{}); err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(f.data, "images", "u1", "raw-alias.ext4")
+			if err := os.MkdirAll(filepath.Dir(alias), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(raw, alias); err != nil {
+				t.Fatal(err)
+			}
+			if users, err := usersOf(f.data, target); err != nil || users.any() {
+				t.Fatalf("raw %s invented snapshot dependents: %v, %v", device, users, err)
+			}
+			if err := os.RemoveAll(target); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != dead {
+				t.Fatalf("raw %s pinned another node: %v, %v", device, removed, err)
+			}
+			if _, err := os.Stat(rawNode); err != nil {
+				t.Fatalf("raw %s lost its own inode: %v", device, err)
+			}
+			if err := os.RemoveAll(dir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(alias); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != rawNode {
+				t.Fatalf("raw %s node outlived its last holder: %v, %v", device, removed, err)
+			}
+		})
+	}
+}
+
+func TestDiskRefsNeverExpandsTrustedChainsFromHeaders(t *testing.T) {
+	f := newNodeFixture(t)
+	target := f.snapshot("u2", "private", f.freshRoot("target"))
+	dead, err := f.e.nodeLink(filepath.Join(target, "rootfs.qcow2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := f.freshRoot("guest")
+	trusted := f.snapshot("u1", "trusted", root)
+	for _, path := range []string{root, filepath.Join(trusted, "rootfs.qcow2")} {
+		if err := createQcow2OverlayOn(path, dead, "qcow2", uint64(f.size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if users, err := usersOf(f.data, target); err != nil || users.any() {
+		t.Fatalf("guest headers expanded daemon-recorded dependencies: %v, %v", users, err)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != dead {
+		t.Fatalf("an unrecorded header pointer pinned a node: %v, %v", removed, err)
+	}
+}
+
+func TestNodeMetadataPreservesExternalSnapshotAncestors(t *testing.T) {
+	f := newNodeFixture(t)
+	parent := f.snapshot("u1", "parent", f.freshRoot("source"))
+	root := f.resume("child", parent)
+	external := filepath.Join(t.TempDir(), "rootfs.qcow2")
+	if err := cloneFile(root, external); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(t.TempDir(), "overlay.qcow2")
+	if _, err := f.e.layerOn(scratch, external, false, "qcow2"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{parent, filepath.Join(f.data, "sandboxes"), scratch} {
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodes := nodeEntries(t, f.data)
+	if len(nodes) != 2 {
+		t.Fatalf("external lineage holds %v, want two nodes", nodes)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+		t.Fatalf("external snapshot lost an ancestor: %v, %v", removed, err)
+	}
+	if err := os.Remove(external); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 2 {
+		t.Fatalf("external snapshot's graph survived its last holder: %v, %v", removed, err)
+	}
+	for _, name := range nodes {
+		if _, err := os.Stat(nodeMetadataPath(filepath.Join(nodesDir(f.data), name))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reclaimed node retained metadata for inode reuse: %s, %v", name, err)
+		}
+	}
+}
+
+func TestOwnedNodeKeysUsesPerDiskMetadataOnly(t *testing.T) {
+	f := newNodeFixture(t)
+	var nodes []string
+	for _, name := range []string{"snapshot-root", "snapshot-volume", "sandbox-root", "sandbox-volume", "foreign"} {
+		src := filepath.Join(t.TempDir(), name+".img")
+		writeFile(t, src, bytes.Repeat([]byte(name), 4096))
+		node, err := f.e.nodeLink(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.e.recordNodeMetadata(node, "raw", []diskLayer{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(src); err != nil {
+			t.Fatal(err)
+		}
+		nodes = append(nodes, node)
+	}
+	snap := filepath.Join(f.data, "snapshots", "u1", "trusted")
+	sb := filepath.Join(f.data, "sandboxes", "owned")
+	for _, dir := range []string{snap, sb} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := krucibleSnapManifest{DiskFile: "rootfs.qcow2", DiskFormat: "qcow2",
+		Backing: []diskLayer{{Path: nodes[0], Format: "raw"}},
+		Volumes: []snapVolume{
+			{File: "vol0.img", Format: "qcow2", Backing: []diskLayer{{Path: nodes[1], Format: "raw"}}},
+			{File: "vol1.img", Format: "raw"},
+		}}
+	for _, name := range []string{m.DiskFile, "vol0.img", "vol1.img"} {
+		if err := createQcow2OverlayOn(filepath.Join(snap, name), nodes[4], "raw", 1<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeSnapshotManifest(snap, m); err != nil {
+		t.Fatal(err)
+	}
+	spec := VMSpec{RootDisk: filepath.Join(sb, "root.qcow2"), RootDiskFormat: "qcow2",
+		Backing: []diskLayer{{Path: nodes[2], Format: "raw"}},
+		Volumes: []VMVolume{{Path: filepath.Join(sb, "vol0.img"), Format: "qcow2",
+			Backing: []diskLayer{{Path: nodes[3], Format: "raw"}}}}}
+	for _, path := range []string{spec.RootDisk, spec.Volumes[0].Path} {
+		if err := createQcow2OverlayOn(path, nodes[4], "raw", 1<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeRecord(vmRecord{ID: "owned", UserID: "u1", SandboxDir: sb, BaseSpec: spec})
+	owned, err := ownedNodeKeys(f.data, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, node := range nodes {
+		fi, err := os.Stat(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, ok := keyOf(fi)
+		if !ok || owned[key] != (i < 4) {
+			t.Fatalf("node %d ownership = %v, want %v (identity available=%v)", i, owned[key], i < 4, ok)
+		}
+	}
+}
+
+func TestMigrateImagesKeepsRecordedRawPayloadsUnchanged(t *testing.T) {
+	f := newNodeFixture(t)
+	tier := filepath.Join(f.data, "images", "rootfs-legacy.ext4")
+	writeBase(t, tier, 3)
+	dir := filepath.Join(f.data, "snapshots", "u1", "raw")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	m := krucibleSnapManifest{DiskFile: "rootfs.qcow2", DiskFormat: "raw",
+		Volumes: []snapVolume{{File: "vol0.img", Format: "raw"}}}
+	before := map[string][]byte{}
+	for _, name := range []string{m.DiskFile, m.Volumes[0].File} {
+		path := filepath.Join(dir, name)
+		if err := createQcow2OverlayOn(path, tier, "raw", 1<<20); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		before[path], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeSnapshotManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(f.data, "images", "raw-alias.ext4")
+	if err := os.Link(filepath.Join(dir, "vol0.img"), alias); err != nil {
+		t.Fatal(err)
+	}
+	migration, err := MigrateImages(f.data)
+	if err != nil || len(migration.Rewritten) != 0 {
+		t.Fatalf("migration interpreted raw guest data: %+v, %v", migration, err)
+	}
+	for path, want := range before {
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("migration changed raw payload %s: %v", path, err)
+		}
+	}
+}
+
+func TestSweepNodesRejectsUntypedLiveHardlinks(t *testing.T) {
+	f := newNodeFixture(t)
+	src := filepath.Join(t.TempDir(), "ancestor.img")
+	writeFile(t, src, bytes.Repeat([]byte{1}, 1<<20))
+	ancestor, err := f.e.nodeLink(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.recordNodeMetadata(ancestor, "raw", []diskLayer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "legacy.qcow2")
+	if err := createQcow2OverlayOn(external, ancestor, "raw", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.nodeLink(external); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err == nil || len(removed) != 0 ||
+		!strings.Contains(err.Error(), "no daemon-recorded disk metadata") {
+		t.Fatalf("untyped external snapshot was guessed or lost an ancestor: %v, %v", removed, err)
+	}
+	if err := os.Remove(external); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 2 {
+		t.Fatalf("unreachable untyped graph could not be reclaimed: %v, %v", removed, err)
+	}
+}
+
+func TestImageMetadataKeepsRawBytesOpaqueAndExpiresWithImage(t *testing.T) {
+	f := newNodeFixture(t)
+	snap := f.snapshot("u2", "private", f.freshRoot("target"))
+	dead, err := f.e.nodeLink(filepath.Join(snap, "rootfs.qcow2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := filepath.Join(f.data, "images", "u1", "raw.ext4")
+	if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := createQcow2OverlayOn(image, dead, "qcow2", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.recordNodeMetadata(image, "raw", []diskLayer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(snap); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != dead {
+		t.Fatalf("saved raw image's payload invented a dependency: %v, %v", removed, err)
+	}
+	if err := os.Remove(image); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(filepath.Dir(image), ".notes.json")
+	writeFile(t, unrelated, []byte("not a disk metadata record"))
+	if _, err := SweepNodes(f.data, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(nodeMetadataPath(image)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted image left disk metadata behind: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("metadata cleanup removed unrelated hidden JSON: %v", err)
+	}
+}
+
+func TestRecordedRawPayloadIsNeverOpened(t *testing.T) {
+	const probeEnv = "BHATTI_TEST_RAW_DISK_LOCK"
+	if path := os.Getenv(probeEnv); path != "" {
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		lock := syscall.Flock_t{Type: syscall.F_WRLCK}
+		err = syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lock)
+		if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EAGAIN) {
+			return
+		}
+		t.Fatalf("raw file's parent-process record lock was lost: %v", err)
+	}
+	f := newNodeFixture(t)
+	dir := filepath.Join(f.data, "snapshots", "u1", "raw")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw := filepath.Join(dir, "rootfs.qcow2")
+	if err := createQcow2OverlayOn(raw, filepath.Join(f.data, "private.img"), "qcow2", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(raw, filepath.Join(dir, "vol0.img")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSnapshotManifest(dir, krucibleSnapManifest{
+		DiskFile: "rootfs.qcow2", DiskFormat: "raw",
+		Volumes: []snapVolume{{File: "vol0.img", Format: "raw"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(f.data, "images", "raw-alias.ext4")
+	if err := os.Link(raw, alias); err != nil {
+		t.Fatal(err)
+	}
+	node, err := f.e.nodeLink(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.recordNodeMetadata(node, "raw", []diskLayer{}); err != nil {
+		t.Fatal(err)
+	}
+	sb := filepath.Join(f.data, "sandboxes", "overlay")
+	if err := os.MkdirAll(sb, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := VMSpec{RootDisk: filepath.Join(sb, "root.qcow2"), RootDiskFormat: "qcow2"}
+	if err := createQcow2OverlayOn(spec.RootDisk, node, "raw", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := os.OpenFile(raw, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+	lock := syscall.Flock_t{Type: syscall.F_WRLCK}
+	if err := syscall.FcntlFlock(locked.Fd(), syscall.F_SETLK, &lock); err != nil {
+		t.Fatal(err)
+	}
+	// Closing any descriptor to this inode drops this process's POSIX record
+	// lock. A subprocess therefore detects even an otherwise invisible magic
+	// probe, including a probe through another hard link.
+	probe := func() {
+		t.Helper()
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRecordedRawPayloadIsNeverOpened$")
+		cmd.Env = append(os.Environ(), probeEnv+"="+raw)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("a metadata-only operation opened raw guest bytes: %v\n%s", err, out)
+		}
+	}
+	probe()
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		t.Fatal(err)
+	}
+	probe()
+	writeRecord(vmRecord{ID: "overlay", UserID: "u1", SandboxDir: sb, BaseSpec: spec})
+	if _, err := diskRefs(f.data); err != nil {
+		t.Fatal(err)
+	}
+	probe()
+	if _, err := MigrateImages(f.data); err != nil {
+		t.Fatal(err)
+	}
+	probe()
+}
+
+// Test fixtures can probe a legacy format; production layer creation always
+// uses its captured format instead of inferring one from guest bytes.
+func chainDepth(path string) (int, error) {
+	if !maybeQcow2(path) {
+		return 0, nil
+	}
+	chain, err := readDiskChain(path, "", nil)
+	if err != nil {
+		return 0, err
+	}
+	depth := 1 + len(chain)
+	if len(chain) > 0 && chain[len(chain)-1].Format == "raw" {
+		depth--
+	}
+	return depth, nil
+}
+
+func backingChain(path string) ([]string, error) {
+	chain, err := readDiskChain(path, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, len(chain))
+	for i, layer := range chain {
+		paths[i] = layer.Path
+	}
+	return paths, nil
+}
+
+func (f *nodeFixture) savedForkImage(owner, name string) (image, node string, backing []diskLayer) {
+	f.t.Helper()
+	source := f.freshRoot(owner + "-" + name + "-source")
+	snap := f.snapshot(owner, name, source)
+	root := f.resume(owner+"-"+name+"-fork", snap)
+	node = backingOf(f.t, root)
+	image = filepath.Join(f.data, "images", owner, name+".ext4")
+	if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := cloneFile(root, image); err != nil {
+		f.t.Fatal(err)
+	}
+	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+	if err := f.e.recordDiskBacking(&spec); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.e.recordNodeMetadata(image, spec.RootDiskFormat, spec.Backing); err != nil {
+		f.t.Fatal(err)
+	}
+	for _, dir := range []string{snap, filepath.Dir(root), filepath.Dir(source)} {
+		if err := os.RemoveAll(dir); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	return image, node, spec.Backing
+}
+
+func TestSavedImageMetadataPreservesItsOwnersForkAuthority(t *testing.T) {
+	for _, linkedRoot := range []bool{false, true} {
+		name := "local-images"
+		if linkedRoot {
+			name = "linked-images-root"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newNodeFixture(t)
+			ownImage, ownNode, _ := f.savedForkImage("u1", "own")
+			foreignImage, foreignNode, _ := f.savedForkImage("u2", "foreign")
+			if linkedRoot {
+				images := filepath.Join(f.data, "images")
+				outside := filepath.Join(t.TempDir(), "images")
+				if err := os.Rename(images, outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, images); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, c := range []struct {
+				owner, image, node, otherImage, otherNode string
+			}{
+				{"u1", ownImage, ownNode, foreignImage, foreignNode},
+				{"u2", foreignImage, foreignNode, ownImage, ownNode},
+			} {
+				owned, err := ownedNodeKeys(f.data, c.owner)
+				if err != nil {
+					t.Fatal(err)
+				}
+				vm := &VM{UserID: c.owner}
+				if _, err := readDiskChain(c.image, "qcow2", func(path string) error {
+					return f.e.authorizedBacking(vm, path, owned)
+				}); err != nil {
+					t.Fatalf("saved image lost its destroyed fork's authority: %v", err)
+				}
+				for _, path := range []string{c.image, c.node} {
+					fi, err := os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					key, ok := keyOf(fi)
+					if !ok || !owned[key] {
+						t.Fatalf("owner %s lost saved-image provenance for %s", c.owner, path)
+					}
+				}
+				for _, path := range []string{c.otherImage, c.otherNode} {
+					fi, err := os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					key, ok := keyOf(fi)
+					if !ok || owned[key] {
+						t.Fatalf("owner %s inherited another owner's image provenance for %s", c.owner, path)
+					}
+				}
+				if err := f.e.authorizedBacking(vm, c.otherNode, owned); err == nil {
+					t.Fatalf("owner %s may read another owner's hidden fork node", c.owner)
+				}
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+				t.Fatalf("saved images lost their hidden fork ancestors: %v, %v", removed, err)
+			}
+		})
+	}
+}
+
+func TestSavedImageMetadataCannotCrossOwnerAliases(t *testing.T) {
+	for _, alias := range []string{"owner-directory", "nested-directory", "image-file", "sidecar-file", "hardlinked-sidecar"} {
+		t.Run(alias, func(t *testing.T) {
+			f := newNodeFixture(t)
+			image, node, backing := f.savedForkImage("u2", "foreign")
+			ownerDir := filepath.Join(f.data, "images", "u1")
+			if alias == "owner-directory" {
+				if err := os.Symlink(filepath.Dir(image), ownerDir); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.MkdirAll(ownerDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				ownImage := filepath.Join(ownerDir, "copied.ext4")
+				switch alias {
+				case "nested-directory":
+					if err := os.Symlink(filepath.Dir(image), filepath.Join(ownerDir, "nested")); err != nil {
+						t.Fatal(err)
+					}
+				case "image-file":
+					if err := os.Symlink(image, ownImage); err != nil {
+						t.Fatal(err)
+					}
+					if err := f.e.recordNodeMetadata(ownImage, "qcow2", backing); err != nil {
+						t.Fatal(err)
+					}
+				case "sidecar-file", "hardlinked-sidecar":
+					if err := cloneFile(image, ownImage); err != nil {
+						t.Fatal(err)
+					}
+					if alias == "sidecar-file" {
+						if err := os.Symlink(nodeMetadataPath(image), nodeMetadataPath(ownImage)); err != nil {
+							t.Fatal(err)
+						}
+					} else if err := os.Link(nodeMetadataPath(image), nodeMetadataPath(ownImage)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			owned, err := ownedNodeKeys(f.data, "u1")
+			if alias == "owner-directory" || alias == "hardlinked-sidecar" {
+				if err == nil {
+					t.Fatal("unsafe owner metadata alias was not rejected")
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			fi, err := os.Stat(node)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, ok := keyOf(fi)
+			if !ok || owned[key] {
+				t.Fatal("an alias conferred another owner's saved-image authority")
+			}
+		})
+	}
+}
+
+func TestSweepNodesReclaimsLegacyNormalizationStages(t *testing.T) {
+	f := newNodeFixture(t)
+	source := f.freshRoot("source")
+	stage, err := os.MkdirTemp(f.data, "legacy-resume-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, err := os.CreateTemp(stage, "disk-*.qcow2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := disk.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloneFile(source, disk.Name()); err != nil {
+		t.Fatal(err)
+	}
+	node, err := f.e.adoptNode(disk.Name(), "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(stage, ".manifest-123"), []byte("interrupted metadata"))
+	untouched := []string{
+		filepath.Join(f.data, "legacy-resume-manual", "disk-123.qcow2"),
+		filepath.Join(f.data, "legacy-resume-123", "notes.txt"),
+		filepath.Join(f.data, "legacy-resume-456", "subdir", "disk-123.qcow2"),
+		filepath.Join(f.data, "legacy-resume-789", "disk-manual.qcow2"),
+		filepath.Join(f.data, "legacy-resume-987", ".manifest-manual"),
+	}
+	for _, path := range untouched {
+		writeFile(t, path, []byte("not a normalization stage"))
+	}
+	outside := filepath.Join(t.TempDir(), "outside.img")
+	writeFile(t, outside, []byte("outside the stage"))
+	linked := filepath.Join(f.data, "legacy-resume-654", "disk-123.qcow2")
+	if err := os.MkdirAll(filepath.Dir(linked), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, linked); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SweepNodes(f.data, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatalf("dry run removed a normalization stage: %v", err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != node {
+		t.Fatalf("crashed normalization stage pinned its adopted node: %v, %v", removed, err)
+	}
+	if _, err := os.Stat(stage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("normalization stage survived cleanup: %v", err)
+	}
+	if _, err := os.Stat(nodeMetadataPath(node)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("normalization cleanup left reclaimed node metadata: %v", err)
+	}
+	for _, path := range append(untouched, outside, linked) {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("normalization cleanup removed an unrecognized path %s: %v", path, err)
+		}
+	}
+}
+
+func TestAdoptNodeSyncsFallbackBeforePublishing(t *testing.T) {
+	for _, failSync := range []bool{false, true} {
+		name := "sync-before-link"
+		if failSync {
+			name = "sync-failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newNodeFixture(t)
+			source := f.freshRoot("source")
+			sourceReal, err := resolveBasePath(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			originalLink, originalSync := linkNode, syncNodeFile
+			t.Cleanup(func() {
+				linkNode, syncNodeFile = originalLink, originalSync
+			})
+			synced, syncs := false, 0
+			syncErr := errors.New("adopted copy sync failed")
+			syncNodeFile = func(paths ...string) error {
+				syncs++
+				if len(paths) != 1 || filepath.Dir(paths[0]) != nodesDir(f.data) ||
+					!numberedStage(filepath.Base(paths[0]), ".adopt-", "") {
+					t.Fatalf("synced the source instead of its new inode: %v", paths)
+				}
+				if failSync {
+					return syncErr
+				}
+				if err := originalSync(paths...); err != nil {
+					return err
+				}
+				synced = true
+				return nil
+			}
+			linkNode = func(src, dst string) error {
+				if src == sourceReal {
+					return &os.LinkError{Op: "link", Old: src, New: dst, Err: syscall.EXDEV}
+				}
+				if !synced {
+					t.Fatal("adopted copy was published before its file sync")
+				}
+				return originalLink(src, dst)
+			}
+			node, err := f.e.adoptNode(source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+			if failSync {
+				if !errors.Is(err, syncErr) || len(nodeEntries(t, f.data)) != 0 {
+					t.Fatalf("failed file sync published a node: %s, %v", node, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.Stat(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after, err := os.Stat(node)
+				if err != nil || os.SameFile(before, after) {
+					t.Fatalf("cross-filesystem adoption did not publish a copied inode: %v", err)
+				}
+			}
+			if syncs != 1 {
+				t.Fatalf("fallback copy crossed %d file-sync barriers, want one", syncs)
+			}
+		})
+	}
+}
+
+func TestRestoredVolumeOwnershipIsPerDisk(t *testing.T) {
+	for _, format := range []string{"raw", "qcow2"} {
+		t.Run(format, func(t *testing.T) {
+			f := newNodeFixture(t)
+			source := filepath.Join(f.data, "snapshots", "u1", "raw", "vol0.img")
+			if format == "raw" {
+				writeFile(t, source, bytes.Repeat([]byte{1}, 513))
+			} else {
+				root := f.freshRoot("source")
+				for gen := 1; gen < maxChainDepth; gen++ {
+					name := "depth-" + string(rune('a'+gen))
+					root = f.resume(name, f.snapshot("u1", name, root))
+				}
+				source = filepath.Join(f.snapshot("u1", "capped", root), "rootfs.qcow2")
+			}
+			sharedInfo, err := os.Stat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			private := filepath.Join(t.TempDir(), "normalized.img")
+			if err := cloneFile(source, private); err != nil {
+				t.Fatal(err)
+			}
+			privateInfo, err := os.Stat(private)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sb := filepath.Join(f.data, "sandboxes", "restored")
+			if err := os.MkdirAll(sb, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var spec VMSpec
+			if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{
+				{path: source, format: format},
+				{path: private, format: format, owned: true},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(source); err != nil {
+				t.Fatalf("restoring a private disk moved the untouched shared source: %v", err)
+			}
+			sharedCopy, err := os.Stat(spec.Volumes[0].Path)
+			if err != nil || os.SameFile(sharedInfo, sharedCopy) {
+				t.Fatalf("shared fallback was not copied: %v", err)
+			}
+			if _, err := os.Stat(private); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("private fallback was copied a second time instead of moved: %v", err)
+			}
+			privateCopy, err := os.Stat(spec.Volumes[1].Path)
+			if err != nil || !os.SameFile(privateInfo, privateCopy) {
+				t.Fatalf("private fallback did not retain its normalized inode: %v", err)
+			}
+			for _, volume := range spec.Volumes {
+				if volume.Format != format {
+					t.Fatalf("fallback lost explicit source format: %+v", volume)
+				}
+			}
+		})
+	}
+}
+
+func TestSweepNodesFindsTrustedSnapshotMetadataAtAnyDepth(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		name := "direct-import"
+		if nested {
+			name = "nested-import"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newNodeFixture(t)
+			parent := f.snapshot("u1", "parent", f.freshRoot("source"))
+			root := f.resume("fork", parent)
+			node := backingOf(t, root)
+			spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+			if err := f.e.recordDiskBacking(&spec); err != nil {
+				t.Fatal(err)
+			}
+			var children []string
+			for _, child := range []string{"published-a", "published-b"} {
+				dir := filepath.Join(f.data, "snapshots", child)
+				if nested {
+					dir = filepath.Join(f.data, "snapshots", "u1", "group", child)
+				}
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := cloneFile(root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeSnapshotManifest(dir, krucibleSnapManifest{
+					DiskFile: "rootfs.qcow2", DiskFormat: "qcow2", Backing: spec.Backing,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				children = append(children, dir)
+			}
+			if err := os.RemoveAll(filepath.Join(f.data, "sandboxes")); err != nil {
+				t.Fatal(err)
+			}
+			if users, err := usersOf(f.data, parent); err != nil || users.Snapshots != 2 || users.Other != 0 {
+				t.Fatalf("noncanonical snapshots lost their dependent identity: %v, %v", users, err)
+			}
+			if err := os.RemoveAll(parent); err != nil {
+				t.Fatal(err)
+			}
+			for _, child := range children {
+				if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+					t.Fatalf("trusted snapshot metadata was undiscovered: %v, %v", removed, err)
+				}
+				if err := os.RemoveAll(child); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != node {
+				t.Fatalf("snapshot lineage survived its last metadata root: %v, %v", removed, err)
+			}
+		})
+	}
+}
+
+func TestSnapshotCatalogDoesNotTrustNestedDirectoryAliases(t *testing.T) {
+	f := newNodeFixture(t)
+	target := f.snapshot("u2", "private", f.freshRoot("target"))
+	dead, err := f.e.nodeLink(filepath.Join(target, "rootfs.qcow2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := filepath.Join(f.data, "sandboxes", "helper", "save", "checkpoint")
+	if err := os.MkdirAll(save, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(save, "rootfs.qcow2")
+	if err := createQcow2OverlayOn(disk, dead, "qcow2", 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	// A non-root helper can share the daemon's UID. Location, not just the
+	// metadata file's ownership, distinguishes this writable save from a
+	// published snapshot.
+	if err := writeSnapshotManifest(save, krucibleSnapManifest{
+		DiskFile: "rootfs.qcow2", DiskFormat: "qcow2",
+		Backing: []diskLayer{{Path: dead, Format: "qcow2"}, {Path: f.base, Format: "raw"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(f.data, "snapshots", "u1", "forged")
+	if err := os.MkdirAll(filepath.Dir(alias), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(save, alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 || removed[0] != dead {
+		t.Fatalf("helper-written metadata gained snapshot authority through an alias: %v, %v", removed, err)
+	}
+	for _, path := range []string{disk, filepath.Join(save, snapshotManifestFile)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("GC removed helper state while ignoring its metadata: %v", err)
+		}
 	}
 }

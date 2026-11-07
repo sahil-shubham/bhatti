@@ -23,12 +23,10 @@ package krucible
 //     when nothing but the store holds the file (no snapshot or saved image
 //     has it under another name) and no disk's chain names it.
 //
-// The chain a disk names is the only record of what depends on what. It is
-// read from the headers, as GCImages reads it for bases: a column in the
-// store would miss every place a copy of an overlay carries its backing name
-// to (a snapshot of a resumed sandbox, a saved image, a fork), and would
-// disagree with the files after a crash between making a disk and recording
-// it.
+// Guest-writable headers cannot be a dependency authority. Each captured disk
+// carries the daemon's typed chain, including the terminal raw image, so GC
+// and a helper's access policy agree without interpreting raw guest bytes.
+// Legacy disks can be inspected only within their owner's existing authority.
 //
 // The same lock as bases (lockBases) orders all of it: a create holds it
 // shared from picking a node until the overlay names it, and a sweep or a
@@ -36,6 +34,7 @@ package krucible
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -52,8 +51,8 @@ import (
 
 // maxChainDepth is how many qcow2 images may make up one disk, the overlay at
 // the top included. Every layer adds a lookup to a read that falls through it
-// and a file the helper holds open, and the confinement policy (backingChain)
-// and every scan here read the whole chain.
+// and a file the helper holds open, so metadata validation and confinement
+// enforce the same bound.
 //
 // A resume or fork that would go past it copies the node's own layer as the
 // new disk instead of layering over it: the copy has the node's depth, not one
@@ -62,10 +61,6 @@ import (
 // paid before nodes, once per generation past the cap.
 const maxChainDepth = 8
 
-// maxChainWalk bounds a walk of a chain that may loop (a header the guest
-// rewrote), well past anything maxChainDepth admits.
-const maxChainWalk = 64
-
 // nodesDir is the node store.
 func nodesDir(dataDir string) string { return filepath.Join(dataDir, "nodes") }
 
@@ -73,11 +68,51 @@ func nodesDir(dataDir string) string { return filepath.Join(dataDir, "nodes") }
 // other file has while this one exists, and the link itself keeps it so.
 func nodeName(k fileKey) string { return fmt.Sprintf("%x-%x.img", k.dev, k.ino) }
 
+type nodeMetadata struct {
+	Format  string      `json:"format"`
+	Backing []diskLayer `json:"backing"`
+}
+
+func nodeMetadataPath(node string) string {
+	return filepath.Join(filepath.Dir(node), "."+filepath.Base(node)+".json")
+}
+
+func removeNodeMetadata(node string) error {
+	if err := os.Remove(nodeMetadataPath(node)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// Persist the removal before the last disk link can disappear and its
+	// inode be reused with an unrelated payload.
+	syncDir(filepath.Dir(node))
+	return nil
+}
+
+// The store can outlive a snapshot's managed name, including snapshots kept
+// outside DataDir. Its daemon-only graph keeps that hard link meaningful
+// without ever reinterpreting a raw node's guest-writable bytes.
+func (e *Engine) recordNodeMetadata(node, format string, backing []diskLayer) error {
+	if format != "raw" && format != "qcow2" {
+		return fmt.Errorf("%s: unsupported node format %q", node, format)
+	}
+	if format == "raw" && len(backing) != 0 {
+		return fmt.Errorf("%s: raw node has recorded backing files", node)
+	}
+	return writeDaemonMetadata(nodeMetadataPath(node), nodeMetadata{Format: format, Backing: backing})
+}
+
 // errNoNodeLink says a disk can't be given a name in the node store.
 var errNoNodeLink = errors.New("can't link the disk into the node store")
 
 // linkNode is os.Link, for a test that needs a link to fail.
 var linkNode = os.Link
+
+// syncNodeDir keeps the publication barrier observable without a power cut in
+// tests. The source's other name may be removed as soon as nodeLink returns.
+var syncNodeDir = syncDir
+var syncNodeFile = flushFiles
 
 // nodeLink returns the name src has in the node store, linking it there
 // first if it has none. The link is the same file, never a copy: it costs a
@@ -118,210 +153,867 @@ func (e *Engine) nodeLink(src string) (string, error) {
 		// the caller copies instead.
 		return "", fmt.Errorf("%w: %v", errNoNodeLink, err)
 	}
+	// Another creator may have linked the same file but not synced it yet.
+	// Reusing that name must publish it before this caller drops its source.
+	syncNodeDir(dir)
 	return dst, nil
 }
 
-// chainDepth counts the qcow2 images that make up the disk at path: itself,
-// if it is one, and each qcow2 file it backs onto in turn. A raw image counts
-// for none.
-func chainDepth(path string) (int, error) {
+// readDiskChain is used for newly constructed disks and authorized legacy
+// disks, never to replace an existing daemon-recorded chain. A raw parent's
+// format is terminal even when the raw payload happens to be a qcow2 header.
+// Only an unknown legacy format permits inference, after authorization.
+func readDiskChain(path, format string, authorize func(string) error) ([]diskLayer, error) {
+	legacy := format == ""
+	if format == "raw" {
+		return []diskLayer{}, nil
+	}
+	if format != "" && format != "qcow2" {
+		return nil, fmt.Errorf("%s: unsupported format %q", path, format)
+	}
+	if legacy && authorize != nil {
+		if err := authorize(path); err != nil {
+			return nil, err
+		}
+	}
+	if legacy {
+		format = "raw"
+		if maybeQcow2(path) {
+			format = "qcow2"
+		}
+	}
+	chain := []diskLayer{}
 	depth := 0
-	for cur := path; ; {
-		if !isQcow2(cur) {
-			return depth, nil
+	for format == "qcow2" {
+		depth++
+		if depth > maxChainDepth {
+			return nil, fmt.Errorf("%s: backing chain deeper than %d", path, maxChainDepth)
 		}
-		if depth++; depth > maxChainWalk {
-			return 0, fmt.Errorf("%s: backing chain deeper than %d or looping", path, maxChainWalk)
-		}
-		next, err := qcow2BackingPath(cur)
+		next, err := qcow2BackingPath(path)
 		if err != nil {
-			return 0, fmt.Errorf("%s: %w", cur, err)
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		nextFormat, err := qcow2BackingFormat(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		if next == "" {
-			return depth, nil
+			return chain, nil
 		}
-		cur = next
+		if authorize != nil {
+			if err := authorize(next); err != nil {
+				return nil, err
+			}
+		}
+		if nextFormat == "" {
+			if !legacy {
+				return nil, fmt.Errorf("%s: backing file %s has no recorded format", path, next)
+			}
+			nextFormat = "raw"
+			if maybeQcow2(next) {
+				nextFormat = "qcow2"
+			}
+		}
+		if nextFormat != "raw" && nextFormat != "qcow2" {
+			return nil, fmt.Errorf("%s: unsupported backing format %q", path, nextFormat)
+		}
+		chain = append(chain, diskLayer{Path: next, Format: nextFormat})
+		path, format = next, nextFormat
 	}
+	return chain, nil
 }
 
-// layerOn makes the disk at dst: a qcow2 overlay over the immutable disk at
-// src, in O(1). src is a snapshot's disk, qcow2 (itself over a base or other
-// nodes) or raw (a frozen data volume).
+// layerOn makes the disk at dst over the immutable disk at src and returns
+// dst's format. The source's already-authorized metadata supplies format;
+// guest bytes must never select a driver for an explicitly raw disk.
 //
 // It copies src instead where an overlay couldn't be made or wouldn't pay:
 // src is as deep as a chain may be (the copy has src's depth, one less than an
 // overlay would), src can't be linked into the node store (another file
-// system), or a raw src isn't a whole number of sectors (an overlay's size
-// would be rounded up past the device the guest was saved with). own says src
-// is the caller's to move, a fork's staging copy, so the copy is a rename.
+// system), a relative backing name would change meaning in the store, or a
+// raw src isn't a whole number of sectors (an overlay's size would be rounded
+// up past the saved device). own says src is the caller's to move, a fork's
+// staging copy, so the copy is a rename.
 //
 // The caller holds the bases lock shared, until dst names what it was made
 // over.
-func (e *Engine) layerOn(dst, src string, own bool) error {
+func (e *Engine) layerOn(dst, src string, own bool, format string) (string, error) {
 	real, err := resolveBasePath(src)
 	if err != nil {
-		return fmt.Errorf("disk %s: %w", src, err)
+		return "", fmt.Errorf("disk %s: %w", src, err)
 	}
 	fi, err := os.Stat(real)
 	if err != nil {
-		return fmt.Errorf("disk %s: %w", src, err)
+		return "", fmt.Errorf("disk %s: %w", src, err)
 	}
-	format, size, depth := "raw", uint64(fi.Size()), 0
-	if isQcow2(real) {
-		format = "qcow2"
+	size, depth := uint64(fi.Size()), 0
+	var chain []diskLayer
+	switch format {
+	case "qcow2":
 		if size, err = qcow2VirtualSize(real); err != nil {
-			return fmt.Errorf("disk %s: %w", src, err)
+			return "", fmt.Errorf("disk %s: %w", src, err)
 		}
-		if depth, err = chainDepth(real); err != nil {
-			return err
+		chain, err = readDiskChain(real, format, nil)
+		if err != nil {
+			return "", err
 		}
+		depth = 1 + len(chain)
+		if len(chain) > 0 && chain[len(chain)-1].Format == "raw" {
+			depth--
+		}
+		backing, err := qcow2Backing(real)
+		if err != nil {
+			return "", err
+		}
+		if backing != "" && !filepath.IsAbs(backing) {
+			// A hard link cannot rebase a header without changing the frozen
+			// source too. Only the new disk gets an absolute backing name.
+			return format, moveOrClone(real, dst, own, format)
+		}
+	case "raw":
+	default:
+		return "", fmt.Errorf("disk %s: unsupported format %q", src, format)
 	}
 	switch {
 	case depth+1 > maxChainDepth:
 		slog.Debug("krucible.node.flatten", "disk", real, "depth", depth, "max", maxChainDepth)
-		return moveOrClone(real, dst, own)
+		return format, moveOrClone(real, dst, own, format)
 	case format == "raw" && size%512 != 0:
-		return moveOrClone(real, dst, own)
+		return format, moveOrClone(real, dst, own, format)
 	}
 	node, err := e.nodeLink(real)
 	if errors.Is(err, errNoNodeLink) {
 		slog.Warn("krucible.node.copy", "disk", real, "reason", err)
-		return moveOrClone(real, dst, own)
+		return format, moveOrClone(real, dst, own, format)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
-	return createQcow2OverlayOn(dst, node, format, size)
+	if err := e.recordNodeMetadata(node, format, chain); err != nil {
+		return "", fmt.Errorf("record node backing: %w", err)
+	}
+	return "qcow2", createQcow2OverlayOn(dst, node, format, size)
 }
 
 // moveOrClone puts the disk at src at dst: moved if the caller owns it and the
-// two share a file system, else copied.
-func moveOrClone(src, dst string, own bool) error {
-	if own {
-		if err := os.Rename(src, dst); err == nil {
-			return nil
+// two share a file system, else copied. A relative backing name must keep its
+// old meaning when the containing disk changes directories.
+func moveOrClone(src, dst string, own bool, format string) error {
+	var backing string
+	if format == "qcow2" {
+		name, err := qcow2Backing(src)
+		if err != nil {
+			return err
+		}
+		if name != "" && !filepath.IsAbs(name) {
+			backing, err = filepath.Abs(filepath.Join(filepath.Dir(src), name))
+			if err != nil {
+				return err
+			}
 		}
 	}
-	return cloneFile(src, dst)
+	moved := false
+	if own {
+		moved = os.Rename(src, dst) == nil
+	}
+	if !moved {
+		if err := cloneFile(src, dst); err != nil {
+			return err
+		}
+	}
+	if backing != "" {
+		return setQcow2Backing(dst, backing)
+	}
+	return nil
 }
 
-// diskRefs maps each file that some qcow2 image under dataDir backs onto,
-// directly or through other images, to the images that do. It reads headers
-// only. An image it can't read stops it: that image might name anything.
-func diskRefs(dataDir string) (map[fileKey][]string, error) {
-	chains := map[string][]string{}
-	var chainOf func(path string, depth int) ([]string, error)
-	chainOf = func(path string, depth int) ([]string, error) {
-		if c, ok := chains[path]; ok {
-			return c, nil
-		}
-		if depth > maxChainWalk {
-			return nil, fmt.Errorf("%s: backing chain deeper than %d or looping", path, maxChainWalk)
-		}
-		b, err := qcow2BackingPath(path)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		var c []string
-		if b != "" {
-			c = []string{b}
-			if isQcow2(b) {
-				rest, err := chainOf(b, depth+1)
-				if err != nil {
-					return nil, err
-				}
-				c = append(c, rest...)
-			}
-		}
-		chains[path] = c
-		return c, nil
+// walkNodeImages also follows linked disk directories: a data directory moved
+// onto another disk, or an images/volume directory linked out of it, must not
+// make the nodes its disks name look unused. Root-level daemon state is still
+// never sniffed, for the same SQLite-lock reason as walkImages.
+func walkNodeImages(dataDir string, fn func(path string, link bool) error) error {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return err
 	}
+	return walkManagedDiskFiles(dataDir, dataDir, fn)
+}
 
-	refs := map[fileKey][]string{}
-	err := walkImages(dataDir, func(path string, link bool) error {
-		if link {
+func walkImageMetadata(dataDir string, fn func(path, disk string) error) error {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return err
+	}
+	images := filepath.Join(dataDir, "images")
+	return walkManagedDiskFiles(dataDir, images, func(path string, _ bool) error {
+		name := filepath.Base(path)
+		if !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
 			return nil
 		}
-		chain, err := chainOf(path, 0)
+		disk := filepath.Join(filepath.Dir(path), strings.TrimSuffix(strings.TrimPrefix(name, "."), ".json"))
+		return fn(path, disk)
+	})
+}
+
+func managedSnapshotDirs(dataDir string) ([]string, error) {
+	managedRoot := filepath.Join(dataDir, "snapshots")
+	root, err := filepath.EvalSymlinks(managedRoot)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	seen := map[string]bool{}
+	add := func(dir string) error {
+		rel, err := filepath.Rel(root, dir)
+		if err != nil {
+			return err
+		}
+		alias := filepath.Join(managedRoot, rel)
+		if !seen[alias] {
+			seen[alias] = true
+			dirs = append(dirs, alias)
+		}
+		return nil
+	}
+	// The shared root may be relocated, but nested aliases must not turn a
+	// helper-writable save directory into a source of daemon disk authority.
+	err = filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil // destroyed while the walk ran: nothing of it to protect
+			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("%w (an image that can't be read might name any node)", err)
+			return err
 		}
-		for _, member := range chain {
-			fi, err := os.Stat(member)
+		if de.IsDir() {
+			if filepath.Dir(filepath.Dir(path)) == root {
+				return add(path) // Legacy owner/name directories can lack a manifest.
+			}
+			return nil
+		}
+		if de.Type().IsRegular() && de.Name() == snapshotManifestFile {
+			return add(filepath.Dir(path))
+		}
+		return nil
+	})
+	return dirs, err
+}
+
+func walkManagedDiskFiles(dataDir, root string, fn func(path string, link bool) error) error {
+	active := map[fileKey]bool{}
+	var walk func(string, bool) error
+	walk = func(dir string, linked bool) error {
+		fi, err := os.Stat(dir)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		k, ok := keyOf(fi)
+		if !ok {
+			return fmt.Errorf("%s: no directory identity here", dir)
+		}
+		if active[k] {
+			return nil
+		}
+		active[k] = true
+		defer delete(active, k)
+		// Lstat on a trailing "/." follows a directory symlink, unlike on
+		// the directory name alone. Child paths retain the managed alias.
+		return filepath.WalkDir(dir+string(filepath.Separator)+".", func(path string, de fs.DirEntry, err error) error {
 			if err != nil {
-				continue // names a file that is gone: nothing to protect either
+				if errors.Is(err, fs.ErrNotExist) && filepath.Clean(path) != dataDir {
+					return nil
+				}
+				return err
+			}
+			switch {
+			case path == basesDir(dataDir):
+				if de.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			case de.IsDir():
+				return nil
+			case filepath.Dir(path) == dataDir && de.Type()&fs.ModeSymlink == 0:
+				return nil
+			case de.Type()&fs.ModeSymlink != 0:
+				fi, err := os.Stat(path)
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if fi.IsDir() {
+					return walk(path, linked || !within(nodesDir(dataDir), path))
+				}
+				if fi.Mode().IsRegular() && filepath.Dir(path) != dataDir {
+					return fn(path, true)
+				}
+			case de.Type().IsRegular():
+				return fn(path, linked)
+			}
+			return nil
+		})
+	}
+	return walk(root, false)
+}
+
+type diskMetadata struct {
+	format  string
+	backing []diskLayer
+}
+
+type diskRoot struct {
+	path, holder, owner string
+	metadata            diskMetadata
+	legacy              bool
+}
+
+type diskCatalog struct {
+	metadata    map[fileKey]diskMetadata
+	storedNodes map[fileKey]bool
+	roots       []diskRoot
+}
+
+// The catalog reads daemon metadata only. Inode identity makes its format
+// decision survive an alias outside the disk's managed directory.
+func readDiskCatalog(dataDir string) (*diskCatalog, error) {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	metadata := map[fileKey]diskMetadata{}
+	var roots []diskRoot
+	register := func(path, format string, backing []diskLayer) error {
+		for {
+			if format != "raw" && format != "qcow2" {
+				return fmt.Errorf("%s: unsupported disk format %q", path, format)
+			}
+			if format == "raw" && len(backing) != 0 {
+				return fmt.Errorf("%s: raw disk has recorded backing files", path)
+			}
+			fi, err := os.Stat(path)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			if err == nil && fi.Mode().IsRegular() {
+				if k, ok := keyOf(fi); ok {
+					if _, exists := metadata[k]; !exists || format == "raw" {
+						metadata[k] = diskMetadata{format: format, backing: backing}
+					}
+				}
+			}
+			if len(backing) == 0 {
+				return nil
+			}
+			path, format, backing = backing[0].Path, backing[0].Format, backing[1:]
+		}
+	}
+	storedNodes := map[fileKey]bool{}
+	nodeFiles, err := os.ReadDir(nodesDir(dataDir))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	for _, de := range nodeFiles {
+		if strings.HasPrefix(de.Name(), ".") || !de.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(nodesDir(dataDir), de.Name())
+		fi, err := os.Stat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if k, ok := keyOf(fi); ok {
+			storedNodes[k] = true
+		}
+		var m nodeMetadata
+		found, err := readDaemonMetadata(nodeMetadataPath(path), &m)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			if err := register(path, m.Format, m.Backing); err != nil {
+				return nil, err
+			}
+		}
+	}
+	root := func(path, holder, owner, format string, backing []diskLayer, legacy bool) error {
+		if path == "" {
+			return nil
+		}
+		if !legacy {
+			if err := register(path, format, backing); err != nil {
+				return err
+			}
+		}
+		roots = append(roots, diskRoot{path: path, holder: holder, owner: owner,
+			metadata: diskMetadata{format: format, backing: backing}, legacy: legacy})
+		return nil
+	}
+	snapshots, err := managedSnapshotDirs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, dir := range snapshots {
+		fi, err := os.Stat(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !fi.IsDir() {
+			continue
+		}
+		m, found, err := readSnapshotManifest(dir)
+		if err != nil {
+			return nil, err
+		}
+		owner := ""
+		rel, err := filepath.Rel(filepath.Join(dataDir, "snapshots"), dir)
+		if err != nil {
+			return nil, err
+		}
+		if first, _, nested := strings.Cut(rel, string(filepath.Separator)); nested {
+			owner = first
+		}
+		disk := m.DiskFile
+		if disk == "" {
+			disk = "rootfs.qcow2"
+		}
+		if !archiveFileName.MatchString(disk) {
+			return nil, fmt.Errorf("%s: invalid disk name %q", dir, disk)
+		}
+		if err := root(filepath.Join(dir, disk), filepath.Join(dir, disk), owner,
+			m.DiskFormat, m.Backing, !found || m.DiskFormat == ""); err != nil {
+			return nil, err
+		}
+		if !found {
+			files, err := os.ReadDir(dir)
+			if err != nil {
+				return nil, err
+			}
+			for _, file := range files {
+				if numberedStage(file.Name(), "vol", ".img") {
+					m.Volumes = append(m.Volumes, snapVolume{File: file.Name()})
+				}
+			}
+		}
+		for _, v := range m.Volumes {
+			if !archiveFileName.MatchString(v.File) {
+				return nil, fmt.Errorf("%s: invalid volume name %q", dir, v.File)
+			}
+			legacy := v.Format == "" || (v.Format == "qcow2" && m.DiskFormat == "")
+			if err := root(filepath.Join(dir, v.File), filepath.Join(dir, v.File), owner,
+				v.Format, v.Backing, legacy); err != nil {
+				return nil, err
+			}
+		}
+	}
+	records, err := filepath.Glob(filepath.Join(dataDir, "sandboxes", "*", stateFile))
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range records {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var rec vmRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return nil, fmt.Errorf("read disk roots from %s: %w", path, err)
+		}
+		spec := rec.BaseSpec
+		format := spec.RootDiskFormat
+		if format == "" {
+			format = "raw" // The old root device API opened an omitted format as raw.
+		}
+		if err := root(spec.RootDisk, path, rec.UserID, format, spec.Backing,
+			format == "qcow2" && spec.Backing == nil); err != nil {
+			return nil, err
+		}
+		for _, v := range spec.Volumes {
+			format := v.Format
+			if format == "" {
+				format = "raw"
+			}
+			if err := root(v.Path, path, rec.UserID, format, v.Backing,
+				format == "qcow2" && v.Backing == nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	err = walkImageMetadata(dataDir, func(path, disk string) error {
+		fi, err := os.Stat(disk)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
+		var m nodeMetadata
+		found, err := readDaemonMetadata(path, &m)
+		if err != nil || !found {
+			return err
+		}
+		return register(disk, m.Format, m.Backing)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &diskCatalog{metadata: metadata, storedNodes: storedNodes, roots: roots}, nil
+}
+
+// diskRefs uses the daemon's graph, not a guest's current headers. Metadata is
+// indexed before walking aliases so raw nodes cannot be reclassified, and
+// store-only nodes are never roots.
+func diskRefs(dataDir string) (map[fileKey][]string, error) {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := readDiskCatalog(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	metadata, storedNodes, roots := catalog.metadata, catalog.storedNodes, catalog.roots
+	refs := map[fileKey][]string{}
+	addFile := func(path, holder string) (bool, error) {
+		fi, err := os.Stat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !fi.Mode().IsRegular() {
+			return false, nil
+		}
+		if k, ok := keyOf(fi); ok {
+			refs[k] = append(refs[k], holder)
+		}
+		return true, nil
+	}
+	add := func(path, holder string, backing []diskLayer) error {
+		if found, err := addFile(path, holder); err != nil || !found {
+			return err
+		}
+		for _, layer := range backing {
+			if _, err := addFile(layer.Path, holder); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	e := &Engine{cfg: Config{DataDir: dataDir}}
+	owners := map[string]map[fileKey]bool{}
+	legacyChain := func(path, owner string, topRecorded bool) ([]diskLayer, error) {
+		owned, ok := owners[owner]
+		if !ok {
+			var err error
+			owned, err = ownedNodeKeys(dataDir, owner)
+			if err != nil {
+				return nil, err
+			}
+			owners[owner] = owned
+		}
+		vm := &VM{UserID: owner}
+		return readDiskChain(path, "", func(next string) error {
+			if topRecorded && next == path {
+				return nil
+			}
+			return e.authorizedBacking(vm, next, owned)
+		})
+	}
+	inspected := map[fileKey]bool{}
+	for _, r := range roots {
+		backing := r.metadata.backing
+		known := !r.legacy
+		if r.legacy {
+			fi, err := os.Stat(r.path)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, err
 			}
 			if k, ok := keyOf(fi); ok {
-				refs[k] = append(refs[k], path)
+				if m, found := metadata[k]; found {
+					backing, known = m.backing, true
+				}
 			}
+		}
+		if !known {
+			// Inferred edges never authorize another legacy disk and are
+			// never promoted into a new provenance record.
+			backing, err = legacyChain(r.path, r.owner, filepath.Base(r.holder) == stateFile)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", r.path, err)
+			}
+			if fi, err := os.Stat(r.path); err == nil {
+				if k, ok := keyOf(fi); ok {
+					inspected[k] = true
+				}
+			}
+		}
+		if err := add(r.path, r.holder, backing); err != nil {
+			return nil, err
+		}
+	}
+	err = walkNodeImages(dataDir, func(path string, link bool) error {
+		if strings.HasPrefix(filepath.Base(path), ".") {
+			return nil
+		}
+		fi, err := os.Stat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !link && within(nodesDir(dataDir), path) {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink == 1 {
+				return nil
+			}
+		}
+		if k, ok := keyOf(fi); ok {
+			if m, found := metadata[k]; found {
+				return add(path, path, m.backing)
+			}
+			if inspected[k] {
+				return add(path, path, nil)
+			}
+			if storedNodes[k] {
+				return fmt.Errorf("%s: live node has no daemon-recorded disk metadata", path)
+			}
+		}
+		rel, err := filepath.Rel(dataDir, path)
+		if err != nil {
+			return err
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) >= 2 && parts[0] == "images" && e.vmmBaseAllowed(&VM{UserID: parts[1]}, path) {
+			owner := ""
+			if len(parts) > 2 && parts[1] != "bases" {
+				owner = parts[1]
+			}
+			backing, err := legacyChain(path, owner, false)
+			if err != nil {
+				return err
+			}
+			return add(path, path, backing)
+		}
+		if link || (len(parts) >= 2 && (parts[0] == "nodes" || parts[0] == "volumes")) {
+			// An untyped alias holds its inode, not whatever bytes in it
+			// resemble a backing header.
+			return add(path, path, nil)
+		}
+		if len(parts) >= 3 && parts[0] == "sandboxes" && filepath.Base(path) == "root.qcow2" {
+			for _, r := range roots {
+				if r.path == path {
+					return nil
+				}
+			}
+			backing, err := legacyChain(path, "", true)
+			if err != nil {
+				return err
+			}
+			return add(path, path, backing)
 		}
 		return nil
 	})
 	return refs, err
 }
 
-// sweepNodesLocked removes the nodes nothing needs, in rounds: taking a node
-// out frees the nodes only it was layered over. With dryRun it reports the
-// first round only. The caller holds the bases lock exclusively.
-func sweepNodesLocked(dataDir string, dryRun bool) (removed []string, err error) {
-	dir := nodesDir(dataDir)
-	for range maxChainDepth + 1 {
-		entries, err := os.ReadDir(dir)
-		if errors.Is(err, fs.ErrNotExist) {
-			return removed, nil
+// numberedStage recognizes only the numeric suffixes os.CreateTemp and
+// os.MkdirTemp generate, not similarly named directories a user may own.
+func numberedStage(name, prefix, suffix string) bool {
+	name, ok := strings.CutPrefix(name, prefix)
+	if !ok {
+		return false
+	}
+	name, ok = strings.CutSuffix(name, suffix)
+	if !ok || name == "" {
+		return false
+	}
+	for i := range len(name) {
+		if name[i] < '0' || name[i] > '9' {
+			return false
 		}
-		if err != nil {
-			return removed, err
-		}
-		// A node some snapshot or image holds under another name has more than
-		// one link: that holder keeps it, whatever names it.
-		cand := map[fileKey]string{}
-		for _, de := range entries {
-			if strings.HasPrefix(de.Name(), ".") || !de.Type().IsRegular() {
+	}
+	return true
+}
+
+// cleanNodeStages runs under the exclusive bases lock. Fork, import and legacy
+// normalization hold it shared until their stages are gone, so only crashed
+// operations can leave these names. Extra hard links would otherwise pin a
+// node after every committed disk over it was destroyed.
+func cleanNodeStages(dataDir string) error {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return err
+	}
+	for _, de := range entries {
+		if de.IsDir() && numberedStage(de.Name(), "legacy-resume-", "") {
+			dir := filepath.Join(dataDir, de.Name())
+			files, err := os.ReadDir(dir)
+			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			path := filepath.Join(dir, de.Name())
-			fi, err := os.Lstat(path)
 			if err != nil {
+				return err
+			}
+			recognized := true
+			for _, file := range files {
+				name := file.Name()
+				if !file.Type().IsRegular() || (!numberedStage(name, "disk-", ".qcow2") && !numberedStage(name, ".manifest-", "")) {
+					recognized = false
+					break
+				}
+			}
+			if recognized {
+				if err := os.RemoveAll(dir); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if !de.IsDir() || !numberedStage(de.Name(), "fork-", "") {
+			continue
+		}
+		dir := filepath.Join(dataDir, de.Name())
+		children, err := os.ReadDir(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if len(children) != 0 {
+			if len(children) != 1 || children[0].Name() != "snap" || !children[0].IsDir() {
 				continue
 			}
-			if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink == 1 {
-				if k, ok := keyOf(fi); ok {
-					cand[k] = path
+			files, err := os.ReadDir(filepath.Join(dir, "snap"))
+			if err != nil {
+				return err
+			}
+			recognized := true
+			for _, file := range files {
+				name := file.Name()
+				if !file.Type().IsRegular() || (name != "rootfs.qcow2" && name != checkpointFile &&
+					name != memoryFile && name != "config.ext4" && name != snapshotManifestFile &&
+					!numberedStage(name, ".manifest-", "") && !numberedStage(name, "vol", ".img")) {
+					recognized = false
+					break
 				}
 			}
+			if !recognized {
+				continue
+			}
 		}
-		if len(cand) == 0 {
-			return removed, nil
+		if err := os.RemoveAll(dir); err != nil {
+			return err
 		}
-		refs, err := diskRefs(dataDir)
+	}
+	entries, err = os.ReadDir(nodesDir(dataDir))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	for _, de := range entries {
+		if de.Type().IsRegular() && (numberedStage(de.Name(), ".adopt-", "") || numberedStage(de.Name(), ".manifest-", "")) {
+			if err := os.Remove(filepath.Join(nodesDir(dataDir), de.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return walkImageMetadata(dataDir, func(path, disk string) error {
+		if _, err := os.Stat(disk); err == nil {
+			return nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		var m nodeMetadata
+		found, err := readDaemonMetadata(path, &m)
+		if err != nil || !found || (m.Format != "raw" && m.Format != "qcow2") {
+			return nil
+		}
+		return removeNodeMetadata(disk)
+	})
+}
+
+// sweepNodesLocked removes the nodes no managed root reaches and no other
+// hard link holds. The caller holds the bases lock exclusively.
+func sweepNodesLocked(dataDir string, dryRun bool) (removed []string, err error) {
+	if !dryRun {
+		if err := cleanNodeStages(dataDir); err != nil {
+			return nil, err
+		}
+	}
+	dir := nodesDir(dataDir)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	cand := map[fileKey]string{}
+	for _, de := range entries {
+		if strings.HasPrefix(de.Name(), ".") || !de.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(dir, de.Name())
+		fi, err := os.Lstat(path)
 		if err != nil {
-			return removed, fmt.Errorf("sweep nodes: %w", err)
+			continue
 		}
-		var garbage []string
-		for k, path := range cand {
-			if len(refs[k]) == 0 {
-				garbage = append(garbage, path)
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink == 1 {
+			if k, ok := keyOf(fi); ok {
+				cand[k] = path
 			}
 		}
-		if len(garbage) == 0 {
-			return removed, nil
+	}
+	if len(cand) == 0 {
+		return nil, nil
+	}
+	refs, err := diskRefs(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("sweep nodes: %w", err)
+	}
+	var garbage []string
+	for k, path := range cand {
+		if len(refs[k]) == 0 {
+			garbage = append(garbage, path)
 		}
-		slices.Sort(garbage)
-		for _, path := range garbage {
-			if !dryRun {
-				if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return removed, err
-				}
+	}
+	slices.Sort(garbage)
+	for _, path := range garbage {
+		if !dryRun {
+			if err := removeNodeMetadata(path); err != nil {
+				return removed, err
 			}
-			removed = append(removed, path)
+			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return removed, err
+			}
 		}
-		if dryRun {
-			return removed, nil
-		}
+		removed = append(removed, path)
 	}
 	return removed, nil
 }
@@ -339,7 +1031,7 @@ func SweepNodes(dataDir string, dryRun bool) ([]string, error) {
 // scheduleNodeSweep sweeps in the background after a sandbox that had disks
 // over nodes is gone (or never came to be). Requests that arrive during a
 // sweep fold into one more run: tearing down a fleet of clones asks once per
-// clone, and each sweep reads every header under the data dir.
+// clone, and each sweep reads the managed disk metadata.
 func (e *Engine) scheduleNodeSweep() {
 	e.sweepMu.Lock()
 	if e.sweeping {
@@ -457,8 +1149,8 @@ func usersOf(dataDir, dir string) (diskUsers, error) {
 			case parts[0] == "nodes":
 			case parts[0] == "sandboxes":
 				sandboxes[parts[1]] = true
-			case parts[0] == "snapshots" && len(parts) >= 4:
-				snapshots[parts[1]+"/"+parts[2]] = true
+			case parts[0] == "snapshots" && len(parts) >= 3:
+				snapshots[filepath.Dir(path)] = true
 			case parts[0] == "images":
 				u.Images++
 			default:
@@ -522,7 +1214,7 @@ func (e *Engine) RemoveSnapshot(ctx context.Context, snapDir string) error {
 // prepareNodeRoot makes a resumed or forked sandbox's root disk in sandboxDir:
 // an overlay over the snapshot's disk. It returns what prepareRootDisk does,
 // with the snapshot's disk in the place of the base.
-func (e *Engine) prepareNodeRoot(sandboxDir, disk string, own bool) (root, format, base string, err error) {
+func (e *Engine) prepareNodeRoot(sandboxDir, disk string, own bool, sourceFormat string) (root, format, base string, err error) {
 	if !rootQcow2() {
 		return "", "", "", fmt.Errorf("a snapshot restores onto a qcow2 root, and KRUCIBLE_ROOT_RAW is set")
 	}
@@ -532,18 +1224,18 @@ func (e *Engine) prepareNodeRoot(sandboxDir, disk string, own bool) (root, forma
 	}
 	defer unlock()
 	root = filepath.Join(sandboxDir, "root.qcow2")
-	if err := e.layerOn(root, disk, own); err != nil {
+	if format, err = e.layerOn(root, disk, own, sourceFormat); err != nil {
 		return "", "", "", fmt.Errorf("layer the root disk over the snapshot's: %w", err)
 	}
-	return root, "qcow2", disk, nil
+	return root, format, disk, nil
 }
 
 // layerRestoredVolumes attaches each frozen volume of the snapshot being
 // restored to spec: as a disk in sandboxDir over it, so none is copied and
 // writes stay in this sandbox. A read-only volume gets one too: what the
 // helper opens is then never the frozen file itself, and the overlay is what
-// names it, where the scan finds it.
-func (e *Engine) layerRestoredVolumes(sandboxDir string, spec *VMSpec, vols []restoreVol, own bool) error {
+// names it in the disk's recorded lifetime graph.
+func (e *Engine) layerRestoredVolumes(sandboxDir string, spec *VMSpec, vols []restoreVol) error {
 	if len(vols) == 0 {
 		return nil
 	}
@@ -555,76 +1247,303 @@ func (e *Engine) layerRestoredVolumes(sandboxDir string, spec *VMSpec, vols []re
 	for _, rv := range vols {
 		idx := len(spec.Volumes)
 		dst := filepath.Join(sandboxDir, fmt.Sprintf("restorevol%d.img", idx))
-		if err := e.layerOn(dst, rv.path, own); err != nil {
+		format, err := e.layerOn(dst, rv.path, rv.owned, rv.format)
+		if err != nil {
 			return fmt.Errorf("restore volume %d: %w", idx, err)
-		}
-		format := "raw"
-		if isQcow2(dst) {
-			format = "qcow2"
 		}
 		spec.Volumes = append(spec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", idx), Path: dst, Format: format, ReadOnly: rv.readOnly})
 	}
 	return nil
 }
 
-// diskBacking lists the files the chains of spec's disks name that this host
-// doesn't keep as images (VMSpec.Backing): the nodes layered over, and what
-// they name in turn. The images under <DataDir>/images are admitted by
-// where they are (vmmBaseAllowed), so a sandbox over a base alone has none.
-func (e *Engine) diskBacking(spec VMSpec) ([]string, error) {
-	images := filepath.Join(e.cfg.DataDir, "images")
-	var out []string
-	add := func(path string) error {
-		if !isQcow2(path) {
+// recordDiskBacking records only disks the daemon has just constructed.
+// Captures retain and validate their source's metadata instead: re-recording a
+// live header could turn a guest-written pointer into daemon authority.
+func (e *Engine) recordDiskBacking(spec *VMSpec) error {
+	var err error
+	if spec.RootDisk != "" {
+		if spec.RootDiskFormat != "raw" && spec.RootDiskFormat != "qcow2" {
+			return fmt.Errorf("root disk: unsupported format %q", spec.RootDiskFormat)
+		}
+		spec.Backing, err = readDiskChain(spec.RootDisk, spec.RootDiskFormat, nil)
+		if err != nil {
+			return fmt.Errorf("root disk: %w", err)
+		}
+	}
+	for i := range spec.Volumes {
+		v := &spec.Volumes[i]
+		if v.Format != "raw" && v.Format != "qcow2" {
+			return fmt.Errorf("volume %s: unsupported format %q", v.BlockID, v.Format)
+		}
+		v.Backing, err = readDiskChain(v.Path, v.Format, nil)
+		if err != nil {
+			return fmt.Errorf("volume %s: %w", v.BlockID, err)
+		}
+	}
+	return nil
+}
+
+// ownedNodeKeys is provenance, not reachability: only names and backing lists
+// the daemon stored for this owner can authorize an otherwise untrusted
+// header. Reading that header here would let it authorize its own pointers.
+func ownedNodeKeys(dataDir, ownerID string) (map[fileKey]bool, error) {
+	keys := map[fileKey]bool{}
+	if ownerID == "" {
+		return keys, nil
+	}
+	if ownerID == "." || ownerID == ".." || filepath.Base(ownerID) != ownerID {
+		return nil, fmt.Errorf("invalid snapshot owner %q", ownerID)
+	}
+	add := func(path string, follow bool) error {
+		var fi os.FileInfo
+		var err error
+		if follow {
+			fi, err = os.Stat(path)
+		} else {
+			fi, err = os.Lstat(path)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
-		chain, err := backingChain(path)
 		if err != nil {
 			return err
 		}
-		for _, b := range chain {
-			if !within(images, b) && !slices.Contains(out, b) {
-				out = append(out, b)
+		if fi.Mode().IsRegular() {
+			if k, ok := keyOf(fi); ok {
+				keys[k] = true
 			}
 		}
 		return nil
 	}
-	if spec.RootDiskFormat == "qcow2" {
-		if err := add(spec.RootDisk); err != nil {
-			return nil, err
+	addChain := func(format string, chain []diskLayer) error {
+		if format == "" {
+			return nil // Legacy header inference cannot confer provenance.
+		}
+		depth := 0
+		for i := 0; ; i++ {
+			switch format {
+			case "raw":
+				if i != len(chain) {
+					return fmt.Errorf("raw disk has recorded backing files")
+				}
+			case "qcow2":
+				depth++
+				if depth > maxChainDepth {
+					return fmt.Errorf("recorded backing chain deeper than %d", maxChainDepth)
+				}
+			default:
+				return fmt.Errorf("unsupported recorded disk format %q", format)
+			}
+			if i == len(chain) {
+				return nil
+			}
+			if err := add(chain[i].Path, true); err != nil {
+				return err
+			}
+			format = chain[i].Format
 		}
 	}
-	for _, v := range spec.Volumes {
-		if err := add(v.Path); err != nil {
+	// A shared snapshots/ directory may be on another disk. An owner or
+	// snapshot symlink, however, cannot confer the target owner's authority.
+	snapshots, err := filepath.EvalSymlinks(filepath.Join(dataDir, "snapshots"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if err == nil {
+		ownerDir := filepath.Join(snapshots, ownerID)
+		fi, err := os.Lstat(ownerDir)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
+		if err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			return nil, fmt.Errorf("snapshot owner directory %s is a symlink", ownerDir)
+		}
+		if err == nil {
+			err = filepath.WalkDir(ownerDir, func(path string, de fs.DirEntry, err error) error {
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if !de.Type().IsRegular() {
+					return nil
+				}
+				name := de.Name()
+				if name == "rootfs.qcow2" || numberedStage(name, "vol", ".img") || numberedStage(name, archiveLayerPrefix, ".img") {
+					return add(path, false)
+				}
+				if name != snapshotManifestFile {
+					return nil
+				}
+				m, found, err := readSnapshotManifest(filepath.Dir(path))
+				if err != nil || !found {
+					return err
+				}
+				if m.DiskFile != "" {
+					if !archiveFileName.MatchString(m.DiskFile) {
+						return fmt.Errorf("%s: invalid disk name %q", path, m.DiskFile)
+					}
+					if err := add(filepath.Join(filepath.Dir(path), m.DiskFile), false); err != nil {
+						return err
+					}
+				}
+				for _, v := range m.Volumes {
+					if !archiveFileName.MatchString(v.File) {
+						return fmt.Errorf("%s: invalid volume name %q", path, v.File)
+					}
+					if err := add(filepath.Join(filepath.Dir(path), v.File), false); err != nil {
+						return err
+					}
+					if err := addChain(v.Format, v.Backing); err != nil {
+						return err
+					}
+				}
+				if err := addChain(m.DiskFormat, m.Backing); err != nil {
+					return err
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	return out, nil
+	// Only the shared images root may be relocated. Following owner, nested
+	// directory, or image symlinks would let an alias confer another owner's
+	// saved-image authority.
+	images, err := filepath.EvalSymlinks(filepath.Join(dataDir, "images"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if err == nil {
+		ownerDir := filepath.Join(images, ownerID)
+		fi, err := os.Lstat(ownerDir)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		if err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			return nil, fmt.Errorf("image owner directory %s is a symlink", ownerDir)
+		}
+		if err == nil && fi.IsDir() {
+			err = filepath.WalkDir(ownerDir, func(path string, de fs.DirEntry, err error) error {
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				name := de.Name()
+				if !de.Type().IsRegular() || !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
+					return nil
+				}
+				disk := filepath.Join(filepath.Dir(path), strings.TrimSuffix(strings.TrimPrefix(name, "."), ".json"))
+				fi, err := os.Lstat(disk)
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if !fi.Mode().IsRegular() {
+					return nil
+				}
+				var m nodeMetadata
+				found, err := readDaemonMetadata(path, &m)
+				if err != nil || !found {
+					return err
+				}
+				if m.Format == "" {
+					return nil
+				}
+				if err := addChain(m.Format, m.Backing); err != nil {
+					return err
+				}
+				if k, ok := keyOf(fi); ok {
+					keys[k] = true
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	records, err := filepath.Glob(filepath.Join(dataDir, "sandboxes", "*", stateFile))
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range records {
+		fi, err := os.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var rec vmRecord
+		if json.Unmarshal(data, &rec) != nil || rec.UserID != ownerID {
+			continue
+		}
+		if err := addChain(rec.BaseSpec.RootDiskFormat, rec.BaseSpec.Backing); err != nil {
+			return nil, err
+		}
+		for _, v := range rec.BaseSpec.Volumes {
+			if err := addChain(v.Format, v.Backing); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return keys, nil
 }
 
 // adoptNode returns the name in the node store of the disk at path, which an
 // import has unpacked and is done with: linked there, or copied in where a
 // link can't reach.
-func (e *Engine) adoptNode(path string) (string, error) {
+func (e *Engine) adoptNode(path, format string, backing []diskLayer) (string, error) {
 	node, err := e.nodeLink(path)
-	if !errors.Is(err, errNoNodeLink) {
-		return node, err
-	}
-	dir, err := filepath.Abs(nodesDir(e.cfg.DataDir))
-	if err != nil {
+	if errors.Is(err, errNoNodeLink) {
+		dir, err := filepath.Abs(nodesDir(e.cfg.DataDir))
+		if err != nil {
+			return "", err
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+		tmp, err := os.CreateTemp(dir, ".adopt-*")
+		if err != nil {
+			return "", err
+		}
+		if err := tmp.Close(); err != nil {
+			return "", err
+		}
+		defer os.Remove(tmp.Name())
+		if err := cloneFile(path, tmp.Name()); err != nil {
+			return "", err
+		}
+		// Syncing the source cannot make this new inode durable.
+		if err := syncNodeFile(tmp.Name()); err != nil {
+			return "", err
+		}
+		node, err = e.nodeLink(tmp.Name())
+		if err != nil {
+			return "", err
+		}
+	} else if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := e.recordNodeMetadata(node, format, backing); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(dir, ".adopt-*")
-	if err != nil {
-		return "", err
-	}
-	tmp.Close()
-	defer os.Remove(tmp.Name())
-	if err := cloneFile(path, tmp.Name()); err != nil {
-		return "", err
-	}
-	return e.nodeLink(tmp.Name())
+	return node, nil
 }

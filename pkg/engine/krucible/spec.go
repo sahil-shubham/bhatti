@@ -23,14 +23,22 @@ type VMFsMount struct {
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
+// diskLayer records how the daemon opens an immutable ancestor. Raw guest
+// bytes must never get a chance to reinterpret that ancestor as a header.
+type diskLayer struct {
+	Path   string `json:"path"`
+	Format string `json:"format"`
+}
+
 // VMVolume is one block data disk as the VMM sees it: an id + host image path +
 // format ("qcow2" | "raw") + read-only flag. The guest device name + mount path
 // travel in the config drive (configdrive.VolumeMountConfig).
 type VMVolume struct {
-	BlockID  string `json:"block_id"`
-	Path     string `json:"path"`
-	Format   string `json:"format"`
-	ReadOnly bool   `json:"read_only,omitempty"`
+	BlockID  string      `json:"block_id"`
+	Path     string      `json:"path"`
+	Format   string      `json:"format"`
+	Backing  []diskLayer `json:"disk_backing"`
+	ReadOnly bool        `json:"read_only,omitempty"`
 }
 
 // VMMCapabilities is what a bhatti-vmm build supports, as printed by
@@ -105,14 +113,10 @@ type VMSpec struct {
 	// krun_add_disk2 (which composes with the root setter); the guest device name
 	// + mount path travel in the config (VolumeMountConfig).
 	Volumes []VMVolume `json:"volumes,omitempty"`
-	// Backing is every file the root disk's and the volumes' chains named when
-	// the daemon made them: the nodes (snapshot disks) a resumed or forked
-	// sandbox's disks are layered over, and what they in turn name. The
-	// daemon alone reads it. The helper may write its root disk, header
-	// included, so at each launch the chain is checked against this list (and
-	// the images the host keeps): a rewritten header can't make the next
-	// launch open another file. Empty for a sandbox over a base alone.
-	Backing []string `json:"backing,omitempty"`
+	// Backing records the root's exact chain, nearest first. The distinct JSON
+	// key deliberately ignores the old flat path allowlist, which recorded no
+	// formats and mixed root and volume dependencies.
+	Backing []diskLayer `json:"disk_backing"`
 	// KernelCmdline overrides the default block-root cmdline used with
 	// KernelImage. Empty = the built-in default (root=/dev/vda … init=ExecPath).
 	KernelCmdline string `json:"kernel_cmdline,omitempty"`

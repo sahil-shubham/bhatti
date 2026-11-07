@@ -705,6 +705,13 @@ func New(cfg Config) (*Engine, error) {
 		slog.Info("krucible.cgroups", "mode", st.Mode, "requested", st.Requested, "reason", st.Reason)
 	}
 	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
+	// A crash can leave node links after their last sandbox or fork stage
+	// disappeared, with no later Destroy to request reclamation.
+	if removed, err := SweepNodes(cfg.DataDir, false); err != nil {
+		slog.Warn("krucible.nodes.sweep_failed", "error", err)
+	} else if len(removed) > 0 {
+		slog.Info("krucible.nodes.swept", "removed", len(removed))
+	}
 	return eng, nil
 }
 
@@ -742,11 +749,10 @@ type createOpts struct {
 	// nodeDisk is the snapshot disk the root is layered over, instead of an
 	// image the spec names: a resume or fork makes the root an overlay over
 	// it (nodes.go), so it costs a header whatever the snapshot holds.
-	nodeDisk string
-	// ownDisks says the snapshot's disks are the caller's to move rather
-	// than keep: a fork's staging copy, which a root that can't be layered
-	// (a chain at its deepest) takes by rename instead of copying again.
-	ownDisks bool
+	nodeDisk   string
+	nodeFormat string
+	// A private staged root can be moved at the depth cap instead of copied.
+	nodeOwned bool
 }
 
 // restoreVol is a frozen volume image (from a snapshot dir) to re-attach to a
@@ -756,6 +762,8 @@ type createOpts struct {
 // source can't be CoW-rebased, and the frozen copy it left is what is shared.
 type restoreVol struct {
 	path     string
+	format   string
+	owned    bool
 	readOnly bool
 }
 
@@ -798,6 +806,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 			}
 			os.RemoveAll(sandboxDir)
 			os.RemoveAll(sockDir)
+			if opts.nodeDisk != "" || len(opts.restoreVolumes) > 0 {
+				e.scheduleNodeSweep()
+			}
 		}
 	}()
 
@@ -906,7 +917,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// snapshot's device set (so a memory restore's RAM view of its disks stays
 	// valid), as a disk of this sandbox's own over it. The captured config
 	// already carries the guest mount points, so no cdVolumes entry is needed.
-	if err = e.layerRestoredVolumes(sandboxDir, &baseSpec, opts.restoreVolumes, opts.ownDisks); err != nil {
+	if err = e.layerRestoredVolumes(sandboxDir, &baseSpec, opts.restoreVolumes); err != nil {
 		return info, err
 	}
 
@@ -915,18 +926,19 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// at /dev/vdb; the virtio-fs path stays the minimal config-less dev profile.
 	if e.cfg.BlockRoot {
 		var rootImg, rootFormat, rootBase string
+		var rootBacking []diskLayer
 		var perr error
 		if opts.nodeDisk != "" {
-			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(sandboxDir, opts.nodeDisk, opts.ownDisks)
+			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(sandboxDir, opts.nodeDisk, opts.nodeOwned, opts.nodeFormat)
 		} else {
-			rootImg, rootFormat, rootBase, perr = e.prepareRootDisk(sandboxDir, spec)
+			rootImg, rootFormat, rootBase, rootBacking, perr = e.prepareRootDisk(sandboxDir, spec)
 		}
 		if perr != nil {
 			return info, perr
 		}
 		// A larger block device does not enlarge ext4 without lohar's boot-time
 		// resize. Reject only actual growth; a size at/below the base is safe.
-		if spec.DiskSizeMB > 0 && !isQcow2(rootBase) {
+		if spec.DiskSizeMB > 0 {
 			baseStat, statErr := os.Stat(rootBase)
 			if statErr != nil {
 				return info, fmt.Errorf("stat root base: %w", statErr)
@@ -936,8 +948,14 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		slog.Debug("krucible root disk", "id", id, "root", rootImg, "base", rootBase)
 		baseSpec.RootDisk = rootImg
 		baseSpec.RootDiskFormat = rootFormat
+		baseSpec.Backing = rootBacking
 		baseSpec.KernelImage = e.cfg.KernelImage // external (lean) kernel, if configured
-		if baseSpec.Backing, err = e.diskBacking(baseSpec); err != nil {
+		if opts.nodeDisk == "" {
+			if err = e.validateDiskBacking(&VM{UserID: spec.UserID}, baseSpec); err != nil {
+				return info, fmt.Errorf("authorize the disks' backing chains: %w", err)
+			}
+		}
+		if err = e.recordDiskBacking(&baseSpec); err != nil {
 			return info, fmt.Errorf("read the disks' backing chains: %w", err)
 		}
 
@@ -1282,6 +1300,9 @@ func (e *Engine) Destroy(ctx context.Context, id string) error {
 	dir := vm.SandboxDir
 	sockDir := vm.SockDir
 	layered := len(vm.baseSpec.Backing) > 0
+	for _, v := range vm.baseSpec.Volumes {
+		layered = layered || len(v.Backing) > 0
+	}
 	vm.Status = "stopped"
 	vm.mu.Unlock()
 
@@ -1496,45 +1517,118 @@ func (e *Engine) resolveBase(spec engine.SandboxSpec) (string, error) {
 	return base, nil
 }
 
+func (e *Engine) rootImageMetadata(base, ownerID string) (diskMetadata, bool, error) {
+	vm := &VM{UserID: ownerID}
+	if !e.vmmBaseAllowed(vm, base) {
+		owned, err := ownedNodeKeys(e.cfg.DataDir, ownerID)
+		if err != nil {
+			return diskMetadata{}, false, err
+		}
+		if err := e.authorizedBacking(vm, base, owned); err != nil {
+			return diskMetadata{}, false, err
+		}
+	}
+	catalog, err := readDiskCatalog(e.cfg.DataDir)
+	if err != nil {
+		return diskMetadata{}, false, err
+	}
+	fi, err := os.Stat(base)
+	if err != nil {
+		return diskMetadata{}, false, err
+	}
+	if key, ok := keyOf(fi); ok {
+		if metadata, found := catalog.metadata[key]; found {
+			if metadata.backing == nil {
+				metadata.backing = []diskLayer{}
+			}
+			return metadata, true, nil
+		}
+	}
+	// Shared bases and the configured ext4 base are daemon-created raw disks.
+	// Their reserved bytes cannot choose a driver, even when they look qcow2.
+	configured := ""
+	if e.cfg.BaseImage != "" {
+		configured, _ = resolveBasePath(e.cfg.BaseImage)
+	}
+	if base == configured || base == filepath.Join(e.cfg.DataDir, "base.img") ||
+		within(basesDir(e.cfg.DataDir), base) || filepath.Dir(base) == filepath.Join(e.cfg.DataDir, "images") {
+		return diskMetadata{format: "raw", backing: []diskLayer{}}, true, nil
+	}
+	// Pre-metadata owner images use the same bounded authorization as legacy
+	// snapshots; inferred records are never written back to the source image.
+	chain, err := e.legacyDiskChain(vm, base, "")
+	if err != nil {
+		return diskMetadata{}, false, err
+	}
+	format := "raw"
+	if isQcow2(base) {
+		format = "qcow2"
+	}
+	return diskMetadata{format: format, backing: chain}, false, nil
+}
+
 // prepareRootDisk makes a new sandbox's root disk in sandboxDir from its
-// base, returning the disk, its format ("qcow2", or "" for raw) and the base.
+// base, returning the disk, its explicit format, the base and the root's chain.
 // It holds the bases lock shared from picking the base until the disk names
 // it, so GC can't remove the base in between.
-func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (root, format, base string, err error) {
+func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (root, format, base string, backing []diskLayer, err error) {
 	unlock, err := lockBases(e.cfg.DataDir, false)
 	if err != nil {
-		return "", "", "", fmt.Errorf("lock base images: %w", err)
+		return "", "", "", nil, fmt.Errorf("lock base images: %w", err)
 	}
 	defer unlock()
 	if base, err = e.resolveBase(spec); err != nil {
-		return "", "", "", err
+		return "", "", "", nil, err
+	}
+	metadata, trusted, err := e.rootImageMetadata(base, spec.UserID)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("base image metadata: %w", err)
+	}
+	if trusted {
+		if err := validateRecordedDisk(base, metadata.format, metadata.backing); err != nil {
+			return "", "", "", nil, fmt.Errorf("base image backing: %w", err)
+		}
 	}
 	if !rootQcow2() {
+		if metadata.format != "raw" {
+			return "", "", "", nil, fmt.Errorf("a raw root requires a raw base image")
+		}
 		root = filepath.Join(sandboxDir, "root.img")
 		if err := cloneFile(base, root); err != nil {
-			return "", "", "", fmt.Errorf("clone base image: %w", err)
+			return "", "", "", nil, fmt.Errorf("clone base image: %w", err)
 		}
 		if err := growFile(root, spec.DiskSizeMB); err != nil {
-			return "", "", "", fmt.Errorf("disk size: %w", err)
+			return "", "", "", nil, fmt.Errorf("disk size: %w", err)
 		}
-		return root, "", base, nil
+		return root, "raw", base, []diskLayer{}, nil
 	}
-	// Default: a qcow2 CoW root — instant + host-FS-independent (no
-	// reflink/btrfs). Raw is the opt-out (KRUCIBLE_ROOT_RAW=1).
 	root = filepath.Join(sandboxDir, "root.qcow2")
-	if isQcow2(base) {
-		// A saved qcow2 image is already a CoW node over the raw base;
-		// copy it as this sandbox's root (it keeps backing that base).
+	if metadata.format == "qcow2" {
 		if spec.DiskSizeMB > 0 {
-			return "", "", "", fmt.Errorf("disk size: not supported for sandboxes created from a saved image")
+			return "", "", "", nil, fmt.Errorf("disk size: not supported for sandboxes created from a saved image")
 		}
-		if err := cloneFile(base, root); err != nil {
-			return "", "", "", fmt.Errorf("clone qcow2 image: %w", err)
+		source, chain := base, metadata.backing
+		if !trusted {
+			source, chain, err = e.normalizeLegacyDisk(sandboxDir, base, metadata.format, metadata.backing)
+			if err != nil {
+				return "", "", "", nil, fmt.Errorf("normalize legacy image: %w", err)
+			}
 		}
-	} else if err := e.createRootOverlayQcow2(root, base, spec.DiskSizeMB); err != nil {
-		return "", "", "", fmt.Errorf("create qcow2 root overlay: %w", err)
+		if source != base {
+			if err := os.Rename(source, root); err != nil {
+				return "", "", "", nil, fmt.Errorf("move normalized image: %w", err)
+			}
+		} else if err := cloneFile(base, root); err != nil {
+			return "", "", "", nil, fmt.Errorf("clone qcow2 image: %w", err)
+		}
+		backing = chain
+	} else {
+		if err := e.createRootOverlayQcow2(root, base, spec.DiskSizeMB); err != nil {
+			return "", "", "", nil, fmt.Errorf("create qcow2 root overlay: %w", err)
+		}
+		backing = []diskLayer{{Path: base, Format: "raw"}}
 	}
-	return root, "qcow2", base, nil
+	return root, "qcow2", base, backing, nil
 }
 
 // isQcow2 reports whether path is a qcow2 image (magic "QFI\xfb"), so a saved

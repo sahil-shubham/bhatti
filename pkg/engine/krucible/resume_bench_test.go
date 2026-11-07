@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -55,6 +56,10 @@ func TestKrucibleResumeScaling(t *testing.T) {
 		}
 	}
 	ke := newPauseEngine(t).(*Engine)
+	records := &pauseRecords{}
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(records))
+	defer slog.SetDefault(previousLogger)
 	snapType := "filesystem"
 	if os.Getenv("KRUCIBLE_BENCH_TYPE") == "memory" {
 		if !ke.caps.Checkpoint {
@@ -91,6 +96,27 @@ func TestKrucibleResumeScaling(t *testing.T) {
 	manifestJSON, _ := json.Marshal(manifest)
 	disk := filepath.Join(golden, "rootfs.qcow2")
 	t.Logf("bench.snapshot type=%s snapshot_ms=%d disk_mb=%d", snapType, time.Since(t0).Milliseconds(), blocksOf(t, disk)>>20)
+	records.take()
+	if ke.caps.Checkpoint {
+		started := time.Now()
+		fork, err := ke.Fork(ctx, src.ID, "benchfork")
+		if err != nil {
+			t.Fatalf("fork: %v", err)
+		}
+		t.Cleanup(func() { _ = ke.Destroy(context.Background(), fork.ID) })
+		for _, record := range records.take() {
+			t.Logf("bench.fork delta_mb=%d wall_ms=%d source_paused_ms=%d save_ms=%d flush_ms=%d copy_ms=%d",
+				deltaMB, time.Since(started).Milliseconds(), record["paused_ms"], record["save_ms"], record["flush_ms"], record["copy_ms"])
+		}
+		if result, err := ke.Exec(ctx, src.ID, []string{"true"}); err != nil || result.ExitCode != 0 {
+			t.Fatalf("source after fork: %+v, %v", result, err)
+		}
+		if err := ke.Destroy(ctx, fork.ID); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Log("bench.fork unsupported: this helper cannot checkpoint memory; no source pause measurement")
+	}
 	// The source isn't needed any more, and its memory is the clones'.
 	if err := ke.Destroy(ctx, src.ID); err != nil {
 		t.Fatal(err)
@@ -110,6 +136,9 @@ func TestKrucibleResumeScaling(t *testing.T) {
 				t1 := time.Now()
 				info, err := start(i)
 				took[i], errs[i], ids[i] = time.Since(t1), err, info.ID
+				if info.ID != "" {
+					t.Cleanup(func() { _ = ke.Destroy(context.Background(), info.ID) })
+				}
 			}()
 		}
 		wg.Wait()

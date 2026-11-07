@@ -190,6 +190,85 @@ func qcow2Backing(path string) (string, error) {
 	return string(name), nil
 }
 
+// qcow2BackingFormat returns the header's backing format, or "" when a
+// reader must probe it. Only the dependency types our chain walker can carry
+// are admitted: another format or an external data file would open disks the
+// archive and confinement policy don't account for.
+func qcow2BackingFormat(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	ref, err := readQcow2BackingRef(f)
+	if err != nil {
+		return "", err
+	}
+	var h [qcow2HeaderLen]byte
+	if _, err := f.ReadAt(h[:], 0); err != nil {
+		return "", fmt.Errorf("read qcow2 header: %w", err)
+	}
+	be := binary.BigEndian
+	off := int64(72)
+	if be.Uint32(h[4:]) == 3 {
+		off = int64(be.Uint32(h[100:]))
+		if off < qcow2HeaderLen {
+			return "", fmt.Errorf("qcow2 header length %d", off)
+		}
+		if be.Uint64(h[72:])&(1<<2) != 0 {
+			return "", fmt.Errorf("qcow2 external data files aren't supported")
+		}
+	}
+	end := ref.cluster
+	if ref.offset != 0 {
+		end = ref.offset
+	}
+	if off > end {
+		return "", fmt.Errorf("qcow2 backing name overlaps its header")
+	}
+	format := ""
+	for off < end {
+		var ext [8]byte
+		if off+int64(len(ext)) > end {
+			return "", fmt.Errorf("qcow2 header extension overlaps its backing name")
+		}
+		if _, err := f.ReadAt(ext[:], off); err != nil {
+			return "", fmt.Errorf("read qcow2 header extension: %w", err)
+		}
+		typ, size := be.Uint32(ext[:]), be.Uint32(ext[4:])
+		off += int64(len(ext))
+		if typ == 0 {
+			break
+		}
+		next := off + ((int64(size) + 7) &^ 7)
+		if next > end {
+			return "", fmt.Errorf("qcow2 header extension overlaps its backing name")
+		}
+		switch typ {
+		case qcow2ExtBackingFmt:
+			if format != "" || (size != 3 && size != 5) {
+				return "", fmt.Errorf("qcow2 invalid backing format extension")
+			}
+			var name [5]byte
+			if _, err := f.ReadAt(name[:size], off); err != nil {
+				return "", fmt.Errorf("read qcow2 backing format: %w", err)
+			}
+			switch string(name[:size]) {
+			case "raw":
+				format = "raw"
+			case "qcow2":
+				format = "qcow2"
+			default:
+				return "", fmt.Errorf("qcow2 unsupported backing format %q", name[:size])
+			}
+		case 0x44415441:
+			return "", fmt.Errorf("qcow2 external data files aren't supported")
+		}
+		off = next
+	}
+	return format, nil
+}
+
 // qcow2VirtualSize returns the size of the disk the qcow2 image at path
 // presents to its guest, which is not the size of the file: an overlay is a
 // few hundred KiB however large the disk it stands for.

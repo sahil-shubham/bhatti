@@ -115,11 +115,11 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
 - **Snapshot/fork restores the device set (volumes)** — a memory snapshot/fork now
   reproduces attached volumes, not just RAM+root: Checkpoint freezes each volume
   (independent copy, consistent with the paused VM) + records it in the manifest;
-  Resume clones each into the new sandbox and re-attaches it as `/dev/vdc+`, so the
-  restored RAM's disk view stays valid. **Fork-your-whole-environment:** the fork
-  gets independent CoW copies (`cloneFile` — instant on APFS/btrfs, a full copy on
-  ext4; libkrun block devices are boot-fixed so a live source can't be rebased).
-  `TestKrucibleForkWithVolume` green on all three platforms.
+  Resume re-attaches each as `/dev/vdc+`, so the restored RAM's disk view stays
+  valid. **Fork-your-whole-environment:** the fork's volumes are its own (since
+  2026-11-08 an overlay over the frozen copy; before, a copy of it — libkrun block
+  devices are boot-fixed, so a live source can't be rebased, and the frozen copy is
+  what is shared). `TestKrucibleForkWithVolume` green on all three platforms.
 - **Honest limit — virtio-fs `--mount` + memory snapshot:** libkrun can't restore a
   virtio-fs device from a memory snapshot (the resume hangs), so memory-snapshot/
   fork of a *mounted* sandbox is **refused cleanly** (fast error → use `--type
@@ -129,6 +129,129 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   requires migrating fresh volumes to qcow2 (the raw-ext4 store today gives instant
   clone only on CoW host FS via cloneFile). (2) restore-with-mounts (needs a libkrun
   fix for virtio-fs snapshot restore). (3) the unified-node DAG/listing UX.
+
+**Snapshot nodes and disk authority (2026-11-08):**
+- **Disk preparation is independent of the saved delta.** A normal resume makes a
+  qcow2 overlay over each immutable snapshot disk, rather than copying that disk.
+  The node store names those disks by `<DataDir>/nodes/<dev>-<ino>.img` hard links;
+  clones share the saved blocks but write only their own overlays. An incompatible
+  filesystem, a relative backing name, a raw disk whose size is not sector-aligned,
+  or the eight-qcow2-image depth cap takes the existing move/copy fallback instead.
+  This is an O(1) disk-preparation claim, not a promise that guest boot time or
+  parallel scheduling is constant.
+- **Formats and dependencies are daemon metadata.** Checkpoint and import publish
+  a daemon-owned `manifest.json` using a temporary file, file fsync, rename and
+  directory fsync. It records the root's format and typed backing chain and each
+  captured volume's original `VMVolume.Format` and typed chain. Persistent volumes
+  are created and attached as raw unconditionally: valid qcow2-looking guest bytes
+  cannot select a driver. A raw disk or raw ancestor is never parsed for a header.
+  Sandbox records, saved-image sidecars and hidden node metadata preserve the same
+  per-disk information for GC and after a fork's staging directory disappears.
+- **Capture cannot launder rewritten headers.** Snapshot and image capture compare
+  every disk's chain with the source VM's recorded chain before copying anything,
+  and repeat the check while paused. Captured copies are checked too. A pointer
+  must match both its recorded path and its recorded format before the daemon
+  opens its target. Capture errors leave the source running.
+- **Legacy snapshots are compatibility reads, not new authority.** Without a local
+  manifest, format inference is allowed only with an owner-authorized walk: shared
+  bases, the owner's images, and nodes anchored by that owner's snapshots/records.
+  Each target is authorized before it is opened. An outside-owner or arbitrary
+  host path is refused, and the inferred snapshot is not given a trusted manifest.
+  Old qcow2 headers missing a backing-format extension are normalized into new
+  private copies only after authorization; their original disks are unchanged.
+  That legacy-only compatibility fallback can copy data and is not the O(1) path.
+  A SQLite/API copy cannot expand a local manifest's disk authority.
+- **GC and dependents use the metadata graph.** Raw bytes never name or pin a node.
+  Nodes remain while a recorded sandbox, snapshot, image or external hard link
+  holds them; crash stages are reclaimed under the bases lock. Snapshot deletion
+  goes through `engine.SnapshotRemover` and returns 409 while live overlays depend
+  on its disks. Destroying those overlays permits deletion without breaking
+  siblings or requiring a second dependency table in SQLite.
+- **Imports rebuild the graph.** Archive layer formats are explicit, and imported
+  header backing paths and host-local backing lists are discarded. Only the
+  validated `layer-N.img` graph and a content-identified shared base determine the
+  paths written into imported disks and their local manifests. New exports use
+  archive v3 with explicit root, volume and layer formats. v1/v2 archives retain
+  compatibility when parent formats disambiguate their layers; a standalone
+  untyped legacy volume defaults to raw, and ambiguous layers are rejected.
+  Missing backing-format extensions are rebuilt from graph metadata. Raw layers
+  remain opaque even if their bytes resemble qcow2.
+- **Confinement and the remaining admission limit.** Confined Linux helpers receive
+  exact disk-file grants, not access to snapshot directories, `manifest.json` or
+  hidden node metadata. Restore checkpoint/RAM files are linked into a separate
+  helper-readable restore directory. Linux root/DAC/Landlock enforcement is not
+  exercised by the macOS HVF runs below. `vmmBaseAllowed` still admits this host's
+  shared bases and any image of the same owner when authorizing a legacy or new
+  image chain; it does not admit another owner's images. To tighten that admission,
+  persist an immutable daemon-owned `(device, inode, format, typed ancestors)`
+  record for each shared base and owner image, resolve the selected image once,
+  and authorize only those exact recorded identities at create/legacy restore.
+  Then remove the directory-wide `vmmBaseAllowed` exception instead of allowing
+  a rewritten header to choose another otherwise-authorized same-owner image.
+- **Pause window.** Checkpoint flushes only the disks it copies while paused and
+  resumes before the snapshot's durability sync. `krucible.checkpoint.paused`
+  records source pause, SAVE, flush and copy durations. The resume benchmark also
+  reports a live fork's source pause on helpers that support memory checkpointing;
+  HVF helpers without that capability cannot supply a real fork measurement.
+
+### Storage hardening evidence (2026-11-08)
+
+Host: Darwin/arm64 HVF, Mac16,12, 10 logical CPUs, 24 GiB RAM, Go 1.27.3.
+The VM tests used `Image-lean-6.12.94-aarch64-k8s` and the existing libkrucible
+install, with `make vmm netd` rebuilding/codesigning the helper. Its reported
+capabilities were `{"pause":true,"checkpoint":false}`.
+
+- `go build ./...` and `go vet ./...`: passed.
+- `GOOS=linux GOARCH=amd64 go build ./...` and
+  `GOOS=linux GOARCH=amd64 go vet ./pkg/engine/krucible/`: passed.
+- `go test -race ./pkg/engine/... ./pkg/server/ -count=1`: passed; krucible
+  41.196 s, server 81.183 s. The ordinary krucible unit suite passed in 26.004 s.
+- Regression tests were demonstrated red by temporarily removing the relevant
+  protection, then restored green: raw-volume metadata, raw-file open suppression,
+  archive terminal-path removal, authorization before legacy header probes, and
+  exact capture checks before and after quiesce. Raw-root format, legacy missing
+  extensions and saved-image owner provenance have the same red/green proof.
+- The complete tagged HVF suite ran in 287.900 s and was **not fully green**.
+  Its raw-volume test initially used shell syntax unsupported by the test rootfs;
+  its saved-image fixture used a path outside the owner's image directory. Those
+  fixtures were corrected, and both targeted VM tests passed (2.552 s combined).
+  The separately recorded `TestKrucibleCredentialSubstitution` failure was
+  `no secret.denied event for the request target`; credential code/tests were
+  deliberately left unchanged.
+- Actual VM storage gates passed: 160 MiB-delta snapshot resumes, independent
+  clone writes, deletion refusal with live clones and success after destruction,
+  boot after manual snapshot-directory removal, and generations beyond the depth
+  cap. The raw-attach VM regression observes a 96 MiB raw device rather than its
+  forged header's 64 MiB device and cannot read the backing filesystem's marker.
+  Unit checkpoint/resume/GC tests preserve the forged raw volume byte for byte
+  and prove that its forged path creates neither helper grants nor node pins.
+- **Not exercised:** memory-snapshot/fork VMs, a real fork's source pause, and a
+  memory-restored raw volume, because this HVF helper cannot checkpoint memory.
+  The real fork tests remain capability-gated; fake-helper tests exercise fork
+  orchestration and the still-serving source. Linux root/Landlock execution needs
+  a Linux/KVM host. The optional qemu-img comparisons skipped because qemu-img
+  was not installed. No remote execution was used.
+
+`KRUCIBLE_BENCH_RESUME=1` / `TestKrucibleResumeScaling` wrote 2,048 MiB of nonzero
+guest data and captured a filesystem snapshot occupying 2,050 MiB. Every batch
+verified the full file's SHA-256 through a resumed guest. Per-resume times below
+are individual concurrent-call durations, not batch wall time divided by N.
+Root allocation is the sum of `st_blocks * 512` for clone disks, reported in
+whole KiB and excluding the shared snapshot/base; filesystem delta is the
+coarser `statfs` free-space change, not an I/O write counter.
+
+| Parallel resumes | Batch wall (ms) | Per-resume mean / p50 / max (ms) | Clone root allocation, total (KiB) | Filesystem delta (MiB) | Fresh-create batch (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 115 | 115 / 115 / 115 | 1,616 | 1 | 102 |
+| 5 | 186 | 174 / 174 / 186 | 8,080 | 7 | 161 |
+| 10 | 457 | 378 / 402 / 457 | 16,160 | 15 | 303 |
+| 20 | 759 | 600 / 627 / 759 | 32,704 | 31 | 633 |
+
+The initial snapshot took 28 ms; a snapshot of the first thin clone took 20 ms
+and held only 2 MiB of its own disk. A real fork pause is **not measured** here:
+the benchmark explicitly reports the absent memory-checkpoint capability.
+These results support delta-independent disk preparation, not constant time as
+parallelism grows and not the legacy/depth/filesystem copy fallbacks.
 
 ## 3. Build & test
 
@@ -142,7 +265,8 @@ make build      # the pure-Go daemon/CLI
 go test -tags krucible ./pkg/engine/krucible/ -count=1   # full krucible suite
 ```
 - `timeout(1)` is NOT available on the Mac.
-- Toolchain: rustc 1.96, go 1.25.7, Docker (lean-kernel build), Homebrew libkrun/libkrunfw.
+- Verification below used Go 1.27.3 and the existing libkrucible install; Docker
+  is needed only when rebuilding the lean kernel.
 - The lean kernel is opt-in-by-presence: build it and the daemon autodetects
   `dist/kernel/*-lean-*`; absent, it falls back to the libkrunfw bundle.
 
