@@ -68,9 +68,8 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Upgrade WebSocket FIRST — before any sandbox lookup.
 	//    This prevents sandbox ID enumeration via HTTP status codes.
-	conn, err := upgrader.Upgrade(w, r, http.Header{
-		"Referrer-Policy": []string{"no-referrer"},
-	})
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	conn, err := upgrader.Upgrade(w, r, w.Header())
 	if err != nil {
 		return
 	}

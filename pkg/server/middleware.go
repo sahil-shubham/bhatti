@@ -71,6 +71,8 @@ func (s *Server) versionHeaders(next http.Handler) http.Handler {
 // requestID names the request: in the context for handlers and logs, and in
 // X-Request-ID so a client can quote it. It is generated here, never taken from
 // the request, so a caller can't forge the ID a log line is filed under.
+// WebSocket upgraders must pass w.Header() explicitly: Gorilla builds the
+// hijacked handshake from that argument, not the ResponseWriter's headers.
 func (s *Server) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := generateRequestID()

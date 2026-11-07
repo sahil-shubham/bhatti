@@ -41,7 +41,7 @@ func (s *Server) handleSandboxTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ws, err := upgrader.Upgrade(w, r, nil)
+	ws, err := upgrader.Upgrade(w, r, w.Header())
 	if err != nil {
 		slog.Debug("sandbox.tunnel.upgrade_failed", "sandbox_id", sb.ID, "error", err)
 		return

@@ -259,7 +259,7 @@ func (s *Server) handleSandboxWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, w.Header())
 	if err != nil {
 		slog.Error("websocket upgrade failed", "error", err)
 		return
@@ -480,7 +480,7 @@ func (s *Server) handleSandboxExecWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, w.Header())
 	if err != nil {
 		slog.Error("exec ws upgrade failed", "error", err)
 		return

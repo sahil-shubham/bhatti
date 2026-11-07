@@ -134,6 +134,52 @@ func TestRequestIDIsNotTakenFromTheRequest(t *testing.T) {
 	}
 }
 
+func TestWebSocketHandshakesCarryRequestIDs(t *testing.T) {
+	for _, endpoint := range []string{"shell", "exec", "tunnel", "web_shell"} {
+		t.Run(endpoint, func(t *testing.T) {
+			_, ts, sb := setupShellTest(t)
+			logs := captureLogs(t)
+			path := "/sandboxes/" + sb.ID
+			headers := http.Header{
+				"Authorization": []string{"Bearer " + testAPIKey},
+				"X-Request-ID":  []string{"forged"},
+			}
+			switch endpoint {
+			case "shell":
+				path += "/ws"
+			case "exec":
+				path += "/exec/ws"
+			case "tunnel":
+				path += "/tunnel?port=8080"
+			case "web_shell":
+				path = "/_shell/" + sb.ID + "/ws"
+				headers.Del("Authorization")
+			}
+			ws, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+path, headers)
+			if err != nil {
+				t.Fatalf("upgrade %s: %v", path, err)
+			}
+			defer ws.Close()
+			id := resp.Header.Get("X-Request-ID")
+			if !requestIDRe.MatchString(id) {
+				t.Errorf("upgrade X-Request-ID = %q, want generated request ID", id)
+			}
+			if got := resp.Header.Get("X-Bhatti-Version"); got != ServerVersion {
+				t.Errorf("upgrade version = %q, want %q", got, ServerVersion)
+			}
+			if endpoint == "web_shell" && resp.Header.Get("Referrer-Policy") != "no-referrer" {
+				t.Error("upgrade lost the web shell's Referrer-Policy")
+			}
+			ws.Close()
+			if endpoint != "web_shell" && id != "" {
+				logs.waitFor(t, "request", func(record map[string]any) bool {
+					return record["request_id"] == id && record["status"] == float64(http.StatusSwitchingProtocols)
+				})
+			}
+		})
+	}
+}
+
 // panicEngine panics when asked for a sandbox's status.
 type panicEngine struct{ *mockEngine }
 
