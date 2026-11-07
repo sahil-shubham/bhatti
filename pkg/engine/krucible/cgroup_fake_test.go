@@ -272,8 +272,13 @@ func gatedHelperScript(t *testing.T) string {
 		"if [ \"$b\" != G ]; then echo \"gate: $b\" > \"$marker.failed\"; exit 3; fi\n" +
 		"echo worked > \"$marker\"\n" +
 		"exec sleep 60\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatal(err)
+	// A child writes it: a descriptor this process held open for writing would
+	// be inherited by whatever another goroutine forks meanwhile, and exec'ing
+	// the script while that child still holds it fails with ETXTBSY.
+	write := exec.Command("sh", "-c", `cat > "$1" && chmod 755 "$1"`, "sh", script)
+	write.Stdin = strings.NewReader(body)
+	if out, err := write.CombinedOutput(); err != nil {
+		t.Fatalf("write %s: %v: %s", script, err, out)
 	}
 	return script
 }
