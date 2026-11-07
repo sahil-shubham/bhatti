@@ -7,7 +7,7 @@ name: macOS VMM — sign + notarize (dry-run)
 # via notarytool. Manual dispatch only; it does NOT publish — it uploads the
 # signed/notarized artifacts for inspection before any real v2 tag.
 #
-# Out of scope on purpose: a real HVF boot-smoke. macos-14 runners are VMs with
+# Out of scope on purpose: a real HVF boot-smoke. GitHub's macOS runners are VMs with
 # no nested virtualization, so booting a guest must happen on physical Apple
 # Silicon (see PLAN-krucible-release.md §5 Phase 1 "boot-smoke runners").
 #
@@ -29,7 +29,7 @@ permissions:
 jobs:
   macos-vmm:
     name: Build + sign + notarize (darwin-arm64)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
