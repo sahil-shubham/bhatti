@@ -88,6 +88,7 @@ import (
 
 	"github.com/sahil-shubham/bhatti/pkg/engine/krucible"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
+	"github.com/sahil-shubham/bhatti/pkg/launchgate"
 
 	// Confines this process (Linux) before Go or libkrun code runs; the daemon
 	// passes the policy in krucible.VMMPolicyEnv.
@@ -117,30 +118,50 @@ func fail(format string, args ...any) {
 	os.Exit(1)
 }
 
+const usage = "usage: vmm [--gate-fd N] <spec.json> | vmm capabilities | vmm check-checkpoint <dir>"
+
 func main() {
+	// The launch gate is the first act, ahead of reading the spec and of
+	// libkrun: guest memory is allocated later inside libkrun, and the daemon
+	// opens the gate only once it has put this process in the sandbox's cgroup,
+	// so that memory is charged there and not to the daemon's. The confinement
+	// constructor (internal/confine) has already run, so the helper is confined
+	// from its first instruction; only this small Go prologue runs ahead of the
+	// placement. The gate applies to whichever command follows, though the
+	// daemon only ever gates the VM run.
+	gateFD, args, err := launchgate.SplitArgs(os.Args[1:])
+	if err != nil {
+		fail("%v\n%s", err, usage)
+	}
+	if gateFD >= 0 {
+		if err := launchgate.Wait(gateFD, launchgate.Timeout); err != nil {
+			fail("gate: %v", err)
+		}
+	}
+
 	// check-checkpoint <dir>: whether this host can restore the checkpoint in
 	// dir, judged by libkrun as a restore would be; exits 1 with the reason.
-	if len(os.Args) == 3 && os.Args[1] == "check-checkpoint" {
+	if len(args) == 2 && args[0] == "check-checkpoint" {
 		if runtime.GOOS == "linux" && os.Geteuid() == 0 && os.Getenv(krucible.VMMPolicyEnv) == "" {
 			fail("check-checkpoint: root needs a confinement policy")
 		}
 		var kerr C.KrunError
-		C.krun_checkpoint_check_host(cstr(os.Args[2]), &kerr)
+		C.krun_checkpoint_check_host(cstr(args[1]), &kerr)
 		noErr(kerr, "check-checkpoint")
 		return
 	}
-	if len(os.Args) != 2 {
-		fail("usage: vmm <spec.json> | vmm capabilities | vmm check-checkpoint <dir>")
+	if len(args) != 1 {
+		fail("%s", usage)
 	}
-	if os.Args[1] == "capabilities" {
+	if args[0] == "capabilities" {
 		if err := json.NewEncoder(os.Stdout).Encode(capabilities); err != nil {
 			fail("capabilities: %v", err)
 		}
 		return
 	}
-	data, err := os.ReadFile(os.Args[1])
+	data, err := os.ReadFile(args[0])
 	if err != nil {
-		fail("read spec %q: %v", os.Args[1], err)
+		fail("read spec %q: %v", args[0], err)
 	}
 	var spec krucible.VMSpec
 	if err := json.Unmarshal(data, &spec); err != nil {

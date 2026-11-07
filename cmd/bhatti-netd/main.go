@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
+	"github.com/sahil-shubham/bhatti/pkg/launchgate"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -33,12 +34,22 @@ func main() {
 	brokerUDS := flag.String("broker-uds", "", "credential broker socket the daemon serves (optional; enables credential substitution)")
 	uid := flag.Int("uid", 65534, "user to run as once the sockets are open, when started as root")
 	gid := flag.Int("gid", 65534, "group to run as once the sockets are open, when started as root")
+	gateFD := flag.Int("gate-fd", -1, "launch gate: read one byte from this descriptor before doing anything (the daemon places netd in its cgroup first)")
 	var daemonListeners []string
 	flag.Func("daemon-listen", "daemon API or proxy TCP listen address (repeatable)", func(addr string) error {
 		daemonListeners = append(daemonListeners, addr)
 		return nil
 	})
 	flag.Parse()
+
+	// First act, before the socket exists: the daemon waits for the socket to
+	// appear, so it must not appear until netd has been placed. Everything
+	// below (listen, goroutines, buffers) is charged to the cgroup netd is in.
+	if *gateFD >= 0 {
+		if err := launchgate.Wait(*gateFD, launchgate.Timeout); err != nil {
+			log.Fatalf("bhatti-netd: %v", err)
+		}
+	}
 
 	if *netUDS == "" {
 		log.Fatal("bhatti-netd: --net-uds is required")
