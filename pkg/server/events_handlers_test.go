@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -694,5 +696,43 @@ func TestEventsFollowNeedsTheRecorder(t *testing.T) {
 	}
 	if got := typesOf(recordsOf(t, doReq(t, ts, "GET", "/events", nil))); !reflect.DeepEqual(got, []string{"stored"}) {
 		t.Errorf("replay without a recorder = %v", got)
+	}
+}
+
+func TestEventsHEADReturnsAndAllowsConnectionReuse(t *testing.T) {
+	for _, recorder := range []bool{false, true} {
+		for _, query := range []string{"", "?follow=1", "?after=0&follow=1"} {
+			t.Run(fmt.Sprintf("recorder=%t/%s", recorder, query), func(t *testing.T) {
+				_, ts := eventsServer(t, recorder)
+				conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(eventWait))
+				// Pipeline a second request: net/http cannot serve it until the
+				// HEAD handler returns, even though it suppresses its body.
+				if _, err := fmt.Fprintf(conn, "HEAD /events%s HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer %s\r\n\r\nGET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", query, testAPIKey); err != nil {
+					t.Fatal(err)
+				}
+				reader := bufio.NewReader(conn)
+				head, err := http.ReadResponse(reader, &http.Request{Method: http.MethodHead})
+				if err != nil {
+					t.Fatal(err)
+				}
+				head.Body.Close()
+				if head.StatusCode != http.StatusOK || head.Header.Get("Content-Type") != "application/x-ndjson" || head.Header.Get("X-Content-Type-Options") != "nosniff" {
+					t.Fatalf("HEAD /events%s = %d, headers %v", query, head.StatusCode, head.Header)
+				}
+				next, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+				if err != nil {
+					t.Fatalf("request after HEAD /events%s: %v", query, err)
+				}
+				defer next.Body.Close()
+				if next.StatusCode != http.StatusOK {
+					t.Fatalf("request after HEAD = %d", next.StatusCode)
+				}
+			})
+		}
 	}
 }

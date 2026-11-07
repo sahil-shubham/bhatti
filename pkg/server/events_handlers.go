@@ -51,6 +51,7 @@ func (s *Server) EndEventStreams() { s.endEventStreams() }
 // retention removed some).
 //
 //	GET /events?after=<id>&type=<prefix>&sandbox=<id|name>&follow=<bool>
+//	HEAD /events answers the same content headers without replaying or following.
 //
 //	after    only events with a greater id. Omitted, a request without follow
 //	         starts at the oldest retained event and a follow stream starts
@@ -117,6 +118,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		errResp(w, 500, "streaming not supported")
 		return
 	}
+	out := &eventsWriter{w: w, flusher: flusher, enc: json.NewEncoder(w)}
+	if r.Method == http.MethodHead {
+		out.begin()
+		return
+	}
 	// Only a follow stream waits, and without a recorder nothing would wake it.
 	rec := s.events
 	if follow && rec == nil {
@@ -144,7 +150,6 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		query.After = newest
 	}
 
-	out := &eventsWriter{w: w, flusher: flusher, enc: json.NewEncoder(w)}
 	if follow {
 		s.followEvents(ctx, r, out, rec, query, gap)
 	} else {
