@@ -59,12 +59,11 @@ func TestProcessReaderReadsItsOwnProcess(t *testing.T) {
 	}
 }
 
-// The reader's CPU time of a spinning child is the CPU time the kernel itself
-// reports for it when it is reaped (wait4's rusage, the number time(1) prints).
-// How much CPU a busy process is given depends on the load on the machine, so
-// this compares two accounts of one process and doesn't ask for a share of a CPU.
+// Freeze both readings around a finite workload: under load the sampler can be
+// descheduled anywhere, including between a reading and its timestamp or the
+// final reading and kill. A stopped child cannot accrue unobserved CPU then.
 func TestProcessReaderAgreesWithTheKernelsAccountOfAChild(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "while :; do :; done")
+	cmd := exec.Command("sh", "-c", "kill -STOP $$; i=0; while [ \"$i\" -lt 200000 ]; do i=$((i + 1)); done; kill -STOP $$")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -77,25 +76,50 @@ func TestProcessReaderAgreesWithTheKernelsAccountOfAChild(t *testing.T) {
 	}()
 	p := newProcessReader()
 	pid := cmd.Process.Pid
+	waitStopped := func() {
+		t.Helper()
+		var status syscall.WaitStatus
+		for {
+			_, err := syscall.Wait4(pid, &status, syscall.WUNTRACED, nil)
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			if err != nil {
+				t.Fatalf("wait for child to stop: %v", err)
+			}
+			// Darwin encodes SIGSTOP and continuation identically; Go calls
+			// this Continued. Without WCONTINUED, wait4 only reports stops.
+			if !status.Continued() {
+				reaped = status.Exited() || status.Signaled()
+				t.Fatalf("child status = %v, want SIGSTOP", status)
+			}
+			return
+		}
+	}
+	waitStopped()
 	first, err := p.usage(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	time.Sleep(1500 * time.Millisecond)
+	if err := cmd.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	waitStopped()
+	end := time.Now()
 	last, err := p.usage(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r, ok := deriveRates(&sample{at: start, ident: incarnation{pid: pid}, usage: first},
-		&sample{at: time.Now(), ident: incarnation{pid: pid}, usage: last})
-	if !ok || r.CPUPercent <= 0 || r.CPUPercent > 110 {
-		t.Errorf("a spinning child used %v%% of a CPU: %+v, %v", r.CPUPercent, r, ok)
+		&sample{at: end, ident: incarnation{pid: pid}, usage: last})
+	if !ok || r.CPUPercent <= 0 || r.CPUPercent > 100 {
+		t.Errorf("the child's bounded workload used %v%% of a CPU: %+v, %v", r.CPUPercent, r, ok)
 	}
 
-	// Once it is reaped the kernel says what it used in all. The process ran on
-	// for the moment between the last reading and the kill, so that is the most
-	// it can differ by, and it can't have used less than was read.
+	// wait4 independently reports the lifetime total in microseconds, not Mach
+	// ticks. Since the last reading the child has stayed stopped, so only
+	// accounting precision and the cost of exit can separate these figures.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
@@ -107,13 +131,15 @@ func TestProcessReaderAgreesWithTheKernelsAccountOfAChild(t *testing.T) {
 	}
 	usec := func(tv syscall.Timeval) uint64 { return uint64(tv.Sec)*1_000_000 + uint64(tv.Usec) }
 	finalUser, finalSystem := usec(ru.Utime), usec(ru.Stime)
-	const slack = 300_000 // µs
+	const slack = 10_000 // µs; no scheduler-dependent gap between reading and exit
 	if last.CPU.UserUsec > finalUser || finalUser-last.CPU.UserUsec > slack {
 		t.Errorf("user time: read %d µs while it ran, the kernel says %d µs in all", last.CPU.UserUsec, finalUser)
 	}
 	if last.CPU.SystemUsec > finalSystem+10_000 || finalSystem > last.CPU.SystemUsec+slack {
 		t.Errorf("system time: read %d µs while it ran, the kernel says %d µs in all", last.CPU.SystemUsec, finalSystem)
 	}
+	t.Logf("stopped child: proc_info user %d system %d µs; wait4 user %d system %d µs; workload %.1f%% of a CPU",
+		last.CPU.UserUsec, last.CPU.SystemUsec, finalUser, finalSystem, r.CPUPercent)
 
 	// Once it is gone, so are its figures.
 	if _, err := p.usage(pid); !errors.Is(err, errGone) {
