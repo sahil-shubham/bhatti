@@ -2,7 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"strings"
 	"sync"
 
@@ -120,6 +123,9 @@ ALTER TABLE sandboxes ADD COLUMN restart_pending INTEGER NOT NULL DEFAULT 0;
 
 // New opens (or creates) the SQLite database and runs migrations.
 func New(dbPath string) (*Store, error) {
+	if err := restrictDBFiles(dbPath); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("store: open db: %w", err)
@@ -369,6 +375,24 @@ func New(dbPath string) (*Store, error) {
 	}
 	ok = true
 	return &Store{db: db}, nil
+}
+
+// restrictDBFiles makes the database owner-only before SQLite opens it. It
+// holds API key hashes, sealed secrets and guest agent tokens. SQLite creates
+// the -wal and -shm files with the database file's mode, so creating it 0600
+// covers them; files left by an older version are tightened here.
+func restrictDBFiles(dbPath string) error {
+	f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("store: open db: %w", err)
+	}
+	f.Close()
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("store: restrict %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // migrateSecretsToV2 converts the legacy v1 secrets schema

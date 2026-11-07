@@ -20,6 +20,43 @@ func testStore(t *testing.T) *Store {
 	return s
 }
 
+// TestDatabaseIsOwnerOnly: the database holds key hashes, sealed secrets and
+// agent tokens. A fresh one and its WAL files are 0600, and one left
+// world-readable by an older version is tightened on open.
+func TestDatabaseIsOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	fresh := filepath.Join(dir, "fresh.db")
+	old := filepath.Join(dir, "old.db")
+	for _, p := range []string{old, old + "-wal", old + "-shm"} {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o644); err != nil { // past the umask
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{fresh, old} {
+		s, err := New(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A write so SQLite has created the WAL and shared-memory files.
+		if err := s.CreateTemplate(Template{ID: "t1", Name: "t1", CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range []string{p, p + "-wal", p + "-shm"} {
+			info, err := os.Stat(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("%s: mode %o, want 600", filepath.Base(f), perm)
+			}
+		}
+		s.Close()
+	}
+}
+
 func TestTemplatesCRUD(t *testing.T) {
 	s := testStore(t)
 
