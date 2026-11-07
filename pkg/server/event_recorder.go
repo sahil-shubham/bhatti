@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,62 +10,14 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
-// subscriberBuffer is the per-subscriber channel capacity. A subscriber
-// whose consumer is too slow to drain at this rate has its channel
-// filled and is disconnected on the next fan-out. The substrate is
-// not a message queue — consumers that need at-least-once delivery
-// route through the events table via /events?since=<id> (Bet 4).
-const subscriberBuffer = 64
-
-// SubscriptionFilter matches a subset of events. Empty fields match all
-// events on that dimension. To subscribe to every event, pass a
-// zero-value SubscriptionFilter.
-type SubscriptionFilter struct {
-	TypePrefix string // e.g. "thermal" matches "thermal.snapshot", "thermal.pause"
-	SandboxID  string // exact match
-	UserID     string // exact match
-}
-
-// matches returns true if e satisfies the filter.
-func (f SubscriptionFilter) matches(e store.Event) bool {
-	if f.TypePrefix != "" && !strings.HasPrefix(e.Type, f.TypePrefix) {
-		return false
-	}
-	if f.SandboxID != "" && f.SandboxID != e.SandboxID {
-		return false
-	}
-	if f.UserID != "" && f.UserID != e.UserID {
-		return false
-	}
-	return true
-}
-
-// Subscription is the consumer side of an event subscription. C delivers
-// every event matching the filter passed to Subscribe. The channel is
-// closed when Cancel is called, when EventRecorder.Close is called, or
-// when the subscriber is disconnected for being slow (its buffer would
-// have blocked a fan-out write). Range over C until it closes; a closed
-// channel signals "no more events for this subscription, for whatever
-// reason."
-type Subscription struct {
-	C      <-chan store.Event
-	Cancel func()
-}
-
-// subscriber is the internal-only state for one Subscription.
-type subscriber struct {
-	filter SubscriptionFilter
-	ch     chan store.Event
-	closed atomic.Bool // ensures close(ch) happens at most once
-}
-
-// EventRecorder buffers events and flushes them to SQLite in batches,
-// AND fans them out in-process to subscribers registered via Subscribe.
-// Record() is non-blocking: if the SQLite buffer is full, the event is
-// dropped from the persistent stream (counted in Dropped). Fan-out to
-// subscribers happens inline on the Record caller's goroutine; slow
-// subscribers (whose per-subscriber buffer would block) are
-// disconnected, not blocked.
+// EventRecorder buffers events and flushes them to SQLite in batches. The
+// events table is the stream: a reader keeps its own cursor into it (see
+// store.EventsAfter) and uses Changed to learn when to look again. A reader
+// that is slow, absent or gone costs the recorder nothing and loses nothing,
+// because what it has not read is still in the table.
+//
+// Record never blocks: when the buffer is full the event is not stored and is
+// counted in Dropped. A recorded event is stored within about 500ms.
 type EventRecorder struct {
 	store     *store.Store
 	ch        chan store.Event
@@ -76,38 +27,32 @@ type EventRecorder struct {
 	closed    bool
 	closeOnce sync.Once
 
-	// Subscriber state. subsMu serialises fan-out, Subscribe, and
-	// disconnect/Cancel — channel close is performed under the lock
-	// so a concurrent fan-out can't observe a closed channel and
-	// panic on send.
-	subsMu     sync.Mutex
-	subs       map[int64]*subscriber
-	subsClosed bool
-	nextID     atomic.Int64
+	// changed is closed, and replaced by a fresh channel, each time a flush
+	// commits events (litestream's notify). Nothing is ever sent on it, so
+	// no waiter can be too slow for the recorder.
+	changedMu sync.Mutex
+	changed   chan struct{}
 }
 
 // NewEventRecorder creates and starts an EventRecorder.
 // Channel buffer: 1000 events. Flushes every 500ms or at 100 events.
 func NewEventRecorder(st *store.Store) *EventRecorder {
 	r := &EventRecorder{
-		store: st,
-		ch:    make(chan store.Event, 1000),
-		done:  make(chan struct{}),
-		subs:  make(map[int64]*subscriber),
+		store:   st,
+		ch:      make(chan store.Event, 1000),
+		done:    make(chan struct{}),
+		changed: make(chan struct{}),
 	}
 	goSafe("event recorder", r.loop)
 	return r
 }
 
-// Record enqueues an event for persistence and fans it out to every
-// matching subscriber. The persistent enqueue is non-blocking (drops if
-// the SQLite buffer is full and bumps Dropped). The fan-out is also
-// non-blocking per subscriber; subscribers whose buffer is full are
-// disconnected.
+// Record enqueues an event for persistence. It does not block: if the buffer is
+// full the event is dropped from the persistent stream and Dropped is bumped.
 func (r *EventRecorder) Record(e store.Event) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
-		r.mu.Unlock()
 		return
 	}
 	select {
@@ -115,83 +60,49 @@ func (r *EventRecorder) Record(e store.Event) {
 	default:
 		r.Dropped.Add(1)
 	}
-	r.mu.Unlock()
-	r.fanOut(e)
 }
 
-// Subscribe registers a new subscriber and returns the consumer side.
-// The returned Subscription.C delivers every event matching f until
-// Cancel is called, the subscriber is disconnected for being slow, or
-// EventRecorder.Close is called.
-func (r *EventRecorder) Subscribe(f SubscriptionFilter) *Subscription {
-	id := r.nextID.Add(1)
-	sub := &subscriber{
-		filter: f,
-		ch:     make(chan store.Event, subscriberBuffer),
-	}
-	r.subsMu.Lock()
-	if r.subsClosed {
-		close(sub.ch)
-		r.subsMu.Unlock()
-		return &Subscription{C: sub.ch, Cancel: func() {}}
-	}
-	r.subs[id] = sub
-	r.subsMu.Unlock()
-	return &Subscription{
-		C:      sub.ch,
-		Cancel: func() { r.disconnect(id) },
-	}
+// Changed returns a channel that is closed the next time a flush commits
+// events. A reader takes it before it reads the table, never after: a flush
+// that commits while the reader is mid-read closes the channel it already
+// holds, so waiting on it returns at once and the reader looks again. Taken
+// after the read, that flush would be missed and the reader would sleep on rows
+// it has not seen. tail is that loop, for a reader that wants nothing else.
+func (r *EventRecorder) Changed() <-chan struct{} {
+	r.changedMu.Lock()
+	defer r.changedMu.Unlock()
+	return r.changed
 }
 
-// disconnect removes the subscriber from the map and closes its
-// channel. Idempotent (the atomic.Bool guards the close call).
-func (r *EventRecorder) disconnect(id int64) {
-	r.subsMu.Lock()
-	defer r.subsMu.Unlock()
-	sub, ok := r.subs[id]
-	if !ok {
-		return
-	}
-	delete(r.subs, id)
-	if sub.closed.CompareAndSwap(false, true) {
-		close(sub.ch)
-	}
-}
-
-// fanOut delivers e to every matching subscriber. Subscribers whose
-// buffered channel is full are disconnected — the substrate refuses
-// to provide back-pressure to producers because of slow consumers.
-//
-// Holds subsMu for the duration so that Cancel/disconnect can't race
-// with a send-to-channel here. Channel sends to a non-full buffered
-// channel are O(1) and don't block, so the critical section is bounded
-// by len(subs) × a few nanoseconds.
-func (r *EventRecorder) fanOut(e store.Event) {
-	r.subsMu.Lock()
-	defer r.subsMu.Unlock()
-	var disconnected []int64
-	for id, sub := range r.subs {
-		if !sub.filter.matches(e) {
-			continue
+// tail calls read, and again after every flush that commits events, until ctx
+// ends or read fails. read is the reader's look at the table.
+func (r *EventRecorder) tail(ctx context.Context, read func() error) error {
+	for {
+		changed := r.Changed()
+		if err := read(); err != nil {
+			return err
 		}
 		select {
-		case sub.ch <- e:
-		default:
-			disconnected = append(disconnected, id)
-		}
-	}
-	for _, id := range disconnected {
-		sub := r.subs[id]
-		delete(r.subs, id)
-		if sub.closed.CompareAndSwap(false, true) {
-			close(sub.ch)
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
-// Close drains remaining events, stops the background goroutine, and
-// closes every active subscription's channel so consumers ranging
-// over Subscription.C exit cleanly.
+// committed wakes every reader waiting on Changed, once the rows they will
+// look for are in the table.
+func (r *EventRecorder) committed() {
+	r.changedMu.Lock()
+	close(r.changed)
+	r.changed = make(chan struct{})
+	r.changedMu.Unlock()
+}
+
+// Close stores the events still buffered and stops the background goroutine.
+// That last flush wakes the readers waiting on Changed if it stored anything;
+// nothing wakes them after it, so a reader that must end with the server needs
+// a context of its own, as the stream handlers have.
 func (r *EventRecorder) Close() {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
@@ -199,15 +110,6 @@ func (r *EventRecorder) Close() {
 		close(r.ch)
 		r.mu.Unlock()
 		<-r.done
-		r.subsMu.Lock()
-		r.subsClosed = true
-		for id, sub := range r.subs {
-			if sub.closed.CompareAndSwap(false, true) {
-				close(sub.ch)
-			}
-			delete(r.subs, id)
-		}
-		r.subsMu.Unlock()
 	})
 }
 
@@ -247,6 +149,8 @@ func (r *EventRecorder) loop() {
 			// Events are lost on flush failure — acceptable trade-off
 			// vs blocking the API. The dropped counter doesn't track
 			// flush failures (those are rare and worth an error log).
+		} else {
+			r.committed()
 		}
 		batch = batch[:0]
 	}

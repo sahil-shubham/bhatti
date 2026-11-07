@@ -18,33 +18,13 @@ import (
 	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
-func nextLifecycleEvent(t *testing.T, sub *Subscription, kind string) store.Event {
-	t.Helper()
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-	for {
-		select {
-		case e, ok := <-sub.C:
-			if !ok {
-				t.Fatal("event subscription closed before", kind)
-			}
-			if e.Type == kind {
-				return e
-			}
-		case <-timer.C:
-			t.Fatalf("timed out waiting for %s", kind)
-		}
-	}
-}
-
 func TestVMExitStopsSandboxAndColdExecRestarts(t *testing.T) {
 	srv, ts := setup(t)
 	eng := srv.engine.(*mockEngine)
 	sb := createSandbox(t, ts, uniqueName(t, "crashed"))
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
-	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-	defer sub.Cancel()
+	sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 
 	srv.lastActivity.Store(sb.EngineID, time.Now())
 	srv.snapshotFailures.Store(sb.EngineID, &eng.nextID) // non-empty failure bookkeeping
@@ -53,8 +33,9 @@ func TestVMExitStopsSandboxAndColdExecRestarts(t *testing.T) {
 		Kind: engine.VMExited, EngineID: sb.EngineID,
 		ExitCode: -1, Signal: "killed", Reason: "VMM was OOM-killed",
 	})
-	exit := nextLifecycleEvent(t, sub, "sandbox.exited")
-	if exit.SandboxID != sb.ID || exit.UserID != sb.CreatedBy || exit.Meta["exit_code"] != -1 ||
+	exit := sub.next("sandbox.exited")
+	// Meta comes back from the events table, where every number is a float64.
+	if exit.SandboxID != sb.ID || exit.UserID != sb.CreatedBy || exit.Meta["exit_code"] != float64(-1) ||
 		exit.Meta["signal"] != "killed" || exit.Meta["reason"] != "VMM was OOM-killed" {
 		t.Fatalf("incorrect exit audit event: %+v", exit)
 	}
@@ -101,10 +82,9 @@ func TestVMExitColdStartsViaPublicProxy(t *testing.T) {
 	sb, id := publishSandbox(t, srv, eng, "proxy-exit", "proxy-exit", 8080)
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
-	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-	defer sub.Cancel()
+	sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1, Reason: "helper died"})
-	nextLifecycleEvent(t, sub, "sandbox.exited")
+	sub.next("sandbox.exited")
 	hitPublicProxy(t, ts, "proxy-exit")
 	eng.mu.Lock()
 	starts := eng.StartCalls
@@ -150,11 +130,10 @@ func TestKeepHotExitRestartAndBackoff(t *testing.T) {
 			}
 			srv.StartEventRecorder()
 			srv.StartLifecycleEvents()
-			sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-			defer sub.Cancel()
+			sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 
 			eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: 137, Reason: "helper exited"})
-			result := nextLifecycleEvent(t, sub, tc.wantEvent)
+			result := sub.next(tc.wantEvent)
 			if result.UserID != sb.CreatedBy || result.SandboxID != sb.ID {
 				t.Fatalf("wrong restart event owner: %+v", result)
 			}
@@ -190,14 +169,12 @@ func TestKeepHotExitDuringStartIsNotLost(t *testing.T) {
 	srv.lifecycle.wait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
-	exits := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID, TypePrefix: "sandbox.exited"})
-	defer exits.Cancel()
-	restarts := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID, TypePrefix: "sandbox.restarted"})
-	defer restarts.Cancel()
+	exits := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID, Type: "sandbox.exited"})
+	restarts := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID, Type: "sandbox.restarted"})
 	secondExitHandled := make(chan struct{})
 	go func() {
 		for range 2 {
-			if _, ok := <-exits.C; !ok {
+			if _, ok := exits.wait(func(store.Event) bool { return true }, eventWait); !ok {
 				return
 			}
 		}
@@ -211,11 +188,11 @@ func TestKeepHotExitDuringStartIsNotLost(t *testing.T) {
 		eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: engineID, ExitCode: -1})
 		select {
 		case <-secondExitHandled:
-		case <-time.After(3 * time.Second):
+		case <-time.After(eventWait):
 		}
 	}
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1})
-	nextLifecycleEvent(t, restarts, "sandbox.restarted")
+	restarts.next("sandbox.restarted")
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
@@ -246,14 +223,13 @@ func TestKeepHotCrashLoopStopsAfterThreeInTenMinutes(t *testing.T) {
 	}
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
-	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-	defer sub.Cancel()
+	sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 	for range 3 {
 		eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1, Reason: "repeated crash"})
-		nextLifecycleEvent(t, sub, "sandbox.restarted")
+		sub.next("sandbox.restarted")
 	}
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1, Reason: "fourth crash"})
-	nextLifecycleEvent(t, sub, "sandbox.restart_failed")
+	sub.next("sandbox.restart_failed")
 	eng.mu.Lock()
 	starts := eng.StartCalls
 	eng.mu.Unlock()
@@ -275,7 +251,7 @@ func TestKeepHotCrashLoopStopsAfterThreeInTenMinutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1, Reason: "later crash"})
-	nextLifecycleEvent(t, sub, "sandbox.restarted")
+	sub.next("sandbox.restarted")
 	if delay := <-delays; delay != 0 {
 		t.Fatalf("restart after window delay = %v, want immediate", delay)
 	}
@@ -792,10 +768,9 @@ func TestRestartGiveUpClearsPendingRestart(t *testing.T) {
 	srv.lifecycle.wait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
-	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-	defer sub.Cancel()
+	sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.VMExited, EngineID: id, ExitCode: -1})
-	nextLifecycleEvent(t, sub, "sandbox.restart_failed")
+	sub.next("sandbox.restart_failed")
 	srv.Close()
 
 	eng.StartErr = nil
@@ -815,12 +790,11 @@ func TestNetworkLostAuditUsesSandboxOwner(t *testing.T) {
 	sb, _ := srv.store.GetSandboxByEngineID(t.Context(), id)
 	srv.StartEventRecorder()
 	srv.StartLifecycleEvents()
-	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-	defer sub.Cancel()
+	sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 	eng.emitLifecycle(engine.LifecycleEvent{
 		Kind: engine.NetworkLost, EngineID: id, UserID: "untrusted", SandboxID: "untrusted", Reason: "bhatti-netd exited: signal: killed",
 	})
-	e := nextLifecycleEvent(t, sub, "sandbox.network_lost")
+	e := sub.next("sandbox.network_lost")
 	if e.SandboxID != sb.ID || e.UserID != sb.CreatedBy || e.Meta["reason"] != "bhatti-netd exited: signal: killed" {
 		t.Fatalf("network loss event = %+v", e)
 	}
@@ -838,10 +812,9 @@ func TestRecoveryEventsAreDeliveredWhenHandlerAttaches(t *testing.T) {
 	sb, _ := srv.store.GetSandboxByEngineID(t.Context(), id)
 	eng.emitLifecycle(engine.LifecycleEvent{Kind: engine.NetworkLost, EngineID: id, Reason: "gateway quarantine"})
 	srv.StartEventRecorder()
-	sub := srv.events.Subscribe(SubscriptionFilter{SandboxID: sb.ID})
-	defer sub.Cancel()
+	sub := watchEvents(t, srv, store.EventFilter{SandboxID: sb.ID})
 	srv.StartLifecycleEvents()
-	nextLifecycleEvent(t, sub, "sandbox.network_lost")
+	sub.next("sandbox.network_lost")
 }
 
 func TestCloseCancelsDelayedKeepHotRestart(t *testing.T) {
