@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -30,8 +31,8 @@ func TestPersistentVolumeUserScoped(t *testing.T) {
 	createTestVolume(t, s, "usr_a", "ws", 1024)
 
 	// Bob can't see Alice's volume
-	if _, err := s.GetPersistentVolume("usr_b", "ws"); err == nil {
-		t.Fatal("expected error: bob should not see alice's volume")
+	if _, err := s.GetPersistentVolume("usr_b", "ws"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("bob read alice's volume: %v, want ErrNotFound", err)
 	}
 
 	// Bob can have his own with the same name
@@ -89,8 +90,8 @@ func TestPersistentVolumeDoubleRWAttachRejected(t *testing.T) {
 	if err := s.AttachPersistentVolume("usr_a", "ws", "sb1", "/ws", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AttachPersistentVolume("usr_a", "ws", "sb2", "/ws", false); err == nil {
-		t.Fatal("expected error: RW double attach should be rejected")
+	if err := s.AttachPersistentVolume("usr_a", "ws", "sb2", "/ws", false); !errors.Is(err, ErrVolumeAttached) {
+		t.Fatalf("second read-write attach: %v, want ErrVolumeAttached", err)
 	}
 }
 
@@ -124,8 +125,8 @@ func TestPersistentVolumeRWBlocksRO(t *testing.T) {
 	s.CreateSandbox(Sandbox{ID: "sb2", Name: "sb2", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()})
 
 	s.AttachPersistentVolume("usr_a", "ws", "sb1", "/ws", false) // RW
-	if err := s.AttachPersistentVolume("usr_a", "ws", "sb2", "/ws", true); err == nil {
-		t.Fatal("expected error: RO attach should be blocked by existing RW")
+	if err := s.AttachPersistentVolume("usr_a", "ws", "sb2", "/ws", true); !errors.Is(err, ErrVolumeAttached) {
+		t.Fatalf("read-only attach beside a read-write one: %v, want ErrVolumeAttached", err)
 	}
 }
 
@@ -137,8 +138,8 @@ func TestPersistentVolumeROBlocksRW(t *testing.T) {
 	s.CreateSandbox(Sandbox{ID: "sb2", Name: "sb2", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()})
 
 	s.AttachPersistentVolume("usr_a", "ws", "sb1", "/ws", true) // RO
-	if err := s.AttachPersistentVolume("usr_a", "ws", "sb2", "/ws", false); err == nil {
-		t.Fatal("expected error: RW attach should be blocked by existing RO")
+	if err := s.AttachPersistentVolume("usr_a", "ws", "sb2", "/ws", false); !errors.Is(err, ErrVolumeAttached) {
+		t.Fatalf("read-write attach beside a read-only one: %v, want ErrVolumeAttached", err)
 	}
 }
 
@@ -149,8 +150,8 @@ func TestPersistentVolumeDeleteWhileAttached(t *testing.T) {
 	s.CreateSandbox(Sandbox{ID: "sb1", Name: "sb1", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()})
 	s.AttachPersistentVolume("usr_a", "ws", "sb1", "/ws", false)
 
-	if err := s.DeletePersistentVolume("usr_a", "ws"); err == nil {
-		t.Fatal("expected error: delete while attached should fail")
+	if err := s.DeletePersistentVolume("usr_a", "ws"); !errors.Is(err, ErrVolumeAttached) {
+		t.Fatalf("delete while attached: %v, want ErrVolumeAttached", err)
 	}
 }
 
@@ -255,8 +256,8 @@ func TestPersistentVolumeUniqueConstraint(t *testing.T) {
 		SizeMB: 2048, FilePath: "/tmp/dup.ext4",
 		Status: "ready", CreatedAt: time.Now(),
 	}
-	if err := s.CreatePersistentVolume(dup); err == nil {
-		t.Fatal("expected UNIQUE constraint error")
+	if err := s.CreatePersistentVolume(dup); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a second volume under the same name: %v, want ErrConflict", err)
 	}
 }
 

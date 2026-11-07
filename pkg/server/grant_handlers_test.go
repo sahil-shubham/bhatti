@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/x509"
-	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
+	"github.com/sahil-shubham/bhatti/pkg/store"
 )
 
 type grantJSON struct {
@@ -91,7 +91,7 @@ func TestSandboxGetsItsOwnCA(t *testing.T) {
 	if eng.LastCreateSpec.CACert != "" {
 		t.Fatal("a sandbox without a network got a CA")
 	}
-	if _, err := srv.store.GetSandboxCA(none.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(none.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("CA stored for a sandbox without a network: %v", err)
 	}
 }
@@ -253,7 +253,7 @@ func TestDestroyAndSecretDeleteDropGrants(t *testing.T) {
 	a := createWith(t, ts, map[string]any{"name": "a", "net_policy": map[string]any{"default": "public"}, "secret_grants": grant})
 	createWith(t, ts, map[string]any{"name": "b", "net_policy": map[string]any{"default": "public"}, "secret_grants": grant})
 	expect(t, doReq(t, ts, "DELETE", "/sandboxes/"+a.ID, nil), 200, nil)
-	if _, err := srv.store.GetSandboxCA(a.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(a.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("CA survived its sandbox: %v", err)
 	}
 	if grants, _ := srv.store.ListSecretGrants("usr_test"); len(grants) != 1 || grants[0].SandboxID == a.ID {

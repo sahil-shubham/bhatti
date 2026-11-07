@@ -64,7 +64,7 @@ func (s *Store) GetVolume(name string) (*Volume, error) {
 	err := s.db.QueryRow(`SELECT name, created_at FROM volumes WHERE name = ?`, name).
 		Scan(&v.Name, &v.CreatedAt)
 	if err != nil {
-		return nil, err
+		return nil, noRows(err, "volume %q not found", name)
 	}
 	return &v, nil
 }
@@ -97,7 +97,7 @@ func (s *Store) DeleteVolume(name string) error {
 		return fmt.Errorf("store: count volume mounts: invalid count %d", count)
 	}
 	if count > 0 {
-		return fmt.Errorf("volume %q is in use by %d sandbox(es)", name, count)
+		return wrap(ErrInUse, "volume %q is in use by %d sandbox(es)", name, count)
 	}
 	res, err := s.db.Exec(`DELETE FROM volumes WHERE name = ?`, name)
 	if err != nil {
@@ -105,7 +105,7 @@ func (s *Store) DeleteVolume(name string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("volume %q not found", name)
+		return wrap(ErrNotFound, "volume %q not found", name)
 	}
 	return nil
 }
@@ -152,14 +152,15 @@ func (s *Store) DetachVolumes(sandboxID string) error {
 	return err
 }
 
-// Returns error on UNIQUE violation (not idempotent — for race coordination).
+// CreatePersistentVolume is not idempotent, for race coordination: a name the
+// user already holds is ErrConflict.
 func (s *Store) CreatePersistentVolume(v PersistentVolume) error {
 	_, err := s.db.Exec(
 		`INSERT INTO volumes_v2 (id, user_id, name, size_mb, file_path, status, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.UserID, v.Name, v.SizeMB, v.FilePath, v.Status, v.CreatedAt,
 	)
-	return err
+	return classify(err)
 }
 
 // GetPersistentVolume retrieves a persistent volume by user and name, including attachments.
@@ -171,7 +172,7 @@ func (s *Store) GetPersistentVolume(userID, name string) (*PersistentVolume, err
 		&v.ID, &v.UserID, &v.Name, &v.SizeMB, &v.FilePath, &v.Status, &v.CreatedAt,
 	)
 	if err != nil {
-		return nil, err
+		return nil, noRows(err, "volume %q not found", name)
 	}
 	rows, err := s.db.Query(
 		`SELECT sandbox_id, mount, read_only FROM volume_attachments WHERE volume_id = ?`, v.ID)
@@ -240,7 +241,7 @@ func (s *Store) DeletePersistentVolume(userID, name string) error {
 	err = tx.QueryRow(`SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
 		userID, name).Scan(&volID)
 	if err != nil {
-		return fmt.Errorf("volume %q not found", name)
+		return noRows(err, "volume %q not found", name)
 	}
 
 	var count int
@@ -251,7 +252,7 @@ func (s *Store) DeletePersistentVolume(userID, name string) error {
 		return fmt.Errorf("store: count volume attachments: invalid count %d", count)
 	}
 	if count > 0 {
-		return fmt.Errorf("volume %q has %d active attachment(s)", name, count)
+		return wrap(ErrVolumeAttached, "volume %q has %d active attachment(s)", name, count)
 	}
 
 	if _, err := tx.Exec(`DELETE FROM volumes_v2 WHERE id = ?`, volID); err != nil {
@@ -303,7 +304,7 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 	err = tx.QueryRow(`SELECT id, status FROM volumes_v2 WHERE user_id = ? AND name = ?`,
 		userID, name).Scan(&volID, &status)
 	if err != nil {
-		return fmt.Errorf("volume %q not found", name)
+		return noRows(err, "volume %q not found", name)
 	}
 	if status == "creating" {
 		return fmt.Errorf("volume %q is being created, retry shortly", name)
@@ -324,11 +325,11 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 
 	if !readOnly {
 		if rwCount > 0 || roCount > 0 {
-			return fmt.Errorf("volume %q already attached (rw=%d, ro=%d)", name, rwCount, roCount)
+			return wrap(ErrVolumeAttached, "volume %q already attached (rw=%d, ro=%d)", name, rwCount, roCount)
 		}
 	} else {
 		if rwCount > 0 {
-			return fmt.Errorf("volume %q has a read-write attachment, cannot attach read-only", name)
+			return wrap(ErrVolumeAttached, "volume %q has a read-write attachment, cannot attach read-only", name)
 		}
 	}
 
@@ -340,7 +341,7 @@ func (s *Store) AttachPersistentVolume(userID, name, sandboxID, mount string, re
 		`INSERT INTO volume_attachments (volume_id, sandbox_id, mount, read_only) VALUES (?, ?, ?, ?)`,
 		volID, sandboxID, mount, ro)
 	if err != nil {
-		return err
+		return classify(err)
 	}
 	return tx.Commit()
 }
@@ -351,7 +352,7 @@ func (s *Store) DetachPersistentVolume(userID, name, sandboxID string) error {
 	err := s.db.QueryRow(`SELECT id FROM volumes_v2 WHERE user_id = ? AND name = ?`,
 		userID, name).Scan(&volID)
 	if err != nil {
-		return fmt.Errorf("volume %q not found", name)
+		return noRows(err, "volume %q not found", name)
 	}
 	_, err = s.db.Exec(
 		`DELETE FROM volume_attachments WHERE volume_id = ? AND sandbox_id = ?`,
@@ -432,7 +433,7 @@ func (s *Store) UpdatePersistentVolumeSize(userID, name string, sizeMB int) erro
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("volume %q not found", name)
+		return wrap(ErrNotFound, "volume %q not found", name)
 	}
 	return nil
 }
@@ -471,7 +472,7 @@ func (s *Store) CreateVolumeBackup(b VolumeBackup) error {
 		`INSERT INTO volume_backups (id, volume_name, user_id, s3_key, size_bytes, sha256, consistency_mode, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		b.ID, b.VolumeName, b.UserID, b.S3Key, b.SizeBytes, b.SHA256, b.ConsistencyMode, b.CreatedAt)
-	return err
+	return classify(err)
 }
 
 // ListVolumeBackups returns backups for a volume, newest first.
@@ -503,7 +504,7 @@ func (s *Store) GetVolumeBackup(userID, backupID string) (*VolumeBackup, error) 
 		 FROM volume_backups WHERE id = ? AND user_id = ?`, backupID, userID).Scan(
 		&b.ID, &b.VolumeName, &b.UserID, &b.S3Key, &b.SizeBytes, &b.SHA256, &b.ConsistencyMode, &b.CreatedAt)
 	if err != nil {
-		return nil, err
+		return nil, noRows(err, "backup %q not found", backupID)
 	}
 	return &b, nil
 }

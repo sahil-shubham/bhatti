@@ -88,7 +88,7 @@ func (s *Store) CreateSnapshot(snap SnapshotRecord) error {
 		snap.ManifestJSON, snap.SizeMB, snap.CreatedAt,
 		snap.Source.Image, snap.Source.DiskSizeMB, hasInit, time.Now().UTC(),
 	); err != nil {
-		return err
+		return classify(err)
 	}
 	if ca := snap.Substitution.CA; ca != nil {
 		created := ca.CreatedAt
@@ -142,7 +142,7 @@ func (s *Store) GetSnapshot(userID, name string) (*SnapshotRecord, error) {
 	snap, err := scanSnapshot(s.db.QueryRow(
 		`SELECT `+snapshotCols+` FROM snapshots WHERE user_id = ? AND name = ?`, userID, name))
 	if err != nil {
-		return nil, fmt.Errorf("snapshot %q not found", name)
+		return nil, noRows(err, "snapshot %q not found", name)
 	}
 	if snap.Substitution, err = s.snapshotSubstitution(snap.ID); err != nil {
 		return nil, err
@@ -218,10 +218,7 @@ func (s *Store) DeleteSnapshot(userID, name string) error {
 	defer tx.Rollback()
 	var id string
 	if err := tx.QueryRow(`SELECT id FROM snapshots WHERE user_id = ? AND name = ?`, userID, name).Scan(&id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("snapshot %q not found", name)
-		}
-		return err
+		return noRows(err, "snapshot %q not found", name)
 	}
 	for _, stmt := range []string{
 		`DELETE FROM snapshot_cas WHERE snapshot_id = ?`,

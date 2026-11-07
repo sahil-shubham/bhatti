@@ -454,11 +454,7 @@ func (s *Server) handleSandboxCheckpoint(w http.ResponseWriter, r *http.Request,
 		manifestIface, err = cp.Checkpoint(r.Context(), sb.EngineID, user.ID, user.SubnetIndex, req.Name, snapDir)
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			errResp(w, 409, err.Error())
-		} else {
-			errRespInternal(w, r, "checkpoint failed", err)
-		}
+		errRespInternal(w, r, "checkpoint failed", err)
 		return
 	}
 
@@ -588,11 +584,7 @@ func (s *Server) handleSnapshotResume(w http.ResponseWriter, r *http.Request, us
 				Meta: map[string]any{"operation": "snapshot_restore", "snapshot": snapName, "new_sandbox": sandboxName, "error": err.Error()},
 			})
 		}
-		if strings.Contains(err.Error(), "in use") {
-			errResp(w, 409, err.Error())
-		} else {
-			errRespInternal(w, r, "resume snapshot failed", err)
-		}
+		errRespInternal(w, r, "resume snapshot failed", err)
 		return
 	}
 
@@ -971,11 +963,12 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request, 
 // Used for 500 errors to avoid leaking internal paths, IPs, or system details.
 // An engine.ErrNotSupported is the caller asking for something this engine
 // can't do, so it's a 501 carrying the engine's (deliberately user-facing) message.
-// An outdated guest agent, or an owner network with no free address, is a
-// client-actionable conflict (recreate or destroy sandboxes), distinct from an
-// unavailable capability probe or a broken engine.
+// An outdated guest agent, an owner network with no free address, or a
+// snapshot name already taken is a client-actionable conflict (recreate,
+// destroy sandboxes, pick another name), distinct from an unavailable
+// capability probe or a broken engine.
 func errRespInternal(w http.ResponseWriter, r *http.Request, logMsg string, err error) {
-	if errors.Is(err, engine.ErrGuestAgentOutdated) || errors.Is(err, engine.ErrNetworkFull) {
+	if errors.Is(err, engine.ErrGuestAgentOutdated) || errors.Is(err, engine.ErrNetworkFull) || errors.Is(err, engine.ErrSnapshotExists) {
 		errResp(w, 409, err.Error())
 		return
 	}

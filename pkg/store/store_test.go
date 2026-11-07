@@ -2,9 +2,9 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -540,8 +540,8 @@ func TestUserCRUD(t *testing.T) {
 	}
 
 	// Delete non-existent
-	if err := s.DeleteUser("usr_nope"); err == nil {
-		t.Fatal("expected error deleting non-existent user")
+	if err := s.DeleteUser("usr_nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleting a non-existent user: %v, want ErrNotFound", err)
 	}
 }
 
@@ -559,11 +559,8 @@ func TestUserDeleteRefusedWithSandboxes(t *testing.T) {
 	})
 
 	err := s.DeleteUser("usr_del")
-	if err == nil {
-		t.Fatal("expected error deleting user with active sandboxes")
-	}
-	if !strings.Contains(err.Error(), "active sandbox") {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, ErrInUse) {
+		t.Fatalf("deleting a user with active sandboxes: %v, want ErrInUse", err)
 	}
 }
 
@@ -578,11 +575,8 @@ func TestUserDeleteRefusedWithSecrets(t *testing.T) {
 	s.SetSecret("usr_sec", "my-key", []byte("encrypted"))
 
 	err := s.DeleteUser("usr_sec")
-	if err == nil {
-		t.Fatal("expected error deleting user with secrets")
-	}
-	if !strings.Contains(err.Error(), "secret") {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, ErrInUse) {
+		t.Fatalf("deleting a user with secrets: %v, want ErrInUse", err)
 	}
 }
 
@@ -737,11 +731,8 @@ func TestRenameSandbox_Conflict(t *testing.T) {
 	})
 
 	err := s.RenameSandbox("usr_alice", "a", "bar")
-	if err == nil {
-		t.Fatal("expected UNIQUE conflict")
-	}
-	if !strings.Contains(err.Error(), "UNIQUE") {
-		t.Fatalf("expected UNIQUE in error, got: %v", err)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("rename onto a taken name: %v, want ErrConflict", err)
 	}
 
 	// 'a' still exists with its original name
@@ -781,11 +772,8 @@ func TestRenameSandbox_OtherUserCannotRename(t *testing.T) {
 
 	// Bob cannot rename Alice's sandbox — rows-affected is zero.
 	err := s.RenameSandbox("usr_bob", "x", "bar")
-	if err == nil {
-		t.Fatal("expected not-found error for cross-user rename")
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected 'not found', got: %v", err)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-user rename: %v, want ErrNotFound", err)
 	}
 
 	// Original is unchanged.

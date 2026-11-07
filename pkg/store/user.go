@@ -26,7 +26,7 @@ func (s *Store) CreateUser(u User) error {
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.ID, u.Name, u.APIKeyHash, u.MaxSandboxes, u.MaxCPUsPerSandbox, u.MaxMemoryMBPerSandbox, u.SubnetIndex, u.CreatedAt,
 	)
-	return err
+	return classify(err)
 }
 
 const userSelectCols = `id, name, api_key_hash, max_sandboxes, max_cpus_per_sandbox, max_memory_mb_per_sandbox, subnet_index, COALESCE(max_volume_storage_mb, 20480), COALESCE(max_images, 10), COALESCE(max_snapshots, 5), created_at`
@@ -37,7 +37,7 @@ func scanUser(s scanner) (*User, error) {
 		&u.MaxMemoryMBPerSandbox, &u.SubnetIndex, &u.MaxVolumeStorageMB, &u.MaxImages,
 		&u.MaxSnapshots, &u.CreatedAt)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	return &u, nil
 }
@@ -82,14 +82,14 @@ func (s *Store) DeleteUser(id string) error {
 		return fmt.Errorf("store: count user sandboxes: invalid count %d", count)
 	}
 	if count > 0 {
-		return fmt.Errorf("user has %d active sandbox(es) — destroy them first", count)
+		return wrap(ErrInUse, "user has %d active sandbox(es) — destroy them first", count)
 	}
 	secrets, err := s.ListUserSecrets(id)
 	if err != nil {
 		return fmt.Errorf("store: list user secrets: %w", err)
 	}
 	if len(secrets) > 0 {
-		return fmt.Errorf("user has %d secret(s) — delete them first", len(secrets))
+		return wrap(ErrInUse, "user has %d secret(s) — delete them first", len(secrets))
 	}
 	res, err := s.db.Exec(`DELETE FROM users WHERE id = ?`, id)
 	if err != nil {
@@ -97,7 +97,7 @@ func (s *Store) DeleteUser(id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("user %q not found", id)
+		return wrap(ErrNotFound, "user %q not found", id)
 	}
 	return nil
 }
@@ -121,11 +121,11 @@ func (s *Store) NextSubnetIndex() (int, error) {
 func (s *Store) RotateUserKey(id, newKeyHash string) error {
 	res, err := s.db.Exec(`UPDATE users SET api_key_hash = ? WHERE id = ?`, newKeyHash, id)
 	if err != nil {
-		return err
+		return classify(err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("user %q not found", id)
+		return wrap(ErrNotFound, "user %q not found", id)
 	}
 	return nil
 }
@@ -141,7 +141,7 @@ func (s *Store) GetUserByName(name string) (*User, error) {
 		&u.ID, &u.Name, &u.APIKeyHash, &u.MaxSandboxes, &u.MaxCPUsPerSandbox,
 		&u.MaxMemoryMBPerSandbox, &u.SubnetIndex, &u.CreatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("user %q not found", name)
+		return nil, noRows(err, "user %q not found", name)
 	}
 	return &u, nil
 }

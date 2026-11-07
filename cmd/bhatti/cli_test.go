@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -470,9 +471,8 @@ func TestUserDeleteFlowWithProtection(t *testing.T) {
 	})
 
 	// Delete should fail
-	err := st.DeleteUser("usr_delf")
-	if err == nil || !strings.Contains(err.Error(), "active sandbox") {
-		t.Fatalf("expected deletion refused, got: %v", err)
+	if err := st.DeleteUser("usr_delf"); !errors.Is(err, store.ErrInUse) {
+		t.Fatalf("expected deletion refused as in use, got: %v", err)
 	}
 
 	// Destroy sandbox

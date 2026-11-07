@@ -75,7 +75,7 @@ func (s *Server) handlePersistentVolumes(w http.ResponseWriter, r *http.Request)
 			Status: "creating", CreatedAt: time.Now(),
 		}
 		if err := s.store.CreatePersistentVolume(vol); err != nil {
-			if strings.Contains(err.Error(), "UNIQUE") {
+			if errors.Is(err, store.ErrConflict) {
 				errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
 			} else {
 				errRespInternal(w, r, "create volume failed", err)
@@ -152,11 +152,12 @@ func (s *Server) handlePersistentVolume(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if err := s.store.DeletePersistentVolume(user.ID, name); err != nil {
-			if strings.Contains(err.Error(), "attachment") {
+			switch {
+			case errors.Is(err, store.ErrVolumeAttached):
 				errResp(w, 409, err.Error())
-			} else if strings.Contains(err.Error(), "not found") {
+			case errors.Is(err, store.ErrNotFound):
 				errResp(w, 404, err.Error())
-			} else {
+			default:
 				errRespInternal(w, r, "delete volume failed", err)
 			}
 			return
@@ -615,7 +616,7 @@ func (s *Server) handleVolumeSnapshot(w http.ResponseWriter, r *http.Request, us
 		Status: "creating", CreatedAt: time.Now(),
 	}
 	if err := s.store.CreatePersistentVolume(vol); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if errors.Is(err, store.ErrConflict) {
 			errResp(w, 409, fmt.Sprintf("volume %q already exists", req.Name))
 		} else {
 			errRespInternal(w, r, "create volume snapshot record failed", err)

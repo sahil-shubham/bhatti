@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -60,7 +61,7 @@ func (s *Store) CreateSandbox(sb Sandbox) error {
 		`INSERT INTO sandboxes (id, name, template_id, engine_id, status, ip, engine_meta_json, created_by, created_at, keep_hot, cpus, memory_mb, disk_size_mb, image, labels, net_policy, has_init) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sb.ID, sb.Name, sb.TemplateID, sb.EngineID, sb.Status, sb.IP, string(sb.EngineMeta), sb.CreatedBy, sb.CreatedAt, keepHot, sb.CPUs, sb.MemoryMB, sb.DiskSizeMB, sb.Image, labelsJSON, string(sb.NetPolicy), hasInit,
 	)
-	return err
+	return classify(err)
 }
 
 // marshalLabels serialises a labels map. An empty/nil map becomes "{}"
@@ -81,8 +82,9 @@ func marshalLabels(labels map[string]string) (string, error) {
 func (s *Store) GetSandbox(userID, idOrName string) (*Sandbox, error) {
 	// Try exact ID match first (deterministic, always unique)
 	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE id = ? AND created_by = ?`, idOrName, userID)
-	if sb, err := scanSandbox(row); err == nil {
-		return sb, nil
+	sb, err := scanSandbox(row)
+	if !errors.Is(err, ErrNotFound) {
+		return sb, err
 	}
 	// Fall back to name match
 	row = s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ?`, idOrName, userID)
@@ -90,7 +92,7 @@ func (s *Store) GetSandbox(userID, idOrName string) (*Sandbox, error) {
 }
 
 // GetActiveSandboxByName returns a non-destroyed sandbox by name for a user.
-// Returns sql.ErrNoRows if no active sandbox with that name exists.
+// Returns ErrNotFound if no active sandbox with that name exists.
 func (s *Store) GetActiveSandboxByName(userID, name string) (*Sandbox, error) {
 	row := s.db.QueryRow(`SELECT `+sandboxCols+` FROM sandboxes WHERE name = ? AND created_by = ? AND status != 'destroyed'`, name, userID)
 	return scanSandbox(row)
@@ -205,8 +207,7 @@ func (s *Store) UpdateSandboxEngine(id, engineID, ip string) error {
 // RenameSandbox updates the user-visible name of a sandbox, scoped to the
 // owning user. The partial unique index idx_sandboxes_user_name (see
 // store.go) enforces per-user name uniqueness among non-destroyed sandboxes;
-// on conflict the returned error contains "UNIQUE", which the handler maps
-// to a 409. Returns a "not found" error if no row matches the (id, userID)
+// a taken name is ErrConflict. ErrNotFound if no row matches the (id, userID)
 // pair — same semantics as DeleteSandbox.
 func (s *Store) RenameSandbox(userID, id, newName string) error {
 	res, err := s.db.Exec(
@@ -214,11 +215,11 @@ func (s *Store) RenameSandbox(userID, id, newName string) error {
 		newName, id, userID,
 	)
 	if err != nil {
-		return err
+		return classify(err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("sandbox %q not found", id)
+		return wrap(ErrNotFound, "sandbox %q not found", id)
 	}
 	return nil
 }
@@ -252,7 +253,7 @@ func (s *Store) UpdateSandboxKeepHot(id string, keepHot bool) error {
 // each other's changes.
 //
 // Empty set + empty remove is a no-op (still does one round-trip to
-// validate ownership; returns "not found" if the (id, userID) pair is
+// validate ownership; ErrNotFound if the (id, userID) pair is
 // absent).
 func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, remove []string) error {
 	tx, err := s.db.Begin()
@@ -266,8 +267,8 @@ func (s *Store) UpdateSandboxLabels(userID, id string, set map[string]string, re
 		`SELECT COALESCE(labels, '{}') FROM sandboxes WHERE id = ? AND created_by = ?`,
 		id, userID,
 	).Scan(&labelsJSON)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("sandbox %q not found", id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return wrap(ErrNotFound, "sandbox %q not found", id)
 	}
 	if err != nil {
 		return err
@@ -350,7 +351,7 @@ func (s *Store) DeleteSandbox(userID, id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("sandbox %q not found", id)
+		return wrap(ErrNotFound, "sandbox %q not found", id)
 	}
 	return nil
 }
@@ -363,7 +364,7 @@ func (s *Store) DeleteSandboxByID(id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("sandbox %q not found", id)
+		return wrap(ErrNotFound, "sandbox %q not found", id)
 	}
 	return nil
 }
@@ -375,7 +376,7 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 	var keepHot, hasInit int
 	err := s.Scan(&sb.ID, &sb.Name, &sb.TemplateID, &sb.EngineID, &sb.Status, &sb.IP, &metaJSON, &sb.CreatedBy, &sb.CreatedAt, &stoppedAt, &keepHot, &sb.ShellTokenHash, &sb.CPUs, &sb.MemoryMB, &sb.DiskSizeMB, &sb.Image, &labelsJSON, &netPolicy, &hasInit)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	sb.EngineMeta = json.RawMessage(metaJSON)
 	if netPolicy != "" {

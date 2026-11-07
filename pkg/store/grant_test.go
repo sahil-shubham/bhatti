@@ -1,7 +1,6 @@
 package store
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -42,10 +41,10 @@ func TestSecretGrantCreateAndLookup(t *testing.T) {
 	if !got.CreatedAt.Equal(when) || got.CreatedAt.Location() != time.UTC || got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) || got.ExpiresAt.Location() != time.UTC || got.RevokedAt != nil {
 		t.Fatalf("times not UTC or nullable: %+v", got)
 	}
-	if _, err := s.GetSandboxSecretGrantByPlaceholder(g.SandboxID, "absent"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder(g.SandboxID, "absent"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent placeholder: %v", err)
 	}
-	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb2", g.Placeholder); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb2", g.Placeholder); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("another sandbox resolved the placeholder: %v", err)
 	}
 }
@@ -54,10 +53,10 @@ func TestSecretGrantOwnership(t *testing.T) {
 	s := testStore(t)
 	g := grantFixture("g1", "alice", "GH_TOKEN", "sb1", "placeholder1", time.Now())
 	putGrant(t, s, g)
-	if _, err := s.GetSecretGrant("bob", g.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSecretGrant("bob", g.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("other user can read grant: %v", err)
 	}
-	if _, err := s.GetSecretGrant("alice", "absent"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSecretGrant("alice", "absent"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent grant: %v", err)
 	}
 	got, err := s.GetSecretGrant("alice", g.ID)
@@ -85,7 +84,7 @@ func TestSecretGrantPlaceholderIsPerSandbox(t *testing.T) {
 			t.Fatalf("%s resolves to %+v, %v; want its own grant %s", sandbox, got, err, id)
 		}
 	}
-	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb3", source.Placeholder); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSandboxSecretGrantByPlaceholder("sb3", source.Placeholder); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an unrelated sandbox resolved the placeholder: %v", err)
 	}
 
@@ -93,7 +92,7 @@ func TestSecretGrantPlaceholderIsPerSandbox(t *testing.T) {
 	if got, err := s.FindSecretGrantByPlaceholder("alice", source.Placeholder); err != nil || got.ID != "g1" {
 		t.Fatalf("owner's grant for the placeholder: %+v, %v", got, err)
 	}
-	if _, err := s.FindSecretGrantByPlaceholder("bob", source.Placeholder); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.FindSecretGrantByPlaceholder("bob", source.Placeholder); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("another owner found the placeholder: %v", err)
 	}
 }
@@ -123,10 +122,10 @@ func TestSecretGrantRevocation(t *testing.T) {
 	s := testStore(t)
 	putGrant(t, s, grantFixture("g1", "alice", "GH_TOKEN", "sb1", "placeholder1", time.Now()))
 	first := time.Date(2026, 10, 4, 12, 0, 0, 0, time.FixedZone("east", 3*3600))
-	if err := s.RevokeSecretGrant("bob", "g1", first); !errors.Is(err, sql.ErrNoRows) {
+	if err := s.RevokeSecretGrant("bob", "g1", first); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("wrong user revoke: %v", err)
 	}
-	if err := s.RevokeSecretGrant("alice", "absent", first); !errors.Is(err, sql.ErrNoRows) {
+	if err := s.RevokeSecretGrant("alice", "absent", first); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing grant revoke: %v", err)
 	}
 	if err := s.RevokeSecretGrant("alice", "g1", first); err != nil {
@@ -171,13 +170,13 @@ func TestSecretGrantDeletionScope(t *testing.T) {
 	if err := s.DeleteSandboxSecretGrants("sb1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSecretGrant("alice", "a1"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSecretGrant("alice", "a1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("sandbox grant survived: %v", err)
 	}
 	if err := s.DeleteSecretGrantsForSecret("alice", "GH"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSecretGrant("alice", "a2"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSecretGrant("alice", "a2"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("secret grant survived: %v", err)
 	}
 	for _, tc := range []struct{ user, id string }{{"bob", "b1"}, {"alice", "a3"}} {
@@ -196,7 +195,7 @@ func TestSecretGrantDeletionScope(t *testing.T) {
 
 func TestSandboxCAPutGetReplaceDelete(t *testing.T) {
 	s := testStore(t)
-	if _, err := s.GetSandboxCA("sb1"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSandboxCA("sb1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing CA: %v", err)
 	}
 	when := time.Date(2026, 10, 4, 12, 0, 0, 0, time.FixedZone("west", -7*3600))
@@ -219,7 +218,7 @@ func TestSandboxCAPutGetReplaceDelete(t *testing.T) {
 	if err := s.DeleteSandboxCA("sb1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSandboxCA("sb1"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSandboxCA("sb1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("CA survived deletion: %v", err)
 	}
 }

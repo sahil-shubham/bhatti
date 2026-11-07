@@ -688,10 +688,10 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.store.CreateSandbox(sb); err != nil {
 			s.discardSubstitution(sbID)
-			// UNIQUE constraint violation → name race. Another concurrent
-			// request won the insert. Destroy the VM we just booted and
-			// return the winner's sandbox.
-			if strings.Contains(err.Error(), "UNIQUE") && spec.Name != "" {
+			// A taken name → name race. Another concurrent request won the
+			// insert. Destroy the VM we just booted and return the winner's
+			// sandbox.
+			if errors.Is(err, store.ErrConflict) && spec.Name != "" {
 				s.engine.Destroy(r.Context(), info.EngineID)
 				if len(resolvedVolumes) > 0 {
 					s.store.DetachAllPersistentVolumesForSandbox(sbID)
@@ -894,9 +894,7 @@ func (s *Server) handleSandbox(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := s.store.RenameSandbox(user.ID, sb.ID, newName); err != nil {
-				// Match the create-path convention for UNIQUE-violation
-				// detection (see the create handler above).
-				if strings.Contains(err.Error(), "UNIQUE") {
+				if errors.Is(err, store.ErrConflict) {
 					errResp(w, 409, fmt.Sprintf("name %q is already in use", newName))
 					return
 				}

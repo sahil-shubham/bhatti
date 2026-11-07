@@ -91,7 +91,7 @@ func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, s
 		return nil, fmt.Errorf("checkpoint: absolute snapshot dir: %w", err)
 	}
 	if _, err := os.Stat(finalDir); err == nil {
-		return nil, fmt.Errorf("snapshot %q already exists", snapName)
+		return nil, fmt.Errorf("snapshot %q %w", snapName, engine.ErrSnapshotExists)
 	}
 	if err := e.EnsureHot(ctx, sandboxID); err != nil {
 		return nil, fmt.Errorf("checkpoint: ensure hot: %w", err)

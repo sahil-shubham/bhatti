@@ -43,7 +43,7 @@ func (s *Store) CreateSecretGrant(g SecretGrant) error {
 		g.ID, g.UserID, g.SecretName, g.SandboxID, string(hostsJSON), g.Placeholder,
 		g.CreatedAt.UTC(), utcGrantTime(g.ExpiresAt), utcGrantTime(g.RevokedAt))
 	if err != nil {
-		return fmt.Errorf("create secret grant: %w", err)
+		return fmt.Errorf("create secret grant: %w", classify(err))
 	}
 	return nil
 }
@@ -126,7 +126,7 @@ func scanSecretGrant(row scanner) (*SecretGrant, error) {
 	var hostsJSON string
 	var expiresAt, revokedAt sql.NullTime
 	if err := row.Scan(&g.ID, &g.UserID, &g.SecretName, &g.SandboxID, &hostsJSON, &g.Placeholder, &g.CreatedAt, &expiresAt, &revokedAt); err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	if err := json.Unmarshal([]byte(hostsJSON), &g.Hosts); err != nil {
 		return nil, fmt.Errorf("parse grant hosts: %w", err)
@@ -153,7 +153,7 @@ func (s *Store) RevokeSecretGrant(userID, id string, at time.Time) error {
 		return fmt.Errorf("revoke secret grant %q: %w", id, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("revoke secret grant %q: %w", id, sql.ErrNoRows)
+		return fmt.Errorf("revoke secret grant %q: %w", id, ErrNotFound)
 	}
 	return nil
 }

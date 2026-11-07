@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -132,8 +133,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, sandboxID
 		Alias:     alias,
 	}
 	if err := s.store.CreatePublishRule(rule); err != nil {
-		if strings.Contains(err.Error(), "already taken") ||
-			strings.Contains(err.Error(), "already published") {
+		if errors.Is(err, store.ErrConflict) {
 			// Idempotent: return the existing rule instead of 409
 			existing, lerr := s.store.ListPublishRules(sb.ID)
 			if lerr == nil {

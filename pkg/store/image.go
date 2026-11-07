@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -25,34 +26,37 @@ func (s *Store) CreateImage(img ImageRecord) error {
 		img.ID, img.UserID, img.Name, img.Source, img.FilePath,
 		img.SizeMB, img.OCIDigest, img.OCIConfigJSON, img.CreatedAt,
 	)
-	return err
+	return classify(err)
 }
 
-// GetImage retrieves an image by user and name. Falls back to admin images (user_id=”).
+// GetImage retrieves an image by user and name: the user's own, else one
+// shared with them, else a global admin image (user_id=”). A query that fails
+// ends the search instead of reading as "not there", so it can't fall through
+// to a different image.
 func (s *Store) GetImage(userID, name string) (*ImageRecord, error) {
 	var img ImageRecord
 	const cols = `id, user_id, name, source, file_path, size_mb, oci_digest, oci_config_json, created_at`
-	scanImg := func(row *sql.Row) error {
-		return row.Scan(&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
-			&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt)
-	}
-
-	// 1. User's own image
-	if scanImg(s.db.QueryRow(`SELECT `+cols+` FROM images WHERE user_id = ? AND name = ?`, userID, name)) == nil {
-		return &img, nil
-	}
-	// 2. Image shared with this user
-	if scanImg(s.db.QueryRow(`SELECT i.id, i.user_id, i.name, i.source, i.file_path,
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`SELECT ` + cols + ` FROM images WHERE user_id = ? AND name = ?`, []any{userID, name}},
+		{`SELECT i.id, i.user_id, i.name, i.source, i.file_path,
 		i.size_mb, i.oci_digest, i.oci_config_json, i.created_at
 		FROM images i JOIN image_shares s ON s.image_id = i.id
-		WHERE s.user_id = ? AND i.name = ?`, userID, name)) == nil {
-		return &img, nil
+		WHERE s.user_id = ? AND i.name = ?`, []any{userID, name}},
+		{`SELECT ` + cols + ` FROM images WHERE user_id = '' AND name = ?`, []any{name}},
+	} {
+		err := s.db.QueryRow(q.sql, q.args...).Scan(&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
+			&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt)
+		if err == nil {
+			return &img, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
 	}
-	// 3. Global admin image (user_id = '')
-	if scanImg(s.db.QueryRow(`SELECT `+cols+` FROM images WHERE user_id = '' AND name = ?`, name)) == nil {
-		return &img, nil
-	}
-	return nil, fmt.Errorf("image %q not found", name)
+	return nil, wrap(ErrNotFound, "image %q not found", name)
 }
 
 // ListImages returns all images visible to a user (their own + shared + admin).
@@ -88,7 +92,7 @@ func (s *Store) DeleteImage(userID, name string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("image %q not found", name)
+		return wrap(ErrNotFound, "image %q not found", name)
 	}
 	return nil
 }
@@ -136,7 +140,7 @@ func (s *Store) GetImageByName(name string) (*ImageRecord, error) {
 		&img.ID, &img.UserID, &img.Name, &img.Source, &img.FilePath,
 		&img.SizeMB, &img.OCIDigest, &img.OCIConfigJSON, &img.CreatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("image %q not found", name)
+		return nil, noRows(err, "image %q not found", name)
 	}
 	return &img, nil
 }

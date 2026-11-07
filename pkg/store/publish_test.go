@@ -1,8 +1,8 @@
 package store
 
 import (
+	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 )
@@ -38,11 +38,11 @@ func TestPublishRuleAliasUnique(t *testing.T) {
 	s.CreatePublishRule(PublishRule{ID: "pub_1", SandboxID: "sb1", UserID: "usr_a", Port: 3000, Alias: "my-alias"})
 
 	err := s.CreatePublishRule(PublishRule{ID: "pub_2", SandboxID: "sb2", UserID: "usr_a", Port: 3000, Alias: "my-alias"})
-	if err == nil {
-		t.Fatal("expected alias uniqueness error")
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("alias already in use: %v, want ErrConflict", err)
 	}
-	if !strings.Contains(err.Error(), "already taken") {
-		t.Errorf("unexpected error: %v", err)
+	if got, err := s.GetPublishRuleByAlias("my-alias"); err != nil || got.SandboxID != "sb1" {
+		t.Fatalf("the refused rule took the alias over: %+v, %v", got, err)
 	}
 }
 
@@ -54,11 +54,11 @@ func TestPublishRuleSandboxPortUnique(t *testing.T) {
 	s.CreatePublishRule(PublishRule{ID: "pub_1", SandboxID: "sb1", UserID: "usr_a", Port: 3000, Alias: "alias-a"})
 
 	err := s.CreatePublishRule(PublishRule{ID: "pub_2", SandboxID: "sb1", UserID: "usr_a", Port: 3000, Alias: "alias-b"})
-	if err == nil {
-		t.Fatal("expected sandbox+port uniqueness error")
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("port already published: %v, want ErrConflict", err)
 	}
-	if !strings.Contains(err.Error(), "already published") {
-		t.Errorf("unexpected error: %v", err)
+	if rules, err := s.ListPublishRules("sb1"); err != nil || len(rules) != 1 || rules[0].Alias != "alias-a" {
+		t.Fatalf("the refused rule changed what the sandbox publishes: %+v, %v", rules, err)
 	}
 }
 
@@ -199,4 +199,3 @@ func createTestImage(t *testing.T, s *Store, userID, name string) ImageRecord {
 	}
 	return img
 }
-

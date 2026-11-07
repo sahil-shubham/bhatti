@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
@@ -192,7 +191,7 @@ func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request, us
 	snap := newSnapshotRecord(user.ID, name, "", finalDir, imp.ManifestJSON)
 	if err := s.store.CreateSnapshot(snap); err != nil {
 		os.RemoveAll(finalDir)
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if errors.Is(err, store.ErrConflict) {
 			errResp(w, 409, fmt.Sprintf("snapshot %q already exists", name))
 		} else {
 			errRespInternal(w, r, "store snapshot record failed", err)

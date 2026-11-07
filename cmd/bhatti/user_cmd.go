@@ -4,10 +4,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg"
@@ -68,7 +68,7 @@ var userCreateCmd = &cobra.Command{
 		}
 
 		if err := st.CreateUser(u); err != nil {
-			if strings.Contains(err.Error(), "UNIQUE") {
+			if errors.Is(err, store.ErrConflict) {
 				return fmt.Errorf("user %q already exists", name)
 			}
 			return fmt.Errorf("create user: %w", err)

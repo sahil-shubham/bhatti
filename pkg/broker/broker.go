@@ -10,7 +10,6 @@ package broker
 
 import (
 	"bufio"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"net"
@@ -182,14 +181,14 @@ func (b *Broker) grantFor(userID, sandboxID, placeholder string) (g *store.Secre
 	switch {
 	case err == nil && g.UserID == userID:
 		return g, true, nil
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
+	case err != nil && !errors.Is(err, store.ErrNotFound):
 		return nil, false, err
 	}
 	g, err = b.cfg.Store.FindSecretGrantByPlaceholder(userID, placeholder)
 	switch {
 	case err == nil:
 		return g, false, nil
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, store.ErrNotFound):
 		return nil, false, nil
 	}
 	return nil, false, err

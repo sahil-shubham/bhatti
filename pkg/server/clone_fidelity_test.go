@@ -315,7 +315,7 @@ func TestFilesystemSnapshotResumeRecordsTheSpecToo(t *testing.T) {
 	if len(resumed.SecretGrants) != 0 {
 		t.Fatalf("a filesystem resume got grants: %+v", resumed.SecretGrants)
 	}
-	if _, err := srv.store.GetSandboxCA(resumed.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(resumed.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a filesystem resume got a CA: %v", err)
 	}
 	if snap, err := srv.store.GetSnapshot("usr_test", "disk"); err != nil || snap.Substitution.CA != nil || len(snap.Substitution.Grants) != 0 {
@@ -337,7 +337,7 @@ func TestFilesystemSnapshotResumeRecordsTheSpecToo(t *testing.T) {
 	if held, err := srv.store.ListSandboxSecretGrants(cold.ID); err != nil || len(held) != 0 || len(cold.SecretGrants) != 0 {
 		t.Fatalf("a cold boot inherited grants: %+v %+v, %v", cold.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(cold.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(cold.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a cold boot inherited a CA: %v", err)
 	}
 }
@@ -553,7 +553,7 @@ func TestSnapshotResumeInheritsGrantsAfterTheSourceIsGone(t *testing.T) {
 	if left := grantsOf(t, ts); len(left) != 0 {
 		t.Fatalf("control: the destroyed source left grants %+v", left)
 	}
-	if _, err := srv.store.GetSandboxCA(src.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(src.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("control: the destroyed source left its CA: %v", err)
 	}
 
@@ -746,7 +746,7 @@ func TestSnapshotExportAndImportCarryNoGrants(t *testing.T) {
 	if len(clone.SecretGrants) != 0 {
 		t.Fatalf("an imported snapshot resumed with grants: %+v", clone.SecretGrants)
 	}
-	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("an imported snapshot resumed with a CA: %v", err)
 	}
 	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 {
@@ -874,7 +874,7 @@ func TestSnapshotFromBeforeRecordingResumesWithItsLiveSource(t *testing.T) {
 	if held, err := srv.store.ListSandboxSecretGrants(cold.ID); err != nil || len(held) != 0 || len(cold.SecretGrants) != 0 {
 		t.Fatalf("a cold boot inherited grants: %+v, %v", held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(cold.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(cold.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a cold boot inherited a CA: %v", err)
 	}
 }
@@ -897,7 +897,7 @@ func TestSnapshotFromBeforeRecordingResumesAfterItsSourceIsGone(t *testing.T) {
 	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
 		t.Fatalf("grants from nowhere: %+v %+v, %v", clone.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a CA from nowhere: %v", err)
 	}
 }
@@ -930,7 +930,7 @@ func TestSnapshotFromBeforeRecordingIgnoresAnotherUsersSandbox(t *testing.T) {
 	if held, err := srv.store.ListSandboxSecretGrants(clone.ID); err != nil || len(held) != 0 || len(clone.SecretGrants) != 0 {
 		t.Fatalf("another user's grants: %+v %+v, %v", clone.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(clone.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("another user's CA: %v", err)
 	}
 }
@@ -973,7 +973,7 @@ func TestRecordedSnapshotNeverMixesInTheLiveSource(t *testing.T) {
 	if held, err := srv.store.ListSandboxSecretGrants(bare.ID); err != nil || len(held) != 0 || len(bare.SecretGrants) != 0 {
 		t.Fatalf("the live source's grants leaked in: %+v %+v, %v", bare.SecretGrants, held, err)
 	}
-	if _, err := srv.store.GetSandboxCA(bare.ID); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := srv.store.GetSandboxCA(bare.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("the live source's CA leaked in: %v", err)
 	}
 }

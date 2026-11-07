@@ -42,7 +42,7 @@ func (s *Store) CreateTemplate(t Template) error {
 		t.ID, t.Name, t.Engine, t.Image, t.CPUs, t.MemoryMB, t.DiskSizeMB, t.UserData,
 		string(secretsJSON), string(labelsJSON), string(mountsJSON), t.CreatedAt,
 	)
-	return err
+	return classify(err)
 }
 
 func (s *Store) GetTemplate(id string) (*Template, error) {
@@ -74,7 +74,7 @@ func (s *Store) DeleteTemplate(id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("template %q not found", id)
+		return wrap(ErrNotFound, "template %q not found", id)
 	}
 	return nil
 }
@@ -89,7 +89,7 @@ func scanTemplate(s scanner) (*Template, error) {
 	var secretsJSON, labelsJSON, mountsJSON string
 	err := s.Scan(&t.ID, &t.Name, &t.Engine, &t.Image, &t.CPUs, &t.MemoryMB, &t.DiskSizeMB, &t.UserData, &secretsJSON, &labelsJSON, &mountsJSON, &t.CreatedAt)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	if err := json.Unmarshal([]byte(secretsJSON), &t.Secrets); err != nil {
 		return nil, fmt.Errorf("unmarshal secrets: %w", err)

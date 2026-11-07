@@ -1,10 +1,8 @@
 package store
 
 import (
-	"database/sql"
 	"errors"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 )
@@ -117,8 +115,8 @@ func TestCreateSnapshotIsAtomic(t *testing.T) {
 	}
 	dup := snapshotFixture("s3", "alice", "base")
 	dup.Substitution = SnapshotSubstitution{CA: &SandboxCA{CertPEM: "cert", KeyEnc: []byte("key")}}
-	if err := s.CreateSnapshot(dup); err == nil || !strings.Contains(err.Error(), "UNIQUE") {
-		t.Fatalf("duplicate name: %v, want a UNIQUE violation callers can recognize", err)
+	if err := s.CreateSnapshot(dup); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate name: %v, want ErrConflict", err)
 	}
 	if n := rowCount(t, s, `SELECT COUNT(*) FROM snapshot_cas`); n != 0 {
 		t.Fatalf("a refused snapshot kept its CA")
@@ -145,8 +143,8 @@ func TestDeleteSnapshotDropsWhatItKept(t *testing.T) {
 	if err := s.DeleteSnapshot("alice", "snap-s1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteSnapshot("alice", "snap-s1"); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("second delete: %v", err)
+	if err := s.DeleteSnapshot("alice", "snap-s1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second delete: %v, want ErrNotFound", err)
 	}
 	if n := rowCount(t, s, `SELECT COUNT(*) FROM snapshot_cas WHERE snapshot_id = 's1'`) +
 		rowCount(t, s, `SELECT COUNT(*) FROM snapshot_grants WHERE snapshot_id = 's1'`); n != 0 {
@@ -186,7 +184,7 @@ func TestDeleteSecretGrantsForSecretReachesSnapshots(t *testing.T) {
 	if err := s.DeleteSecretGrantsForSecret("alice", "GH_TOKEN"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSecretGrant("alice", "g1"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetSecretGrant("alice", "g1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("the sandbox's grant survived: %v", err)
 	}
 	names := func(user string) []string {

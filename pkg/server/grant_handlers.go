@@ -1,7 +1,6 @@
 package server
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -173,7 +172,7 @@ func (s *Server) captureSubstitution(userID, sandboxID string) (store.SnapshotSu
 	switch {
 	case err == nil && ca.UserID == userID:
 		sub.CA = ca
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
+	case err != nil && !errors.Is(err, store.ErrNotFound):
 		return sub, fmt.Errorf("read sandbox CA: %w", err)
 	}
 	grants, err := s.store.ListSandboxSecretGrants(sandboxID)
@@ -249,7 +248,7 @@ func (s *Server) inheritFromSandbox(userID string, src *store.Sandbox, to store.
 func (s *Server) liveSnapshotSource(userID, sourceID string) (store.SnapshotSource, store.SnapshotSubstitution) {
 	src, err := s.store.GetSandboxByID(sourceID)
 	if err != nil || src.CreatedBy != userID {
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			slog.Warn("snapshot.source_lookup", "source", sourceID, "error", err)
 		}
 		return store.SnapshotSource{}, store.SnapshotSubstitution{}
@@ -380,7 +379,7 @@ func (s *Server) handleSecretGrantCreate(w http.ResponseWriter, r *http.Request,
 		errRespInternal(w, r, "guest agent cannot install sandbox CA", err)
 		return
 	}
-	if _, err := s.store.GetSandboxCA(sb.ID); errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.store.GetSandboxCA(sb.ID); errors.Is(err, store.ErrNotFound) {
 		errResp(w, 409, fmt.Sprintf("sandbox %q has no substitution CA (it was created without a network, before credential substitution, or from a filesystem snapshot); recreate it to grant secrets", sb.Name))
 		return
 	} else if err != nil {

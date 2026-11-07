@@ -35,7 +35,7 @@ func (s *Store) GetSandboxCA(sandboxID string) (*SandboxCA, error) {
 	err := s.db.QueryRow(`SELECT sandbox_id, user_id, cert_pem, key_enc, created_at FROM sandbox_cas WHERE sandbox_id = ?`, sandboxID).
 		Scan(&ca.SandboxID, &ca.UserID, &ca.CertPEM, &ca.KeyEnc, &ca.CreatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("get sandbox CA %q: %w", sandboxID, err)
+		return nil, fmt.Errorf("get sandbox CA %q: %w", sandboxID, classify(err))
 	}
 	ca.CreatedAt = ca.CreatedAt.UTC()
 	return &ca, nil

@@ -33,6 +33,11 @@ var ErrGuestReseedFailed = errors.New("guest CRNG reseed failed")
 // on its gateway subnet. The API returns 409: destroying sandboxes frees them.
 var ErrNetworkFull = errors.New("owner's sandbox network is full")
 
+// ErrSnapshotExists means a snapshot of that name is already on disk. The API
+// returns 409: pick another name or delete the old snapshot. Errors wrap it
+// as `snapshot "<name>" already exists`.
+var ErrSnapshotExists = errors.New("already exists")
+
 // GuestAgentCapabilities is optional. Engines without guest capability
 // discovery do not claim support for credential-substitution grants.
 type GuestAgentCapabilities interface {

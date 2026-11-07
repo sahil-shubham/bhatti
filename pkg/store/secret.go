@@ -2,7 +2,6 @@ package store
 
 import (
 	"database/sql"
-	"fmt"
 	"time"
 )
 
@@ -32,7 +31,7 @@ func (s *Store) GetSecretValue(userID, name string) ([]byte, error) {
 	var encrypted []byte
 	err := s.db.QueryRow(`SELECT value_encrypted FROM secrets WHERE name = ? AND user_id = ?`, name, userID).Scan(&encrypted)
 	if err != nil {
-		return nil, fmt.Errorf("secret %q not found", name)
+		return nil, noRows(err, "secret %q not found", name)
 	}
 	return encrypted, nil
 }
@@ -79,7 +78,7 @@ func (s *Store) GetSecret(userID, name string) (*SecretRecord, error) {
 	err := s.db.QueryRow(`SELECT name, created_at, COALESCE(updated_at, created_at) FROM secrets WHERE name = ? AND user_id = ?`, name, userID).
 		Scan(&sr.Name, &createdStr, &updatedStr)
 	if err != nil {
-		return nil, err
+		return nil, noRows(err, "secret %q not found", name)
 	}
 	sr.CreatedAt, _ = time.Parse(time.DateTime, createdStr)
 	sr.UpdatedAt, _ = time.Parse(time.DateTime, updatedStr)
@@ -97,7 +96,7 @@ func (s *Store) DeleteSecret(userID, name string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("secret %q not found", name)
+		return wrap(ErrNotFound, "secret %q not found", name)
 	}
 	return nil
 }

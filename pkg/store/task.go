@@ -2,7 +2,6 @@ package store
 
 import (
 	"database/sql"
-	"fmt"
 	"time"
 )
 
@@ -26,7 +25,7 @@ func (s *Store) CreateTask(t TaskRecord) error {
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.UserID, t.Type, t.Status, t.Progress, t.ResultJSON, t.Error, t.CreatedAt,
 	)
-	return err
+	return classify(err)
 }
 
 // GetTask retrieves a task by ID.
@@ -40,7 +39,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ResultJSON, &t.Error, &t.CreatedAt, &completedAt,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("task %q not found", id)
+		return nil, noRows(err, "task %q not found", id)
 	}
 	if completedAt.Valid {
 		t.CompletedAt = &completedAt.Time
