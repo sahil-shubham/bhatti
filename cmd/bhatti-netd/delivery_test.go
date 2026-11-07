@@ -64,10 +64,7 @@ func forwardedDest(t *testing.T, dst [4]byte, dport uint16, corrupt bool) string
 	guestSide, netdSide := net.Pipe()
 	t.Cleanup(func() { guestSide.Close(); netdSide.Close() })
 
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatalf("NewGateway: %v", err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	if err := gw.SetSandbox("100.64.0.2", "sb1", nil, "52:54:00:00:00:02", testNetToken); err != nil {
 		t.Fatal(err)
 	}
@@ -177,10 +174,7 @@ func TestSiblingUDPDatagramsRoundTrip(t *testing.T) {
 	aGuest, aNetd := net.Pipe()
 	bGuest, bNetd := net.Pipe()
 	t.Cleanup(func() { aGuest.Close(); aNetd.Close(); bGuest.Close(); bNetd.Close() })
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	pol := &gateway.EgressPolicy{Siblings: gateway.PosturePublic}
 	for _, peer := range []struct {
 		ip, id, mac, token string
@@ -237,10 +231,7 @@ func TestInternetUDPReplyReachesGuest(t *testing.T) {
 	t.Cleanup(func() { host.Close() })
 	guestSide, netdSide := net.Pipe()
 	t.Cleanup(func() { guestSide.Close(); netdSide.Close() })
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	if err := gw.SetSandbox("100.64.0.2", "a", &gateway.EgressPolicy{Default: gateway.PosturePublic},
 		"52:54:00:00:00:02", testNetToken); err != nil {
 		t.Fatal(err)

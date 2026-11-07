@@ -19,10 +19,7 @@ func TestGuestFrameCannotBorrowAnotherPolicy(t *testing.T) {
 	guestSide, netdSide := net.Pipe()
 	defer guestSide.Close()
 	defer netdSide.Close()
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	for _, identity := range []struct{ ip, mac, token string }{
 		{"100.64.0.2", "52:54:00:00:00:02", testNetToken},
 		{"100.64.0.3", "52:54:00:00:00:03", strings.Repeat("cd", 32)},
@@ -79,10 +76,7 @@ func TestGuestARPClaimsOnlyItsOwnIPAndMAC(t *testing.T) {
 	guestSide, netdSide := net.Pipe()
 	defer guestSide.Close()
 	defer netdSide.Close()
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	if err := gw.SetSandbox("100.64.0.2", "sb1", nil, "52:54:00:00:00:02", testNetToken); err != nil {
 		t.Fatal(err)
 	}
@@ -121,10 +115,7 @@ func TestGuestARPClaimsOnlyItsOwnIPAndMAC(t *testing.T) {
 }
 
 func TestSpoofWarningIsRateLimitedPerAttachment(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	if err := gw.SetSandbox("100.64.0.2", "sb1", nil, "52:54:00:00:00:02", testNetToken); err != nil {
 		t.Fatal(err)
 	}

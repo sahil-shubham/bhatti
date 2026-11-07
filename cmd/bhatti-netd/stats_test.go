@@ -1,12 +1,5 @@
 package main
 
-// This file is named to sort first so that go test runs these tests first.
-// They wait on control-socket round trips that QueryStats gives up on after a
-// second, and under -race on arm64 an idle gVisor stack spins its TCP workers
-// (measured: a few cores of CPU per stack, none without -race), so every stack
-// an earlier test leaves running slows every goroutine wake-up after it. Each
-// test here stops its own stack when it is done.
-
 import (
 	"context"
 	"encoding/json"
@@ -114,23 +107,13 @@ func (b *syncBuffer) String() string {
 	return b.sb.String()
 }
 
-// queryNetStats asks netd for its report. The machine running the tests may be
-// saturated, so a query that only ran out of its own second is tried again for
-// a while; any other failure is real.
 func queryNetStats(t *testing.T, sock string) gateway.NetStats {
 	t.Helper()
-	giveUp := time.Now().Add(30 * time.Second)
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		s, err := gateway.QueryStats(ctx, sock)
-		cancel()
-		if err == nil {
-			return s
-		}
-		if !errors.Is(err, context.DeadlineExceeded) || time.Now().After(giveUp) {
-			t.Fatalf("QueryStats: %v", err)
-		}
+	s, err := gateway.QueryStats(context.Background(), sock)
+	if err != nil {
+		t.Fatalf("QueryStats: %v", err)
 	}
+	return s
 }
 
 func findGuest(report gateway.NetStats, ip string) (gateway.GuestStats, bool) {
@@ -171,13 +154,7 @@ type statsRig struct {
 
 func newStatsRig(t *testing.T, host hostProtection) *statsRig {
 	t.Helper()
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Under -race on arm64 gVisor's idle TCP workers spin, so a stack left
-	// running slows every test after it; stop this one when the test is done.
-	t.Cleanup(gw.stack.Close)
+	gw := newTestGateway(t, host)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go gw.Run(ctx)
@@ -192,20 +169,10 @@ func newStatsRig(t *testing.T, host hostProtection) *statsRig {
 	return &statsRig{t: t, gw: gw, sock: ln.Addr().String(), ctl: ctl}
 }
 
-// sendControl pushes one control message. A set or del is idempotent, so one
-// that only timed out on a saturated machine is sent again for a while.
 func sendControl(t *testing.T, ctl *gateway.ControlClient, m gateway.ControlMsg) {
 	t.Helper()
-	giveUp := time.Now().Add(30 * time.Second)
-	for {
-		err := ctl.Send(m)
-		if err == nil {
-			return
-		}
-		var ne net.Error
-		if !errors.As(err, &ne) || !ne.Timeout() || time.Now().After(giveUp) {
-			t.Fatalf("control %s %s: %v", m.Op, m.GuestIP, err)
-		}
+	if err := ctl.Send(m); err != nil {
+		t.Fatalf("control %s %s: %v", m.Op, m.GuestIP, err)
 	}
 }
 
@@ -471,11 +438,7 @@ func TestCountingDoesNotAllocate(t *testing.T) {
 		}
 	}
 
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(gw.stack.Close)
+	gw := newTestGateway(t, hostProtection{})
 	if err := gw.SetSandbox(statsGuestIP, "sb-a", nil, statsGuestMAC, testNetToken); err != nil {
 		t.Fatal(err)
 	}

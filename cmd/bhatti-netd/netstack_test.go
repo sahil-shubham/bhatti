@@ -26,6 +26,21 @@ var (
 	testNetToken = strings.Repeat("ab", 32)
 )
 
+func newTestGateway(t *testing.T, host hostProtection) *Gateway {
+	t.Helper()
+	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Idle TCP workers otherwise survive the test, accumulating CPU load under
+	// -race and making unrelated socket deadlines depend on test order.
+	t.Cleanup(func() {
+		gw.stack.Close()
+		gw.stack.Wait()
+	})
+	return gw
+}
+
 // arpRequestFrame builds "who has gwIP? tell guestIP/guestMAC" (broadcast).
 func arpRequestFrame() []byte {
 	eth := make([]byte, header.EthernetMinimumSize)
@@ -94,10 +109,7 @@ func TestGatewayAnswersARP(t *testing.T) {
 	defer guestSide.Close()
 	defer netdSide.Close()
 
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatalf("NewGateway: %v", err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	if err := gw.SetSandbox("100.64.0.2", "sb1", nil, "52:54:00:00:00:02", testNetToken); err != nil {
 		t.Fatal(err)
 	}
@@ -176,10 +188,7 @@ func TestGatewayOverUnixSocket(t *testing.T) {
 // subnet (but not the gateway) is routed via the stack; the gateway itself and
 // out-of-subnet addresses are not.
 func TestIsSibling(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatalf("NewGateway: %v", err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	cases := []struct {
 		addr [4]byte
 		want bool
@@ -204,10 +213,7 @@ func TestSandboxHardDenySurvivesBroadCIDRs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, protected)
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, protected)
 	for _, cidr := range []string{"100.64.0.0/10", "0.0.0.0/0"} {
 		t.Run(cidr, func(t *testing.T) {
 			p, err := gateway.PolicyFromWire(gateway.NetPolicyWire{Default: "public", AllowCIDRs: []string{cidr}})
@@ -258,10 +264,7 @@ func TestHostServicesReachableOnlyOnDaemonPorts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, host)
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, host)
 	at := func(s string) netip.AddrPort { return netip.MustParseAddrPort(s) }
 	for _, tc := range []struct {
 		wire  gateway.NetPolicyWire
@@ -296,10 +299,7 @@ func TestHostServicesReachableOnlyOnDaemonPorts(t *testing.T) {
 }
 
 func TestSiblingVerdictBothTransports(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	var logs bytes.Buffer
 	original := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -344,10 +344,7 @@ func TestSiblingVerdictBothTransports(t *testing.T) {
 }
 
 func TestUnregisteredGuestWarningRateLimited(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	var logs bytes.Buffer
 	original := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))

@@ -6,11 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
 	"github.com/sahil-shubham/bhatti/pkg/launchgate"
@@ -227,10 +229,31 @@ func protectHost(interfaceAddrs []net.Addr, daemonListeners []string) (hostProte
 // startup snapshot of host addresses, independent of its wire policy.
 // Closing the listener on ctx.Done unblocks Accept.
 func serve(ctx context.Context, ln net.Listener, cfg gwConfig, ctlLn net.Listener, cred *credProxy) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	gw, err := NewGateway(cfg.ip, cfg.prefix, cfg.mac, cfg.host)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		cancel()
+		stopped := make(chan struct{})
+		go func() {
+			gw.ep.Close()
+			gw.stack.Close()
+			gw.stack.Wait()
+			close(stopped)
+		}()
+		// Close aborts registered endpoints, including live TCP and DNS flows.
+		// A forward already being created can race that snapshot; shutdown must
+		// not keep the netd process alive waiting for that peer to close.
+		const limit = 2 * time.Second
+		select {
+		case <-stopped:
+		case <-time.After(limit):
+			slog.Warn("netd.shutdown_timeout", "timeout", limit)
+		}
+	}()
 	gw.cred = cred
 	if ctlLn != nil {
 		go func() { <-ctx.Done(); ctlLn.Close() }()

@@ -17,10 +17,7 @@ import (
 // TestControlChannelPerGuestPolicy proves that the daemon's policy replaces the
 // deny fallback, while unregistered/deleted guests cannot egress.
 func TestControlChannelPerGuestPolicy(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4([4]byte{100, 64, 0, 1}), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatalf("NewGateway: %v", err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 
 	// Short UDS dir: t.TempDir() on macOS exceeds the AF_UNIX sockaddr_un limit.
 	dir, err := os.MkdirTemp("/tmp", "bctl")
@@ -88,10 +85,7 @@ func TestControlChannelPerGuestPolicy(t *testing.T) {
 // A guest can't be registered on the subnet's network or broadcast address: a
 // guest given .255 looks like it works and breaks everything broadcast.
 func TestSetSandboxRefusesNetworkAndBroadcastAddresses(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4([4]byte{100, 64, 0, 1}), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	for i, tc := range []struct {
 		ip string
 		ok bool
@@ -108,10 +102,7 @@ func TestSetSandboxRefusesNetworkAndBroadcastAddresses(t *testing.T) {
 }
 
 func TestMalformedControlPolicyRevokesPreviousGrant(t *testing.T) {
-	gw, err := NewGateway(tcpip.AddrFrom4(testGwIP), 24, testGwMAC, hostProtection{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	gw := newTestGateway(t, hostProtection{})
 	dir, err := os.MkdirTemp("/tmp", "bctl")
 	if err != nil {
 		t.Fatal(err)

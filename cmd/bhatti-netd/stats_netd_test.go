@@ -1,7 +1,5 @@
 package main
 
-// Named to sort first, like a_stats_test.go (see there for why).
-
 import (
 	"context"
 	"errors"
@@ -97,6 +95,7 @@ func TestNetdReportsTrafficOverItsControlSocket(t *testing.T) {
 		if !want.matches(got) {
 			t.Errorf("counters moved after the traffic settled: %+v, want %s", got, want)
 		}
+		t.Logf("real netd STATS: %+v", got)
 	})
 
 	t.Run("a netd that has died", func(t *testing.T) {
