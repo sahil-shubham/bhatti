@@ -47,6 +47,10 @@ type MetricsSnapshot struct {
 }
 
 // InsertEvents inserts a batch of events in a single transaction.
+//
+// An event about a sandbox that names no user is stored as its owner's: the
+// thermal loop, recovery and the web shell act on a sandbox outside any user's
+// request, and an owner reads their events by user (EventsAfter).
 func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -54,7 +58,10 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO events (type, user_id, sandbox_id, meta) VALUES (?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO events (type, user_id, sandbox_id, meta) VALUES (?1,
+		CASE WHEN ?2 != '' OR ?3 = '' THEN ?2
+		ELSE COALESCE((SELECT created_by FROM sandboxes WHERE id = ?3), '') END,
+		?3, ?4)`)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}

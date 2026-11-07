@@ -34,6 +34,7 @@ var migrations = []migration{
 	{"secrets keyed by user", migrateSecretsKey},
 	{"secret grants unique per sandbox", migrateSecretGrants},
 	{"events cursor index", migrateEventsCursorIndex},
+	{"sandbox events owned", migrateSandboxEventOwners},
 }
 
 // errSchemaNewer marks a database that a newer build has migrated past the
@@ -597,4 +598,22 @@ func migrateGrantPlaceholderScope(ctx context.Context, tx *sql.Tx) (bool, error)
 func migrateEventsCursorIndex(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx, `CREATE INDEX idx_events_user_id ON events(user_id, id)`)
 	return err
+}
+
+// migrateSandboxEventOwners gives each sandbox's owner the events about it
+// that were stored without a user, as InsertEvents now stores them, so an
+// owner reading from the start of the stream sees the thermal history too.
+// The owner comes from the sandbox's row, or, once destroy has deleted that,
+// from the events about it that do name a user, when they all name the same
+// one.
+func migrateSandboxEventOwners(ctx context.Context, tx *sql.Tx) error {
+	return execAll(ctx, tx, []string{
+		`UPDATE events SET user_id = (SELECT created_by FROM sandboxes WHERE sandboxes.id = events.sandbox_id)
+		WHERE user_id = '' AND sandbox_id IN (SELECT id FROM sandboxes WHERE created_by != '')`,
+		`UPDATE events SET user_id = owner.user_id
+		FROM (SELECT sandbox_id, MIN(user_id) AS user_id FROM events
+			WHERE sandbox_id != '' AND user_id != ''
+			GROUP BY sandbox_id HAVING COUNT(DISTINCT user_id) = 1) AS owner
+		WHERE events.user_id = '' AND events.sandbox_id = owner.sandbox_id`,
+	})
 }

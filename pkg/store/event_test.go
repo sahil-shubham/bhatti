@@ -421,3 +421,91 @@ func TestEventsAfterReadsPastAnUnreadableMeta(t *testing.T) {
 		t.Errorf("timestamp %v was not read back", got[0].Timestamp)
 	}
 }
+
+// TestSandboxEventsBelongToTheOwner: the thermal loop and other background
+// paths record events about a sandbox without a user. They are stored as the
+// owner's, so the owner's stream has them; an event that names a user keeps
+// it, and one about no sandbox stays nobody's.
+func TestSandboxEventsBelongToTheOwner(t *testing.T) {
+	st := newTestStore(t)
+	if err := st.CreateSandbox(t.Context(), Sandbox{ID: "sb1", Name: "dev", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert(t, st,
+		Event{Type: "thermal.pause", SandboxID: "sb1"},
+		Event{Type: "secret.granted", UserID: "usr_b", SandboxID: "sb1"},
+		Event{Type: "daemon.started"},
+		Event{Type: "thermal.wake", SandboxID: "sb_gone"},
+	)
+
+	got := mustAfter(t, st, EventQuery{UserID: "usr_a"})
+	if len(got) != 1 || got[0].Type != "thermal.pause" {
+		t.Fatalf("owner's events = %+v, want just thermal.pause", got)
+	}
+	if got := mustAfter(t, st, EventQuery{UserID: "usr_b"}); len(got) != 1 || got[0].Type != "secret.granted" {
+		t.Fatalf("an event naming usr_b = %+v, want it kept as usr_b's", got)
+	}
+	unowned, err := st.QueryEvents(t.Context(), EventFilter{Type: "daemon"})
+	if err != nil || len(unowned) != 1 || unowned[0].UserID != "" {
+		t.Fatalf("daemon.started = %+v (%v), want it stored with no user", unowned, err)
+	}
+}
+
+// TestLadderGivesOldSandboxEventsToTheOwner: events stored without a user by
+// an earlier release go to the owner on upgrade, found from the sandbox's row
+// or, for a destroyed sandbox, from its other events when they agree.
+func TestLadderGivesOldSandboxEventsToTheOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	st, err := New(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSandbox(t.Context(), Sandbox{ID: "live", Name: "live", Status: "running", CreatedBy: "usr_a", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range [][3]string{
+		{"thermal.pause", "", "live"},
+		{"sandbox.created", "usr_b", "gone"},
+		{"thermal.snapshot", "", "gone"},
+		{"sandbox.created", "usr_c", "shared"},
+		{"secret.granted", "usr_d", "shared"},
+		{"thermal.wake", "", "shared"},
+		{"daemon.started", "", ""},
+	} {
+		if _, err := st.db.ExecContext(t.Context(), `INSERT INTO events (type, user_id, sandbox_id) VALUES (?, ?, ?)`, row[0], row[1], row[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setUserVersion(t, st.db, len(migrations)-1)
+	st.Close()
+
+	st, err = New(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	owners := map[string]string{}
+	rows, err := st.db.QueryContext(t.Context(), `SELECT type, user_id FROM events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ, user string
+		if err := rows.Scan(&typ, &user); err != nil {
+			t.Fatal(err)
+		}
+		owners[typ] = user
+	}
+	want := map[string]string{
+		"thermal.pause":    "usr_a", // from the sandbox's row
+		"thermal.snapshot": "usr_b", // destroyed: from its creation event
+		"thermal.wake":     "",      // its events disagree: left alone
+		"daemon.started":   "",
+	}
+	for typ, user := range want {
+		if owners[typ] != user {
+			t.Errorf("%s: user %q, want %q", typ, owners[typ], user)
+		}
+	}
+}
