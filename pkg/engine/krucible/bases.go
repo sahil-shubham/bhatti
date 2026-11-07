@@ -263,6 +263,12 @@ func walkImages(dataDir string, fn func(path string, link bool) error) error {
 	skip := basesDir(dataDir)
 	return filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// Gone between being listed and being read: a sandbox destroyed, or
+			// an installer removing its staging area, while this walk runs.
+			// What no longer exists needs no migrating.
+			if errors.Is(err, fs.ErrNotExist) && path != dataDir {
+				return nil
+			}
 			return err
 		}
 		switch {
@@ -282,11 +288,12 @@ func walkImages(dataDir string, fn func(path string, link bool) error) error {
 	})
 }
 
-// maybeQcow2 is isQcow2 that says yes when it can't read the file.
+// maybeQcow2 is isQcow2 that says yes when it can't read the file, unless the
+// file is gone.
 func maybeQcow2(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
-		return true
+		return !errors.Is(err, fs.ErrNotExist)
 	}
 	defer f.Close()
 	var magic [4]byte

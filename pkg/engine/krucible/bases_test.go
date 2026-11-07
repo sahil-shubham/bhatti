@@ -301,3 +301,33 @@ func TestNewRootNamesTheBaseNotTheTier(t *testing.T) {
 		}
 	}
 }
+
+// TestWalkImagesSkipsWhatVanishes: the daemon walks its data dir at startup
+// while an installer may still be deleting its staging area there. A
+// directory removed mid-walk is skipped, not an error that marks the
+// migration failed.
+func TestWalkImagesSkipsWhatVanishes(t *testing.T) {
+	data := t.TempDir()
+	for _, dir := range []string{"a", "b/inner"} {
+		if err := os.MkdirAll(filepath.Join(data, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("nowhere", filepath.Join(data, dir, "link")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var seen []string
+	err := walkImages(data, func(path string, link bool) error {
+		seen = append(seen, path)
+		if filepath.Base(filepath.Dir(path)) == "a" {
+			return os.RemoveAll(filepath.Join(data, "b"))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walkImages = %v, want the vanished directory skipped", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("visited %v, want only a/link", seen)
+	}
+}
