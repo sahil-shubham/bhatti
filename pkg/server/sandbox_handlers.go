@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -170,11 +169,6 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !s.checkSandboxQuota(w, r, user) {
-			return
-		}
-
-		// Enforce per-user resource caps
-		if !checkSandboxSize(w, user, req.CPUs, req.MemoryMB) {
 			return
 		}
 
@@ -461,6 +455,33 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// A fork runs at its source's size, a template at its own: the caps
+		// judge what will actually run, and a cap lowered since the source or
+		// template was made still applies.
+		var src *store.Sandbox // fork source
+		var forker engine.ForkEngine
+		if req.From != "" {
+			var ok bool
+			if forker, ok = s.engine.(engine.ForkEngine); !ok {
+				errResp(w, 501, "engine does not support fork (--from)")
+				return
+			}
+			var serr error
+			if src, serr = s.store.GetSandbox(user.ID, req.From); serr != nil {
+				errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
+				return
+			}
+			// The record matches the forked VM: the source's image, vCPUs and
+			// RAM, and a clone of its disk.
+			spec.Image = src.Image
+			spec.CPUs = src.CPUs
+			spec.MemoryMB = src.MemoryMB
+			spec.DiskSizeMB = src.DiskSizeMB
+		}
+		if !checkSandboxSize(w, user, spec.CPUs, spec.MemoryMB) {
+			return
+		}
+
 		// Set user context for engine-level network isolation
 		spec.UserID = user.ID
 		spec.SubnetIndex = user.SubnetIndex
@@ -589,29 +610,9 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		handlerPhase("engine_create_start")
 		var info engine.SandboxInfo
 		var err error
-		var src *store.Sandbox         // fork source
 		var grants []store.SecretGrant // the sandbox's own at boot, or a fork's inherited ones
-		if req.From != "" {
+		if src != nil {
 			// Fork: clone a running sandbox (memory copy) instead of a fresh boot.
-			forker, ok := s.engine.(interface {
-				Fork(ctx context.Context, sandboxID, newName string) (engine.SandboxInfo, error)
-			})
-			if !ok {
-				errResp(w, 501, "engine does not support fork (--from)")
-				return
-			}
-			var serr error
-			src, serr = s.store.GetSandbox(user.ID, req.From)
-			if serr != nil {
-				errResp(w, 404, fmt.Sprintf("source sandbox %q not found", req.From))
-				return
-			}
-			// The fork inherits the source's image + resources (the record matches
-			// the actual forked VM: the source's vCPUs and RAM, a clone of its disk).
-			spec.Image = src.Image
-			spec.CPUs = src.CPUs
-			spec.MemoryMB = src.MemoryMB
-			spec.DiskSizeMB = src.DiskSizeMB
 			info, err = forker.Fork(r.Context(), src.EngineID, spec.Name)
 		} else {
 			// netd names the guest by our ID, so a grant minted now resolves

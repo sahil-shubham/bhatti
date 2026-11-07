@@ -191,6 +191,12 @@ type DetachedExecEngine interface {
 	ExecDetached(ctx context.Context, id string, cmd []string, outputFile string) (pid int, outputPath string, err error)
 }
 
+// ForkEngine is optionally implemented by engines that can clone a running
+// sandbox, memory included, into a new one named newName.
+type ForkEngine interface {
+	Fork(ctx context.Context, sandboxID, newName string) (SandboxInfo, error)
+}
+
 // SessionAttacher is optionally implemented by engines that support
 // reconnecting to existing TTY sessions.
 //

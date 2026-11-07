@@ -391,6 +391,28 @@ func TestSnapshotResumeHoldsTheCaps(t *testing.T) {
 	}
 }
 
+// TestForkHoldsTheCaps: a fork runs at its source's size, so a source bigger
+// than the owner's caps (made before they came down) can't be forked past
+// them, whatever size the request names.
+func TestForkHoldsTheCaps(t *testing.T) {
+	srv, ts, eng := setupClone(t, 2, 4096)
+	big := engine.SandboxSpec{Name: "src", Image: "browser", CPUs: 4, MemoryMB: 8192}
+	eng.remember("eng-src", big)
+	if err := srv.store.CreateSandbox(store.Sandbox{ID: "src-id", Name: "src", EngineID: "eng-src", Status: "running",
+		CreatedBy: "usr_test", CreatedAt: time.Now(), CPUs: big.CPUs, MemoryMB: big.MemoryMB, Image: big.Image}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doReq(t, ts, "POST", "/sandboxes", map[string]any{"name": "child", "from": "src", "cpus": 1, "memory_mb": 512})
+	if resp.StatusCode != 400 {
+		t.Fatalf("fork of an over-cap source = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if sbs, err := srv.store.ListSandboxes("usr_test"); err != nil || len(sbs) != 1 {
+		t.Fatalf("the refused fork left sandboxes: %+v, %v", sbs, err)
+	}
+}
+
 // TestForkRecordsTheSourceSpec: a fork is recorded as its source is — image,
 // vCPUs, RAM, disk and boot config — whatever the request said.
 func TestForkRecordsTheSourceSpec(t *testing.T) {
