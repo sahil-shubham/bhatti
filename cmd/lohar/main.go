@@ -525,34 +525,68 @@ type NetConfig struct {
 	Gateway string `json:"gateway"`
 }
 
+// configFetchPolicy bounds how hard lohar tries to get its boot config.
+type configFetchPolicy struct {
+	attempts int
+	backoff  time.Duration // attempt n waits n × backoff before the next
+	budget   time.Duration // no new attempt starts once this much time has passed
+	exchange time.Duration // the longest one attempt may take once connected
+}
+
+var bootConfigFetch = configFetchPolicy{attempts: 5, backoff: 25 * time.Millisecond, budget: 8 * time.Second, exchange: 3 * time.Second}
+
 // fetchConfig pulls the sandbox's boot config over the guest→host config vsock
-// (§3.4), replacing the on-disk config drive. Returns nil if the config port is
-// not wired (the virtio-fs dev profile) or the fetch fails — the caller then
-// boots config-less, same as an absent config drive before.
+// (§3.4), replacing the on-disk config drive. lohar asks at boot and never
+// again, and a guest that boots without the answer has no auth token and no
+// eth0 address: it listens, refuses every host request, and never recovers. So
+// a failed attempt is retried before giving up. Returns nil — a config-less
+// boot — only if the host never answers, or the config port is not wired.
 func fetchConfig() *SandboxConfig {
-	conn, err := dialVsock(proto.VsockPortConfig)
+	return fetchConfigVia(func() (net.Conn, error) { return dialVsock(proto.VsockPortConfig) }, bootConfigFetch)
+}
+
+func fetchConfigVia(dial func() (net.Conn, error), p configFetchPolicy) *SandboxConfig {
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		cfg, err := fetchConfigOnce(dial, p.exchange)
+		if err == nil {
+			return cfg
+		}
+		fmt.Fprintf(os.Stderr, "lohar: fetch config (attempt %d of %d): %v\n", attempt, p.attempts, err)
+		if attempt >= p.attempts || time.Since(start) >= p.budget {
+			fmt.Fprintln(os.Stderr, "lohar: booting without its config: no auth token, no eth0 address")
+			return nil
+		}
+		time.Sleep(time.Duration(attempt) * p.backoff)
+	}
+}
+
+func fetchConfigOnce(dial func() (net.Conn, error), exchange time.Duration) (*SandboxConfig, error) {
+	conn, err := dial()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: config vsock dial: %v\n", err)
-		return nil
+		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// A host that stops answering must cost one attempt, not the boot.
+	if err := conn.SetDeadline(time.Now().Add(exchange)); err != nil {
+		fmt.Fprintf(os.Stderr, "lohar: config deadline: %v\n", err)
+	}
 	if err := proto.WriteFrame(conn, proto.CONFIG_REQ, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: config req: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("config req: %w", err)
 	}
 	typ, payload, err := proto.ReadFrame(conn)
-	if err != nil || typ != proto.CONFIG_RESP {
-		fmt.Fprintf(os.Stderr, "lohar: config resp: type=0x%02x err=%v\n", typ, err)
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("config resp: %w", err)
+	}
+	if typ != proto.CONFIG_RESP {
+		return nil, fmt.Errorf("config resp: type=0x%02x", typ)
 	}
 	var cfg SandboxConfig
 	if err := json.Unmarshal(payload, &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "lohar: parse config: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "lohar: fetched config for %s\n", cfg.SandboxID)
-	return &cfg
+	return &cfg, nil
 }
 
 func writeConfigFiles(files map[string]struct {

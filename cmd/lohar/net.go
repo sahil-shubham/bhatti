@@ -21,21 +21,60 @@ const (
 	VMADDR_CID_HOST = 2 // the host's well-known vsock CID
 )
 
+// vsockConnectTries bounds how often dialVsock retries a connect(2) that a
+// signal interrupted.
+const vsockConnectTries = 8
+
+// The syscalls dialVsock makes, as variables so a test can interrupt one.
+var (
+	vsockSocket = func() (int, error) {
+		return syscall.Socket(AF_VSOCK, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	}
+	vsockConnect = func(fd int, addr *SockaddrVM) syscall.Errno {
+		_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd),
+			uintptr(unsafe.Pointer(addr)), unsafe.Sizeof(*addr))
+		return errno
+	}
+)
+
 // dialVsock connects to the host (VMADDR_CID_HOST) on a vsock port — the
 // guest→host direction, used at boot to fetch config (§3.4). libkrun bridges it
 // to the daemon's UDS (krun_add_vsock_port2 listen=false).
+//
+// connect(2) on a vsock socket waits for the host's answer under a timeout, and
+// a signal landing in that wait fails it with EINTR: the kernel never restarts
+// a call that has a timeout, whatever SA_RESTART says. The signal is the Go
+// runtime's preemption SIGURG, which it sends to a goroutine that has run 10 ms
+// without yielding; lohar's main goroutine, which blocks on nothing during init,
+// is that goroutine about when it reaches this connect, and the host takes a few
+// ms to answer when several guests boot at once. About one boot in a thousand
+// was hit, came up without its config, and never became ready. The kernel has
+// dropped the interrupted attempt, so another starts clean on a fresh socket.
 func dialVsock(port uint32) (net.Conn, error) {
-	fd, err := syscall.Socket(AF_VSOCK, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("vsock socket: %w", err)
-	}
 	addr := SockaddrVM{Family: AF_VSOCK, Port: port, CID: VMADDR_CID_HOST}
-	if _, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd),
-		uintptr(unsafe.Pointer(&addr)), unsafe.Sizeof(addr)); errno != 0 {
+	var errno syscall.Errno
+	for try := 1; try <= vsockConnectTries; try++ {
+		fd, err := vsockSocket()
+		if err != nil {
+			return nil, fmt.Errorf("vsock socket: %w", err)
+		}
+		if errno = vsockConnect(fd, &addr); errno == 0 {
+			// Non-blocking, so the deadlines the caller sets mean something:
+			// os.File honours them only on a pollable fd, and silently not on
+			// a blocking one.
+			if err := syscall.SetNonblock(fd, true); err != nil {
+				syscall.Close(fd)
+				return nil, fmt.Errorf("vsock nonblock: %w", err)
+			}
+			return &vsockConn{file: os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port))}, nil
+		}
 		syscall.Close(fd)
-		return nil, fmt.Errorf("vsock connect (cid=%d port=%d): %v", VMADDR_CID_HOST, port, errno)
+		if errno != syscall.EINTR {
+			break
+		}
+		logf("vsock connect (port %d) interrupted (try %d of %d)", port, try, vsockConnectTries)
 	}
-	return &vsockConn{file: os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port))}, nil
+	return nil, fmt.Errorf("vsock connect (cid=%d port=%d): %w", VMADDR_CID_HOST, port, errno)
 }
 
 // SockaddrVM matches struct sockaddr_vm (16 bytes).

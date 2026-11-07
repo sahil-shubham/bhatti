@@ -229,6 +229,9 @@ func (c *AgentClient) ExecWithSync(ctx context.Context, argv []string, env map[s
 			}
 			return result, nil
 		case proto.ERROR:
+			if c.token != "" && unexpectedFrame(payload, proto.AUTH) {
+				return engine.ExecResult{}, fmt.Errorf("agent error: %s: %w", payload, ErrGuestUnconfigured)
+			}
 			return engine.ExecResult{}, fmt.Errorf("agent error: %s", payload)
 		default:
 			// Unknown frame type — skip (forward compatibility).
@@ -326,6 +329,11 @@ func (c *AgentClient) Shell(ctx context.Context, argv []string, env map[string]s
 	return &agentTermConn{conn: conn}, nil
 }
 
+// ErrGuestUnconfigured means the guest agent took our AUTH frame for a request:
+// it runs with no auth token because it booted without its boot config. It
+// fetches that config once, at boot, so it will never accept this client.
+var ErrGuestUnconfigured = errors.New("the guest agent has no auth token: it booted without its boot config")
+
 // ErrPortRefused means the guest agent couldn't connect to the requested port:
 // nothing is listening there (yet). Nothing was sent to the guest app.
 var ErrPortRefused = errors.New("refused")
@@ -375,6 +383,12 @@ func (c *AgentClient) Forward(ctx context.Context, port uint16) (io.ReadWriteClo
 //
 // Short connection timeouts on early attempts avoid waiting through a full
 // boot timeout when the guest's control socket is not accepting yet.
+//
+// A timeout alone says nothing about how far the guest got, so the error
+// carries the last probe's failure: a missing socket means the VMM's vsock
+// isn't up yet, a connection that is closed unanswered means the guest isn't
+// serving, and ErrGuestUnconfigured means the agent runs but will never accept
+// us (that one ends the wait at once).
 func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -382,9 +396,18 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 
 	start := time.Now()
 	attempt := 0
+	var lastErr error
+	notReady := func(cause error) error {
+		if lastErr == nil {
+			return fmt.Errorf("agent not ready after %d attempts (%dms): %w",
+				attempt, time.Since(start).Milliseconds(), cause)
+		}
+		return fmt.Errorf("agent not ready after %d attempts (%dms; last probe: %v): %w",
+			attempt, time.Since(start).Milliseconds(), lastErr, cause)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("agent not ready: %w", err)
+			return notReady(err)
 		}
 
 		// Try a lightweight exec. If the agent responds, it's ready.
@@ -415,20 +438,27 @@ func (c *AgentClient) WaitReady(ctx context.Context, timeout time.Duration) erro
 			return nil
 		}
 
+		lastErr = err
+		if err == nil {
+			lastErr = fmt.Errorf("probe exited %d: %s", result.ExitCode, strings.TrimSpace(result.Stderr))
+		}
 		slog.Debug("wait_ready.attempt_failed",
 			"attempt", attempt,
 			"attempt_ms", time.Since(attemptStart).Milliseconds(),
 			"total_ms", time.Since(start).Milliseconds(),
-			"error", err,
+			"error", lastErr,
 			"addr", c.controlSock)
+		if errors.Is(err, ErrGuestUnconfigured) {
+			lastErr = nil // err, as the cause, says it
+			return notReady(err)
+		}
 
 		// Brief pause before retry. The dial timeout provides the main
 		// pacing — this just prevents a tight spin when the guest sends
 		// RST ("connection refused", returns instantly).
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("agent not ready after %d attempts (%dms): %w",
-				attempt, time.Since(start).Milliseconds(), ctx.Err())
+			return notReady(ctx.Err())
 		case <-time.After(10 * time.Millisecond):
 		}
 	}

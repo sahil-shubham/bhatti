@@ -1093,7 +1093,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 		readyCancel()
 		vmCancel()
 		vm.closeConfigSrv()
-		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, tailFile(vm.logPath, 4096))
+		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, vmmLogExcerpt(vm.logPath, 4096))
 	case werr = <-readyDone:
 	}
 	readyCancel()
@@ -1103,13 +1103,13 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 		// Leave the shared netd running; sibling sandboxes may still be using it.
 		vmCancel()
 		vm.closeConfigSrv()
-		return fmt.Errorf("agent not ready: %w\nvmm log:\n%s", werr, tailFile(vm.logPath, 4096))
+		return fmt.Errorf("agent not ready: %w\nvmm log:\n%s", werr, vmmLogExcerpt(vm.logPath, 4096))
 	}
 	select {
 	case exitErr := <-waitDone:
 		vmCancel()
 		vm.closeConfigSrv()
-		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, tailFile(vm.logPath, 4096))
+		return fmt.Errorf("vmm helper exited before agent ready: %v\nvmm log:\n%s", exitErr, vmmLogExcerpt(vm.logPath, 4096))
 	default:
 	}
 	// lohar lives on the guest's disk, not in the daemon binary. A failed
@@ -1637,6 +1637,79 @@ func tailFile(path string, n int64) string {
 		return ""
 	}
 	return string(buf)
+}
+
+// vmmLogExcerpt is the helper's log boiled down for a failed boot: each
+// distinct line once, with a count where it repeated, and the last limit bytes
+// of that. A readiness probe makes libkrun log a line per vsock connection —
+// thousands in 30 s — which leaves a plain tail nothing else, while the lines
+// that say how far the guest got (lohar's boot trace on the console) were
+// written first.
+func vmmLogExcerpt(path string, limit int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	raw, _ := io.ReadAll(io.LimitReader(f, 8<<20))
+
+	type entry struct {
+		line  string
+		count int
+	}
+	var order []*entry
+	byKey := map[string]*entry{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		key := logLineKey(line)
+		if e := byKey[key]; e != nil {
+			e.count++
+			continue
+		}
+		e := &entry{line: line, count: 1}
+		byKey[key] = e
+		order = append(order, e)
+	}
+	var b strings.Builder
+	for _, e := range order {
+		b.WriteString(e.line)
+		if e.count > 1 {
+			fmt.Fprintf(&b, " (x%d)", e.count)
+		}
+		b.WriteByte('\n')
+	}
+	out := b.String()
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+// logLineKey makes log lines that differ only in their timestamp and numbers
+// equal.
+func logLineKey(line string) string {
+	if strings.HasPrefix(line, "[") {
+		if _, rest, ok := strings.Cut(line, " "); ok {
+			line = rest // "[<timestamp>" is the first field
+		}
+	}
+	var b strings.Builder
+	inDigits := false
+	for i := range len(line) {
+		if c := line[i]; c >= '0' && c <= '9' {
+			if !inDigits {
+				b.WriteByte('#')
+			}
+			inDigits = true
+		} else {
+			inDigits = false
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // netdStartFailed reaps a netd that didn't come up and says why: whether it
