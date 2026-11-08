@@ -277,15 +277,9 @@ func TestKrucibleRestoreRefusals(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"vcpu-mismatch", "vCPU", func(_ *testing.T, _ string, m *krucibleSnapManifest) {
-			m.Vcpus++
-		}},
-		{"ram-mismatch", "RAM layout", func(_ *testing.T, _ string, m *krucibleSnapManifest) {
-			m.MemMiB += 256
-		}},
-		{"device-mismatch", "devices differ", func(_ *testing.T, _ string, m *krucibleSnapManifest) {
-			m.Volumes = nil
-		}},
+		{"vcpu-mismatch", "vCPU", tamperManifest(func(m *krucibleSnapManifest) { m.Vcpus++ })},
+		{"ram-mismatch", "RAM layout", tamperManifest(func(m *krucibleSnapManifest) { m.MemMiB += 256 })},
+		{"device-mismatch", "devices differ", tamperManifest(func(m *krucibleSnapManifest) { m.Volumes = nil })},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -327,6 +321,23 @@ func TestKrucibleRestoreRefusals(t *testing.T) {
 	}
 	if err := e.Destroy(ctx, fresh.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// tamperManifest changes the snapshot's daemon-written manifest, which is what
+// a restore trusts, and the API's copy passed along with it: the checkpoint
+// itself then disagrees with what the restore asks the helper to build.
+func tamperManifest(change func(*krucibleSnapManifest)) func(*testing.T, string, *krucibleSnapManifest) {
+	return func(t *testing.T, dir string, api *krucibleSnapManifest) {
+		change(api)
+		local, found, err := readSnapshotManifest(dir)
+		if err != nil || !found {
+			t.Fatalf("snapshot manifest in %s: found=%v err=%v", dir, found, err)
+		}
+		change(&local)
+		if err := writeSnapshotManifest(dir, local); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
