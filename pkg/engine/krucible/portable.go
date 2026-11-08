@@ -1222,13 +1222,13 @@ func (e *Engine) keepBase(ctx context.Context, src, sum, name string) (string, e
 	// Link, not rename: it never replaces a file already there.
 	err := linkBase(src, dst)
 	if err != nil && !errors.Is(err, fs.ErrExist) {
-		// Hard links unavailable: copy beside the bases, then publish by rename.
+		// Hard links unavailable: copy beside the bases, then publish exclusively.
 		tmp := filepath.Join(dir, "."+filepath.Base(dst)+".partial")
 		if cerr := cloneFile(ctx, src, tmp); cerr != nil {
 			os.Remove(tmp)
 			return "", fmt.Errorf("import: keep base image: %w", errors.Join(err, cerr))
 		}
-		err = os.Rename(tmp, dst)
+		err = renameNoReplace(tmp, dst)
 		os.Remove(tmp)
 		if err != nil && !errors.Is(err, fs.ErrExist) {
 			return "", fmt.Errorf("import: keep base image: %w", err)
