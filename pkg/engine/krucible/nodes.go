@@ -993,6 +993,11 @@ func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 		if err != nil || !found {
 			return err
 		}
+		if strings.HasPrefix(filepath.Base(disk), ".image-") {
+			// Capture released its lease, but publication still needs these
+			// ancestors. An unfinished hidden disk has no trusted sidecar.
+			return root(disk, disk, "", m.Format, m.Backing, false)
+		}
 		return register(disk, m.Format, m.Backing)
 	})
 	if err != nil {

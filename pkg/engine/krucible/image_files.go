@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
@@ -84,4 +85,20 @@ func (e *Engine) publishImageFiles(ctx context.Context, stagingPath, imagePath s
 		return err
 	}
 	return nil
+}
+
+// Only startup can discard image stages: handlers release their storage lease
+// between capture and publication, so an exclusive runtime sweep is not enough.
+func cleanImageStages(dataDir string) error {
+	return walkManagedDiskFiles(dataDir, filepath.Join(dataDir, "images"), func(path string, _ bool) error {
+		name := filepath.Base(path)
+		if strings.HasPrefix(name, "..image-") && strings.HasSuffix(name, ".json") {
+			path = filepath.Join(filepath.Dir(path), strings.TrimSuffix(strings.TrimPrefix(name, "."), ".json"))
+			name = filepath.Base(path)
+		}
+		if strings.HasPrefix(name, ".image-") {
+			return removeImageFiles(path)
+		}
+		return nil
+	})
 }

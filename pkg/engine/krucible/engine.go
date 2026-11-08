@@ -692,6 +692,15 @@ func New(cfg Config) (*Engine, error) {
 	if err := eng.initConfinement(); err != nil {
 		return nil, err
 	}
+	unlockStorage, err := lockBases(cfg.DataDir, true)
+	if err != nil {
+		return nil, err
+	}
+	err = cleanImageStages(cfg.DataDir)
+	unlockStorage()
+	if err != nil {
+		return nil, fmt.Errorf("krucible: clean image stages: %w", err)
+	}
 	if err := eng.migrateNodeAccess(); err != nil {
 		return nil, fmt.Errorf("krucible: migrate node access: %w", err)
 	}
