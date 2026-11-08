@@ -96,7 +96,7 @@ func durabilityEngine(t *testing.T, thermal, agSock, ctlSock string) (*Engine, *
 		Agent: agent.NewKrucibleClient(agSock, "", ""),
 		cmd:   cmd, waitDone: done, HelperPID: cmd.Process.Pid,
 	}
-	e := &Engine{caps: VMMCapabilities{Pause: true}, vms: map[string]*VM{vm.ID: vm}}
+	e := &Engine{cfg: Config{DataDir: t.TempDir()}, caps: VMMCapabilities{Pause: true}, vms: map[string]*VM{vm.ID: vm}}
 	return e, vm
 }
 
