@@ -519,9 +519,31 @@ func (e *Engine) nodeProvenance(nodes map[fileKey]string) (map[fileKey]string, e
 			return nil, err
 		}
 		for _, de := range entries {
-			if de.IsDir() && (root != "images" || de.Name() != "bases") {
-				users[de.Name()] = true
+			if !de.IsDir() || (root == "images" && de.Name() == "bases") {
+				continue
 			}
+			if root == "snapshots" {
+				files, err := os.ReadDir(filepath.Join(e.cfg.DataDir, root, de.Name()))
+				if err != nil {
+					return nil, err
+				}
+				snapshot := false
+				for _, file := range files {
+					name := file.Name()
+					if name == snapshotManifestFile || name == "rootfs.qcow2" ||
+						name == checkpointFile || name == memoryFile || name == "config.ext4" ||
+						numberedStage(name, "vol", ".img") {
+						snapshot = true
+						break
+					}
+				}
+				// A direct snapshot has no owner encoded in its directory name.
+				// Its first authorized restore assigns the retained node group.
+				if snapshot {
+					continue
+				}
+			}
+			users[de.Name()] = true
 		}
 	}
 	records, err := filepath.Glob(filepath.Join(e.cfg.DataDir, "sandboxes", "*", stateFile))
