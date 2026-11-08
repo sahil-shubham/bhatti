@@ -147,11 +147,16 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   cannot select a driver. A raw disk or raw ancestor is never parsed for a header.
   Sandbox records, saved-image sidecars and hidden node metadata preserve the same
   per-disk information for GC and after a fork's staging directory disappears.
+  Image deletion and failed capture remove the disk and sidecar together. OCI
+  pull/import publish from private stages with explicit raw metadata, replacing
+  stale qcow2 authority even when the raw bytes happen to look like a header.
 - **Capture cannot launder rewritten headers.** Snapshot and image capture compare
   every disk's chain with the source VM's recorded chain before copying anything,
   and repeat the check while paused. Captured copies are checked too. A pointer
   must match both its recorded path and its recorded format before the daemon
   opens its target. Capture errors leave the source running.
+  Checkpoint holds the shared bases lease from before capture through manifest
+  publication, source resume and failure cleanup.
 - **Legacy snapshots are compatibility reads, not new authority.** Without a local
   manifest, format inference is allowed only with an owner-authorized walk: shared
   bases, the owner's images, and nodes anchored by that owner's snapshots/records.
@@ -161,12 +166,22 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   private copies only after authorization; their original disks are unchanged.
   That legacy-only compatibility fallback can copy data and is not the O(1) path.
   A SQLite/API copy cannot expand a local manifest's disk authority.
+  For old VM records, a known top-level qcow2 driver is separate from permission
+  to infer missing ancestor formats. Only an absent typed chain enables that
+  compatibility; nonnil chains remain strict, and a known raw top stays opaque.
 - **GC and dependents use the metadata graph.** Raw bytes never name or pin a node.
   Nodes remain while a recorded sandbox, snapshot, image or external hard link
-  holds them; crash stages are reclaimed under the bases lock. Snapshot deletion
-  goes through `engine.SnapshotRemover` and returns 409 while live overlays depend
-  on its disks. Destroying those overlays permits deletion without breaking
-  siblings or requiring a second dependency table in SQLite.
+  holds them. Multiple physical store names for one inode are internal aliases,
+  not external holders; an unreachable inode's aliases are reclaimed together.
+  Publication syncs a private inode pin and daemon pending/format metadata before
+  exposing the final store name. Startup/sweep reconciles interrupted publication;
+  copied adoption publishes by rename, so hard-link-free filesystems work too.
+  Startup reclaims unrecorded sandbox directories only after ruling out surviving
+  helpers, and refuses recovery rather than deleting an unrecorded live helper's
+  disks. A complete first VM record is durable before launching any new helper.
+  Snapshot deletion goes through `engine.SnapshotRemover` and returns 409 while
+  live overlays depend on its disks. Destroying those overlays permits deletion
+  without breaking siblings or requiring a second dependency table in SQLite.
 - **Imports rebuild the graph.** Archive layer formats are explicit, and imported
   header backing paths and host-local backing lists are discarded. Only the
   validated `layer-N.img` graph and a content-identified shared base determine the
@@ -176,11 +191,20 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   untyped legacy volume defaults to raw, and ambiguous layers are rejected.
   Missing backing-format extensions are rebuilt from graph metadata. Raw layers
   remain opaque even if their bytes resemble qcow2.
-- **Confinement and the remaining admission limit.** Confined Linux helpers receive
-  exact disk-file grants, not access to snapshot directories, `manifest.json` or
-  hidden node metadata. Restore checkpoint/RAM files are linked into a separate
-  helper-readable restore directory. Linux root/DAC/Landlock enforcement is not
-  exercised by the macOS HVF runs below. `vmmBaseAllowed` still admits this host's
+  Engine-owned import publication retains the shared lease across final rename;
+  the completed staging manifest is a GC root before that step. Export retains
+  the lease from planning through streaming and the final compression flush.
+- **Confinement and the remaining admission limit.** Linux node disks use durable,
+  owner-scoped synthetic groups, disjoint from helper and netd identity ranges.
+  A node is daemon-only before publication; only its owner's group receives read
+  access. Private nodes are never opened to the universal helper group, even
+  without Landlock. Startup migrates pre-change permissions. Adopted helpers keep
+  their already-open chain descriptors; their next start receives the new groups.
+  Landlock further limits each helper to exact chain files, excluding snapshot
+  directories, `manifest.json` and hidden node metadata. Restore checkpoint/RAM
+  files are linked into a separate helper-readable restore directory. Linux
+  enforcement is not exercised by the historical macOS HVF runs below.
+  `vmmBaseAllowed` still admits this host's
   shared bases and any image of the same owner when authorizing a legacy or new
   image chain; it does not admit another owner's images. To tighten that admission,
   persist an immutable daemon-owned `(device, inode, format, typed ancestors)`
@@ -193,6 +217,88 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   records source pause, SAVE, flush and copy durations. The resume benchmark also
   reports a live fork's source pause on helpers that support memory checkpointing;
   HVF helpers without that capability cannot supply a real fork measurement.
+
+### Upgrade and rollback across v2.5.10
+
+The storage upgrade adds filesystem/JSON authority records, not a storage-table
+migration. Existing v2.5.10 VM records remain compatibility reads, including a
+known qcow2 root whose header omits the optional backing-format extension.
+Captured copies are normalized before receiving new typed metadata; the running
+source is not rewritten.
+
+**Replacing only the binary with v2.5.10 is not a transparent rollback after
+creating layered state:**
+
+- **Layered sandboxes:** an already-running, adopted helper may keep running, but
+  Linux cold starts fail because v2.5.10 does not authorize `/nodes/...`
+  ancestors. Stopping a working layered sandbox can therefore make it
+  unstartable under the old daemon.
+- **Layered snapshots:** the files are not flattened or converted on downgrade.
+  Their node-backed root/volume chains have the same Linux cold-start limitation;
+  the old daemon has no node-store retention/reclamation protocol. Do not use it
+  to manage or clean up newly layered snapshots and their nodes.
+- **Archives:** new exports are archive v3; v2.5.10 accepts archive v1 only and
+  rejects them. Keeping a new archive is not an old-version restore plan.
+- **Re-upgrading does not undo all rollback damage:** old recovery rewrites VM
+  records through its older spec and drops `disk_backing`. A fork whose staging
+  snapshot is already gone can lose its only owner-provenance anchor, leaving
+  store-only ancestors unauthorized even after the new binary is restored.
+  Surviving named snapshot/image anchors can preserve that particular provenance,
+  but are not a general rollback guarantee.
+
+For a rollback, restore a consistent **pre-upgrade data-directory backup and its
+matching binaries**. Preserve nodes, manifests, image sidecars and VM records;
+deleting the new metadata to make old readers appear compatible can destroy the
+information needed to recover layered disks. Preserve post-upgrade data
+separately before restoring an older backup.
+
+### Storage review fixes and verification (2026-11-08)
+
+The release review's ten findings are addressed by:
+
+- `31b0109` — findings 3, 5, 6 and 9: owner-scoped node DAC, recoverable inode
+  publication, physical-store alias accounting and rename-only copied adoption.
+  These share the publication and inode-accounting protocol.
+- `1e8d8d7` — finding 4: safely reclaim interrupted, unrecorded creates before
+  dependency traversal; preserve/refuse recovery for a surviving helper.
+- `f46042f` — findings 1, 2 and 10: shared leases cover checkpoint publication,
+  engine-owned import rename and the entire export stream/final flush.
+- `d8c9e48` — finding 7: paired image authority lifecycle, private publisher stages
+  and explicit raw metadata on raw replacement.
+- `1028faf` — finding 8: v2.5.10-shaped VM records cold-start and capture missing
+  backing-format extensions without weakening typed chains.
+
+Each finding's protection was temporarily removed, its deterministic regression
+was observed failing, and the protection was restored before the passing suites.
+Crash tests exit a subprocess at publication boundaries; concurrency tests use
+fake peers, channels and nonblocking flock probes rather than timing sleeps.
+The root Linux DAC subprocess uses numeric credentials without Landlock and
+proves own-chain access plus `EACCES` for foreign nodes, including an attacker
+with no private ancestors of its own.
+
+Observed verification:
+
+- `go build ./... && go vet ./...`: passed.
+- `GOOS=linux GOARCH=amd64 go build ./...` and
+  `GOOS=linux GOARCH=amd64 go vet ./pkg/engine/krucible/`: passed.
+- `go test -race ./pkg/engine/... ./pkg/server/ -count=1`: passed; krucible
+  57.802 s, server 88.309 s.
+- Root container, `golang:1.26.3-bookworm`,
+  `go test -race ./pkg/engine/krucible/ -count=1`: passed, 47.994 s.
+- `scripts/test-cgroups-systemd.sh`: passed on systemd 257; both krucible and
+  launchgate suites passed. Its no-toolchain/no-KVM and optional qemu-img skips
+  remain skips, not exercised VM or qemu comparisons.
+- `make vmm netd`: passed and codesigned the HVF helper.
+- Full tagged HVF suite with `Image-lean-6.12.94-aarch64-k8s`: **failed** after
+  336.859 s, solely in `TestKrucibleNetDNS`'s `TempDir RemoveAll` cleanup:
+  `directory not empty`. The remaining directory contained only
+  `images/.bases.lock`; no guest DNS assertion failed. An outliving background
+  sweep is the inferred teardown cause, not a confirmed new storage regression.
+  This teardown failure is not suppressed or reported as green.
+
+No remote execution, push, tag or history rewrite was performed. Real memory
+checkpoint/fork VM coverage remains capability-gated on this HVF helper; the
+deterministic fake-helper regressions exercise those orchestration paths.
 
 ### Storage hardening evidence (2026-11-08)
 
