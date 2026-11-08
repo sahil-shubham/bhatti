@@ -110,6 +110,9 @@ func (e *Engine) publishImageFiles(ctx context.Context, stagingPath, imagePath s
 // between capture and publication, so an exclusive runtime sweep is not enough.
 func cleanImageStages(dataDir string) error {
 	if err := walkImageMetadata(dataDir, func(path, disk string) error {
+		if !numberedStage(filepath.Base(disk), ".image-", ".ext4") {
+			return nil
+		}
 		var m nodeMetadata
 		found, err := readDaemonMetadata(path, &m)
 		if err != nil || !found || m.ImagePath == "" || m.ImagePath == disk {
@@ -135,7 +138,7 @@ func cleanImageStages(dataDir string) error {
 			path = filepath.Join(filepath.Dir(path), strings.TrimSuffix(strings.TrimPrefix(name, "."), ".json"))
 			name = filepath.Base(path)
 		}
-		if strings.HasPrefix(name, ".image-") {
+		if numberedStage(name, ".image-", ".ext4") {
 			return removeImageFiles(path)
 		}
 		return nil

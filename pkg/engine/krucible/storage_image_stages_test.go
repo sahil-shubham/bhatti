@@ -106,3 +106,51 @@ func TestStartupRemovesAbandonedImageStagesBeforeSweep(t *testing.T) {
 		}
 	}
 }
+
+func TestStartupPreservesConfiguredImageWithStageLikeName(t *testing.T) {
+	for _, pendingPublication := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disk", true: "metadata"}[pendingPublication], func(t *testing.T) {
+			f := newNodeFixture(t)
+			golden := filepath.Join(f.data, "images", ".image-golden.ext4")
+			if err := os.Rename(f.base, golden); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.e.recordNodeMetadata(golden, "raw", []diskLayer{}); err != nil {
+				t.Fatal(err)
+			}
+			var metadata nodeMetadata
+			if found, err := readDaemonMetadata(nodeMetadataPath(golden), &metadata); err != nil || !found {
+				t.Fatalf("read configured image metadata: found=%v err=%v", found, err)
+			}
+			if pendingPublication {
+				metadata.ImagePath = filepath.Join(f.data, "images", "unpublished.ext4")
+				if err := writeDaemonMetadata(nodeMetadataPath(golden), metadata); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stage := filepath.Join(f.data, "images", ".image-123.ext4")
+			writeFile(t, stage, []byte("abandoned image"))
+			if err := f.e.recordNodeMetadata(stage, "raw", []diskLayer{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(storageStartupConfig(t, f.data, golden)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(golden); err != nil {
+				t.Errorf("startup removed configured image: %v", err)
+			}
+			var retained nodeMetadata
+			if found, err := readDaemonMetadata(nodeMetadataPath(golden), &retained); err != nil || !found {
+				t.Fatalf("startup removed configured image metadata: found=%v err=%v", found, err)
+			}
+			if retained.ImagePath != metadata.ImagePath {
+				t.Errorf("startup reclassified user metadata as a stage: got %q want %q", retained.ImagePath, metadata.ImagePath)
+			}
+			for _, path := range []string{stage, nodeMetadataPath(stage)} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("startup retained generated stage %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
