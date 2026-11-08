@@ -96,7 +96,7 @@ func (p *clockPeer) vm(t *testing.T, thermal string, info proto.AgentInfo) (*Eng
 		Status: "running", Thermal: thermal, AgentInfo: info,
 		Agent: agent.NewKrucibleClient(p.agentSock, "", ""),
 	}
-	return &Engine{caps: VMMCapabilities{Pause: true}, vms: map[string]*VM{vm.ID: vm}}, vm
+	return &Engine{cfg: Config{DataDir: t.TempDir()}, caps: VMMCapabilities{Pause: true}, vms: map[string]*VM{vm.ID: vm}}, vm
 }
 
 var clockSyncInfo = proto.AgentInfo{Version: "v2.5.5", Features: []proto.AgentFeature{proto.FeatureClockSync}}
