@@ -280,7 +280,7 @@ func (e *Engine) reclaimUnrecordedSandboxes() error {
 		return err
 	}
 	var abandoned []string
-	specs := map[string]bool{}
+	specs := map[string]os.FileInfo{}
 	for _, de := range entries {
 		if !de.IsDir() {
 			continue
@@ -292,7 +292,12 @@ func (e *Engine) reclaimUnrecordedSandboxes() error {
 			return err
 		}
 		abandoned = append(abandoned, dir)
-		specs[filepath.Join(dir, "vmspec.json")] = true
+		spec := filepath.Join(dir, "vmspec.json")
+		if fi, err := os.Stat(spec); err == nil {
+			specs[spec] = fi
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if len(abandoned) == 0 {
 		return nil
@@ -322,8 +327,18 @@ func (e *Engine) reclaimUnrecordedSandboxes() error {
 			}
 			continue
 		}
-		if len(args) == 2 && specs[args[1]] && filepath.Base(args[0]) == binary {
-			return fmt.Errorf("unrecorded sandbox %s still has helper %d; preserve its disks", filepath.Dir(args[1]), pid)
+		// Reclamation needs proof of disuse, not proof that a process is
+		// adoptable: old helper names and symlinked data paths remain live.
+		for _, arg := range args {
+			fi, err := os.Stat(arg)
+			if err != nil {
+				continue
+			}
+			for spec, abandonedSpec := range specs {
+				if os.SameFile(fi, abandonedSpec) {
+					return fmt.Errorf("unrecorded sandbox %s still has helper %d; preserve its disks", filepath.Dir(spec), pid)
+				}
+			}
 		}
 	}
 	for _, dir := range abandoned {

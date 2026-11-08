@@ -329,6 +329,9 @@ func TestRecoveryPreservesUnrecordedLiveHelper(t *testing.T) {
 	e := &Engine{cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t), VMMBinary: os.Args[0]},
 		vms: map[string]*VM{}, netds: map[string]*netdInstance{}}
 	spec, _ := sandboxPaths(t, e, "unrecorded")
+	if err := os.WriteFile(spec, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	pid := fakeHelper(t, spec)
 	disk := filepath.Join(filepath.Dir(spec), "root.qcow2")
 	if err := os.WriteFile(disk, []byte("private disk"), 0o600); err != nil {
@@ -342,5 +345,33 @@ func TestRecoveryPreservesUnrecordedLiveHelper(t *testing.T) {
 	}
 	if !isHelper(pid, spec, e.cfg.VMMBinary) {
 		t.Fatal("unrecorded live helper was killed")
+	}
+}
+
+func TestRecoveryPreservesUnrecordedHelperThroughAliases(t *testing.T) {
+	e := &Engine{cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t), VMMBinary: os.Args[0]},
+		vms: map[string]*VM{}, netds: map[string]*netdInstance{}}
+	spec, _ := sandboxPaths(t, e, "aliased")
+	if err := os.WriteFile(spec, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "data-alias")
+	if err := os.Symlink(e.cfg.DataDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	aliasSpec := filepath.Join(alias, "sandboxes", "aliased", "vmspec.json")
+	pid := gatedStandinAs(t, aliasSpec, "older-helper-name")
+	disk := filepath.Join(filepath.Dir(spec), "root.qcow2")
+	if err := os.WriteFile(disk, []byte("private disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.recover(); err == nil || !strings.Contains(err.Error(), "still has helper") {
+		t.Fatalf("aliased live process did not prevent recovery: %v", err)
+	}
+	if data, err := os.ReadFile(disk); err != nil || string(data) != "private disk" {
+		t.Fatalf("aliased live process's disk changed: %q, %v", data, err)
+	}
+	if !running(pid, "older-helper-name", aliasSpec) {
+		t.Fatal("aliased process was killed")
 	}
 }
