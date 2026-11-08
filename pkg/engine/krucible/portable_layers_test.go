@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -155,7 +156,7 @@ func TestLayeredSnapshotMovesToAnotherHost(t *testing.T) {
 		t.Fatalf("depth %d, %v; the resumed root, the imported disk and its node make three", d, err)
 	}
 	final := filepath.Join(b.cfg.DataDir, "snapshots", "imported")
-	if err := os.Rename(dest, final); err != nil {
+	if err := b.PublishSnapshotImport(context.Background(), dest, final); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.RemoveSnapshot(context.Background(), final); !errors.Is(err, engine.ErrSnapshotInUse) {
@@ -471,6 +472,149 @@ func TestLayeredSnapshotImportsIndependentNodes(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("deleting the first import broke the second's chain: %v", err)
 		}
+	}
+}
+
+func TestPublishSnapshotImportSerializesWithGC(t *testing.T) {
+	f, dir, m := layeredSnapshot(t)
+	archive := exportArchive(t, f.e, dir, m, true)
+	b := portableEngine(t, "", "exit 0")
+	parent := filepath.Join(b.cfg.DataDir, "snapshots", "u1")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging, final := filepath.Join(parent, "import-pending.tmp"), filepath.Join(parent, "published")
+	if _, err := b.ImportSnapshot(t.Context(), bytes.NewReader(archive), staging); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(staging, snapshotManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := []string{
+		backingOf(t, filepath.Join(staging, "rootfs.qcow2")),
+		backingOf(t, filepath.Join(staging, "vol0.img")),
+	}
+	for _, node := range nodes {
+		fi, err := os.Stat(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Sys().(*syscall.Stat_t).Nlink != 1 {
+			t.Fatalf("imported ancestor is not store-only: %s", node)
+		}
+	}
+	// Import has released its lease. The completed managed staging manifest
+	// is a stable root until publication acquires its own lease.
+	if removed, err := SweepNodes(b.cfg.DataDir, false); err != nil || len(removed) != 0 {
+		t.Fatalf("GC missed the completed staging manifest: %v, %v", removed, err)
+	}
+	release, err := lockBases(b.cfg.DataDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := b.PublishSnapshotImport(ctx, staging, final); !errors.Is(err, context.Canceled) {
+		t.Fatalf("publication renamed while GC owned the exclusive lock: %v", err)
+	}
+	mustNotExist(t, final)
+	if got, err := os.ReadFile(filepath.Join(staging, snapshotManifestFile)); err != nil || !bytes.Equal(got, before) {
+		t.Fatalf("canceled publication changed its staging root: %s, %v", got, err)
+	}
+	release()
+	if err := b.PublishSnapshotImport(t.Context(), staging, final); err != nil {
+		t.Fatal(err)
+	}
+	requireBasesLease(t, b.cfg.DataDir, false)
+	mustNotExist(t, staging)
+	if got, err := os.ReadFile(filepath.Join(final, snapshotManifestFile)); err != nil || !bytes.Equal(got, before) {
+		t.Fatalf("publication changed its completed manifest: %s, %v", got, err)
+	}
+	if removed, err := SweepNodes(b.cfg.DataDir, false); err != nil || len(removed) != 0 {
+		t.Fatalf("GC missed the final manifest: %v, %v", removed, err)
+	}
+	for _, node := range nodes {
+		if _, err := os.Stat(node); err != nil {
+			t.Fatalf("publication lost an imported ancestor: %s: %v", node, err)
+		}
+	}
+	if err := b.RemoveSnapshot(t.Context(), final); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range nodes {
+		mustNotExist(t, node)
+	}
+}
+
+func TestLayeredExportPinsNodesUntilStreamFinishes(t *testing.T) {
+	for _, outcome := range []string{"success", "writer-error", "cancelled"} {
+		t.Run(outcome, func(t *testing.T) {
+			f, source, m := layeredSnapshot(t)
+			archive := exportArchive(t, f.e, source, m, true)
+			b := portableEngine(t, "", "exit 0")
+			dir, imp, err := importArchive(b, archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nodes := []string{
+				backingOf(t, filepath.Join(dir, "rootfs.qcow2")),
+				backingOf(t, filepath.Join(dir, "vol0.img")),
+			}
+			var writeErr error
+			if outcome == "writer-error" {
+				writeErr = errors.New("blocked export writer failed")
+			} else if outcome == "cancelled" {
+				writeErr = context.Canceled
+			}
+			w := newGatedExportWriter(t, writeErr)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- b.ExportSnapshot(ctx, w, dir, imp.ManifestJSON, engine.SnapshotExport{Name: "layered"})
+			}()
+			waitForExportWrite(t, ctx, w, done)
+			requireBasesLease(t, b.cfg.DataDir, true)
+			removeCtx, stopRemove := context.WithCancel(t.Context())
+			stopRemove()
+			if err := b.RemoveSnapshot(removeCtx, dir); !errors.Is(err, context.Canceled) {
+				t.Fatalf("snapshot deletion did not wait for the exporting lease: %v", err)
+			}
+			for _, node := range nodes {
+				if _, err := os.Stat(node); err != nil {
+					t.Fatalf("streaming export lost an imported ancestor: %s: %v", node, err)
+				}
+			}
+			if outcome == "cancelled" {
+				cancel()
+			}
+			w.unblock()
+			select {
+			case err := <-done:
+				if writeErr == nil && err != nil {
+					t.Fatal(err)
+				}
+				if writeErr != nil && (err == nil || !strings.Contains(err.Error(), writeErr.Error())) {
+					t.Fatalf("export lost its streaming failure: %v, want %v", err, writeErr)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("export did not finish after its writer was released")
+			}
+			requireBasesLease(t, b.cfg.DataDir, false)
+			if outcome == "success" {
+				if _, err := readArchiveManifestFrom(w.Bytes()); err != nil {
+					t.Fatalf("export did not finish a whole archive: %v", err)
+				}
+			}
+			if err := b.RemoveSnapshot(t.Context(), dir); err != nil {
+				t.Fatal(err)
+			}
+			for _, node := range nodes {
+				mustNotExist(t, node)
+			}
+		})
 	}
 }
 

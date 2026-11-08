@@ -60,7 +60,16 @@ type SnapshotPorter interface {
 
 	// ImportSnapshot unpacks an archive ExportSnapshot wrote into destDir,
 	// which it creates (its parent must exist), and checks that this host can
-	// run the snapshot. On error destDir is gone. The directory can be renamed
-	// before use: the manifest names its files relative to it.
+	// run the snapshot. On error destDir is gone. A completed managed staging
+	// directory must stay in place until PublishSnapshotImport: its manifest
+	// keeps backing data live even between the two operations' storage leases.
 	ImportSnapshot(ctx context.Context, r io.Reader, destDir string) (SnapshotImport, error)
+
+	// PublishSnapshotImport moves a completed managed staging directory to
+	// finalDir and makes the rename durable while excluding backing-data GC.
+	// Its manifest names snapshot files relative to the directory, so the
+	// move does not change disk authority. On error the caller must remove
+	// any staging directory that remains; a failed durability barrier removes
+	// the unpublished final directory.
+	PublishSnapshotImport(ctx context.Context, stagingDir, finalDir string) error
 }

@@ -189,6 +189,13 @@ func (m *krucibleSnapManifest) normalize() {
 
 // ExportSnapshot implements engine.SnapshotPorter.
 func (e *Engine) ExportSnapshot(ctx context.Context, w io.Writer, snapDir string, manifestJSON []byte, opts engine.SnapshotExport) error {
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return fmt.Errorf("export: lock nodes: %w", err)
+	}
+	// Planning retains layer pathnames, not open files. Keep them pinned
+	// through streaming, the final zstd flush, and failed-frame cleanup.
+	defer unlock()
 	am, paths, err := e.planExport(snapDir, manifestJSON, opts)
 	if err != nil {
 		return err
@@ -603,6 +610,38 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 		return imp, fmt.Errorf("import: write local snapshot manifest: %w", err)
 	}
 	return engine.SnapshotImport{Name: am.Name, Type: am.Snapshot.Type, ManifestJSON: manifestJSON}, nil
+}
+
+// PublishSnapshotImport implements engine.SnapshotPorter.
+func (e *Engine) PublishSnapshotImport(ctx context.Context, stagingDir, finalDir string) (err error) {
+	// Import's completed managed staging manifest is already a stable GC
+	// root between leases. Reacquiring here serializes its name change with
+	// snapshot enumeration without holding a lease in the HTTP handler.
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return fmt.Errorf("import: lock publication: %w", err)
+	}
+	defer unlock()
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		return fmt.Errorf("import: publish snapshot: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if cleanupErr := os.RemoveAll(finalDir); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("import: remove failed publication: %w", cleanupErr))
+			}
+		}
+	}()
+	finalParent := filepath.Dir(finalDir)
+	if err := syncNodeDirectory(finalParent); err != nil {
+		return fmt.Errorf("import: sync publication directory: %w", err)
+	}
+	if stagingParent := filepath.Dir(stagingDir); stagingParent != finalParent {
+		if err := syncNodeDirectory(stagingParent); err != nil {
+			return fmt.Errorf("import: sync staging directory: %w", err)
+		}
+	}
+	return nil
 }
 
 // Only extracted entries are inspected and normalized. Archive metadata, not

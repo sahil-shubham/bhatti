@@ -172,7 +172,7 @@ func setupClone(t *testing.T, maxCPUs, maxMemoryMB int) (*Server, *httptest.Serv
 	}); err != nil {
 		t.Fatal(err)
 	}
-	eng := &cloneEngine{portingEngine: &portingEngine{mockEngine: newMockEngine()}, specs: map[string]engine.SandboxSpec{}}
+	eng := &cloneEngine{portingEngine: newPortingEngine(), specs: map[string]engine.SandboxSpec{}}
 	srv := New(eng, st, dir)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() { srv.Close(); ts.Close(); st.Close() })

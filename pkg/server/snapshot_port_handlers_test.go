@@ -26,9 +26,19 @@ type portingEngine struct {
 	*mockEngine
 	export  func(w io.Writer) error
 	imp     func(r io.Reader, destDir string) (engine.SnapshotImport, error)
+	publish func(ctx context.Context, stagingDir, finalDir string) error
 	resumed struct {
 		snapDir  string
 		manifest string
+	}
+}
+
+func newPortingEngine() *portingEngine {
+	return &portingEngine{
+		mockEngine: newMockEngine(),
+		publish: func(_ context.Context, stagingDir, finalDir string) error {
+			return os.Rename(stagingDir, finalDir)
+		},
 	}
 }
 
@@ -38,6 +48,10 @@ func (p *portingEngine) ExportSnapshot(_ context.Context, w io.Writer, _ string,
 
 func (p *portingEngine) ImportSnapshot(_ context.Context, r io.Reader, destDir string) (engine.SnapshotImport, error) {
 	return p.imp(r, destDir)
+}
+
+func (p *portingEngine) PublishSnapshotImport(ctx context.Context, stagingDir, finalDir string) error {
+	return p.publish(ctx, stagingDir, finalDir)
 }
 
 func (p *portingEngine) ResumeFromManifestJSON(ctx context.Context, snapDir string, manifestJSON []byte, newName, _ string) (engine.SandboxInfo, error) {
@@ -63,7 +77,7 @@ func setupPortingServer(t *testing.T) (*Server, *httptest.Server, *portingEngine
 		MaxSandboxes: 50, MaxCPUsPerSandbox: 4, MaxMemoryMBPerSandbox: 4096,
 		SubnetIndex: 1, CreatedAt: time.Now(),
 	})
-	eng := &portingEngine{mockEngine: newMockEngine()}
+	eng := newPortingEngine()
 	srv := New(eng, st, dir)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(func() { srv.Close(); ts.Close(); st.Close() })
@@ -170,6 +184,74 @@ func TestSnapshotImportRegistersAResumableSnapshot(t *testing.T) {
 	resp.Body.Close()
 	if eng.resumed.snapDir != final || eng.resumed.manifest != manifest {
 		t.Fatalf("resume used %+v; want %s with the imported manifest", eng.resumed, final)
+	}
+}
+
+func TestSnapshotImportDelegatesPublication(t *testing.T) {
+	for _, outcome := range []string{"success", "publication-error"} {
+		t.Run(outcome, func(t *testing.T) {
+			srv, _, eng, st, dir := setupPortingServer(t)
+			user, err := st.GetUser(t.Context(), "usr_test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.WithValue(t.Context(), userContextKey, user)
+			const manifest = `{"type":"memory","vcpus":1}`
+			var staging string
+			eng.imp = func(_ io.Reader, dest string) (engine.SnapshotImport, error) {
+				staging = dest
+				if err := os.Mkdir(dest, 0o700); err != nil {
+					return engine.SnapshotImport{}, err
+				}
+				if err := os.WriteFile(filepath.Join(dest, "memory.bin"), []byte("imported RAM"), 0o600); err != nil {
+					return engine.SnapshotImport{}, err
+				}
+				return engine.SnapshotImport{Name: "published", Type: "memory", ManifestJSON: []byte(manifest)}, nil
+			}
+			final := filepath.Join(dir, "snapshots", user.ID, "published")
+			called := false
+			eng.publish = func(gotCtx context.Context, gotStage, gotFinal string) error {
+				called = true
+				if gotCtx != ctx || gotStage != staging || gotFinal != final {
+					t.Errorf("publication received context %v, %q -> %q; want request context and %q -> %q",
+						gotCtx == ctx, gotStage, gotFinal, staging, final)
+				}
+				if _, err := st.GetSnapshot(t.Context(), user.ID, "published"); !errors.Is(err, store.ErrNotFound) {
+					t.Errorf("snapshot registered before engine publication: %v", err)
+				}
+				if outcome == "publication-error" {
+					return errors.New("engine publication failed")
+				}
+				return os.Rename(gotStage, gotFinal)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/snapshots/import", strings.NewReader("archive")).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			srv.handleSnapshotImport(rec, req)
+			if !called {
+				t.Fatal("server renamed the imported snapshot instead of delegating publication to its engine")
+			}
+			mustBeGone(t, staging)
+			if outcome == "publication-error" {
+				if rec.Code != http.StatusInternalServerError {
+					t.Fatalf("publication failure returned %d: %s", rec.Code, rec.Body.String())
+				}
+				mustBeGone(t, final)
+				if snapshots, err := st.ListSnapshots(t.Context(), user.ID); err != nil || len(snapshots) != 0 {
+					t.Fatalf("failed publication registered a snapshot: %+v, %v", snapshots, err)
+				}
+				return
+			}
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("publication returned %d: %s", rec.Code, rec.Body.String())
+			}
+			snap, err := st.GetSnapshot(t.Context(), user.ID, "published")
+			if err != nil || filepath.Dir(snap.MemPath) != final || snap.ManifestJSON != manifest {
+				t.Fatalf("registered snapshot did not use the engine's publication: %+v, %v", snap, err)
+			}
+			if _, err := os.Stat(filepath.Join(final, "memory.bin")); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

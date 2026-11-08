@@ -185,7 +185,7 @@ func (s *Server) handleSnapshotImport(w http.ResponseWriter, r *http.Request) {
 		errResp(w, 409, fmt.Sprintf("snapshot %q already exists", name))
 		return
 	}
-	if err := os.Rename(staging, finalDir); err != nil {
+	if err := sp.PublishSnapshotImport(r.Context(), staging, finalDir); err != nil {
 		errRespInternal(w, r, "import snapshot failed", err)
 		return
 	}

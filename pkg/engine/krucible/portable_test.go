@@ -15,8 +15,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -144,6 +146,196 @@ func importArchive(e *Engine, archive []byte) (string, engine.SnapshotImport, er
 	dest := filepath.Join(e.cfg.DataDir, "snapshots", "import-1.tmp")
 	imp, err := e.ImportSnapshot(context.Background(), bytes.NewReader(archive), dest)
 	return dest, imp, err
+}
+
+func tryBasesLock(dataDir string, how int) error {
+	f, err := openBasesLock(dataDir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
+}
+
+func requireBasesLease(t *testing.T, dataDir string, held bool) {
+	t.Helper()
+	err := tryBasesLock(dataDir, syscall.LOCK_EX)
+	if held && !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("exclusive bases probe = %v, want a held shared lease", err)
+	}
+	if held {
+		if err := tryBasesLock(dataDir, syscall.LOCK_SH); err != nil {
+			t.Fatalf("held bases lease is not shared: %v", err)
+		}
+	}
+	if !held && err != nil {
+		t.Fatalf("bases lease was not released: %v", err)
+	}
+}
+
+type gatedExportWriter struct {
+	bytes.Buffer
+	entered  chan struct{}
+	release  chan struct{}
+	first    sync.Once
+	released sync.Once
+	err      error
+}
+
+func newGatedExportWriter(t *testing.T, err error) *gatedExportWriter {
+	t.Helper()
+	w := &gatedExportWriter{entered: make(chan struct{}), release: make(chan struct{}), err: err}
+	t.Cleanup(w.unblock)
+	return w
+}
+
+func (w *gatedExportWriter) Write(p []byte) (int, error) {
+	w.first.Do(func() {
+		close(w.entered)
+		<-w.release
+	})
+	if w.err != nil {
+		return 0, w.err
+	}
+	return w.Buffer.Write(p)
+}
+
+func (w *gatedExportWriter) unblock() {
+	w.released.Do(func() { close(w.release) })
+}
+
+func waitForExportWrite(t *testing.T, ctx context.Context, w *gatedExportWriter, done <-chan error) {
+	t.Helper()
+	select {
+	case <-w.entered:
+	case err := <-done:
+		t.Fatalf("export returned before reaching its writer: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("export never reached its writer: %v", ctx.Err())
+	}
+}
+
+func TestPublishSnapshotImportFailureReleasesLock(t *testing.T) {
+	e := portableEngine(t, "", "exit 0")
+	parent := filepath.Join(e.cfg.DataDir, "snapshots", "u1")
+	staging, final := filepath.Join(parent, "import-failed.tmp"), filepath.Join(parent, "taken")
+	writeFile(t, filepath.Join(staging, snapshotManifestFile), []byte("{}"))
+	writeFile(t, final, []byte("existing snapshot"))
+	if err := e.PublishSnapshotImport(t.Context(), staging, final); err == nil {
+		t.Fatal("publication replaced a non-directory destination")
+	}
+	requireBasesLease(t, e.cfg.DataDir, false)
+	if got, err := os.ReadFile(final); err != nil || string(got) != "existing snapshot" {
+		t.Fatalf("failed publication changed the existing destination: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, snapshotManifestFile)); err != nil {
+		t.Fatalf("failed rename lost its completed staging root: %v", err)
+	}
+	if err := os.Remove(final); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.PublishSnapshotImport(t.Context(), staging, final); err != nil {
+		t.Fatalf("publication could not proceed after the failed rename: %v", err)
+	}
+	requireBasesLease(t, e.cfg.DataDir, false)
+	mustNotExist(t, staging)
+}
+
+func TestExportSnapshotLockWaitHonorsContextBeforePlanning(t *testing.T) {
+	e := portableEngine(t, "", "exit 0")
+	release, err := lockBases(e.cfg.DataDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	dir := filepath.Join(e.cfg.DataDir, "snapshots", "u1", "missing")
+	var buf bytes.Buffer
+	if err := e.ExportSnapshot(ctx, &buf, dir, []byte("{"), engine.SnapshotExport{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("export planned a snapshot before its canceled lock wait: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("export wrote %d bytes before acquiring its lease", buf.Len())
+	}
+	release()
+	requireBasesLease(t, e.cfg.DataDir, false)
+	if err := e.ExportSnapshot(t.Context(), &buf, dir, []byte("{"), engine.SnapshotExport{}); err == nil {
+		t.Fatal("export accepted an invalid snapshot")
+	}
+	requireBasesLease(t, e.cfg.DataDir, false)
+}
+
+func TestExportSnapshotPinsThroughFinalFlush(t *testing.T) {
+	e := portableEngine(t, "", "exit 0")
+	dir := filepath.Join(e.cfg.DataDir, "snapshots", "u1", "small")
+	writeFile(t, filepath.Join(dir, "rootfs.img"), []byte("standalone raw disk"))
+	m := krucibleSnapManifest{
+		Arch: hostSnapshotArch(), Type: "filesystem", Vcpus: 1, MemMiB: 64,
+		DiskFile: "rootfs.img", DiskFormat: "raw",
+	}
+	if err := writeSnapshotManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	am, paths, err := e.planExport(dir, nil, engine.SnapshotExport{Name: "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Establish that this fixture fits in the encoder's buffer: its first
+	// downstream write can only come from the final zstd Close.
+	var control bytes.Buffer
+	zw, err := zstd.NewWriter(&control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeArchive(t.Context(), zw, am, paths); err != nil {
+		zw.Close()
+		t.Fatal(err)
+	}
+	if control.Len() != 0 {
+		zw.Close()
+		t.Fatal("small export reached its writer before the final flush")
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, outcome := range []string{"success", "writer-error"} {
+		t.Run(outcome, func(t *testing.T) {
+			var writeErr error
+			if outcome == "writer-error" {
+				writeErr = errors.New("final zstd flush failed")
+			}
+			w := newGatedExportWriter(t, writeErr)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- e.ExportSnapshot(ctx, w, dir, nil, engine.SnapshotExport{Name: "small"})
+			}()
+			waitForExportWrite(t, ctx, w, done)
+			requireBasesLease(t, e.cfg.DataDir, true)
+			w.unblock()
+			select {
+			case err := <-done:
+				if !errors.Is(err, writeErr) {
+					t.Fatalf("final zstd flush returned %v, want %v", err, writeErr)
+				}
+			case <-ctx.Done():
+				t.Fatalf("final flush did not finish after its writer was released: %v", ctx.Err())
+			}
+			requireBasesLease(t, e.cfg.DataDir, false)
+			if writeErr == nil {
+				zr, err := zstd.NewReader(bytes.NewReader(w.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer zr.Close()
+				if _, err := io.Copy(io.Discard, zr); err != nil {
+					t.Fatalf("successful final flush left a truncated zstd frame: %v", err)
+				}
+			}
+		})
+	}
 }
 
 func fileSum(t *testing.T, path string) string {

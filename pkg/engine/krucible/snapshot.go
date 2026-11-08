@@ -86,7 +86,19 @@ func (e *Engine) CheckpointTyped(ctx context.Context, sandboxID, userID string, 
 	return e.checkpoint(ctx, sandboxID, snapName, snapDir, snapType)
 }
 
-func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (manifest any, err error) {
+func (e *Engine) checkpoint(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (any, error) {
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint: lock nodes: %w", err)
+	}
+	defer unlock()
+	return e.checkpointLocked(ctx, sandboxID, snapName, snapDir, snapType)
+}
+
+// checkpointLocked requires the shared bases lease before launchMu. Keep it
+// until capture, source resume, manifest publication and failed-directory
+// cleanup have all finished; a new checkpoint is not a GC root until then.
+func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snapDir, snapType string) (manifest any, err error) {
 	if snapType == "memory" && !e.caps.Checkpoint {
 		return nil, errNoCheckpoint
 	}
@@ -522,7 +534,7 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (info engi
 		}
 	}()
 
-	manifest, err := e.Checkpoint(ctx, sandboxID, "", 0, "snap", tmp)
+	manifest, err := e.checkpointLocked(ctx, sandboxID, "snap", tmp, "memory")
 	if err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("fork: checkpoint: %w", err)
 	}

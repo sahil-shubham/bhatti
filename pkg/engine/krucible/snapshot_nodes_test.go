@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,7 +87,7 @@ func TestFailedResumeReclaimsItsUnheldNode(t *testing.T) {
 	}
 }
 
-func captureControlPeer(t *testing.T, quiesce func(string) error) (string, <-chan string) {
+func captureControlPeer(t *testing.T, quiesce func(string) error, observers ...func(string) error) (string, <-chan string) {
 	t.Helper()
 	path := filepath.Join(shortSockDir(t), "capture.sock")
 	ln, err := net.Listen("unix", path)
@@ -114,6 +115,12 @@ func captureControlPeer(t *testing.T, quiesce func(string) error) (string, <-cha
 				if err == nil && quiesce != nil && (words[0] == "PAUSE" || words[0] == "SAVE") {
 					err = quiesce(words[0])
 				}
+				for _, observe := range observers {
+					if err != nil {
+						break
+					}
+					err = observe(words[0])
+				}
 			}
 			if err == nil {
 				_, _ = fmt.Fprintln(c, "OK")
@@ -124,6 +131,141 @@ func captureControlPeer(t *testing.T, quiesce func(string) error) (string, <-cha
 		}
 	}()
 	return path, operations
+}
+
+func TestCheckpointPinsBackingThroughCaptureAndPublication(t *testing.T) {
+	for _, entry := range []string{"untyped", "typed-default", "typed-memory", "typed-filesystem"} {
+		for _, outcome := range []string{"success", "manifest-error"} {
+			t.Run(entry+"/"+outcome, func(t *testing.T) {
+				f := newNodeFixture(t)
+				parent := f.snapshot("u1", "parent", f.freshRoot("original"))
+				root := f.resume("source", parent)
+				node := backingOf(t, root)
+				if err := os.RemoveAll(parent); err != nil {
+					t.Fatal(err)
+				}
+				snapRoot := filepath.Join(f.data, "snapshots", "u1")
+				final := filepath.Join(snapRoot, "captured")
+				probes := make(chan error, 2)
+				ctlSock, ops := captureControlPeer(t, nil, func(op string) error {
+					if op != "PAUSE" && op != "SAVE" && op != "RESUME" {
+						return nil
+					}
+					probes <- tryBasesLock(f.data, syscall.LOCK_EX)
+					if err := tryBasesLock(f.data, syscall.LOCK_SH); err != nil {
+						return fmt.Errorf("checkpoint holds an exclusive rather than shared lease: %w", err)
+					}
+					if op == "RESUME" {
+						if _, err := os.Stat(filepath.Join(final, snapshotManifestFile)); !errors.Is(err, os.ErrNotExist) {
+							return fmt.Errorf("manifest published before the source resumed: %v", err)
+						}
+						if outcome == "manifest-error" {
+							// Fail manifest publication after capture and resume,
+							// rather than rejecting the source during preflight.
+							return os.Mkdir(filepath.Join(final, snapshotManifestFile), 0o700)
+						}
+					}
+					return nil
+				})
+				agSock, _, _ := durabilityPeer(t, 0)
+				e, vm := durabilityEngine(t, "hot", agSock, ctlSock)
+				e.cfg, e.caps.Checkpoint = f.e.cfg, true
+				vm.UserID, vm.SandboxDir = "u1", filepath.Dir(root)
+				vm.baseSpec = VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+				if err := e.recordDiskBacking(&vm.baseSpec); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				var manifest any
+				var err error
+				if entry == "untyped" {
+					manifest, err = e.Checkpoint(ctx, vm.ID, "u1", 0, "captured", snapRoot)
+				} else {
+					typ := strings.TrimPrefix(entry, "typed-")
+					if typ == "default" {
+						typ = ""
+					}
+					manifest, err = e.CheckpointTyped(ctx, vm.ID, "u1", 0, "captured", snapRoot, typ)
+				}
+				quiesce := "SAVE"
+				if entry == "typed-filesystem" {
+					quiesce = "PAUSE"
+				}
+				if got := readOperations(ops); !slices.Equal(got, []string{quiesce, "RESUME"}) {
+					t.Fatalf("checkpoint did not capture and resume exactly once: %v", got)
+				}
+				for range 2 {
+					select {
+					case probe := <-probes:
+						if !errors.Is(probe, syscall.EWOULDBLOCK) {
+							t.Errorf("exclusive bases probe during capture/resume = %v, want a shared lease", probe)
+						}
+					default:
+						t.Fatal("checkpoint missed a capture/resume lock probe")
+					}
+				}
+				requireBasesLease(t, f.data, false)
+				if outcome == "manifest-error" {
+					if err == nil || !strings.Contains(err.Error(), "checkpoint: manifest:") || manifest != nil {
+						t.Fatalf("expected a post-capture manifest failure, got %v, %v", manifest, err)
+					}
+					mustNotExist(t, final)
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				local, found, err := readSnapshotManifest(final)
+				if err != nil || !found || len(local.Backing) == 0 || local.Backing[0].Path != node {
+					t.Fatalf("checkpoint lost its published node authority: %+v, %v, %v", local, found, err)
+				}
+				// Once the source vanishes, only the completed checkpoint's
+				// manifest can keep its store-only ancestor alive.
+				if err := os.RemoveAll(filepath.Dir(root)); err != nil {
+					t.Fatal(err)
+				}
+				if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+					t.Fatalf("published checkpoint lost its ancestor: %v, %v", removed, err)
+				}
+				if _, err := os.Stat(node); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckpointLockWaitHonorsContextBeforeCapture(t *testing.T) {
+	for _, entry := range []string{"untyped", "typed-default", "typed-memory", "typed-filesystem"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newNodeFixture(t)
+			f.e.caps = VMMCapabilities{Checkpoint: true, Pause: true}
+			release, err := lockBases(f.data, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			snapRoot := filepath.Join(f.data, "snapshots", "u1")
+			if entry == "untyped" {
+				_, err = f.e.Checkpoint(ctx, "missing", "u1", 0, "cancelled", snapRoot)
+			} else {
+				typ := strings.TrimPrefix(entry, "typed-")
+				if typ == "default" {
+					typ = ""
+				}
+				_, err = f.e.CheckpointTyped(ctx, "missing", "u1", 0, "cancelled", snapRoot, typ)
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("checkpoint reached source lookup/capture before a canceled lock wait: %v", err)
+			}
+			mustNotExist(t, filepath.Join(snapRoot, "cancelled"))
+			release()
+			requireBasesLease(t, f.data, false)
+		})
+	}
 }
 
 func TestCaptureCannotLaunderAnotherTenantsBackingNode(t *testing.T) {
