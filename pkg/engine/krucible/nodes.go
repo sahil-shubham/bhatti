@@ -69,8 +69,16 @@ func nodesDir(dataDir string) string { return filepath.Join(dataDir, "nodes") }
 func nodeName(k fileKey) string { return fmt.Sprintf("%x-%x.img", k.dev, k.ino) }
 
 type nodeMetadata struct {
-	Format  string      `json:"format"`
-	Backing []diskLayer `json:"backing"`
+	Format    string      `json:"format"`
+	Backing   []diskLayer `json:"backing"`
+	Dev       uint64      `json:"dev,omitempty"`
+	Ino       uint64      `json:"ino,omitempty"`
+	ImagePath string      `json:"image_path,omitempty"`
+}
+
+func (m nodeMetadata) matches(fi os.FileInfo) bool {
+	k, ok := keyOf(fi)
+	return ok && m.Ino != 0 && m.Dev == k.dev && m.Ino == k.ino
 }
 
 func nodeMetadataPath(node string) string {
@@ -98,7 +106,15 @@ func (e *Engine) recordNodeMetadata(node, format string, backing []diskLayer) er
 	if err := validateNodeMetadata(node, format, backing); err != nil {
 		return err
 	}
-	return writeDaemonMetadata(nodeMetadataPath(node), nodeMetadata{Format: format, Backing: backing})
+	m := nodeMetadata{Format: format, Backing: backing}
+	if fi, err := os.Stat(node); err == nil {
+		if k, ok := keyOf(fi); ok {
+			m.Dev, m.Ino = k.dev, k.ino
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return writeDaemonMetadata(nodeMetadataPath(node), m)
 }
 
 func validateNodeMetadata(node, format string, backing []diskLayer) error {
@@ -1000,6 +1016,9 @@ func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 		if err != nil || !found {
 			return err
 		}
+		if !m.matches(fi) {
+			return nil
+		}
 		if strings.HasPrefix(filepath.Base(disk), ".image-") {
 			// Capture released its lease, but publication still needs these
 			// ancestors. An unfinished hidden disk has no trusted sidecar.
@@ -1816,7 +1835,7 @@ func ownedNodeKeys(dataDir, ownerID string) (map[fileKey]bool, error) {
 				if err != nil || !found {
 					return err
 				}
-				if m.Format == "" {
+				if m.Format == "" || !m.matches(fi) {
 					return nil
 				}
 				if err := addChain(m.Format, m.Backing); err != nil {

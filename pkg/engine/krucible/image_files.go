@@ -48,14 +48,12 @@ func (e *Engine) publishImageFiles(ctx context.Context, stagingPath, imagePath s
 		return err
 	}
 	defer unlock()
+	var m nodeMetadata
 	if raw {
 		// A raw publisher knows the driver. Removing the old sidecar alone
 		// would let guest-controlled magic select the legacy qcow2 reader.
-		if err := e.recordNodeMetadata(stagingPath, "raw", []diskLayer{}); err != nil {
-			return err
-		}
+		m = nodeMetadata{Format: "raw", Backing: []diskLayer{}}
 	} else {
-		var m nodeMetadata
 		found, err := readDaemonMetadata(nodeMetadataPath(stagingPath), &m)
 		if err != nil {
 			return err
@@ -70,10 +68,31 @@ func (e *Engine) publishImageFiles(ctx context.Context, stagingPath, imagePath s
 	if err := flushFiles(stagingPath); err != nil {
 		return err
 	}
+	fi, err := os.Stat(stagingPath)
+	if err != nil {
+		return err
+	}
+	if !raw && !m.matches(fi) {
+		return fmt.Errorf("saved image %s has mismatched disk metadata", stagingPath)
+	}
+	k, ok := keyOf(fi)
+	if !ok {
+		return fmt.Errorf("image %s has no file identity", stagingPath)
+	}
+	m.Dev, m.Ino = k.dev, k.ino
+	m.ImagePath, err = filepath.Abs(imagePath)
+	if err != nil {
+		return err
+	}
+	// The inode binds the two renames: startup can finish authority only for
+	// the exact disk already moved into the final image pathname.
+	if err := writeDaemonMetadata(nodeMetadataPath(stagingPath), m); err != nil {
+		return err
+	}
 	if err := removeNodeMetadata(imagePath); err != nil {
 		return err
 	}
-	if err := os.Rename(stagingPath, imagePath); err != nil {
+	if err := renameNode(stagingPath, imagePath); err != nil {
 		return err
 	}
 	if err := os.Rename(nodeMetadataPath(stagingPath), nodeMetadataPath(imagePath)); err != nil {
@@ -90,6 +109,26 @@ func (e *Engine) publishImageFiles(ctx context.Context, stagingPath, imagePath s
 // Only startup can discard image stages: handlers release their storage lease
 // between capture and publication, so an exclusive runtime sweep is not enough.
 func cleanImageStages(dataDir string) error {
+	if err := walkImageMetadata(dataDir, func(path, disk string) error {
+		var m nodeMetadata
+		found, err := readDaemonMetadata(path, &m)
+		if err != nil || !found || m.ImagePath == "" || m.ImagePath == disk {
+			return nil
+		}
+		fi, err := os.Stat(m.ImagePath)
+		if errors.Is(err, os.ErrNotExist) || (err == nil && !m.matches(fi)) {
+			return removeNodeMetadata(disk)
+		}
+		if err != nil {
+			return err
+		}
+		if err := os.Rename(path, nodeMetadataPath(m.ImagePath)); err != nil {
+			return err
+		}
+		return syncNodeDirectory(filepath.Dir(m.ImagePath))
+	}); err != nil {
+		return err
+	}
 	return walkManagedDiskFiles(dataDir, filepath.Join(dataDir, "images"), func(path string, _ bool) error {
 		name := filepath.Base(path)
 		if strings.HasPrefix(name, "..image-") && strings.HasSuffix(name, ".json") {
