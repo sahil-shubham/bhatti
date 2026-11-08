@@ -39,6 +39,7 @@ type vmRecord struct {
 	MemMiB     uint32 `json:"mem_mib"`
 	Thermal    string `json:"thermal"`
 	Status     string `json:"status"`
+	Pending    bool   `json:"pending,omitempty"`
 	Token      string `json:"token"`
 	LogPath    string `json:"log_path"`
 	BaseSpec   VMSpec `json:"base_spec"`
@@ -105,7 +106,7 @@ func stateFilePath(sandboxDir string) string { return filepath.Join(sandboxDir, 
 // toRecordLocked builds the durable record. Caller must hold vm.mu.
 func (vm *VM) toRecordLocked() vmRecord {
 	return vmRecord{
-		ID: vm.ID, Name: vm.Name, UserID: vm.UserID,
+		ID: vm.ID, Name: vm.Name, UserID: vm.UserID, Pending: vm.createPending,
 		SandboxDir: vm.SandboxDir, SockDir: vm.SockDir,
 		ControlUDS: vm.ControlUDS, ForwardUDS: vm.ForwardUDS, CtlSockUDS: vm.CtlSockUDS,
 		MemMiB: vm.MemMiB, Thermal: vm.Thermal, Status: vm.Status, Token: vm.Token,
@@ -147,7 +148,7 @@ func writeRecord(rec vmRecord) {
 // fields left nil; the caller decides alive/dead and sets Agent/Status).
 func vmFromRecord(rec vmRecord) *VM {
 	return &VM{
-		ID: rec.ID, Name: rec.Name, UserID: rec.UserID,
+		ID: rec.ID, Name: rec.Name, UserID: rec.UserID, createPending: rec.Pending,
 		SandboxDir: rec.SandboxDir, SockDir: rec.SockDir,
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
@@ -262,9 +263,9 @@ func killHelper(pid int, spec, binary string) {
 // adopted paused hasn't run since: its guest can't answer until Resume.
 var errAgentInfoPaused = errors.New("not asked yet: the guest was paused when this daemon started")
 
-// An interrupted create has no committed identity or disk authority. Never
-// infer either from its overlay headers: first rule out a surviving helper,
-// then remove the directory while creators are excluded by the bases lock.
+// An interrupted create has no committed identity or disk authority, even if
+// its initial safety record exists. Rule out surviving foreign users before
+// reclaiming its directory while creators are excluded by the bases lock.
 func (e *Engine) reclaimUnrecordedSandboxes() error {
 	unlock, err := lockBases(e.cfg.DataDir, true)
 	if err != nil {
@@ -281,13 +282,22 @@ func (e *Engine) reclaimUnrecordedSandboxes() error {
 	}
 	var abandoned []string
 	specs := map[string]os.FileInfo{}
+	pending := map[string]bool{}
 	for _, de := range entries {
 		if !de.IsDir() {
 			continue
 		}
 		dir := filepath.Join(root, de.Name())
 		if _, err := os.Lstat(stateFilePath(dir)); err == nil {
-			continue
+			data, err := os.ReadFile(stateFilePath(dir))
+			if err != nil {
+				return err
+			}
+			var rec vmRecord
+			if json.Unmarshal(data, &rec) != nil || !rec.Pending {
+				continue
+			}
+			pending[dir] = true
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -329,13 +339,21 @@ func (e *Engine) reclaimUnrecordedSandboxes() error {
 		}
 		// Reclamation needs proof of disuse, not proof that a process is
 		// adoptable: old helper names and symlinked data paths remain live.
-		for _, arg := range args {
+		for argIndex, arg := range args {
 			fi, err := os.Stat(arg)
 			if err != nil {
 				continue
 			}
 			for spec, abandonedSpec := range specs {
 				if os.SameFile(fi, abandonedSpec) {
+					if pending[filepath.Dir(spec)] && argIndex == 1 && len(args) == 2 && filepath.Base(args[0]) == binary {
+						// Only an uncommitted helper with strict identity may be
+						// killed; use its actual alias for killHelper's argv check.
+						killHelper(pid, arg, e.cfg.VMMBinary)
+						if !pidAlive(pid) {
+							continue
+						}
+					}
 					return fmt.Errorf("unrecorded sandbox %s still has helper %d; preserve its disks", filepath.Dir(spec), pid)
 				}
 			}

@@ -550,6 +550,8 @@ type VM struct {
 	sandboxRef   string                 // the server's ID for the sandbox (spec.SandboxID); "" for forks/restores
 	vmmUID       uint32                 // the helper's own uid and primary gid (vmmuser.go); 0 = runs as the daemon; persisted
 
+	createPending bool // safety record exists, but initial creation has not completed
+
 	// Report an older restored agent without persisting this launch-only result.
 	reseedUnsupported bool
 }
@@ -1003,7 +1005,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	}
 
 	vm = &VM{
-		ID: id, Name: name, UserID: spec.UserID,
+		ID: id, Name: name, UserID: spec.UserID, createPending: true,
 		SandboxDir: sandboxDir, SockDir: sockDir,
 		ControlUDS: controlUDS, ForwardUDS: forwardUDS, CtlSockUDS: ctlSockUDS,
 		MemMiB: memMiB, Thermal: "hot", Status: "stopped", Token: token,
@@ -1025,7 +1027,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		return info, errNoCheckpoint
 	}
 	// A helper must never outlive a daemon without a complete disk/owner
-	// record. Recovery can then safely reclaim every dead unrecorded create.
+	// safety record. Pending creates remain reclaimable until creation succeeds.
 	vm.mu.Lock()
 	initialRecord := vm.toRecordLocked()
 	vm.mu.Unlock()
@@ -1061,6 +1063,14 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		if err != nil {
 			return info, fmt.Errorf("fork: reconcile guest network identity: %w", err)
 		}
+	}
+
+	vm.mu.Lock()
+	vm.createPending = false
+	committedRecord := vm.toRecordLocked()
+	vm.mu.Unlock()
+	if err = writeDaemonMetadata(stateFilePath(sandboxDir), committedRecord); err != nil {
+		return info, fmt.Errorf("commit sandbox state: %w", err)
 	}
 
 	e.mu.Lock()
