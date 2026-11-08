@@ -189,7 +189,10 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if img.FilePath != "" {
-		os.Remove(img.FilePath)
+		if err := s.removeImageFiles(detached(r.Context()), img.FilePath); err != nil {
+			errRespInternal(w, r, "delete image files failed", err)
+			return
+		}
 	}
 	slog.Info("image.deleted", "name", name, "user", user.Name)
 	s.RecordEvent(store.Event{
@@ -607,6 +610,8 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		errResp(w, 409, fmt.Sprintf("image %q already exists — delete first", req.Name))
+		return
 	}
 
 	if !s.loharAvailable(w) {
@@ -628,7 +633,6 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 
 	loharPath := s.loharPath
 	outputDir := filepath.Join(s.dataDir, "images", user.ID)
-	os.MkdirAll(outputDir, 0700)
 	outputPath := filepath.Join(outputDir, req.Name+".ext4")
 
 	// Run in background goroutine
@@ -639,6 +643,12 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 			delete(s.pullCancels, taskID)
 			s.pullCancelMu.Unlock()
 		}()
+		staging, err := imageStage(outputDir)
+		if err != nil {
+			s.store.FailTask(detached(ctx), taskID, "create image stage: "+err.Error())
+			return
+		}
+		defer s.removeImageFiles(context.Background(), staging)
 
 		var ociOpts []oci.Option
 		ociOpts = append(ociOpts, oci.WithProgress(func(msg string) {
@@ -651,9 +661,8 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		config, err := oci.PullAndConvert(ctx, req.Ref, outputPath, loharPath, ociOpts...)
+		config, err := oci.PullAndConvert(ctx, req.Ref, staging, loharPath, ociOpts...)
 		if err != nil {
-			os.Remove(outputPath)
 			s.store.FailTask(detached(ctx), taskID, err.Error())
 			slog.Error("image pull failed", "ref", req.Ref, "user", user.ID, "error", err)
 			s.RecordEvent(store.Event{
@@ -676,8 +685,12 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:     time.Now(),
 		}
 		if err := s.store.CreateImage(detached(ctx), img); err != nil {
-			os.Remove(outputPath)
 			s.store.FailTask(detached(ctx), taskID, "store image: "+err.Error())
+			return
+		}
+		if err := s.publishImageFiles(ctx, staging, outputPath, true); err != nil {
+			s.store.DeleteImage(detached(ctx), user.ID, req.Name)
+			s.store.FailTask(detached(ctx), taskID, "publish image: "+err.Error())
 			return
 		}
 
@@ -734,12 +747,16 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request) {
 
 	loharPath := s.loharPath
 	outputDir := filepath.Join(s.dataDir, "images", user.ID)
-	os.MkdirAll(outputDir, 0700)
 	outputPath := filepath.Join(outputDir, name+".ext4")
-
-	config, err := oci.ImportFromTarball(r.Context(), tmpFile.Name(), outputPath, loharPath)
+	staging, err := imageStage(outputDir)
 	if err != nil {
-		os.Remove(outputPath)
+		errRespInternal(w, r, "create image stage", err)
+		return
+	}
+	defer s.removeImageFiles(context.Background(), staging)
+
+	config, err := oci.ImportFromTarball(r.Context(), tmpFile.Name(), staging, loharPath)
+	if err != nil {
 		errResp(w, 400, "import failed: "+err.Error())
 		return
 	}
@@ -756,8 +773,12 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     time.Now(),
 	}
 	if err := s.store.CreateImage(detached(r.Context()), img); err != nil {
-		os.Remove(outputPath)
 		errRespInternal(w, r, "store image", err)
+		return
+	}
+	if err := s.publishImageFiles(r.Context(), staging, outputPath, true); err != nil {
+		s.store.DeleteImage(detached(r.Context()), user.ID, name)
+		errRespInternal(w, r, "publish image", err)
 		return
 	}
 
@@ -821,17 +842,21 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request) 
 	}
 
 	outputDir := filepath.Join(s.dataDir, "images", user.ID)
-	os.MkdirAll(outputDir, 0700)
 	outputPath := filepath.Join(outputDir, req.Name+".ext4")
+	staging, err := imageStage(outputDir)
+	if err != nil {
+		errRespInternal(w, r, "create image stage", err)
+		return
+	}
+	defer s.removeImageFiles(context.Background(), staging)
 
-	if err := saver.SaveImage(r.Context(), sb.EngineID, outputPath); err != nil {
-		os.Remove(outputPath)
+	if err := saver.SaveImage(r.Context(), sb.EngineID, staging); err != nil {
 		errRespInternal(w, r, "save image failed", err)
 		return
 	}
 
 	var sizeMB int
-	if fi, err := os.Stat(outputPath); err == nil {
+	if fi, err := os.Stat(staging); err == nil {
 		sizeMB = int(fi.Size() / 1024 / 1024)
 	}
 
@@ -842,8 +867,12 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request) 
 		CreatedAt: time.Now(),
 	}
 	if err := s.store.CreateImage(detached(r.Context()), img); err != nil {
-		os.Remove(outputPath)
 		errRespInternal(w, r, "store image record failed", err)
+		return
+	}
+	if err := s.publishImageFiles(r.Context(), staging, outputPath, false); err != nil {
+		s.store.DeleteImage(detached(r.Context()), user.ID, req.Name)
+		errRespInternal(w, r, "publish image", err)
 		return
 	}
 

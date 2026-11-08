@@ -631,17 +631,14 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 	// 4. Copy the overlay (reflink where the host FS supports it; else a copy —
 	// the overlay is a small delta).
 	if err := cloneFile(spec.RootDisk, dst); err != nil {
-		return fmt.Errorf("freeze: copy overlay: %w", err)
+		return errors.Join(fmt.Errorf("freeze: copy overlay: %w", err), removeImageFiles(dst))
 	}
 	if err := e.validateDiskBacking(vm, VMSpec{RootDisk: dst,
 		RootDiskFormat: spec.RootDiskFormat, Backing: spec.Backing}); err != nil {
-		_ = os.Remove(dst)
-		return fmt.Errorf("freeze: captured root disk: %w", err)
+		return errors.Join(fmt.Errorf("freeze: captured root disk: %w", err), removeImageFiles(dst))
 	}
 	if err := e.recordNodeMetadata(dst, spec.RootDiskFormat, spec.Backing); err != nil {
-		_ = os.Remove(dst)
-		_ = os.Remove(nodeMetadataPath(dst))
-		return fmt.Errorf("freeze: record image backing: %w", err)
+		return errors.Join(fmt.Errorf("freeze: record image backing: %w", err), removeImageFiles(dst))
 	}
 	return nil
 }
