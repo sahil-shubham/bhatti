@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -154,5 +155,31 @@ func TestGetUserByName(t *testing.T) {
 	_, err = s.GetUserByName(t.Context(), "nobody")
 	if err == nil {
 		t.Fatal("should error on nonexistent user")
+	}
+}
+
+func TestDeleteImageByIDPreservesSameNameReplacement(t *testing.T) {
+	s := testStore(t)
+	original := createTestImage(t, s, "usr_owner", "saved")
+	other := createTestImage(t, s, "usr_other", "saved")
+	if err := s.DeleteImageByID(t.Context(), original.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetImage(t.Context(), original.UserID, original.Name); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted registration still exists: %v", err)
+	}
+	replacement := original
+	replacement.ID = "replacement"
+	if err := s.CreateImage(t.Context(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteImageByID(t.Context(), original.ID); err != nil {
+		t.Fatalf("cleanup of an absent identity failed: %v", err)
+	}
+	for _, want := range []ImageRecord{replacement, other} {
+		got, err := s.GetImage(t.Context(), want.UserID, want.Name)
+		if err != nil || got.ID != want.ID {
+			t.Errorf("identity cleanup removed another registration: %+v, %v", got, err)
+		}
 	}
 }

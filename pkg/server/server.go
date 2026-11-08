@@ -119,6 +119,10 @@ type Server struct {
 	pullCancelMu sync.Mutex
 	pullCancels  map[string]context.CancelFunc // taskID → cancel
 
+	imageMu     sync.Mutex
+	imageGates  map[imageName]*imageGate
+	onImageLock func(string, string) // optional test hook, before acquiring the name gate
+
 	// Live WebSocket tunnels, closed on Destroy even when the guest engine
 	// leaves established streams open. No host listeners are created.
 	tunnelMu         sync.Mutex

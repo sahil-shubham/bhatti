@@ -179,6 +179,8 @@ func (s *Server) handleImageGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 	user := UserFromContext(r.Context())
 	name := r.PathValue("name")
+	unlock := s.lockImage(user.ID, name)
+	defer unlock()
 	img, err := s.store.GetImage(r.Context(), user.ID, name)
 	if err != nil {
 		errResp(w, 404, err.Error())
@@ -684,13 +686,8 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 			OCIConfigJSON: string(configJSON),
 			CreatedAt:     time.Now(),
 		}
-		if err := s.store.CreateImage(detached(ctx), img); err != nil {
-			s.store.FailTask(detached(ctx), taskID, "store image: "+err.Error())
-			return
-		}
-		if err := s.publishImageFiles(ctx, staging, outputPath, true); err != nil {
-			s.store.DeleteImage(detached(ctx), user.ID, req.Name)
-			s.store.FailTask(detached(ctx), taskID, "publish image: "+err.Error())
+		if err := s.registerImage(ctx, img, staging, true); err != nil {
+			s.store.FailTask(detached(ctx), taskID, "register image: "+err.Error())
 			return
 		}
 
@@ -772,13 +769,8 @@ func (s *Server) handleImageImport(w http.ResponseWriter, r *http.Request) {
 		OCIConfigJSON: string(configJSON),
 		CreatedAt:     time.Now(),
 	}
-	if err := s.store.CreateImage(detached(r.Context()), img); err != nil {
-		errRespInternal(w, r, "store image", err)
-		return
-	}
-	if err := s.publishImageFiles(r.Context(), staging, outputPath, true); err != nil {
-		s.store.DeleteImage(detached(r.Context()), user.ID, name)
-		errRespInternal(w, r, "publish image", err)
+	if err := s.registerImage(r.Context(), img, staging, true); err != nil {
+		errRespInternal(w, r, "register image", err)
 		return
 	}
 
@@ -866,13 +858,8 @@ func (s *Server) handleSandboxSaveImage(w http.ResponseWriter, r *http.Request) 
 		FilePath: outputPath, SizeMB: sizeMB,
 		CreatedAt: time.Now(),
 	}
-	if err := s.store.CreateImage(detached(r.Context()), img); err != nil {
-		errRespInternal(w, r, "store image record failed", err)
-		return
-	}
-	if err := s.publishImageFiles(r.Context(), staging, outputPath, false); err != nil {
-		s.store.DeleteImage(detached(r.Context()), user.ID, req.Name)
-		errRespInternal(w, r, "publish image", err)
+	if err := s.registerImage(r.Context(), img, staging, false); err != nil {
+		errRespInternal(w, r, "register image", err)
 		return
 	}
 

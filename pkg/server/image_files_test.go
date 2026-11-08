@@ -26,9 +26,10 @@ import (
 
 type imageFilesEngine struct {
 	engine.Engine
-	save      func(context.Context, string, string) error
-	removed   chan string
-	published chan bool
+	save          func(context.Context, string, string) error
+	removed       chan string
+	published     chan bool
+	beforePublish func(string, string, bool) error
 }
 
 func imageTestSidecar(path string) string {
@@ -61,6 +62,11 @@ func (e *imageFilesEngine) PublishSavedImage(_ context.Context, staging, final s
 }
 
 func (e *imageFilesEngine) publish(staging, final string, raw bool) error {
+	if e.beforePublish != nil {
+		if err := e.beforePublish(staging, final, raw); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(staging, final); err != nil {
 		return err
 	}
@@ -180,9 +186,16 @@ func TestSaveImageFailureCleansOnlyItsStagedPair(t *testing.T) {
 
 func TestRawImagePublishersReplaceMetadataAndCleanFailures(t *testing.T) {
 	for _, publisher := range []string{"import", "pull"} {
-		for _, failure := range []string{"none", "conversion", "registration"} {
+		for _, failure := range []string{"none", "conversion", "registration", "publication"} {
 			t.Run(publisher+"/"+failure, func(t *testing.T) {
 				s, ts, e := imageLifecycleFixture(t)
+				e.beforePublish = func(_, _ string, _ bool) error {
+					assertImageGateHeld(t, s, "usr_test", "raw")
+					if failure == "publication" {
+						return errors.New("injected image publication failure")
+					}
+					return nil
+				}
 				if failure == "conversion" {
 					t.Setenv("BHATTI_TEST_MKE2FS_EXIT", "1")
 				}
@@ -230,7 +243,7 @@ func TestRawImagePublishersReplaceMetadataAndCleanFailures(t *testing.T) {
 					want := http.StatusCreated
 					if failure == "conversion" {
 						want = http.StatusBadRequest
-					} else if failure == "registration" {
+					} else if failure == "registration" || failure == "publication" {
 						want = http.StatusInternalServerError
 					}
 					if resp.StatusCode != want {
@@ -276,6 +289,9 @@ func TestRawImagePublishersReplaceMetadataAndCleanFailures(t *testing.T) {
 					}
 					if _, err := os.Stat(final); !errors.Is(err, os.ErrNotExist) {
 						t.Fatalf("failed publisher left a final disk: %v", err)
+					}
+					if _, err := s.store.GetImage(t.Context(), "usr_test", "raw"); !errors.Is(err, store.ErrNotFound) {
+						t.Fatalf("failed publisher retained its registration: %v", err)
 					}
 				}
 			})

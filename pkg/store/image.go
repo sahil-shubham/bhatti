@@ -98,6 +98,13 @@ func (s *Store) DeleteImage(ctx context.Context, userID, name string) error {
 	return nil
 }
 
+// DeleteImageByID removes only the registration owned by a failed publisher.
+// A missing identity is already clean; a same-name replacement is not ours.
+func (s *Store) DeleteImageByID(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM images WHERE id = ?`, id)
+	return err
+}
+
 // --- Image Sharing ---
 
 // ShareImage grants a user access to an image.
