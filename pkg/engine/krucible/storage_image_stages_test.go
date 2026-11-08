@@ -11,6 +11,11 @@ import (
 func storageStartupConfig(t *testing.T, data, base string) Config {
 	t.Helper()
 	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		// testing's shared temp parent is outside DataDir, so production
+		// confinement correctly refuses to change its DAC for the fixture.
+		if err := os.Chmod(filepath.Dir(data), 0o711); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := os.Stat("/dev/kvm"); errors.Is(err, os.ErrNotExist) {
 			f, err := os.OpenFile("/dev/kvm", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o666)
 			if err != nil {

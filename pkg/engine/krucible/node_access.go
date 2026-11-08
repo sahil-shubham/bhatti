@@ -425,6 +425,10 @@ func (e *Engine) migrateNodeAccess() error {
 		if !fi.Mode().IsRegular() {
 			return fmt.Errorf("%s is not a plain node-store file", path)
 		}
+		// Publication pins alias disk data, not private daemon metadata.
+		if numberedStage(de.Name(), ".publish-", "") {
+			continue
+		}
 		if strings.HasPrefix(de.Name(), ".") && fi.Sys().(*syscall.Stat_t).Nlink != 1 {
 			_ = setNodeAccess(path, 0)
 			return fmt.Errorf("%s has an alias to hidden node metadata", path)

@@ -696,10 +696,13 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = cleanImageStages(cfg.DataDir)
+	err = reconcileNodePublications(cfg.DataDir)
+	if err == nil {
+		err = cleanImageStages(cfg.DataDir)
+	}
 	unlockStorage()
 	if err != nil {
-		return nil, fmt.Errorf("krucible: clean image stages: %w", err)
+		return nil, fmt.Errorf("krucible: reconcile storage publications: %w", err)
 	}
 	if err := eng.migrateNodeAccess(); err != nil {
 		return nil, fmt.Errorf("krucible: migrate node access: %w", err)
