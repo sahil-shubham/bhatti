@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
+	"github.com/sahil-shubham/bhatti/pkg/launchgate"
 )
 
 // placementEngine is an engine in systemd mode on a fake systemd whose helpers
@@ -482,7 +483,9 @@ func TestSpawnedGatewayIsPlacedBeforeItListens(t *testing.T) {
 	}
 	// The gate travels in the environment: argv is how every daemon release
 	// recognises its gateway, and must stay what it was before placement.
-	if args, err := procArgs(pid); err == nil && strings.Contains(strings.Join(args, " "), "gate") {
+	if args, err := procArgs(pid); err == nil && slices.ContainsFunc(args, func(a string) bool {
+		return strings.HasPrefix(a, "--gate") || strings.Contains(a, launchgate.Env)
+	}) {
 		t.Fatalf("netd argv %q carries the launch gate", args)
 	}
 }
