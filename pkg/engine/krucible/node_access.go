@@ -222,12 +222,23 @@ func setNodeAccess(path string, gid uint32) error {
 	return setNodeAccessMode(path, gid, gid != 0)
 }
 
+type nodeAccessFile interface {
+	Stat() (os.FileInfo, error)
+	Chmod(os.FileMode) error
+	Chown(int, int) error
+	Sync() error
+}
+
 func setNodeAccessMode(path string, gid uint32, readable bool) error {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	return applyNodeAccess(f, path, gid, readable)
+}
+
+func applyNodeAccess(f nodeAccessFile, path string, gid uint32, readable bool) error {
 	fi, err := f.Stat()
 	if err != nil {
 		return err
@@ -235,14 +246,29 @@ func setNodeAccessMode(path string, gid uint32, readable bool) error {
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a plain node file", path)
 	}
-	if err := f.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := f.Chown(0, int(gid)); err != nil {
-		return err
-	}
+	mode := os.FileMode(0o600)
 	if readable {
-		if err := f.Chmod(0o640); err != nil {
+		mode = 0o640
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	current := fi.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+	if st.Uid == 0 && st.Gid == gid && current == mode {
+		return nil
+	}
+	// Only a group transition needs to revoke the old group's access.
+	if st.Gid != gid {
+		if err := f.Chmod(0o600); err != nil {
+			return err
+		}
+		current = 0o600
+	}
+	if st.Uid != 0 || st.Gid != gid {
+		if err := f.Chown(0, int(gid)); err != nil {
+			return err
+		}
+	}
+	if current != mode {
+		if err := f.Chmod(mode); err != nil {
 			return err
 		}
 	}
