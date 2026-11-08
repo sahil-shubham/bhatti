@@ -131,8 +131,8 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   fix for virtio-fs snapshot restore). (3) the unified-node DAG/listing UX.
 
 **Snapshot nodes and disk authority (2026-11-08):**
-- **Disk preparation is independent of the saved delta.** A normal resume makes a
-  qcow2 overlay over each immutable snapshot disk, rather than copying that disk.
+- **Disk preparation is independent of the saved delta.** An owner-assigned resume
+  makes a qcow2 overlay over each immutable snapshot disk, rather than copying it.
   The node store names those disks by `<DataDir>/nodes/<dev>-<ino>.img` hard links;
   clones share the saved blocks but write only their own overlays. An incompatible
   filesystem, a relative backing name, a raw disk whose size is not sector-aligned,
@@ -147,6 +147,10 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   cannot select a driver. A raw disk or raw ancestor is never parsed for a header.
   Sandbox records, saved-image sidecars and hidden node metadata preserve the same
   per-disk information for GC and after a fork's staging directory disappears.
+  Root creation converts any regular shared tier image into a content-addressed
+  base under the exclusive lease before shared disk preparation, then resolves
+  the base again. Shared preparation refuses a still-unmigrated tier rather than
+  recording a tier path that a later update could retarget.
   Image sidecars additionally bind authority to the disk's device/inode identity.
   Publication durably records its final pathname before renaming the disk, then
   the sidecar; startup finishes the sidecar rename only if that identity matches
@@ -183,6 +187,9 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   sweeps and snapshot deletion warn and ignore the whole directory: it grants no
   authority and pins no nodes. Capture's shared lease excludes a live capture
   from this treatment; resume still refuses unauthorized legacy ancestors.
+  An explicit ownership refusal or a missing file anywhere in the chain permits
+  that skip: a gap is already unrestorable. Other errors, including permission
+  failures and malformed or truncated headers, stop reclamation and preserve bases.
 - **GC and dependents use the metadata graph.** Raw bytes never name or pin a node.
   Nodes remain while a recorded sandbox, snapshot, image or external hard link
   holds them. Multiple physical store names for one inode are internal aliases,
@@ -191,15 +198,20 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   exposing the final store name. Startup reconciles interrupted node publications
   under the exclusive lease before root-Linux access migration; publication data
   pins are not classified as metadata. Sweeps reconcile later interrupted node
-  publications too. Copied node adoption and missing-base import copies publish
-  by rename, without retrying a hard link on hard-link-free filesystems.
-  Completed hidden image stages with trusted metadata are GC roots at runtime;
-  startup removes publisher stages before its sweep, when no publisher can run.
+  publications too. Copied node adoption publishes by rename; a missing-base
+  import copy uses a non-replacing rename and compares existing full hashes.
+  A filesystem without exclusive rename support fails rather than replacing a
+  base. Completed hidden image stages with trusted metadata are GC roots at
+  runtime; startup removes only generated `.image-<digits>.ext4` stages before
+  its sweep, when no publisher can run.
   Before reclaiming an unrecorded or pending-create directory, recovery compares
   readable process arguments to the spec by file identity, including symlinked
   paths and old executable names. A pending helper is killed only when its two
   arguments identify the configured helper basename and that same spec inode;
   any other live reference makes recovery refuse to remove the disks.
+  New engines absolutize DataDir before launching helpers. A legacy relative
+  argument ending in `<sandbox>/vmspec.json` is conservatively preserved, never
+  used as sufficient identity to kill a process.
   The pre-launch safety record is pending until engine creation completes.
   This does not close the existing crash window after engine creation returns
   and before the server inserts its database row; that engine-completed sandbox
@@ -224,10 +236,13 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
 - **Confinement and the remaining admission limit.** A root Linux daemon assigns
   node disks durable, owner-scoped synthetic groups, disjoint from helper and netd
   identity ranges. A node is daemon-only before publication; only its owner's
-  group receives read access. Anonymous engine callers share one anonymous
-  storage scope, independent of network scopes. Forks inherit the source's
-  storage owner even without a NIC, without starting a gateway. Reusing a node
-  with correct permissions never transiently revokes its owner's read access.
+  group receives read access. Historical empty owners cannot be distinguished
+  from genuine anonymous callers: on root Linux they therefore restore roots
+  and volumes by private copy, including private backing ancestors, and never
+  read node-store files. Their groups remain per-sandbox, not one merged scope.
+  Non-root behavior is unchanged. Forks inherit the source's storage owner even
+  without a NIC, without starting a gateway. Reusing a node with correct
+  permissions never transiently revokes its owner's read access.
   Private nodes are never opened to the universal helper group, even without
   Landlock. This owner-scoped DAC guarantee applies to root Linux, not non-root
   daemons or macOS. Startup migrates pre-change permissions, but a direct
