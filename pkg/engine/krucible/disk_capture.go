@@ -1,6 +1,7 @@
 package krucible
 
 import (
+	"context"
 	"fmt"
 	"slices"
 )
@@ -74,9 +75,9 @@ func validateCaptureDisk(path, source, format string, chain []diskLayer, legacy 
 
 // Only a daemon-owned captured disk may gain explicit formats or rebased links.
 // A relative top pointer still resolves from the source, not the capture dir.
-func (e *Engine) normalizeCapturedDisk(path, source, format string, chain []diskLayer, legacy bool) ([]diskLayer, error) {
+func (e *Engine) normalizeCapturedDisk(ctx context.Context, path, source, format string, chain []diskLayer, legacy bool) ([]diskLayer, error) {
 	if !legacy {
 		return chain, validateRecordedDisk(path, format, chain)
 	}
-	return e.normalizeLegacyDiskCopy(path, source, format, chain)
+	return e.normalizeLegacyDiskCopy(ctx, path, source, format, chain)
 }

@@ -1,6 +1,7 @@
 package krucible
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -403,7 +404,7 @@ func (e *Engine) confineCheckpoint(dir string) (string, func() error, error) {
 // hand the helper — spec, but with volumes and a restore's checkpoint linked
 // into the sandbox dir — the policy file to name in VMMPolicyEnv, and what to
 // undo once the launch is over.
-func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, string, func(), error) {
+func (e *Engine) confineLaunch(ctx context.Context, vm *VM, spec VMSpec, specPath string) (VMSpec, string, func(), error) {
 	cleanup := func() {}
 	fail := func(err error) (VMSpec, string, func(), error) { cleanup(); return spec, "", func() {}, err }
 	var uid, nodeGID uint32
@@ -568,7 +569,7 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 			if path, err := linkInto(src, dst); err != nil {
 				return fail(err)
 			} else if path == src { // on another filesystem
-				if err := cloneFile(src, dst); err != nil {
+				if err := cloneFile(ctx, src, dst); err != nil {
 					return fail(err)
 				}
 			}

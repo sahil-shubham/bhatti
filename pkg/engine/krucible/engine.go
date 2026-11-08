@@ -941,7 +941,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// snapshot's device set (so a memory restore's RAM view of its disks stays
 	// valid), as a disk of this sandbox's own over it. The captured config
 	// already carries the guest mount points, so no cdVolumes entry is needed.
-	if err = e.layerRestoredVolumes(sandboxDir, &baseSpec, opts.restoreVolumes); err != nil {
+	if err = e.layerRestoredVolumes(ctx, sandboxDir, &baseSpec, opts.restoreVolumes); err != nil {
 		return info, err
 	}
 
@@ -953,9 +953,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		var rootBacking []diskLayer
 		var perr error
 		if opts.nodeDisk != "" {
-			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(sandboxDir, opts.nodeDisk, opts.nodeOwned, opts.nodeFormat)
+			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(ctx, sandboxDir, opts.nodeDisk, opts.nodeOwned, opts.nodeFormat)
 		} else {
-			rootImg, rootFormat, rootBase, rootBacking, perr = e.prepareRootDisk(sandboxDir, spec)
+			rootImg, rootFormat, rootBase, rootBacking, perr = e.prepareRootDisk(ctx, sandboxDir, spec)
 		}
 		if perr != nil {
 			return info, perr
@@ -1092,7 +1092,7 @@ func (e *Engine) launch(ctx context.Context, vm *VM, snapshotDir string) (err er
 	if e.confineVMM {
 		var done func()
 		var err error
-		if spec, policy, done, err = e.confineLaunch(vm, spec, specPath); err != nil {
+		if spec, policy, done, err = e.confineLaunch(ctx, vm, spec, specPath); err != nil {
 			return fmt.Errorf("confine vmm helper: %w", err)
 		}
 		defer done()
@@ -1603,8 +1603,8 @@ func (e *Engine) rootImageMetadata(base, ownerID string) (diskMetadata, bool, er
 // base, returning the disk, its explicit format, the base and the root's chain.
 // It holds the bases lock shared from picking the base until the disk names
 // it, so GC can't remove the base in between.
-func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (root, format, base string, backing []diskLayer, err error) {
-	unlock, err := lockBases(e.cfg.DataDir, false)
+func (e *Engine) prepareRootDisk(ctx context.Context, sandboxDir string, spec engine.SandboxSpec) (root, format, base string, backing []diskLayer, err error) {
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
 	if err != nil {
 		return "", "", "", nil, fmt.Errorf("lock base images: %w", err)
 	}
@@ -1626,7 +1626,7 @@ func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (ro
 			return "", "", "", nil, fmt.Errorf("a raw root requires a raw base image")
 		}
 		root = filepath.Join(sandboxDir, "root.img")
-		if err := cloneFile(base, root); err != nil {
+		if err := cloneFile(ctx, base, root); err != nil {
 			return "", "", "", nil, fmt.Errorf("clone base image: %w", err)
 		}
 		if err := growFile(root, spec.DiskSizeMB); err != nil {
@@ -1641,7 +1641,7 @@ func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (ro
 		}
 		source, chain := base, metadata.backing
 		if !trusted {
-			source, chain, err = e.normalizeLegacyDisk(sandboxDir, base, metadata.format, metadata.backing)
+			source, chain, err = e.normalizeLegacyDisk(ctx, sandboxDir, base, metadata.format, metadata.backing)
 			if err != nil {
 				return "", "", "", nil, fmt.Errorf("normalize legacy image: %w", err)
 			}
@@ -1650,7 +1650,7 @@ func (e *Engine) prepareRootDisk(sandboxDir string, spec engine.SandboxSpec) (ro
 			if err := os.Rename(source, root); err != nil {
 				return "", "", "", nil, fmt.Errorf("move normalized image: %w", err)
 			}
-		} else if err := cloneFile(base, root); err != nil {
+		} else if err := cloneFile(ctx, base, root); err != nil {
 			return "", "", "", nil, fmt.Errorf("clone qcow2 image: %w", err)
 		}
 		backing = chain
@@ -1808,17 +1808,23 @@ func buildBaseImage(srcDir, dst string) error {
 
 // cloneFile CoW-clones a file (APFS clonefile on darwin, reflink on linux),
 // falling back to a plain copy.
-func cloneFile(src, dst string) error {
+func cloneFile(ctx context.Context, src, dst string) error {
 	var primary *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		primary = exec.Command("cp", "-c", src, dst) // clonefile
+		primary = exec.CommandContext(ctx, "cp", "-c", src, dst) // clonefile
 	default:
-		primary = exec.Command("cp", "--reflink=auto", src, dst)
+		primary = exec.CommandContext(ctx, "cp", "--reflink=auto", src, dst)
 	}
 	if out, err := primary.CombinedOutput(); err != nil {
-		fallback := exec.Command("cp", src, dst)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		fallback := exec.CommandContext(ctx, "cp", src, dst)
 		if out2, err2 := fallback.CombinedOutput(); err2 != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("clone image (%v: %s) and fallback (%v: %s) both failed",
 				err, out, err2, out2)
 		}

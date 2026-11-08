@@ -446,7 +446,7 @@ func TestSnapshotRestorePolicyCannotReadOrWriteLocalManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	vm := &VM{ID: "restored", UserID: "u1", SandboxDir: filepath.Dir(root), SockDir: shortSockDir(t)}
-	helper, _, cleanup, err := f.e.confineLaunch(vm, spec, vm.specPath())
+	helper, _, cleanup, err := f.e.confineLaunch(t.Context(), vm, spec, vm.specPath())
 	if err != nil {
 		t.Fatal(err)
 	}

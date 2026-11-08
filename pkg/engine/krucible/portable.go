@@ -600,11 +600,11 @@ func (e *Engine) ImportSnapshot(ctx context.Context, r io.Reader, destDir string
 	if needBase {
 		base = e.keptBasePath(am.Base.SHA256, am.Base.Name)
 	}
-	if adopted, err = e.rebuildChains(destDir, &am, base); err != nil {
+	if adopted, err = e.rebuildChains(ctx, destDir, &am, base); err != nil {
 		return imp, err
 	}
 	if needBase {
-		if _, err := e.keepBase(filepath.Join(destDir, archiveBaseFile), am.Base.SHA256, am.Base.Name); err != nil {
+		if _, err := e.keepBase(ctx, filepath.Join(destDir, archiveBaseFile), am.Base.SHA256, am.Base.Name); err != nil {
 			return imp, err
 		}
 	}
@@ -804,7 +804,7 @@ func rewriteArchiveBacking(path, backing, format, headerFormat string) error {
 // a header is rewritten before the file is linked into the store, and a node
 // is never changed once it is there. Each layer's file in destDir is gone
 // afterwards: the store holds it, and the disk above names it.
-func (e *Engine) rebuildChains(destDir string, am *archiveManifest, base string) (nodes []string, err error) {
+func (e *Engine) rebuildChains(ctx context.Context, destDir string, am *archiveManifest, base string) (nodes []string, err error) {
 	below := make(map[string]archiveLayer, len(am.Layers))
 	for _, l := range am.Layers {
 		below[l.Over] = l
@@ -851,7 +851,7 @@ func (e *Engine) rebuildChains(destDir string, am *archiveManifest, base string)
 			if hasBase {
 				dependencies = append(dependencies, diskLayer{Path: base, Format: "raw"})
 			}
-			node, err := e.adoptNode(path, chain[i].Format, dependencies)
+			node, err := e.adoptNode(ctx, path, chain[i].Format, dependencies)
 			if err != nil {
 				return nodes, fmt.Errorf("import: %w", err)
 			}
@@ -1209,7 +1209,7 @@ var linkBase = os.Link
 // against sum, its sha256) into the bases directory, where later imports find
 // it. A base there is never replaced: one already under the name is used if it
 // holds the same bytes.
-func (e *Engine) keepBase(src, sum, name string) (string, error) {
+func (e *Engine) keepBase(ctx context.Context, src, sum, name string) (string, error) {
 	dir := basesDir(e.cfg.DataDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("import: %w", err)
@@ -1224,7 +1224,7 @@ func (e *Engine) keepBase(src, sum, name string) (string, error) {
 	if err != nil && !errors.Is(err, fs.ErrExist) {
 		// Hard links unavailable: copy beside the bases, then publish by rename.
 		tmp := filepath.Join(dir, "."+filepath.Base(dst)+".partial")
-		if cerr := cloneFile(src, tmp); cerr != nil {
+		if cerr := cloneFile(ctx, src, tmp); cerr != nil {
 			os.Remove(tmp)
 			return "", fmt.Errorf("import: keep base image: %w", errors.Join(err, cerr))
 		}

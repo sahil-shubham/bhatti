@@ -619,7 +619,7 @@ func nodeDACTestBinary(t *testing.T, root string) string {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(root, "dac-child")
-	if err := cloneFile(executable, binary); err != nil {
+	if err := cloneFile(t.Context(), executable, binary); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(binary, 0o755); err != nil {
@@ -701,14 +701,14 @@ func nodeDACVM(t *testing.T, f *nodeFixture, owner, id string, layered bool) (*V
 			t.Fatal(err)
 		}
 		var parent VMSpec
-		if err := f.e.layerRestoredVolumes(parentDir, &parent, []restoreVol{{path: source, format: "raw"}}); err != nil {
+		if err := f.e.layerRestoredVolumes(t.Context(), parentDir, &parent, []restoreVol{{path: source, format: "raw"}}); err != nil {
 			t.Fatal(err)
 		}
 		frozen := filepath.Join(snapshot, "vol1.img")
-		if err := cloneFile(parent.Volumes[0].Path, frozen); err != nil {
+		if err := cloneFile(t.Context(), parent.Volumes[0].Path, frozen); err != nil {
 			t.Fatal(err)
 		}
-		if err := f.e.layerRestoredVolumes(vm.SandboxDir, &spec, []restoreVol{{path: frozen, format: "qcow2"}}); err != nil {
+		if err := f.e.layerRestoredVolumes(t.Context(), vm.SandboxDir, &spec, []restoreVol{{path: frozen, format: "qcow2"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -718,7 +718,7 @@ func nodeDACVM(t *testing.T, f *nodeFixture, owner, id string, layered bool) (*V
 	if err := os.WriteFile(vm.specPath(), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, policy, cleanup, err := f.e.confineLaunch(vm, spec, vm.specPath())
+	_, policy, cleanup, err := f.e.confineLaunch(t.Context(), vm, spec, vm.specPath())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -305,7 +305,7 @@ func TestNewRootNamesTheBaseNotTheTier(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		root, format, got, _, err := e.prepareRootDisk(dir, spec)
+		root, format, got, _, err := e.prepareRootDisk(t.Context(), dir, spec)
 		if err != nil {
 			t.Fatal(err)
 		}

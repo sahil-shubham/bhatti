@@ -18,7 +18,7 @@ func TestImageDeleteAndRawReplacementRetireSavedMetadata(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloneFile(source, image); err != nil {
+	if err := cloneFile(t.Context(), source, image); err != nil {
 		t.Fatal(err)
 	}
 	chain, err := readDiskChain(source, "qcow2", nil)
@@ -62,7 +62,7 @@ func TestImageDeleteAndRawReplacementRetireSavedMetadata(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	root, format, base, backing, err := f.e.prepareRootDisk(dir, engine.SandboxSpec{BaseImage: image, UserID: "u1"})
+	root, format, base, backing, err := f.e.prepareRootDisk(t.Context(), dir, engine.SandboxSpec{BaseImage: image, UserID: "u1"})
 	if err != nil {
 		t.Fatalf("create from same-name raw replacement: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestSavedImagePublicationMovesDiskAndMetadata(t *testing.T) {
 	f := newNodeFixture(t)
 	source := f.freshRoot("source")
 	staging, image := filepath.Join(f.data, "images", ".save.ext4"), filepath.Join(f.data, "images", "saved.ext4")
-	if err := cloneFile(source, staging); err != nil {
+	if err := cloneFile(t.Context(), source, staging); err != nil {
 		t.Fatal(err)
 	}
 	chain, err := readDiskChain(staging, "qcow2", nil)

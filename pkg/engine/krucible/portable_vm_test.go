@@ -188,7 +188,7 @@ func TestKrucibleSnapshotImportRefusesAnotherCPU(t *testing.T) {
 			copyDir := filepath.Join(t.TempDir(), "cpu")
 			os.MkdirAll(copyDir, 0o700)
 			for _, f := range []string{checkpointFile, memoryFile, "rootfs.qcow2", snapshotManifestFile} {
-				if err := cloneFile(filepath.Join(dir, f), filepath.Join(copyDir, f)); err != nil {
+				if err := cloneFile(t.Context(), filepath.Join(dir, f), filepath.Join(copyDir, f)); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -1,6 +1,7 @@
 package krucible
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,18 +12,18 @@ import (
 // Legacy inference must not turn the frozen source into a new trust record.
 // Only new daemon-written copies receive explicit formats and rebased links.
 // The caller holds the shared bases lock and sweeps unreferenced nodes on error.
-func (e *Engine) normalizeLegacyDisk(dir, path, format string, chain []diskLayer) (string, []diskLayer, error) {
+func (e *Engine) normalizeLegacyDisk(ctx context.Context, dir, path, format string, chain []diskLayer) (string, []diskLayer, error) {
 	if err := validateRecordedDisk(path, format, chain); err == nil {
 		return path, chain, nil
 	}
 	if _, err := validateLegacyDisk(path, path, format, chain); err != nil {
 		return "", nil, err
 	}
-	copyPath, err := copyLegacyDisk(dir, path)
+	copyPath, err := copyLegacyDisk(ctx, dir, path)
 	if err != nil {
 		return "", nil, err
 	}
-	normalized, err := e.normalizeLegacyDiskCopy(copyPath, path, format, chain)
+	normalized, err := e.normalizeLegacyDiskCopy(ctx, copyPath, path, format, chain)
 	if err != nil {
 		return "", nil, errors.Join(err, os.Remove(copyPath))
 	}
@@ -76,7 +77,7 @@ func validateLegacyDisk(path, source, format string, chain []diskLayer) (int, er
 
 // path is already a private copy. Leave strict ancestors alone; copy only
 // ancestors needing an explicit format, an absolute pointer, or a new child.
-func (e *Engine) normalizeLegacyDiskCopy(path, source, format string, chain []diskLayer) (normalized []diskLayer, err error) {
+func (e *Engine) normalizeLegacyDiskCopy(ctx context.Context, path, source, format string, chain []diskLayer) (normalized []diskLayer, err error) {
 	qcowCount, err := validateLegacyDisk(path, source, format, chain)
 	if err != nil {
 		return nil, err
@@ -109,7 +110,7 @@ func (e *Engine) normalizeLegacyDiskCopy(path, source, format string, chain []di
 		if !relative && (expected == nil || (headerFormat == backingFormat && expected.Path == backing)) {
 			continue
 		}
-		copyPath, err := copyLegacyDisk(filepath.Dir(path), ancestor)
+		copyPath, err := copyLegacyDisk(ctx, filepath.Dir(path), ancestor)
 		if err != nil {
 			return nil, err
 		}
@@ -121,7 +122,7 @@ func (e *Engine) normalizeLegacyDiskCopy(path, source, format string, chain []di
 		if err := rewriteArchiveBacking(copyPath, backing, backingFormat, headerFormat); err != nil {
 			return nil, fmt.Errorf("normalize legacy disk %s: %w", ancestor, err)
 		}
-		node, err := e.adoptNode(copyPath, "qcow2", normalized[i:])
+		node, err := e.adoptNode(ctx, copyPath, "qcow2", normalized[i:])
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +155,7 @@ func (e *Engine) normalizeLegacyDiskCopy(path, source, format string, chain []di
 	return normalized, nil
 }
 
-func copyLegacyDisk(dir, source string) (string, error) {
+func copyLegacyDisk(ctx context.Context, dir, source string) (string, error) {
 	f, err := os.CreateTemp(dir, "disk-*.qcow2")
 	if err != nil {
 		return "", err
@@ -163,7 +164,7 @@ func copyLegacyDisk(dir, source string) (string, error) {
 	if err := f.Close(); err != nil {
 		return "", errors.Join(err, os.Remove(path))
 	}
-	if err := cloneFile(source, path); err != nil {
+	if err := cloneFile(ctx, source, path); err != nil {
 		return "", errors.Join(err, os.Remove(path))
 	}
 	if err := os.Chmod(path, 0o600); err != nil {

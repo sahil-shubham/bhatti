@@ -505,7 +505,7 @@ func readDiskChainWithInference(path, format string, authorize func(string) erro
 //
 // The caller holds the bases lock shared, until dst names what it was made
 // over.
-func (e *Engine) layerOn(dst, src string, own bool, format string) (string, error) {
+func (e *Engine) layerOn(ctx context.Context, dst, src string, own bool, format string) (string, error) {
 	real, err := resolveBasePath(src)
 	if err != nil {
 		return "", fmt.Errorf("disk %s: %w", src, err)
@@ -536,7 +536,7 @@ func (e *Engine) layerOn(dst, src string, own bool, format string) (string, erro
 		if backing != "" && !filepath.IsAbs(backing) {
 			// A hard link cannot rebase a header without changing the frozen
 			// source too. Only the new disk gets an absolute backing name.
-			return format, moveOrClone(real, dst, own, format)
+			return format, moveOrClone(ctx, real, dst, own, format)
 		}
 	case "raw":
 	default:
@@ -545,14 +545,14 @@ func (e *Engine) layerOn(dst, src string, own bool, format string) (string, erro
 	switch {
 	case depth+1 > maxChainDepth:
 		slog.Debug("krucible.node.flatten", "disk", real, "depth", depth, "max", maxChainDepth)
-		return format, moveOrClone(real, dst, own, format)
+		return format, moveOrClone(ctx, real, dst, own, format)
 	case format == "raw" && size%512 != 0:
-		return format, moveOrClone(real, dst, own, format)
+		return format, moveOrClone(ctx, real, dst, own, format)
 	}
 	node, err := e.linkNodeMetadata(real, format, chain)
 	if errors.Is(err, errNoNodeLink) {
 		slog.Warn("krucible.node.copy", "disk", real, "reason", err)
-		return format, moveOrClone(real, dst, own, format)
+		return format, moveOrClone(ctx, real, dst, own, format)
 	}
 	if err != nil {
 		return "", err
@@ -563,7 +563,7 @@ func (e *Engine) layerOn(dst, src string, own bool, format string) (string, erro
 // moveOrClone puts the disk at src at dst: moved if the caller owns it and the
 // two share a file system, else copied. A relative backing name must keep its
 // old meaning when the containing disk changes directories.
-func moveOrClone(src, dst string, own bool, format string) error {
+func moveOrClone(ctx context.Context, src, dst string, own bool, format string) error {
 	var backing string
 	if format == "qcow2" {
 		name, err := qcow2Backing(src)
@@ -582,7 +582,7 @@ func moveOrClone(src, dst string, own bool, format string) error {
 		moved = os.Rename(src, dst) == nil
 	}
 	if !moved {
-		if err := cloneFile(src, dst); err != nil {
+		if err := cloneFile(ctx, src, dst); err != nil {
 			return err
 		}
 	}
@@ -1541,7 +1541,7 @@ func (e *Engine) RemoveSnapshot(ctx context.Context, snapDir string) error {
 // prepareNodeRoot makes a resumed or forked sandbox's root disk in sandboxDir:
 // an overlay over the snapshot's disk. It returns what prepareRootDisk does,
 // with the snapshot's disk in the place of the base.
-func (e *Engine) prepareNodeRoot(sandboxDir, disk string, own bool, sourceFormat string) (root, format, base string, err error) {
+func (e *Engine) prepareNodeRoot(ctx context.Context, sandboxDir, disk string, own bool, sourceFormat string) (root, format, base string, err error) {
 	if !rootQcow2() {
 		return "", "", "", fmt.Errorf("a snapshot restores onto a qcow2 root, and KRUCIBLE_ROOT_RAW is set")
 	}
@@ -1551,7 +1551,7 @@ func (e *Engine) prepareNodeRoot(sandboxDir, disk string, own bool, sourceFormat
 	}
 	defer unlock()
 	root = filepath.Join(sandboxDir, "root.qcow2")
-	if format, err = e.layerOn(root, disk, own, sourceFormat); err != nil {
+	if format, err = e.layerOn(ctx, root, disk, own, sourceFormat); err != nil {
 		return "", "", "", fmt.Errorf("layer the root disk over the snapshot's: %w", err)
 	}
 	return root, format, disk, nil
@@ -1562,7 +1562,7 @@ func (e *Engine) prepareNodeRoot(sandboxDir, disk string, own bool, sourceFormat
 // writes stay in this sandbox. A read-only volume gets one too: what the
 // helper opens is then never the frozen file itself, and the overlay is what
 // names it in the disk's recorded lifetime graph.
-func (e *Engine) layerRestoredVolumes(sandboxDir string, spec *VMSpec, vols []restoreVol) error {
+func (e *Engine) layerRestoredVolumes(ctx context.Context, sandboxDir string, spec *VMSpec, vols []restoreVol) error {
 	if len(vols) == 0 {
 		return nil
 	}
@@ -1574,7 +1574,7 @@ func (e *Engine) layerRestoredVolumes(sandboxDir string, spec *VMSpec, vols []re
 	for _, rv := range vols {
 		idx := len(spec.Volumes)
 		dst := filepath.Join(sandboxDir, fmt.Sprintf("restorevol%d.img", idx))
-		format, err := e.layerOn(dst, rv.path, rv.owned, rv.format)
+		format, err := e.layerOn(ctx, dst, rv.path, rv.owned, rv.format)
 		if err != nil {
 			return fmt.Errorf("restore volume %d: %w", idx, err)
 		}
@@ -1837,7 +1837,7 @@ func ownedNodeKeys(dataDir, ownerID string) (map[fileKey]bool, error) {
 // adoptNode returns the name in the node store of the disk at path, which an
 // import has unpacked and is done with: linked there, or copied in where a
 // link can't reach.
-func (e *Engine) adoptNode(path, format string, backing []diskLayer) (string, error) {
+func (e *Engine) adoptNode(ctx context.Context, path, format string, backing []diskLayer) (string, error) {
 	node, err := e.linkNodeMetadata(path, format, backing)
 	if !errors.Is(err, errNoNodeLink) {
 		return node, err
@@ -1862,7 +1862,7 @@ func (e *Engine) adoptNode(path, format string, backing []diskLayer) (string, er
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	if err := cloneFile(path, tmp.Name()); err != nil {
+	if err := cloneFile(ctx, path, tmp.Name()); err != nil {
 		return "", err
 	}
 	if err := e.prepareNodeAccess(tmp.Name()); err != nil {

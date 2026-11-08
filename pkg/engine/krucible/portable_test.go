@@ -783,7 +783,7 @@ func TestConfineLaunchMarksVirtioFSMounts(t *testing.T) {
 	for _, readOnly := range []bool{false, true} {
 		t.Run(strconv.FormatBool(readOnly), func(t *testing.T) {
 			e := &Engine{}
-			_, path, cleanup, err := e.confineLaunch(vm, VMSpec{
+			_, path, cleanup, err := e.confineLaunch(t.Context(), vm, VMSpec{
 				RootDisk: filepath.Join(dir, "rootfs.raw"),
 				Mounts:   []VMFsMount{{HostPath: mount, ReadOnly: readOnly}},
 			}, filepath.Join(dir, "spec.json"))
@@ -933,13 +933,13 @@ func TestSnapshotExportRefusesBeforeWriting(t *testing.T) {
 		},
 		"root path traversal": func(t *testing.T, dir string, m *krucibleSnapManifest) {
 			outside := filepath.Join(filepath.Dir(dir), "escape.qcow2")
-			if err := cloneFile(filepath.Join(dir, m.DiskFile), outside); err != nil {
+			if err := cloneFile(t.Context(), filepath.Join(dir, m.DiskFile), outside); err != nil {
 				t.Fatal(err)
 			}
 			m.DiskFile = "../escape.qcow2"
 		},
 		"root shadows a layer": func(t *testing.T, dir string, m *krucibleSnapManifest) {
-			if err := cloneFile(filepath.Join(dir, m.DiskFile), filepath.Join(dir, "layer-2.img")); err != nil {
+			if err := cloneFile(t.Context(), filepath.Join(dir, m.DiskFile), filepath.Join(dir, "layer-2.img")); err != nil {
 				t.Fatal(err)
 			}
 			m.DiskFile = "layer-2.img"
@@ -982,7 +982,7 @@ func TestConfineLaunchKeepsRawBackingOpaque(t *testing.T) {
 		RootDisk: root, RootDiskFormat: "qcow2", Backing: []diskLayer{{Path: f.base, Format: "raw"}},
 		Volumes: []VMVolume{{BlockID: "vol0", Path: volume, Format: "qcow2", Backing: []diskLayer{{Path: node, Format: "raw"}}}},
 	}
-	_, policy, cleanup, err := f.e.confineLaunch(vm, spec, filepath.Join(vm.SandboxDir, "vmspec.json"))
+	_, policy, cleanup, err := f.e.confineLaunch(t.Context(), vm, spec, filepath.Join(vm.SandboxDir, "vmspec.json"))
 	if err != nil {
 		t.Fatalf("raw guest data was treated as a qcow2 dependency: %v", err)
 	}
@@ -1034,12 +1034,12 @@ func TestCapturedDisksKeepTheirSourcesBackingAuthority(t *testing.T) {
 			captured.Volumes = slices.Clone(spec.Volumes)
 			copies := t.TempDir()
 			captured.RootDisk = filepath.Join(copies, "rootfs.qcow2")
-			if err := cloneFile(spec.RootDisk, captured.RootDisk); err != nil {
+			if err := cloneFile(t.Context(), spec.RootDisk, captured.RootDisk); err != nil {
 				t.Fatal(err)
 			}
 			for i, volume := range spec.Volumes {
 				captured.Volumes[i].Path = filepath.Join(copies, "vol"+strconv.Itoa(i)+".img")
-				if err := cloneFile(volume.Path, captured.Volumes[i].Path); err != nil {
+				if err := cloneFile(t.Context(), volume.Path, captured.Volumes[i].Path); err != nil {
 					t.Fatal(err)
 				}
 			}

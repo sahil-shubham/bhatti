@@ -258,14 +258,14 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 	}
 	flushDur = time.Since(t)
 	t = time.Now()
-	if err := cloneFile(spec.RootDisk, filepath.Join(finalDir, "rootfs.qcow2")); err != nil {
+	if err := cloneFile(cctx, spec.RootDisk, filepath.Join(finalDir, "rootfs.qcow2")); err != nil {
 		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
 	}
 	copyDur = time.Since(t)
 	// Compare against the source baseline, not a header the helper can rewrite.
 	// Validate the daemon-owned copy so a change during the copy cannot turn
 	// a captured disk into authority to read another sandbox's node.
-	rootBacking, err := e.normalizeCapturedDisk(filepath.Join(finalDir, "rootfs.qcow2"),
+	rootBacking, err := e.normalizeCapturedDisk(cctx, filepath.Join(finalDir, "rootfs.qcow2"),
 		spec.RootDisk, spec.RootDiskFormat, spec.Backing, baseline.rootLegacy)
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint: captured root disk: %w", err)
@@ -282,10 +282,10 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 		t = time.Now()
 		for i, v := range spec.Volumes {
 			file := fmt.Sprintf("vol%d.img", i)
-			if err := cloneFile(v.Path, filepath.Join(finalDir, file)); err != nil {
+			if err := cloneFile(cctx, v.Path, filepath.Join(finalDir, file)); err != nil {
 				return nil, fmt.Errorf("checkpoint: copy volume %d: %w", i, err)
 			}
-			backing, err := e.normalizeCapturedDisk(filepath.Join(finalDir, file),
+			backing, err := e.normalizeCapturedDisk(cctx, filepath.Join(finalDir, file),
 				v.Path, v.Format, v.Backing, baseline.legacyVolume(i))
 			if err != nil {
 				return nil, fmt.Errorf("checkpoint: captured volume %d: %w", i, err)
@@ -432,7 +432,7 @@ func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte
 					return "", nil, err
 				}
 			}
-			return e.normalizeLegacyDisk(stage, path, format, chain)
+			return e.normalizeLegacyDisk(ctx, stage, path, format, chain)
 		}
 		source.RootDisk, source.Backing, err = normalize(source.RootDisk, source.RootDiskFormat, source.Backing)
 		if err != nil {
@@ -644,10 +644,10 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 
 	// 4. Copy the overlay (reflink where the host FS supports it; else a copy —
 	// the overlay is a small delta).
-	if err := cloneFile(spec.RootDisk, dst); err != nil {
+	if err := cloneFile(pauseCtx, spec.RootDisk, dst); err != nil {
 		return errors.Join(fmt.Errorf("freeze: copy overlay: %w", err), removeImageFiles(dst))
 	}
-	backing, err := e.normalizeCapturedDisk(dst, spec.RootDisk, spec.RootDiskFormat, spec.Backing, baseline.rootLegacy)
+	backing, err := e.normalizeCapturedDisk(pauseCtx, dst, spec.RootDisk, spec.RootDiskFormat, spec.Backing, baseline.rootLegacy)
 	if err != nil {
 		cleanupErr := removeImageFiles(dst)
 		if baseline.rootLegacy {

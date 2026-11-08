@@ -77,7 +77,7 @@ func (f *nodeFixture) snapshot(user, name, root string) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	if err := cloneFile(root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
+	if err := cloneFile(f.t.Context(), root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
 		f.t.Fatal(err)
 	}
 	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
@@ -100,7 +100,7 @@ func (f *nodeFixture) resume(id, snapDir string) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	root, format, _, err := f.e.prepareNodeRoot(dir, filepath.Join(snapDir, "rootfs.qcow2"), false, "qcow2")
+	root, format, _, err := f.e.prepareNodeRoot(f.t.Context(), dir, filepath.Join(snapDir, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestRemoveSnapshotCountsEverythingLayeredOver(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(saved), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloneFile(root, saved); err != nil { // what image save leaves
+	if err := cloneFile(t.Context(), root, saved); err != nil { // what image save leaves
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -518,7 +518,7 @@ func TestLayerOnCopiesWhereItCannotLayer(t *testing.T) {
 
 	dst := filepath.Join(f.data, "sandboxes", "copy", "root.qcow2")
 	os.MkdirAll(filepath.Dir(dst), 0o700)
-	if _, err := f.e.layerOn(dst, disk, false, "qcow2"); err != nil {
+	if _, err := f.e.layerOn(t.Context(), dst, disk, false, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(dst); !bytes.Equal(got, want) {
@@ -530,7 +530,7 @@ func TestLayerOnCopiesWhereItCannotLayer(t *testing.T) {
 
 	moved := filepath.Join(f.data, "sandboxes", "moved", "root.qcow2")
 	os.MkdirAll(filepath.Dir(moved), 0o700)
-	if _, err := f.e.layerOn(moved, disk, true, "qcow2"); err != nil {
+	if _, err := f.e.layerOn(t.Context(), moved, disk, true, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(disk); !errors.Is(err, os.ErrNotExist) {
@@ -562,7 +562,7 @@ func TestRestoredVolumesAreOverlays(t *testing.T) {
 	sb := filepath.Join(f.data, "sandboxes", "a")
 	os.MkdirAll(sb, 0o700)
 	spec := VMSpec{}
-	err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{
+	err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{
 		{path: filepath.Join(snap, "vol0.img"), format: "raw"},
 		{path: filepath.Join(snap, "vol1.img"), format: "raw", readOnly: true},
 		{path: filepath.Join(snap, "vol2.img"), format: "raw"},
@@ -674,7 +674,7 @@ func TestConfineLaunchTrustsOnlyTheBackingTheDaemonRecorded(t *testing.T) {
 	node := backingOf(t, root)
 	vm := &VM{ID: "a", SandboxDir: filepath.Dir(root), SockDir: filepath.Join(f.data, "sock")}
 	launch := func(spec VMSpec) (string, error) {
-		_, policy, cleanup, err := f.e.confineLaunch(vm, spec, filepath.Join(vm.SandboxDir, "vmspec.json"))
+		_, policy, cleanup, err := f.e.confineLaunch(t.Context(), vm, spec, filepath.Join(vm.SandboxDir, "vmspec.json"))
 		if err != nil {
 			return "", err
 		}
@@ -718,12 +718,12 @@ func TestConfineLaunchReadiesAVolumesChain(t *testing.T) {
 	sb := filepath.Join(f.data, "sandboxes", "a")
 	os.MkdirAll(sb, 0o700)
 	spec := VMSpec{RootDisk: f.freshRoot("a"), RootDiskFormat: "qcow2"}
-	if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{{path: filepath.Join(snap, "vol0.img"), format: "raw"}}); err != nil {
+	if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{{path: filepath.Join(snap, "vol0.img"), format: "raw"}}); err != nil {
 		t.Fatal(err)
 	}
 	node := backingOf(t, spec.Volumes[0].Path)
 	vm := &VM{ID: "a", SandboxDir: sb, SockDir: filepath.Join(f.data, "sock")}
-	_, _, cleanup, err := f.e.confineLaunch(vm, spec, filepath.Join(sb, "vmspec.json"))
+	_, _, cleanup, err := f.e.confineLaunch(t.Context(), vm, spec, filepath.Join(sb, "vmspec.json"))
 	if err == nil || !strings.Contains(err.Error(), node) {
 		t.Fatalf("a volume over an unrecorded node was admitted: %v", err)
 	}
@@ -733,7 +733,7 @@ func TestConfineLaunchReadiesAVolumesChain(t *testing.T) {
 	if err := f.e.recordDiskBacking(&spec); err != nil {
 		t.Fatal(err)
 	}
-	_, policy, cleanup, err := f.e.confineLaunch(vm, spec, filepath.Join(sb, "vmspec.json"))
+	_, policy, cleanup, err := f.e.confineLaunch(t.Context(), vm, spec, filepath.Join(sb, "vmspec.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -807,7 +807,7 @@ func TestLayerOnPreservesRelativeBacking(t *testing.T) {
 				t.Fatal(err)
 			}
 			own := strings.HasSuffix(name, "move")
-			if _, err := f.e.layerOn(dst, src, own, "qcow2"); err != nil {
+			if _, err := f.e.layerOn(t.Context(), dst, src, own, "qcow2"); err != nil {
 				t.Fatal(err)
 			}
 			if got := backingOf(t, dst); got != backing {
@@ -852,7 +852,7 @@ func TestLayerOnRejectsAlreadyOverDepthSource(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.e.layerOn(dst, src, false, "qcow2"); err == nil || !strings.Contains(err.Error(), "deeper than") {
+	if _, err := f.e.layerOn(t.Context(), dst, src, false, "qcow2"); err == nil || !strings.Contains(err.Error(), "deeper than") {
 		t.Fatalf("an over-depth source produced another over-depth disk: %v", err)
 	}
 	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
@@ -903,7 +903,7 @@ func TestNodeLinkPublishesNameBeforeReturning(t *testing.T) {
 		}
 		return oldSync(dir)
 	}
-	if _, err := f.e.layerOn(dst, src, false, "qcow2"); err != nil {
+	if _, err := f.e.layerOn(t.Context(), dst, src, false, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
 	if links != 1 || syncs != 2 {
@@ -1039,7 +1039,7 @@ func TestSweepNodesFollowsPersistedExternalDisks(t *testing.T) {
 	volume := filepath.Join(snap, "vol0.img")
 	writeFile(t, volume, bytes.Repeat([]byte("volume"), 1<<18))
 	externalVol := filepath.Join(outside, "volume.qcow2")
-	if _, err := f.e.layerOn(externalVol, volume, false, "raw"); err != nil {
+	if _, err := f.e.layerOn(t.Context(), externalVol, volume, false, "raw"); err != nil {
 		t.Fatal(err)
 	}
 	sb := filepath.Dir(root)
@@ -1242,14 +1242,14 @@ func TestSweepNodesReclaimsCrashedStages(t *testing.T) {
 		t.Fatal(err)
 	}
 	disk := filepath.Join(snap, "rootfs.qcow2")
-	if err := cloneFile(src, disk); err != nil {
+	if err := cloneFile(t.Context(), src, disk); err != nil {
 		t.Fatal(err)
 	}
 	sb := filepath.Join(f.data, "sandboxes", "child")
 	if err := os.MkdirAll(sb, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	root, format, _, err := f.e.prepareNodeRoot(sb, disk, true, "qcow2")
+	root, format, _, err := f.e.prepareNodeRoot(t.Context(), sb, disk, true, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1269,7 +1269,7 @@ func TestSweepNodesReclaimsCrashedStages(t *testing.T) {
 	if err := adopt.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloneFile(src, adopt.Name()); err != nil {
+	if err := cloneFile(t.Context(), src, adopt.Name()); err != nil {
 		t.Fatal(err)
 	}
 	adoptedNode, err := f.e.nodeLink(adopt.Name())
@@ -1488,11 +1488,11 @@ func TestNodeMetadataPreservesExternalSnapshotAncestors(t *testing.T) {
 	parent := f.snapshot("u1", "parent", f.freshRoot("source"))
 	root := f.resume("child", parent)
 	external := filepath.Join(t.TempDir(), "rootfs.qcow2")
-	if err := cloneFile(root, external); err != nil {
+	if err := cloneFile(t.Context(), root, external); err != nil {
 		t.Fatal(err)
 	}
 	scratch := filepath.Join(t.TempDir(), "overlay.qcow2")
-	if _, err := f.e.layerOn(scratch, external, false, "qcow2"); err != nil {
+	if _, err := f.e.layerOn(t.Context(), scratch, external, false, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{parent, filepath.Join(f.data, "sandboxes"), scratch} {
@@ -1825,7 +1825,7 @@ func (f *nodeFixture) savedForkImage(owner, name string) (image, node string, ba
 	if err := os.MkdirAll(filepath.Dir(image), 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	if err := cloneFile(root, image); err != nil {
+	if err := cloneFile(f.t.Context(), root, image); err != nil {
 		f.t.Fatal(err)
 	}
 	spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
@@ -1938,7 +1938,7 @@ func TestSavedImageMetadataCannotCrossOwnerAliases(t *testing.T) {
 						t.Fatal(err)
 					}
 				case "sidecar-file", "hardlinked-sidecar":
-					if err := cloneFile(image, ownImage); err != nil {
+					if err := cloneFile(t.Context(), image, ownImage); err != nil {
 						t.Fatal(err)
 					}
 					if alias == "sidecar-file" {
@@ -1984,10 +1984,10 @@ func TestSweepNodesReclaimsLegacyNormalizationStages(t *testing.T) {
 	if err := disk.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloneFile(source, disk.Name()); err != nil {
+	if err := cloneFile(t.Context(), source, disk.Name()); err != nil {
 		t.Fatal(err)
 	}
-	node, err := f.e.adoptNode(disk.Name(), "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+	node, err := f.e.adoptNode(t.Context(), disk.Name(), "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2104,7 +2104,7 @@ func TestAdoptNodeSyncsFallbackBeforePublishing(t *testing.T) {
 					events = append(events, "directory-sync")
 					return originalDirSync(dir)
 				}
-				node, err := f.e.adoptNode(source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+				node, err := f.e.adoptNode(t.Context(), source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
 				if failSync {
 					if !errors.Is(err, syncErr) || len(nodeEntries(t, f.data)) != 0 || renames != 0 {
 						t.Fatalf("failed file sync published a node: %s, %v", node, err)
@@ -2164,7 +2164,7 @@ func TestRestoredVolumeOwnershipIsPerDisk(t *testing.T) {
 				t.Fatal(err)
 			}
 			private := filepath.Join(t.TempDir(), "normalized.img")
-			if err := cloneFile(source, private); err != nil {
+			if err := cloneFile(t.Context(), source, private); err != nil {
 				t.Fatal(err)
 			}
 			privateInfo, err := os.Stat(private)
@@ -2176,7 +2176,7 @@ func TestRestoredVolumeOwnershipIsPerDisk(t *testing.T) {
 				t.Fatal(err)
 			}
 			var spec VMSpec
-			if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{
+			if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{
 				{path: source, format: format},
 				{path: private, format: format, owned: true},
 			}); err != nil {
@@ -2229,7 +2229,7 @@ func TestSweepNodesFindsTrustedSnapshotMetadataAtAnyDepth(t *testing.T) {
 				if err := os.MkdirAll(dir, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				if err := cloneFile(root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
+				if err := cloneFile(t.Context(), root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
 					t.Fatal(err)
 				}
 				if err := writeSnapshotManifest(dir, krucibleSnapManifest{
@@ -2400,7 +2400,7 @@ func TestNodePublicationRecoversExternalSnapshotCrash(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer unlock()
-		if _, err := e.layerOn(overlay, source, false, "qcow2"); err != nil {
+		if _, err := e.layerOn(t.Context(), overlay, source, false, "qcow2"); err != nil {
 			t.Fatal(err)
 		}
 		t.Fatal("publisher did not stop at its crash boundary")
@@ -2413,7 +2413,7 @@ func TestNodePublicationRecoversExternalSnapshotCrash(t *testing.T) {
 			ancestor := backingOf(t, root)
 			unrelated := f.snapshot("u1", "unrelated", f.freshRoot("unrelated"))
 			external := filepath.Join(t.TempDir(), "rootfs.qcow2")
-			if err := cloneFile(root, external); err != nil {
+			if err := cloneFile(t.Context(), root, external); err != nil {
 				t.Fatal(err)
 			}
 			before, err := os.ReadFile(external)
@@ -2512,7 +2512,7 @@ func TestNodePublicationDirectorySyncFailureExposesNoOverlay(t *testing.T) {
 	t.Cleanup(func() { syncNodeDir = oldSync })
 	syncErr := errors.New("node directory sync failed")
 	syncNodeDir = func(string) error { return syncErr }
-	if _, err := f.e.layerOn(dst, source, false, "raw"); !errors.Is(err, syncErr) {
+	if _, err := f.e.layerOn(t.Context(), dst, source, false, "raw"); !errors.Is(err, syncErr) {
 		t.Fatalf("publication ignored its directory barrier: %v", err)
 	}
 	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
@@ -2543,7 +2543,7 @@ func TestNodePublicationSameInodeConcurrentPublishers(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				f := newNodeFixture(t)
 				source := filepath.Join(t.TempDir(), "snapshot.qcow2")
-				if err := cloneFile(f.freshRoot("source"), source); err != nil {
+				if err := cloneFile(t.Context(), f.freshRoot("source"), source); err != nil {
 					t.Fatal(err)
 				}
 				before, err := os.ReadFile(source)
@@ -2591,7 +2591,7 @@ func TestNodePublicationSameInodeConcurrentPublishers(t *testing.T) {
 					unlock, err := lockBases(f.data, false)
 					if err == nil {
 						defer unlock()
-						_, err = f.e.layerOn(firstRoot, source, false, "qcow2")
+						_, err = f.e.layerOn(t.Context(), firstRoot, source, false, "qcow2")
 					}
 					firstDone <- err
 				}()
@@ -2601,9 +2601,9 @@ func TestNodePublicationSameInodeConcurrentPublishers(t *testing.T) {
 					if err == nil {
 						defer unlock()
 						if secondKind == "adopt" {
-							_, err = f.e.adoptNode(source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+							_, err = f.e.adoptNode(t.Context(), source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
 						} else {
-							_, err = f.e.layerOn(secondRoot, source, false, "qcow2")
+							_, err = f.e.layerOn(t.Context(), secondRoot, source, false, "qcow2")
 						}
 					}
 					secondDone <- err
@@ -2665,7 +2665,7 @@ func TestSweepNodesReclaimsAllHistoricalAliases(t *testing.T) {
 				f := newNodeFixture(t)
 				source := filepath.Join(t.TempDir(), "ancestor.raw")
 				writeFile(t, source, bytes.Repeat([]byte{1}, 4096))
-				ancestor, err := f.e.adoptNode(source, "raw", []diskLayer{})
+				ancestor, err := f.e.adoptNode(t.Context(), source, "raw", []diskLayer{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2680,7 +2680,7 @@ func TestSweepNodesReclaimsAllHistoricalAliases(t *testing.T) {
 				if format == "qcow2" {
 					backing = []diskLayer{{Path: ancestor, Format: "raw"}}
 				}
-				node, err := f.e.adoptNode(source, format, backing)
+				node, err := f.e.adoptNode(t.Context(), source, format, backing)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2807,7 +2807,7 @@ func TestNodePublicationFileSyncFailureExposesNoNode(t *testing.T) {
 		}
 		return syncErr
 	}
-	if _, err := f.e.layerOn(dst, source, false, "raw"); !errors.Is(err, syncErr) {
+	if _, err := f.e.layerOn(t.Context(), dst, source, false, "raw"); !errors.Is(err, syncErr) {
 		t.Fatalf("linked publication ignored its file barrier: %v", err)
 	}
 	if syncs != 1 {

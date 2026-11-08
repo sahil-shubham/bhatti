@@ -47,10 +47,10 @@ func layeredSnapshot(t *testing.T) (f *nodeFixture, dir string, m krucibleSnapMa
 		t.Fatal(err)
 	}
 	var spec VMSpec
-	if err := f.e.layerRestoredVolumes(sb, &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "raw"}}); err != nil {
+	if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "raw"}}); err != nil {
 		t.Fatal(err)
 	}
-	root, _, _, err := f.e.prepareNodeRoot(sb, filepath.Join(first, "rootfs.qcow2"), false, "qcow2")
+	root, _, _, err := f.e.prepareNodeRoot(t.Context(), sb, filepath.Join(first, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,10 +61,10 @@ func layeredSnapshot(t *testing.T) (f *nodeFixture, dir string, m krucibleSnapMa
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloneFile(root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
+	if err := cloneFile(t.Context(), root, filepath.Join(dir, "rootfs.qcow2")); err != nil {
 		t.Fatal(err)
 	}
-	if err := cloneFile(spec.Volumes[0].Path, filepath.Join(dir, "vol0.img")); err != nil {
+	if err := cloneFile(t.Context(), spec.Volumes[0].Path, filepath.Join(dir, "vol0.img")); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(dir, checkpointFile), []byte("KRUNCKPT checkpoint"))
@@ -144,7 +144,7 @@ func TestLayeredSnapshotMovesToAnotherHost(t *testing.T) {
 	// what is layered over it keeps it from being deleted.
 	sb := filepath.Join(b.cfg.DataDir, "sandboxes", "x")
 	os.MkdirAll(sb, 0o700)
-	root, _, _, err := b.prepareNodeRoot(sb, filepath.Join(dest, "rootfs.qcow2"), false, "qcow2")
+	root, _, _, err := b.prepareNodeRoot(t.Context(), sb, filepath.Join(dest, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestLayeredArchiveRebuildsMultipleGenerations(t *testing.T) {
 	f, first, m := layeredSnapshot(t)
 	root := f.resume("next", first)
 	var spec VMSpec
-	if err := f.e.layerRestoredVolumes(filepath.Dir(root), &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "qcow2"}}); err != nil {
+	if err := f.e.layerRestoredVolumes(t.Context(), filepath.Dir(root), &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "qcow2"}}); err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(f.data, "snapshots", "u1", "third")
@@ -738,7 +738,7 @@ func TestLayeredArchiveRebuildsMultipleGenerations(t *testing.T) {
 		{filepath.Join(first, checkpointFile), checkpointFile},
 		{filepath.Join(first, memoryFile), memoryFile},
 	} {
-		if err := cloneFile(file.src, filepath.Join(dir, file.name)); err != nil {
+		if err := cloneFile(t.Context(), file.src, filepath.Join(dir, file.name)); err != nil {
 			t.Fatal(err)
 		}
 	}
