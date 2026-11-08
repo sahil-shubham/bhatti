@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -261,9 +262,91 @@ func killHelper(pid int, spec, binary string) {
 // adopted paused hasn't run since: its guest can't answer until Resume.
 var errAgentInfoPaused = errors.New("not asked yet: the guest was paused when this daemon started")
 
+// An interrupted create has no committed identity or disk authority. Never
+// infer either from its overlay headers: first rule out a surviving helper,
+// then remove the directory while creators are excluded by the bases lock.
+func (e *Engine) reclaimUnrecordedSandboxes() error {
+	unlock, err := lockBases(e.cfg.DataDir, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	root := filepath.Join(e.cfg.DataDir, "sandboxes")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var abandoned []string
+	specs := map[string]bool{}
+	for _, de := range entries {
+		if !de.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, de.Name())
+		if _, err := os.Lstat(stateFilePath(dir)); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		abandoned = append(abandoned, dir)
+		specs[filepath.Join(dir, "vmspec.json")] = true
+	}
+	if len(abandoned) == 0 {
+		return nil
+	}
+	pids, err := listPIDs()
+	if err != nil {
+		return fmt.Errorf("enumerate helpers before reclaiming unrecorded sandboxes: %w", err)
+	}
+	binary := filepath.Base(e.cfg.VMMBinary)
+	for _, pid := range pids {
+		args, err := procArgs(pid)
+		if err != nil {
+			if !pidAlive(pid) {
+				continue
+			}
+			// Some platforms hide unrelated processes' argv. A matching
+			// executable name that cannot be inspected is not proof of death.
+			name, nameErr := procName(pid)
+			if nameErr != nil {
+				if pidAlive(pid) {
+					return fmt.Errorf("inspect process %d before sandbox reclamation: %w", pid, nameErr)
+				}
+				continue
+			}
+			if name == binary || (len(name) >= 15 && strings.HasPrefix(binary, name)) {
+				return fmt.Errorf("inspect possible helper %d before sandbox reclamation: %w", pid, err)
+			}
+			continue
+		}
+		if len(args) == 2 && specs[args[1]] && filepath.Base(args[0]) == binary {
+			return fmt.Errorf("unrecorded sandbox %s still has helper %d; preserve its disks", filepath.Dir(args[1]), pid)
+		}
+	}
+	for _, dir := range abandoned {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+		if e.cfg.SocketDir != "" {
+			if err := os.RemoveAll(filepath.Join(e.cfg.SocketDir, filepath.Base(dir))); err != nil {
+				return err
+			}
+		}
+		slog.Info("krucible.recover.unrecorded_reclaimed", "sandbox_id", filepath.Base(dir))
+	}
+	syncDir(root)
+	return nil
+}
+
 // recover rebuilds the engine's sandboxes from their state.json. Bad records
 // are skipped.
-func (e *Engine) recover() {
+func (e *Engine) recover() error {
+	if err := e.reclaimUnrecordedSandboxes(); err != nil {
+		return err
+	}
 	matches, _ := filepath.Glob(filepath.Join(e.cfg.DataDir, "sandboxes", "*", stateFile))
 	var recovered []*VM
 	for _, p := range matches {
@@ -363,6 +446,7 @@ func (e *Engine) recover() {
 		}
 	}
 	e.reportOrphanScopes()
+	return nil
 }
 
 // killStrays kills every helper still running the spec of a sandbox recovered

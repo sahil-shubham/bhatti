@@ -170,7 +170,9 @@ func TestRecoverAdoptsLiveHelpers(t *testing.T) {
 	recordSandbox(e, "dead", "running", gone.Process.Pid)
 
 	t.Cleanup(e.Shutdown) // stop adopted monitors before fakeHelper cleanup
-	e.recover()
+	if err := e.recover(); err != nil {
+		t.Fatal(err)
+	}
 
 	want := map[string]struct {
 		status, thermal string
@@ -286,5 +288,59 @@ func TestLaunchRecordsHelperBeforeReady(t *testing.T) {
 	}
 	if rec = readRecord(t, dir); rec.HelperPID != 0 {
 		t.Fatalf("failed launch left state.json naming helper %d", rec.HelperPID)
+	}
+}
+
+func TestRecoveryReclaimsUnrecordedClone(t *testing.T) {
+	f := newNodeFixture(t)
+	f.e.cfg.SocketDir = shortSockDir(t)
+	f.e.vms, f.e.netds = map[string]*VM{}, map[string]*netdInstance{}
+	source := f.freshRoot("source")
+	snap := f.snapshot("u1", "saved", source)
+	spec, _ := sandboxPaths(t, f.e, "interrupted")
+	root, _, _, err := f.e.prepareNodeRoot(filepath.Dir(spec), filepath.Join(snap, "rootfs.qcow2"), false, "qcow2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stop at the crash window: a private overlay exists, but its first
+	// durable VM record has not been published and no helper was started.
+	if _, err := diskRefs(f.data); err == nil {
+		t.Fatal("unrecorded clone did not reproduce the dependency-walk failure")
+	}
+	f.e.cfg.VMMBinary = os.Args[0]
+	if err := f.e.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted clone survived recovery: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.e.cfg.SocketDir, "interrupted")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted socket directory survived recovery: %v", err)
+	}
+	if _, err := GCImages(f.data, nil, false); err != nil {
+		t.Fatalf("GC after interrupted clone recovery: %v", err)
+	}
+	if err := f.e.RemoveSnapshot(context.Background(), snap); err != nil {
+		t.Fatalf("delete after interrupted clone recovery: %v", err)
+	}
+}
+
+func TestRecoveryPreservesUnrecordedLiveHelper(t *testing.T) {
+	e := &Engine{cfg: Config{DataDir: t.TempDir(), SocketDir: shortSockDir(t), VMMBinary: os.Args[0]},
+		vms: map[string]*VM{}, netds: map[string]*netdInstance{}}
+	spec, _ := sandboxPaths(t, e, "unrecorded")
+	pid := fakeHelper(t, spec)
+	disk := filepath.Join(filepath.Dir(spec), "root.qcow2")
+	if err := os.WriteFile(disk, []byte("private disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.recover(); err == nil || !strings.Contains(err.Error(), "still has helper") {
+		t.Fatalf("live unrecorded helper did not prevent recovery: %v", err)
+	}
+	if data, err := os.ReadFile(disk); err != nil || string(data) != "private disk" {
+		t.Fatalf("unrecorded live helper's disk changed: %q, %v", data, err)
+	}
+	if !isHelper(pid, spec, e.cfg.VMMBinary) {
+		t.Fatal("unrecorded live helper was killed")
 	}
 }

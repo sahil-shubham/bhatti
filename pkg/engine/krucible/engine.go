@@ -707,7 +707,9 @@ func New(cfg Config) (*Engine, error) {
 	} else {
 		slog.Info("krucible.cgroups", "mode", st.Mode, "requested", st.Requested, "reason", st.Reason)
 	}
-	eng.recover() // rehydrate live/dead sandboxes from <sandboxDir>/state.json
+	if err := eng.recover(); err != nil {
+		return nil, fmt.Errorf("krucible: recover sandboxes: %w", err)
+	}
 	// A crash can leave node links after their last sandbox or fork stage
 	// disappeared, with no later Destroy to request reclamation.
 	if removed, err := SweepNodes(cfg.DataDir, false); err != nil {
@@ -785,6 +787,13 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	if err := gateway.ValidateWire(*spec.NetPolicy); err != nil {
 		return info, fmt.Errorf("create sandbox net policy: %w", err)
 	}
+	// Reconciliation may remove an unrecorded directory only while no
+	// creator can still be building its first durable VM record.
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return info, fmt.Errorf("create: lock nodes: %w", err)
+	}
+	defer unlock()
 	id, err := generateID()
 	if err != nil {
 		return info, err
@@ -1002,6 +1011,14 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 
 	if opts.snapshotDir != "" && !e.caps.Checkpoint {
 		return info, errNoCheckpoint
+	}
+	// A helper must never outlive a daemon without a complete disk/owner
+	// record. Recovery can then safely reclaim every dead unrecorded create.
+	vm.mu.Lock()
+	initialRecord := vm.toRecordLocked()
+	vm.mu.Unlock()
+	if err = writeDaemonMetadata(stateFilePath(sandboxDir), initialRecord); err != nil {
+		return info, fmt.Errorf("persist initial sandbox state: %w", err)
 	}
 	if err = e.launch(ctx, vm, opts.snapshotDir); err != nil {
 		return info, err

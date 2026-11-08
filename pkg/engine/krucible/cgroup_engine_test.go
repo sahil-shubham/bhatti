@@ -238,7 +238,9 @@ func TestRecoverAdoptsAHelperInItsScope(t *testing.T) {
 	ps := recordRunning(t, e, testID, pid, placedScope{unit: "bhatti-" + ownerSlug("s:"+testID) + "-" + testID + ".scope"})
 	sd.place(pid, ps)
 
-	e.recover()
+	if err := e.recover(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(e.Shutdown) // runs before the stand-in is killed: no watcher persists into a dir being removed
 	vm := e.vms[testID]
 	if vm.Status != "running" || vm.scope != (placedScope{unit: ps.unit}) {
@@ -267,7 +269,9 @@ func TestRecoverPlacesAHelperAPreviousDaemonNeverPlaced(t *testing.T) {
 	fakeControl(t, ctl, "running")
 	ps := recordRunning(t, e, testID, pid, placedScope{})
 
-	e.recover()
+	if err := e.recover(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(e.Shutdown)
 	vm := e.vms[testID]
 	if vm.Status != "running" || vm.scope != (placedScope{unit: ps.unit, partial: true}) {
@@ -285,7 +289,9 @@ func TestRecoverPlacesAHelperAPreviousDaemonNeverPlaced(t *testing.T) {
 
 	// The next daemon finds it in its scope and still calls it partial.
 	e2 := &Engine{cfg: e.cfg, vms: map[string]*VM{}, netds: map[string]*netdInstance{}, cg: newTestManager(sd)}
-	e2.recover()
+	if err := e2.recover(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(e2.Shutdown)
 	if got := e2.vms[testID].scope; got != (placedScope{unit: ps.unit, partial: true}) {
 		t.Fatalf("after another restart: %+v", got)
@@ -318,7 +324,9 @@ func TestRecoverKeepsAGuestItCannotPlace(t *testing.T) {
 	fakeControl(t, ctl, "running")
 	recordRunning(t, e, testID, pid, placedScope{})
 
-	e.recover()
+	if err := e.recover(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(e.Shutdown)
 	vm := e.vms[testID]
 	if vm.Status != "running" || !pidAlive(pid) {
@@ -343,7 +351,9 @@ func TestRecoverReportsScopesNobodyClaims(t *testing.T) {
 	sd := newFakeSystemd()
 	sd.units["bhatti-0123456789ab-feedfacefeedface.scope"] = &fakeUnit{props: map[string]any{"Description": "bhatti sandbox=feedfacefeedface"}, active: "active"}
 	e := recoverFixture(t, sd)
-	e.recover()
+	if err := e.recover(); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(logs.String(), "krucible.cgroup.orphan_scope") || !strings.Contains(logs.String(), "feedfacefeedface") {
 		t.Fatalf("orphan scope not reported:\n%s", logs.String())
 	}

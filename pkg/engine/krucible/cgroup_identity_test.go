@@ -123,7 +123,9 @@ func TestRecoveryPinsIdentityBeforeHelperProbes(t *testing.T) {
 				}
 			}()
 
-			e.recover()
+			if err := e.recover(); err != nil {
+				t.Fatal(err)
+			}
 			vm := e.vms[testID]
 			vm.mu.Lock()
 			status, thermal, scope := vm.Status, vm.Thermal, vm.scope

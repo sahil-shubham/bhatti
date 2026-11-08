@@ -21,6 +21,11 @@ func procArgs(pid int) ([]string, error) {
 	return strings.Split(string(b), "\x00"), nil
 }
 
+func procName(pid int) (string, error) {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+	return strings.TrimSpace(string(b)), err
+}
+
 func procStartTime(pid int) (uint64, error) {
 	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {

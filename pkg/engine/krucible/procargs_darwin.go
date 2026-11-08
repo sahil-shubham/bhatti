@@ -50,6 +50,17 @@ func procStartTime(pid int) (uint64, error) {
 	return uint64(start.Sec)*1_000_000 + uint64(start.Usec), nil
 }
 
+func procName(pid int) (string, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return "", err
+	}
+	if int(kp.Proc.P_pid) != pid {
+		return "", unix.ESRCH
+	}
+	return string(bytes.TrimRight(kp.Proc.P_comm[:], "\x00")), nil
+}
+
 // listPIDs returns the pids of the processes running now.
 func listPIDs() ([]int, error) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")

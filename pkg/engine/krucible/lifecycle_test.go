@@ -169,7 +169,9 @@ func TestAdoptedVMMDeathIsObservedWithoutRestart(t *testing.T) {
 	pid := fakeHelper(t, spec)
 	fakeControl(t, control, "running")
 	recordSandbox(e, "adopted", "running", pid)
-	e.recover()
+	if err := e.recover(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(e.Shutdown)
 	events := make(chan engine.LifecycleEvent, 2)
 	e.SetLifecycleHandler(func(event engine.LifecycleEvent) { events <- event })
