@@ -737,6 +737,7 @@ type diskRoot struct {
 	path, holder, owner string
 	metadata            diskMetadata
 	legacy              bool
+	manifestless        bool
 }
 
 type storedNode struct {
@@ -915,6 +916,7 @@ func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 		if !archiveFileName.MatchString(disk) {
 			return nil, fmt.Errorf("%s: invalid disk name %q", dir, disk)
 		}
+		firstRoot := len(roots)
 		if err := root(filepath.Join(dir, disk), filepath.Join(dir, disk), owner,
 			m.DiskFormat, m.Backing, !found || m.DiskFormat == ""); err != nil {
 			return nil, err
@@ -938,6 +940,11 @@ func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 			if err := root(filepath.Join(dir, v.File), filepath.Join(dir, v.File), owner,
 				v.Format, v.Backing, legacy); err != nil {
 				return nil, err
+			}
+		}
+		if !found {
+			for i := firstRoot; i < len(roots); i++ {
+				roots[i].manifestless = true
 			}
 		}
 	}
@@ -1068,7 +1075,33 @@ func diskRefs(dataDir string) (map[fileKey][]string, error) {
 		})
 	}
 	inspected := map[fileKey]bool{}
+	ignoredSnapshots := map[string]bool{}
+	// Captures hold a shared lease through manifest publication. Without a
+	// manifest, an unauthorized graph is an interrupted capture, not a root.
+	// Check the whole directory before adding any of its disks' references.
+	for i := range roots {
+		r := &roots[i]
+		dir := filepath.Dir(r.path)
+		if !r.manifestless || ignoredSnapshots[dir] {
+			continue
+		}
+		backing, err := legacyChain(r.path, r.owner, false)
+		if err != nil {
+			ignoredSnapshots[dir] = true
+			slog.Warn("krucible.snapshot.incomplete_ignored", "path", dir, "error", err)
+			continue
+		}
+		r.metadata.backing, r.legacy = backing, false
+		if fi, err := os.Stat(r.path); err == nil {
+			if k, ok := keyOf(fi); ok {
+				inspected[k] = true
+			}
+		}
+	}
 	for _, r := range roots {
+		if r.manifestless && ignoredSnapshots[filepath.Dir(r.path)] {
+			continue
+		}
 		backing := r.metadata.backing
 		known := !r.legacy
 		if r.legacy {
@@ -1106,6 +1139,9 @@ func diskRefs(dataDir string) (map[fileKey][]string, error) {
 		}
 	}
 	err = walkNodeImages(dataDir, func(path string, link bool) error {
+		if ignoredSnapshots[filepath.Dir(path)] {
+			return nil
+		}
 		if strings.HasPrefix(filepath.Base(path), ".") {
 			return nil
 		}
