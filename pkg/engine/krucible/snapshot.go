@@ -32,8 +32,8 @@ type krucibleSnapManifest struct {
 	ConfigFile  string `json:"config_file"`
 	Token       string `json:"token"`
 	KernelImage string `json:"kernel_image,omitempty"`
-	// Backing comes only from the source's validated, daemon-recorded chain.
-	// The local manifest is authoritative; an archive rebuilds this list.
+	// Backing records the strictly validated captured graph, normalizing private
+	// legacy copies first. The local manifest is authoritative, not an archive.
 	Backing []diskLayer `json:"backing"`
 
 	// Device set (so a restore/fork reproduces it — a memory restore's RAM view of
@@ -138,7 +138,8 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
-	if err := e.captureDiskBacking(vm, &spec); err != nil {
+	baseline, err := e.captureDiskBacking(vm, &spec)
+	if err != nil {
 		return nil, fmt.Errorf("checkpoint: source disk backing: %w", err)
 	}
 
@@ -149,6 +150,9 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 	defer func() {
 		if err != nil && ownDir {
 			_ = os.RemoveAll(finalDir)
+			if baseline.legacy() {
+				e.scheduleNodeSweep()
+			}
 		}
 	}()
 	if snapType == "filesystem" {
@@ -223,7 +227,7 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 			manifest = nil
 		}
 	}()
-	if err := e.validateDiskBacking(vm, spec); err != nil {
+	if err := baseline.validate(spec); err != nil {
 		if stage != "" {
 			_ = os.RemoveAll(stage)
 		}
@@ -258,11 +262,12 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 		return nil, fmt.Errorf("checkpoint: copy disk: %w", err)
 	}
 	copyDur = time.Since(t)
-	// Trust the source's recorded chain, not a header the helper can rewrite.
+	// Compare against the source baseline, not a header the helper can rewrite.
 	// Validate the daemon-owned copy so a change during the copy cannot turn
 	// a captured disk into authority to read another sandbox's node.
-	if err := e.validateDiskBacking(vm, VMSpec{RootDisk: filepath.Join(finalDir, "rootfs.qcow2"),
-		RootDiskFormat: spec.RootDiskFormat, Backing: spec.Backing}); err != nil {
+	rootBacking, err := e.normalizeCapturedDisk(filepath.Join(finalDir, "rootfs.qcow2"),
+		spec.RootDisk, spec.RootDiskFormat, spec.Backing, baseline.rootLegacy)
+	if err != nil {
 		return nil, fmt.Errorf("checkpoint: captured root disk: %w", err)
 	}
 
@@ -280,15 +285,16 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 			if err := cloneFile(v.Path, filepath.Join(finalDir, file)); err != nil {
 				return nil, fmt.Errorf("checkpoint: copy volume %d: %w", i, err)
 			}
-			if err := e.validateDiskBacking(vm, VMSpec{RootDisk: filepath.Join(finalDir, file),
-				RootDiskFormat: v.Format, Backing: v.Backing}); err != nil {
+			backing, err := e.normalizeCapturedDisk(filepath.Join(finalDir, file),
+				v.Path, v.Format, v.Backing, baseline.legacyVolume(i))
+			if err != nil {
 				return nil, fmt.Errorf("checkpoint: captured volume %d: %w", i, err)
 			}
 			format := v.Format
 			if format == "" {
 				format = "raw"
 			}
-			snapVols = append(snapVols, snapVolume{File: file, Format: format, Backing: v.Backing, ReadOnly: v.ReadOnly})
+			snapVols = append(snapVols, snapVolume{File: file, Format: format, Backing: backing, ReadOnly: v.ReadOnly})
 		}
 		copyDur += time.Since(t)
 		for _, mnt := range spec.Mounts {
@@ -303,7 +309,7 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 		Arch: hostSnapshotArch(), Type: snapType,
 		Vcpus: spec.Vcpus, MemMiB: spec.MemMiB,
 		DiskFile: "rootfs.qcow2", DiskFormat: spec.RootDiskFormat, ConfigFile: "config.ext4",
-		Token: token, KernelImage: spec.KernelImage, Backing: spec.Backing,
+		Token: token, KernelImage: spec.KernelImage, Backing: rootBacking,
 		Mounts: snapMounts, Volumes: snapVols, NetPolicy: snapNet,
 	}
 	if err := writeSnapshotManifest(finalDir, m); err != nil {
@@ -583,6 +589,13 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 	if !e.caps.Pause {
 		return errNoPause // the consistent copy needs the VM paused
 	}
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
+	if err != nil {
+		return fmt.Errorf("freeze: lock nodes: %w", err)
+	}
+	defer unlock()
+	// Legacy normalization can adopt store-only ancestors. Retain this lease
+	// through sidecar publication, failed-image cleanup, and source resume.
 	// Reachable agent for the guest sync; releases its own lock before we take
 	// launchMu below.
 	if err := e.EnsureHot(ctx, sandboxID); err != nil {
@@ -598,7 +611,8 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 	vm.launchMu.Lock()
 	defer vm.launchMu.Unlock()
 	spec := vm.baseSpec
-	if err := e.captureDiskBacking(vm, &spec); err != nil {
+	baseline, err := e.captureDiskBacking(vm, &spec)
+	if err != nil {
 		return fmt.Errorf("freeze: source disk backing: %w", err)
 	}
 
@@ -621,7 +635,7 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 			vm.syncGuestClock(rctx)
 		}
 	}()
-	if err := e.validateDiskBacking(vm, spec); err != nil {
+	if err := baseline.validate(spec); err != nil {
 		return fmt.Errorf("freeze: paused source disk backing: %w", err)
 	}
 
@@ -633,12 +647,20 @@ func (e *Engine) freezeDisk(ctx context.Context, sandboxID, dst string) error {
 	if err := cloneFile(spec.RootDisk, dst); err != nil {
 		return errors.Join(fmt.Errorf("freeze: copy overlay: %w", err), removeImageFiles(dst))
 	}
-	if err := e.validateDiskBacking(vm, VMSpec{RootDisk: dst,
-		RootDiskFormat: spec.RootDiskFormat, Backing: spec.Backing}); err != nil {
-		return errors.Join(fmt.Errorf("freeze: captured root disk: %w", err), removeImageFiles(dst))
+	backing, err := e.normalizeCapturedDisk(dst, spec.RootDisk, spec.RootDiskFormat, spec.Backing, baseline.rootLegacy)
+	if err != nil {
+		cleanupErr := removeImageFiles(dst)
+		if baseline.rootLegacy {
+			e.scheduleNodeSweep()
+		}
+		return errors.Join(fmt.Errorf("freeze: captured root disk: %w", err), cleanupErr)
 	}
-	if err := e.recordNodeMetadata(dst, spec.RootDiskFormat, spec.Backing); err != nil {
-		return errors.Join(fmt.Errorf("freeze: record image backing: %w", err), removeImageFiles(dst))
+	if err := e.recordNodeMetadata(dst, spec.RootDiskFormat, backing); err != nil {
+		cleanupErr := removeImageFiles(dst)
+		if baseline.rootLegacy {
+			e.scheduleNodeSweep()
+		}
+		return errors.Join(fmt.Errorf("freeze: record image backing: %w", err), cleanupErr)
 	}
 	return nil
 }

@@ -693,40 +693,6 @@ func (e *Engine) validateDiskBacking(vm *VM, spec VMSpec) error {
 	return nil
 }
 
-// A pre-upgrade VM can lack typed chains. Capture establishes a temporary
-// authorized baseline before pausing, then compares against it while paused;
-// otherwise a change between the two checks could become trusted metadata.
-func (e *Engine) captureDiskBacking(vm *VM, spec *VMSpec) error {
-	// Unlike an absent snapshot manifest, the VM contract's empty format
-	// already means raw; it is not permission to inspect guest bytes.
-	if spec.RootDiskFormat == "" {
-		spec.RootDiskFormat = "raw"
-	}
-	if spec.RootDiskFormat == "qcow2" && spec.Backing == nil {
-		chain, err := e.legacyDiskChain(vm, spec.RootDisk, spec.RootDiskFormat)
-		if err != nil {
-			return err
-		}
-		spec.Backing = chain
-	}
-	copied := false
-	for i, v := range spec.Volumes {
-		if v.Format != "qcow2" || v.Backing != nil {
-			continue
-		}
-		chain, err := e.legacyDiskChain(vm, v.Path, v.Format)
-		if err != nil {
-			return err
-		}
-		if !copied {
-			spec.Volumes = slices.Clone(spec.Volumes)
-			copied = true
-		}
-		spec.Volumes[i].Backing = chain
-	}
-	return e.validateDiskBacking(vm, *spec)
-}
-
 // Legacy inference is a compatibility read, never a new trust record. The
 // authorizer runs before a named file can be opened or sniffed.
 func (e *Engine) legacyDiskChain(vm *VM, path, format string) ([]diskLayer, error) {
@@ -734,7 +700,7 @@ func (e *Engine) legacyDiskChain(vm *VM, path, format string) ([]diskLayer, erro
 	if err != nil {
 		return nil, err
 	}
-	return readDiskChain(path, format, func(next string) error {
+	return readLegacyDiskChain(path, format, func(next string) error {
 		return e.authorizedBacking(vm, next, owned)
 	})
 }

@@ -423,19 +423,28 @@ func reconcileNodePublications(dataDir string) error {
 // readDiskChain is used for newly constructed disks, never to replace a
 // daemon-recorded chain. Unknown top formats retain legacy inference.
 func readDiskChain(path, format string, authorize func(string) error) ([]diskLayer, error) {
-	legacy := format == ""
+	return readDiskChainWithInference(path, format, authorize, format == "")
+}
+
+// A pre-typed VM can know its top driver while omitting ancestor formats.
+// Raw disks stay opaque, and authorization still precedes every ancestor probe.
+func readLegacyDiskChain(path, format string, authorize func(string) error) ([]diskLayer, error) {
+	return readDiskChainWithInference(path, format, authorize, true)
+}
+
+func readDiskChainWithInference(path, format string, authorize func(string) error, legacy bool) ([]diskLayer, error) {
 	if format == "raw" {
 		return []diskLayer{}, nil
 	}
 	if format != "" && format != "qcow2" {
 		return nil, fmt.Errorf("%s: unsupported format %q", path, format)
 	}
-	if legacy && authorize != nil {
+	if format == "" && authorize != nil {
 		if err := authorize(path); err != nil {
 			return nil, err
 		}
 	}
-	if legacy {
+	if format == "" {
 		format = "raw"
 		if maybeQcow2(path) {
 			format = "qcow2"
@@ -730,15 +739,6 @@ type diskRoot struct {
 	legacy              bool
 }
 
-type diskCatalog struct {
-	metadata    map[fileKey]diskMetadata
-	storedNodes map[fileKey]*storedNode
-	roots       []diskRoot
-}
-
-// The catalog reads daemon metadata only. Inode identity makes its format
-// decision survive an alias outside the disk's managed directory.
-func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 type storedNode struct {
 	names []string
 	count uint64
@@ -788,6 +788,15 @@ func readNodeStore(dataDir string) (map[fileKey]*storedNode, []string, error) {
 	return nodes, pending, nil
 }
 
+type diskCatalog struct {
+	metadata    map[fileKey]diskMetadata
+	storedNodes map[fileKey]*storedNode
+	roots       []diskRoot
+}
+
+// The catalog reads daemon metadata only. Inode identity makes its format
+// decision survive an alias outside the disk's managed directory.
+func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 	dataDir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, err
@@ -856,6 +865,8 @@ func readNodeStore(dataDir string) (map[fileKey]*storedNode, []string, error) {
 		if err := register(pin, p.Format, p.Backing); err != nil {
 			return nil, err
 		}
+		roots = append(roots, diskRoot{path: pin, holder: path,
+			metadata: diskMetadata{format: p.Format, backing: p.Backing}})
 	}
 	root := func(path, holder, owner, format string, backing []diskLayer, legacy bool) error {
 		if path == "" {
@@ -865,8 +876,6 @@ func readNodeStore(dataDir string) (map[fileKey]*storedNode, []string, error) {
 			if err := register(path, format, backing); err != nil {
 				return err
 			}
-		roots = append(roots, diskRoot{path: pin, holder: path,
-			metadata: diskMetadata{format: p.Format, backing: p.Backing}})
 		}
 		roots = append(roots, diskRoot{path: path, holder: holder, owner: owner,
 			metadata: diskMetadata{format: format, backing: backing}, legacy: legacy})
@@ -1178,6 +1187,9 @@ func numberedStage(name, prefix, suffix string) bool {
 // operations can leave these names. Extra hard links would otherwise pin a
 // node after every committed disk over it was destroyed.
 func cleanNodeStages(dataDir string) error {
+	if err := reconcileNodePublications(dataDir); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return err
@@ -1187,9 +1199,6 @@ func cleanNodeStages(dataDir string) error {
 			dir := filepath.Join(dataDir, de.Name())
 			files, err := os.ReadDir(dir)
 			if errors.Is(err, fs.ErrNotExist) {
-	if err := reconcileNodePublications(dataDir); err != nil {
-		return err
-	}
 				continue
 			}
 			if err != nil {
@@ -1313,29 +1322,29 @@ func sweepNodesLocked(dataDir string, dryRun bool) (removed []string, err error)
 			if err := removeNodeMetadata(path); err != nil {
 				return removed, err
 			}
+		}
+	}
+	for _, path := range garbage {
+		if !dryRun {
 			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return removed, err
 			}
 		}
 		removed = append(removed, path)
 	}
+	if !dryRun && len(removed) != 0 {
+		if err := syncNodeDir(dir); err != nil {
+			return removed, err
+		}
+	}
 	return removed, nil
 }
 
-		}
-	}
-	for _, path := range garbage {
-		if !dryRun {
 // SweepNodes removes the nodes nothing needs any more and returns them.
 func SweepNodes(dataDir string, dryRun bool) ([]string, error) {
 	unlock, err := lockBases(dataDir, true)
 	if err != nil {
 		return nil, err
-	}
-	if !dryRun && len(removed) != 0 {
-		if err := syncNodeDir(dir); err != nil {
-			return removed, err
-		}
 	}
 	defer unlock()
 	return sweepNodesLocked(dataDir, dryRun)
