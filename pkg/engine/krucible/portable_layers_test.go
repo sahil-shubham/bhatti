@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -548,7 +549,7 @@ func TestPublishSnapshotImportSerializesWithGC(t *testing.T) {
 	}
 }
 
-func TestLayeredExportPinsNodesUntilStreamFinishes(t *testing.T) {
+func TestLayeredExportKeepsOpenInputsAfterSnapshotRemoval(t *testing.T) {
 	for _, outcome := range []string{"success", "writer-error", "cancelled"} {
 		t.Run(outcome, func(t *testing.T) {
 			f, source, m := layeredSnapshot(t)
@@ -576,16 +577,12 @@ func TestLayeredExportPinsNodesUntilStreamFinishes(t *testing.T) {
 				done <- b.ExportSnapshot(ctx, w, dir, imp.ManifestJSON, engine.SnapshotExport{Name: "layered"})
 			}()
 			waitForExportWrite(t, ctx, w, done)
-			requireBasesLease(t, b.cfg.DataDir, true)
-			removeCtx, stopRemove := context.WithCancel(t.Context())
-			stopRemove()
-			if err := b.RemoveSnapshot(removeCtx, dir); !errors.Is(err, context.Canceled) {
-				t.Fatalf("snapshot deletion did not wait for the exporting lease: %v", err)
+			requireBasesLease(t, b.cfg.DataDir, false)
+			if err := b.RemoveSnapshot(ctx, dir); err != nil {
+				t.Fatalf("snapshot deletion waited for the exporting writer: %v", err)
 			}
 			for _, node := range nodes {
-				if _, err := os.Stat(node); err != nil {
-					t.Fatalf("streaming export lost an imported ancestor: %s: %v", node, err)
-				}
+				mustNotExist(t, node)
 			}
 			if outcome == "cancelled" {
 				cancel()
@@ -608,13 +605,64 @@ func TestLayeredExportPinsNodesUntilStreamFinishes(t *testing.T) {
 					t.Fatalf("export did not finish a whole archive: %v", err)
 				}
 			}
-			if err := b.RemoveSnapshot(t.Context(), dir); err != nil {
-				t.Fatal(err)
-			}
+			mustNotExist(t, dir)
 			for _, node := range nodes {
 				mustNotExist(t, node)
 			}
 		})
+	}
+}
+
+func TestLayeredExportBlockedWriterDoesNotBlockDeleteAndSweep(t *testing.T) {
+	f, source, m := layeredSnapshot(t)
+	archive := exportArchive(t, f.e, source, m, true)
+	b := portableEngine(t, "", "exit 0")
+	dir, imp, err := importArchive(b, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := backingOf(t, filepath.Join(dir, "rootfs.qcow2"))
+	w := newGatedExportWriter(t, io.ErrClosedPipe)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	// The fake never releases during the assertion: even cancellation cannot
+	// make a non-cooperating response writer return.
+	t.Cleanup(func() {
+		w.unblock()
+		<-finished
+	})
+	go func() {
+		done <- b.ExportSnapshot(ctx, w, dir, imp.ManifestJSON, engine.SnapshotExport{Name: "blocked"})
+		close(finished)
+	}()
+	waitForExportWrite(t, ctx, w, done)
+	cancel()
+	requireBasesLease(t, b.cfg.DataDir, false)
+	reclaimed := make(chan error, 1)
+	go func() {
+		if err := b.RemoveSnapshot(t.Context(), dir); err != nil {
+			reclaimed <- err
+			return
+		}
+		_, err := SweepNodes(b.cfg.DataDir, false)
+		reclaimed <- err
+	}()
+	select {
+	case err := <-reclaimed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("blocked export prevented snapshot deletion or node sweep")
+	}
+	mustNotExist(t, dir)
+	mustNotExist(t, node)
+	select {
+	case err := <-done:
+		t.Fatalf("writer returned without its cleanup release: %v", err)
+	default:
 	}
 }
 

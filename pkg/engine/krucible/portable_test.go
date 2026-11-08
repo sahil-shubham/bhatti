@@ -281,6 +281,15 @@ func TestExportSnapshotPinsThroughFinalFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sources := make([]*os.File, 0, len(paths))
+	for _, path := range paths {
+		src, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer src.Close()
+		sources = append(sources, src)
+	}
 	// Establish that this fixture fits in the encoder's buffer: its first
 	// downstream write can only come from the final zstd Close.
 	var control bytes.Buffer
@@ -288,7 +297,7 @@ func TestExportSnapshotPinsThroughFinalFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeArchive(t.Context(), zw, am, paths); err != nil {
+	if err := writeArchive(t.Context(), zw, am, sources); err != nil {
 		zw.Close()
 		t.Fatal(err)
 	}
@@ -313,7 +322,7 @@ func TestExportSnapshotPinsThroughFinalFlush(t *testing.T) {
 				done <- e.ExportSnapshot(ctx, w, dir, nil, engine.SnapshotExport{Name: "small"})
 			}()
 			waitForExportWrite(t, ctx, w, done)
-			requireBasesLease(t, e.cfg.DataDir, true)
+			requireBasesLease(t, e.cfg.DataDir, false)
 			w.unblock()
 			select {
 			case err := <-done:

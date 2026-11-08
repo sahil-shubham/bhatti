@@ -193,18 +193,41 @@ func (e *Engine) ExportSnapshot(ctx context.Context, w io.Writer, snapDir string
 	if err != nil {
 		return fmt.Errorf("export: lock nodes: %w", err)
 	}
-	// Planning retains layer pathnames, not open files. Keep them pinned
-	// through streaming, the final zstd flush, and failed-frame cleanup.
-	defer unlock()
+	// Open every input before releasing the lease: unlinked snapshot files
+	// and ancestors stay readable without letting a slow client hold up GC.
 	am, paths, err := e.planExport(snapDir, manifestJSON, opts)
 	if err != nil {
+		unlock()
 		return err
 	}
+	sources := make([]*os.File, 0, len(paths))
+	closeSources := func() {
+		for _, src := range sources {
+			src.Close()
+		}
+	}
+	defer closeSources()
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			unlock()
+			return err
+		}
+		src, err := os.Open(path)
+		if err != nil {
+			unlock()
+			return fmt.Errorf("export: %w", err)
+		}
+		sources = append(sources, src)
+	}
+	unlock()
+	// Cancellation must release inode pins even if the writer never returns.
+	stopClose := context.AfterFunc(ctx, closeSources)
+	defer stopClose()
 	zw, err := zstd.NewWriter(w)
 	if err != nil {
 		return fmt.Errorf("export: %w", err)
 	}
-	if err := writeArchive(ctx, zw, am, paths); err != nil {
+	if err := writeArchive(ctx, zw, am, sources); err != nil {
 		// No end of frame: the stream must not pass for a whole one.
 		zw.Reset(io.Discard)
 		zw.Close()
@@ -432,7 +455,7 @@ func portableManifest(m krucibleSnapManifest) krucibleSnapManifest {
 	return m
 }
 
-func writeArchive(ctx context.Context, w io.Writer, am archiveManifest, paths []string) error {
+func writeArchive(ctx context.Context, w io.Writer, am archiveManifest, sources []*os.File) error {
 	tw := tar.NewWriter(w)
 	manifest, err := json.MarshalIndent(am, "", "  ")
 	if err != nil {
@@ -453,7 +476,7 @@ func writeArchive(ctx context.Context, w io.Writer, am archiveManifest, paths []
 	}
 	buf := make([]byte, archiveBufSize)
 	for i, f := range am.Files {
-		if err := copyIntoArchive(ctx, tw, paths[i], f, buf); err != nil {
+		if err := copyIntoArchive(ctx, tw, sources[i], f, buf); err != nil {
 			return err
 		}
 	}
@@ -463,12 +486,7 @@ func writeArchive(ctx context.Context, w io.Writer, am archiveManifest, paths []
 	return nil
 }
 
-func copyIntoArchive(ctx context.Context, tw *tar.Writer, path string, f archiveFile, buf []byte) error {
-	src, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("export: %w", err)
-	}
-	defer src.Close()
+func copyIntoArchive(ctx context.Context, tw *tar.Writer, src *os.File, f archiveFile, buf []byte) error {
 	fi, err := src.Stat()
 	if err != nil {
 		return fmt.Errorf("export: %w", err)
