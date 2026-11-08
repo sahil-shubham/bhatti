@@ -60,6 +60,7 @@ func TestKrucibleBaseUpdateKeepsSandboxes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		t.Cleanup(eng.waitNodeSweep)
 		return eng
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

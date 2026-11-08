@@ -67,6 +67,9 @@ func newNetEngineAt(t *testing.T, dataDir, sockDir string) engine.Engine {
 	if err != nil {
 		t.Fatalf("New(net): %v", err)
 	}
+	// Destroy sweeps nodes in the background; this cleanup runs after the
+	// tests' own Destroy cleanups and before dataDir is removed.
+	t.Cleanup(eng.waitNodeSweep)
 	return eng
 }
 

@@ -56,6 +56,7 @@ func TestKrucibleTierRootfsBoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(tier): %v", err)
 	}
+	t.Cleanup(eng.waitNodeSweep)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

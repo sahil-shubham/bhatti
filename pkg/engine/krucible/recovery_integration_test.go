@@ -41,6 +41,7 @@ func recoveryEngine(t *testing.T, dataDir, sockDir, baseRootfs string) *Engine {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(eng.waitNodeSweep)
 	return eng
 }
 

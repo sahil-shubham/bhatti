@@ -40,6 +40,7 @@ func secondHost(t *testing.T, a *Engine, base string) *Engine {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(b.waitNodeSweep)
 	return b
 }
 

@@ -46,6 +46,7 @@ func TestKrucibleLeanKernel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		t.Cleanup(eng.waitNodeSweep)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		t0 := time.Now()

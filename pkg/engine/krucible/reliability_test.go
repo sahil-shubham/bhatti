@@ -191,6 +191,7 @@ func TestKrucibleCreateCleansUpOnLaunchFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(eng.waitNodeSweep)
 
 	// Short deadline: Create should abort readiness at ~ctx, not block for the
 	// internal 30s WaitReady floor. Measure it — a create that ignores the

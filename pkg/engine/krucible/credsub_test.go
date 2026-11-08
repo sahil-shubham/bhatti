@@ -153,6 +153,7 @@ func TestKrucibleCredentialSubstitution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(eng.waitNodeSweep)
 
 	// The daemon's side: a store with the secret, the sandbox's CA and its
 	// grants, and the broker serving it to the owner's netd.
