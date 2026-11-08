@@ -692,6 +692,9 @@ func New(cfg Config) (*Engine, error) {
 	if err := eng.initConfinement(); err != nil {
 		return nil, err
 	}
+	if err := eng.migrateNodeAccess(); err != nil {
+		return nil, fmt.Errorf("krucible: migrate node access: %w", err)
+	}
 	// Before recovery, which places the helpers a previous daemon left unplaced.
 	// A bhatti that asked for systemd and can't have it refuses to start here.
 	cg, err := resolveCgroups(cfg.Cgroups, defaultCgroupHost())

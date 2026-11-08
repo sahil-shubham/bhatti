@@ -78,29 +78,37 @@ func nodeMetadataPath(node string) string {
 }
 
 func removeNodeMetadata(node string) error {
-	if err := os.Remove(nodeMetadataPath(node)); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	err := os.Remove(nodeMetadataPath(node))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	// Persist the removal before the last disk link can disappear and its
-	// inode be reused with an unrelated payload.
-	syncDir(filepath.Dir(node))
-	return nil
+	// Retrying a failed directory sync must persist even an already absent
+	// sidecar before the last disk link can disappear and its inode be reused.
+	syncErr := syncNodeDirectory(filepath.Dir(node))
+	if errors.Is(err, fs.ErrNotExist) && errors.Is(syncErr, fs.ErrNotExist) {
+		return nil
+	}
+	return syncErr
 }
 
 // The store can outlive a snapshot's managed name, including snapshots kept
 // outside DataDir. Its daemon-only graph keeps that hard link meaningful
 // without ever reinterpreting a raw node's guest-writable bytes.
 func (e *Engine) recordNodeMetadata(node, format string, backing []diskLayer) error {
+	if err := validateNodeMetadata(node, format, backing); err != nil {
+		return err
+	}
+	return writeDaemonMetadata(nodeMetadataPath(node), nodeMetadata{Format: format, Backing: backing})
+}
+
+func validateNodeMetadata(node, format string, backing []diskLayer) error {
 	if format != "raw" && format != "qcow2" {
 		return fmt.Errorf("%s: unsupported node format %q", node, format)
 	}
 	if format == "raw" && len(backing) != 0 {
 		return fmt.Errorf("%s: raw node has recorded backing files", node)
 	}
-	return writeDaemonMetadata(nodeMetadataPath(node), nodeMetadata{Format: format, Backing: backing})
+	return nil
 }
 
 // errNoNodeLink says a disk can't be given a name in the node store.
@@ -109,10 +117,20 @@ var errNoNodeLink = errors.New("can't link the disk into the node store")
 // linkNode is os.Link, for a test that needs a link to fail.
 var linkNode = os.Link
 
-// syncNodeDir keeps the publication barrier observable without a power cut in
-// tests. The source's other name may be removed as soon as nodeLink returns.
-var syncNodeDir = syncDir
+// Publication barriers are injectable so tests can stop a publisher without
+// running its cleanup, or fail a copied inode's sync before it is exposed.
+var syncNodeDir = syncNodeDirectory
 var syncNodeFile = flushFiles
+var renameNode = os.Rename
+
+func syncNodeDirectory(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
 
 // nodeLink returns the name src has in the node store, linking it there
 // first if it has none. The link is the same file, never a copy: it costs a
@@ -140,6 +158,9 @@ func (e *Engine) nodeLink(src string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
+	if err := e.prepareNodeAccess(real); err != nil {
+		return "", err
+	}
 	dst := filepath.Join(dir, nodeName(k))
 	switch err := linkNode(real, dst); {
 	case err == nil:
@@ -155,14 +176,252 @@ func (e *Engine) nodeLink(src string) (string, error) {
 	}
 	// Another creator may have linked the same file but not synced it yet.
 	// Reusing that name must publish it before this caller drops its source.
-	syncNodeDir(dir)
+	if err := syncNodeDir(dir); err != nil {
+		return "", err
+	}
 	return dst, nil
 }
 
-// readDiskChain is used for newly constructed disks and authorized legacy
-// disks, never to replace an existing daemon-recorded chain. A raw parent's
-// format is terminal even when the raw payload happens to be a qcow2 header.
-// Only an unknown legacy format permits inference, after authorization.
+// A pending record is durable while its private inode pin still exists. The
+// final sidecar therefore cannot outlive its inode and authorize a reused
+// identity, even if publication stops before exposing the final name.
+type nodePublication struct {
+	Node    string      `json:"node"`
+	Format  string      `json:"format"`
+	Backing []diskLayer `json:"backing"`
+}
+
+func nodePendingPath(pin string) string { return pin + ".json" }
+
+func nodePendingName(name string) bool {
+	pin, ok := strings.CutSuffix(name, ".json")
+	return ok && (numberedStage(pin, ".publish-", "") || numberedStage(pin, ".adopt-", ""))
+}
+
+func readNodePublication(path string) (nodePublication, error) {
+	var p nodePublication
+	found, err := readDaemonMetadata(path, &p)
+	if err != nil {
+		return p, err
+	}
+	if !found {
+		return p, fs.ErrNotExist
+	}
+	if p.Node == "" || filepath.Base(p.Node) != p.Node || strings.HasPrefix(p.Node, ".") ||
+		!strings.HasSuffix(p.Node, ".img") {
+		return p, fmt.Errorf("%s: invalid pending node %q", path, p.Node)
+	}
+	return p, nil
+}
+
+// linkNodeMetadata is the production hard-link path. A failed first link has
+// exposed no authority and can still use the caller's copy fallback.
+func (e *Engine) linkNodeMetadata(src, format string, backing []diskLayer) (string, error) {
+	real, err := resolveBasePath(src)
+	if err != nil {
+		return "", err
+	}
+	fi, err := os.Stat(real)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s isn't a regular file", real)
+	}
+	if _, ok := keyOf(fi); !ok {
+		return "", fmt.Errorf("%w: no file identity here", errNoNodeLink)
+	}
+	dir, err := filepath.Abs(nodesDir(e.cfg.DataDir))
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	if err := e.prepareNodeAccess(real); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(dir, ".publish-*")
+	if err != nil {
+		return "", err
+	}
+	pin := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(pin)
+		return "", err
+	}
+	if err := os.Remove(pin); err != nil {
+		return "", err
+	}
+	if err := linkNode(real, pin); err != nil {
+		return "", fmt.Errorf("%w: %v", errNoNodeLink, err)
+	}
+	// Received raw layers have not necessarily crossed any file barrier yet.
+	if err := syncNodeFile(pin); err != nil {
+		_ = os.Remove(pin)
+		return "", err
+	}
+	return e.commitNode(pin, format, backing, false)
+}
+
+// commitNode owns pin, either a private hard link or a synced adopted copy.
+// Once pending metadata may exist, only exclusive recovery removes leftovers:
+// a failed shared-lock publisher must never unlink another publisher's node.
+func (e *Engine) commitNode(pin, format string, backing []diskLayer, move bool) (string, error) {
+	recoverable := false
+	defer func() {
+		if !recoverable {
+			_ = os.Remove(pin)
+		}
+	}()
+	fi, err := os.Lstat(pin)
+	if err != nil {
+		return "", err
+	}
+	k, ok := keyOf(fi)
+	if !ok || !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s: no regular node identity", pin)
+	}
+	dir := filepath.Dir(pin)
+	node := filepath.Join(dir, nodeName(k))
+	if err := validateNodeMetadata(node, format, backing); err != nil {
+		return "", err
+	}
+	if have, err := os.Lstat(node); err == nil {
+		if !os.SameFile(fi, have) {
+			return "", fmt.Errorf("node store entry %s is not %s", node, pin)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	p := nodePublication{Node: filepath.Base(node), Format: format, Backing: backing}
+	recoverable = true
+	// This directory sync also persists the pin before any final sidecar.
+	if err := writeDaemonMetadata(nodePendingPath(pin), p); err != nil {
+		return "", err
+	}
+	if err := e.recordNodeMetadata(node, format, backing); err != nil {
+		return "", err
+	}
+	if move {
+		if have, err := os.Lstat(node); err == nil {
+			if !os.SameFile(fi, have) {
+				return "", fmt.Errorf("node store entry %s is not %s", node, pin)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		} else if err := renameNode(pin, node); err != nil {
+			return "", err
+		}
+	} else {
+		switch err := linkNode(pin, node); {
+		case err == nil:
+		case errors.Is(err, fs.ErrExist):
+			have, serr := os.Lstat(node)
+			if serr != nil || !os.SameFile(fi, have) {
+				return "", fmt.Errorf("node store entry %s is not %s", node, pin)
+			}
+		default:
+			return "", err
+		}
+	}
+	// EEXIST is not a durability barrier: each concurrent publisher must sync.
+	if err := syncNodeDir(dir); err != nil {
+		return "", err
+	}
+	if err := finishNodePublication(pin); err != nil {
+		return "", err
+	}
+	return node, nil
+}
+
+func finishNodePublication(pin string) error {
+	if err := os.Remove(nodePendingPath(pin)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(pin); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return syncNodeDir(filepath.Dir(pin))
+}
+
+// Recover before deleting any fork/normalization stages: their pending nodes
+// may be the only daemon-recorded graph for an external snapshot.
+func reconcileNodePublications(dataDir string) error {
+	dir := nodesDir(dataDir)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	e := &Engine{cfg: Config{DataDir: dataDir}}
+	for _, de := range entries {
+		if !nodePendingName(de.Name()) {
+			continue
+		}
+		pending := filepath.Join(dir, de.Name())
+		p, err := readNodePublication(pending)
+		if err != nil {
+			return err
+		}
+		pin := strings.TrimSuffix(pending, ".json")
+		node := filepath.Join(dir, p.Node)
+		fi, err := os.Lstat(pin)
+		if errors.Is(err, fs.ErrNotExist) {
+			fi, err = os.Lstat(node)
+			if errors.Is(err, fs.ErrNotExist) {
+				if err := removeNodeMetadata(node); err != nil {
+					return err
+				}
+				if err := finishNodePublication(pin); err != nil {
+					return err
+				}
+				continue
+			}
+			if err == nil {
+				k, ok := keyOf(fi)
+				if !ok || nodeName(k) != p.Node {
+					return fmt.Errorf("%s: pending node identity changed", pending)
+				}
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s: pending node is not regular", pending)
+		}
+		if have, err := os.Lstat(node); err == nil {
+			if !os.SameFile(fi, have) {
+				return fmt.Errorf("node store entry %s is not %s", node, pin)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if err := e.recordNodeMetadata(node, p.Format, p.Backing); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(node); errors.Is(err, fs.ErrNotExist) {
+			if err := renameNode(pin, node); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		if err := syncNodeDir(dir); err != nil {
+			return err
+		}
+		if err := finishNodePublication(pin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readDiskChain is used for newly constructed disks, never to replace a
+// daemon-recorded chain. Unknown top formats retain legacy inference.
 func readDiskChain(path, format string, authorize func(string) error) ([]diskLayer, error) {
 	legacy := format == ""
 	if format == "raw" {
@@ -281,16 +540,13 @@ func (e *Engine) layerOn(dst, src string, own bool, format string) (string, erro
 	case format == "raw" && size%512 != 0:
 		return format, moveOrClone(real, dst, own, format)
 	}
-	node, err := e.nodeLink(real)
+	node, err := e.linkNodeMetadata(real, format, chain)
 	if errors.Is(err, errNoNodeLink) {
 		slog.Warn("krucible.node.copy", "disk", real, "reason", err)
 		return format, moveOrClone(real, dst, own, format)
 	}
 	if err != nil {
 		return "", err
-	}
-	if err := e.recordNodeMetadata(node, format, chain); err != nil {
-		return "", fmt.Errorf("record node backing: %w", err)
 	}
 	return "qcow2", createQcow2OverlayOn(dst, node, format, size)
 }
@@ -476,13 +732,62 @@ type diskRoot struct {
 
 type diskCatalog struct {
 	metadata    map[fileKey]diskMetadata
-	storedNodes map[fileKey]bool
+	storedNodes map[fileKey]*storedNode
 	roots       []diskRoot
 }
 
 // The catalog reads daemon metadata only. Inode identity makes its format
 // decision survive an alias outside the disk's managed directory.
 func readDiskCatalog(dataDir string) (*diskCatalog, error) {
+type storedNode struct {
+	names []string
+	count uint64
+	links uint64
+}
+
+// Count physical regular names in the store exactly once. Directory aliases
+// are roots, not additional hard links; hidden publication pins count too.
+func readNodeStore(dataDir string) (map[fileKey]*storedNode, []string, error) {
+	dir := nodesDir(dataDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, err
+	}
+	nodes := map[fileKey]*storedNode{}
+	var pending []string
+	for _, de := range entries {
+		path := filepath.Join(dir, de.Name())
+		if nodePendingName(de.Name()) {
+			pending = append(pending, path)
+		}
+		if !de.Type().IsRegular() {
+			continue
+		}
+		fi, err := os.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		k, ok := keyOf(fi)
+		st, statOK := fi.Sys().(*syscall.Stat_t)
+		if !ok || !statOK || !fi.Mode().IsRegular() {
+			continue
+		}
+		n := nodes[k]
+		if n == nil {
+			n = &storedNode{links: uint64(st.Nlink)}
+			nodes[k] = n
+		}
+		n.count++
+		if !strings.HasPrefix(de.Name(), ".") {
+			n.names = append(n.names, path)
+		}
+	}
+	return nodes, pending, nil
+}
+
 	dataDir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, err
@@ -514,35 +819,42 @@ func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 			path, format, backing = backing[0].Path, backing[0].Format, backing[1:]
 		}
 	}
-	storedNodes := map[fileKey]bool{}
-	nodeFiles, err := os.ReadDir(nodesDir(dataDir))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	storedNodes, pending, err := readNodeStore(dataDir)
+	if err != nil {
 		return nil, err
 	}
-	for _, de := range nodeFiles {
-		if strings.HasPrefix(de.Name(), ".") || !de.Type().IsRegular() {
-			continue
+	for _, n := range storedNodes {
+		for _, path := range n.names {
+			var m nodeMetadata
+			found, err := readDaemonMetadata(nodeMetadataPath(path), &m)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				if err := register(path, m.Format, m.Backing); err != nil {
+					return nil, err
+				}
+			}
 		}
-		path := filepath.Join(nodesDir(dataDir), de.Name())
-		fi, err := os.Stat(path)
+	}
+	// Dry runs cannot reconcile a crashed publisher. Its daemon record still
+	// roots the pinned graph without promoting global sidecars to ownership.
+	for _, path := range pending {
+		p, err := readNodePublication(path)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		if k, ok := keyOf(fi); ok {
-			storedNodes[k] = true
-		}
-		var m nodeMetadata
-		found, err := readDaemonMetadata(nodeMetadataPath(path), &m)
-		if err != nil {
+		pin := strings.TrimSuffix(path, ".json")
+		if _, err := os.Lstat(pin); errors.Is(err, fs.ErrNotExist) {
+			pin = filepath.Join(nodesDir(dataDir), p.Node)
+		} else if err != nil {
 			return nil, err
 		}
-		if found {
-			if err := register(path, m.Format, m.Backing); err != nil {
-				return nil, err
-			}
+		if err := register(pin, p.Format, p.Backing); err != nil {
+			return nil, err
 		}
 	}
 	root := func(path, holder, owner, format string, backing []diskLayer, legacy bool) error {
@@ -553,6 +865,8 @@ func readDiskCatalog(dataDir string) (*diskCatalog, error) {
 			if err := register(path, format, backing); err != nil {
 				return err
 			}
+		roots = append(roots, diskRoot{path: pin, holder: path,
+			metadata: diskMetadata{format: p.Format, backing: p.Backing}})
 		}
 		roots = append(roots, diskRoot{path: path, holder: holder, owner: owner,
 			metadata: diskMetadata{format: format, backing: backing}, legacy: legacy})
@@ -788,19 +1102,17 @@ func diskRefs(dataDir string) (map[fileKey][]string, error) {
 		if err != nil {
 			return err
 		}
-		if !link && within(nodesDir(dataDir), path) {
-			if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink == 1 {
+		if k, ok := keyOf(fi); ok {
+			if n := storedNodes[k]; !link && within(nodesDir(dataDir), path) && n != nil && n.links <= n.count {
 				return nil
 			}
-		}
-		if k, ok := keyOf(fi); ok {
 			if m, found := metadata[k]; found {
 				return add(path, path, m.backing)
 			}
 			if inspected[k] {
 				return add(path, path, nil)
 			}
-			if storedNodes[k] {
+			if n := storedNodes[k]; n != nil && len(n.names) != 0 {
 				return fmt.Errorf("%s: live node has no daemon-recorded disk metadata", path)
 			}
 		}
@@ -875,6 +1187,9 @@ func cleanNodeStages(dataDir string) error {
 			dir := filepath.Join(dataDir, de.Name())
 			files, err := os.ReadDir(dir)
 			if errors.Is(err, fs.ErrNotExist) {
+	if err := reconcileNodePublications(dataDir); err != nil {
+		return err
+	}
 				continue
 			}
 			if err != nil {
@@ -937,7 +1252,8 @@ func cleanNodeStages(dataDir string) error {
 		return err
 	}
 	for _, de := range entries {
-		if de.Type().IsRegular() && (numberedStage(de.Name(), ".adopt-", "") || numberedStage(de.Name(), ".manifest-", "")) {
+		if de.Type().IsRegular() && (numberedStage(de.Name(), ".adopt-", "") ||
+			numberedStage(de.Name(), ".publish-", "") || numberedStage(de.Name(), ".manifest-", "")) {
 			if err := os.Remove(filepath.Join(nodesDir(dataDir), de.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
@@ -967,27 +1283,14 @@ func sweepNodesLocked(dataDir string, dryRun bool) (removed []string, err error)
 		}
 	}
 	dir := nodesDir(dataDir)
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
+	nodes, _, err := readNodeStore(dataDir)
 	if err != nil {
 		return nil, err
 	}
-	cand := map[fileKey]string{}
-	for _, de := range entries {
-		if strings.HasPrefix(de.Name(), ".") || !de.Type().IsRegular() {
-			continue
-		}
-		path := filepath.Join(dir, de.Name())
-		fi, err := os.Lstat(path)
-		if err != nil {
-			continue
-		}
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Nlink == 1 {
-			if k, ok := keyOf(fi); ok {
-				cand[k] = path
-			}
+	cand := map[fileKey][]string{}
+	for k, n := range nodes {
+		if len(n.names) != 0 && n.links <= n.count {
+			cand[k] = n.names
 		}
 	}
 	if len(cand) == 0 {
@@ -998,14 +1301,15 @@ func sweepNodesLocked(dataDir string, dryRun bool) (removed []string, err error)
 		return nil, fmt.Errorf("sweep nodes: %w", err)
 	}
 	var garbage []string
-	for k, path := range cand {
+	for k, names := range cand {
 		if len(refs[k]) == 0 {
-			garbage = append(garbage, path)
+			garbage = append(garbage, names...)
 		}
 	}
 	slices.Sort(garbage)
-	for _, path := range garbage {
-		if !dryRun {
+	if !dryRun {
+		// Remove every alias's metadata before releasing any group's last pin.
+		for _, path := range garbage {
 			if err := removeNodeMetadata(path); err != nil {
 				return removed, err
 			}
@@ -1018,11 +1322,20 @@ func sweepNodesLocked(dataDir string, dryRun bool) (removed []string, err error)
 	return removed, nil
 }
 
+		}
+	}
+	for _, path := range garbage {
+		if !dryRun {
 // SweepNodes removes the nodes nothing needs any more and returns them.
 func SweepNodes(dataDir string, dryRun bool) ([]string, error) {
 	unlock, err := lockBases(dataDir, true)
 	if err != nil {
 		return nil, err
+	}
+	if !dryRun && len(removed) != 0 {
+		if err := syncNodeDir(dir); err != nil {
+			return removed, err
+		}
 	}
 	defer unlock()
 	return sweepNodesLocked(dataDir, dryRun)
@@ -1511,39 +1824,40 @@ func ownedNodeKeys(dataDir, ownerID string) (map[fileKey]bool, error) {
 // import has unpacked and is done with: linked there, or copied in where a
 // link can't reach.
 func (e *Engine) adoptNode(path, format string, backing []diskLayer) (string, error) {
-	node, err := e.nodeLink(path)
-	if errors.Is(err, errNoNodeLink) {
-		dir, err := filepath.Abs(nodesDir(e.cfg.DataDir))
-		if err != nil {
-			return "", err
-		}
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return "", err
-		}
-		tmp, err := os.CreateTemp(dir, ".adopt-*")
-		if err != nil {
-			return "", err
-		}
-		if err := tmp.Close(); err != nil {
-			return "", err
-		}
-		defer os.Remove(tmp.Name())
-		if err := cloneFile(path, tmp.Name()); err != nil {
-			return "", err
-		}
-		// Syncing the source cannot make this new inode durable.
-		if err := syncNodeFile(tmp.Name()); err != nil {
-			return "", err
-		}
-		node, err = e.nodeLink(tmp.Name())
-		if err != nil {
-			return "", err
-		}
-	} else if err != nil {
+	node, err := e.linkNodeMetadata(path, format, backing)
+	if !errors.Is(err, errNoNodeLink) {
+		return node, err
+	}
+	dir, err := filepath.Abs(nodesDir(e.cfg.DataDir))
+	if err != nil {
 		return "", err
 	}
-	if err := e.recordNodeMetadata(node, format, backing); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	return node, nil
+	tmp, err := os.CreateTemp(dir, ".adopt-*")
+	if err != nil {
+		return "", err
+	}
+	owned := true
+	defer func() {
+		if owned {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := cloneFile(path, tmp.Name()); err != nil {
+		return "", err
+	}
+	if err := e.prepareNodeAccess(tmp.Name()); err != nil {
+		return "", err
+	}
+	// Syncing the source cannot make this new inode durable.
+	if err := syncNodeFile(tmp.Name()); err != nil {
+		return "", err
+	}
+	owned = false
+	return e.commitNode(tmp.Name(), format, backing, true)
 }

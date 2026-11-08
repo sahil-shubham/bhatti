@@ -30,16 +30,15 @@ import (
 // Landlock, from its disks. It costs a hash and a map.
 //
 // Every helper is also in vmmGroup, which shared read-only things open to:
-// the directories on the way to the images (search only) and images that
-// aren't world-readable. An owner's helpers are in a group of the owner's
-// (vmmNetGIDBase+n), the only one its bhatti-netd's socket accepts. Volumes
-// and a restore's checkpoint are hard-linked into the sandbox dir, so their
-// own directories stay the daemon's alone.
+// the directories on the way to the images (search only) and shared bases.
+// An owner's helpers also get its ephemeral netd socket group and its durable
+// node group. Private ancestors are daemon-owned and readable only by that
+// owner's node group, even when Landlock is unavailable.
 //
-// The ids come from 0x70000000 (1879048192) up: that group, 2^20 per-sandbox
-// ids, then 2^20 owner groups — above what useradd hands out for subordinate
-// ids and systemd for containers, below systemd's foreign range, and named by
-// no account.
+// The ids come from 0x70000000 (1879048192) up: that shared group, then 2^20
+// per-sandbox ids, 2^20 ephemeral netd groups and 2^20 durable node groups —
+// above subordinate/container ids, below systemd's foreign range, and named
+// by no account.
 const (
 	vmmGroup      = 0x70000000
 	vmmIDSlots    = 1 << 20
@@ -152,6 +151,15 @@ func (e *Engine) shareWithVMMs(path string, other, group os.FileMode) error {
 		return err
 	}
 	st := fi.Sys().(*syscall.Stat_t)
+	if e.dropVMM && fi.Mode().IsRegular() {
+		private, err := e.privateNodeFile(path, fi)
+		if err != nil {
+			return err
+		}
+		if private {
+			return fmt.Errorf("%s is a private node, not a universally shared image", path)
+		}
+	}
 	if fi.Mode()&other != 0 || (st.Gid == vmmGroup && fi.Mode()&group != 0) {
 		return nil
 	}
@@ -398,10 +406,13 @@ func (e *Engine) confineCheckpoint(dir string) (string, func() error, error) {
 func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, string, func(), error) {
 	cleanup := func() {}
 	fail := func(err error) (VMSpec, string, func(), error) { cleanup(); return spec, "", func() {}, err }
-	var uid uint32
+	var uid, nodeGID uint32
 	if e.dropVMM {
 		var err error
 		if uid, err = e.vmmUIDFor(vm); err != nil {
+			return fail(err)
+		}
+		if nodeGID, err = e.nodeGIDFor(vm); err != nil {
 			return fail(err)
 		}
 	}
@@ -410,6 +421,20 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 	give := func(path string, owner, group uint32, mode os.FileMode) error {
 		if !e.dropVMM {
 			return nil
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		private, err := e.privateNodeFile(path, fi)
+		if err != nil {
+			return err
+		}
+		if private {
+			if mode&0o222 != 0 {
+				return fmt.Errorf("%s is an immutable private node", path)
+			}
+			return e.nodeReadable(path, nodeGID)
 		}
 		if err := os.Lchown(path, int(owner), int(group)); err != nil {
 			return err
@@ -420,7 +445,7 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 	p := VMMPolicy{Rules: []VMMRule{{specPath, vmmReadFile}, {"/dev/kvm", vmmDevice}}}
 	if e.dropVMM {
 		p.UID, p.GID = uid, uid
-		p.Groups = []uint32{vmmGroup}
+		p.Groups = []uint32{vmmGroup, nodeGID}
 		if e.kvmGID != 0 {
 			p.Groups = append(p.Groups, e.kvmGID)
 		}
@@ -457,7 +482,7 @@ func (e *Engine) confineLaunch(vm *VM, spec VMSpec, specPath string) (VMSpec, st
 		}
 		for _, b := range chain {
 			if e.dropVMM {
-				if err := e.vmmReadable(b.Path); err != nil {
+				if err := e.backingReadable(b.Path, nodeGID); err != nil {
 					return err
 				}
 			}

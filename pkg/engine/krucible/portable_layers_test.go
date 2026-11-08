@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -1133,6 +1134,88 @@ func TestLegacyArchiveDefaultsStandaloneVolumesToRaw(t *testing.T) {
 			got, err := os.ReadFile(filepath.Join(dest, imported.Volumes[0].File))
 			if err != nil || !bytes.Equal(got, raw) {
 				t.Fatalf("legacy raw guest bytes changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestLayeredSnapshotImportsWithoutHardlinks(t *testing.T) {
+	for _, linkErr := range []error{syscall.EXDEV, syscall.EOPNOTSUPP} {
+		t.Run(linkErr.Error(), func(t *testing.T) {
+			f, dir, m := layeredSnapshot(t)
+			wantRoot, err := os.ReadFile(backingOf(t, filepath.Join(dir, m.DiskFile)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantVolume := fileSum(t, backingOf(t, filepath.Join(dir, "vol0.img")))
+			archive := exportArchive(t, f.e, dir, m, true)
+			am, err := readArchiveManifestFrom(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := portableEngine(t, "", "exit 0")
+			base := b.keptBasePath(am.Base.SHA256, am.Base.Name)
+			if err := os.MkdirAll(filepath.Dir(base), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := cloneFile(f.base, base); err != nil {
+				t.Fatal(err)
+			}
+			oldLink := linkNode
+			t.Cleanup(func() { linkNode = oldLink })
+			links := 0
+			linkNode = func(src, dst string) error {
+				links++
+				return &os.LinkError{Op: "link", Old: src, New: dst, Err: linkErr}
+			}
+			var roots, volumes, snapshots []string
+			for _, name := range []string{"first", "second"} {
+				dest := filepath.Join(b.cfg.DataDir, "snapshots", "u1", name)
+				if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := b.ImportSnapshot(context.Background(), bytes.NewReader(archive), dest); err != nil {
+					t.Fatal(err)
+				}
+				local, found, err := readSnapshotManifest(dest)
+				if err != nil || !found || len(local.Backing) != 2 || len(local.Volumes) != 1 || len(local.Volumes[0].Backing) != 1 {
+					t.Fatalf("no-link import lost typed chains: %+v, %v", local, err)
+				}
+				if local.Backing[0].Format != "qcow2" || local.Backing[1].Format != "raw" || local.Backing[1].Path != base ||
+					local.Volumes[0].Backing[0].Format != "raw" {
+					t.Fatalf("no-link import changed dependency drivers: %+v", local)
+				}
+				root, volume := local.Backing[0].Path, local.Volumes[0].Backing[0].Path
+				if filepath.Dir(root) != nodesDir(b.cfg.DataDir) || filepath.Dir(volume) != nodesDir(b.cfg.DataDir) {
+					t.Fatal("import retained source-host nodes")
+				}
+				gotRoot, err := os.ReadFile(root)
+				if err != nil || len(gotRoot) != len(wantRoot) ||
+					!bytes.Equal(gotRoot[qcow2ClusterSize:], wantRoot[qcow2ClusterSize:]) ||
+					fileSum(t, volume) != wantVolume {
+					t.Fatalf("copy adoption changed disk bytes: %v", err)
+				}
+				roots, volumes, snapshots = append(roots, root), append(volumes, volume), append(snapshots, dest)
+			}
+			if links != 4 || roots[0] == roots[1] || volumes[0] == volumes[1] {
+				t.Fatalf("no-link imports reused nodes or retried hard links: links=%d roots=%v volumes=%v", links, roots, volumes)
+			}
+			if err := b.RemoveSnapshot(context.Background(), snapshots[0]); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{roots[0], volumes[0], nodeMetadataPath(roots[0]), nodeMetadataPath(volumes[0])} {
+				mustNotExist(t, path)
+			}
+			for _, path := range []string{roots[1], volumes[1], base} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("first import cleanup broke second: %s: %v", path, err)
+				}
+			}
+			if err := b.RemoveSnapshot(context.Background(), snapshots[1]); err != nil {
+				t.Fatal(err)
+			}
+			if entries := nodeStoreEntries(t, b.cfg.DataDir); len(entries) != 0 {
+				t.Fatalf("no-link imports left stale nodes/metadata: %v", entries)
 			}
 		})
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -872,14 +873,18 @@ func TestNodeLinkPublishesNameBeforeReturning(t *testing.T) {
 		t.Fatal("no file identity")
 	}
 	node := filepath.Join(nodesDir(f.data), nodeName(k))
-	dst := filepath.Join(f.data, "sandboxes", "new", "root.qcow2")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		t.Fatal(err)
+	dst := filepath.Join(t.TempDir(), "root.qcow2")
+	oldSync, oldLink := syncNodeDir, linkNode
+	t.Cleanup(func() { syncNodeDir, linkNode = oldSync, oldLink })
+	links, syncs := 0, 0
+	linkNode = func(src, dst string) error {
+		if dst == node {
+			assertNodePendingBeforeLink(t, src, dst)
+			links++
+		}
+		return oldLink(src, dst)
 	}
-	oldSync := syncNodeDir
-	t.Cleanup(func() { syncNodeDir = oldSync })
-	syncs := 0
-	syncNodeDir = func(dir string) {
+	syncNodeDir = func(dir string) error {
 		syncs++
 		if dir != nodesDir(f.data) {
 			t.Fatalf("synced %s, not the node directory", dir)
@@ -887,21 +892,26 @@ func TestNodeLinkPublishesNameBeforeReturning(t *testing.T) {
 		if have, err := os.Stat(node); err != nil || !os.SameFile(fi, have) {
 			t.Fatalf("the publication barrier ran before the link existed: %v", err)
 		}
-		if syncs == 1 {
+		var m nodeMetadata
+		if found, err := readDaemonMetadata(nodeMetadataPath(node), &m); err != nil || !found || m.Format != "qcow2" {
+			t.Fatalf("node publication has no durable metadata: %+v, %v", m, err)
+		}
+		if syncs <= 2 {
 			if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("the overlay was published before its backing name: %v", err)
 			}
 		}
+		return oldSync(dir)
 	}
 	if _, err := f.e.layerOn(dst, src, false, "qcow2"); err != nil {
 		t.Fatal(err)
 	}
-	if syncs != 1 {
-		t.Fatalf("nodeLink returned without its publication barrier: %d barriers", syncs)
+	if links != 1 || syncs != 2 {
+		t.Fatalf("node publication crossed %d link and %d directory barriers", links, syncs)
 	}
-	// A second publisher can observe the link before the first publisher's
-	// barrier. Seeing EEXIST is not proof that the name is already durable.
-	if got, err := f.e.nodeLink(src); err != nil || got != node || syncs != 2 {
+	// The retained primitive still syncs an EEXIST name itself.
+	linkNode = oldLink
+	if got, err := f.e.nodeLink(src); err != nil || got != node || syncs != 3 {
 		t.Fatalf("reused link was not published: %s, %v, %d barriers", got, err, syncs)
 	}
 }
@@ -2024,70 +2034,113 @@ func TestSweepNodesReclaimsLegacyNormalizationStages(t *testing.T) {
 }
 
 func TestAdoptNodeSyncsFallbackBeforePublishing(t *testing.T) {
-	for _, failSync := range []bool{false, true} {
-		name := "sync-before-link"
-		if failSync {
-			name = "sync-failure"
-		}
-		t.Run(name, func(t *testing.T) {
-			f := newNodeFixture(t)
-			source := f.freshRoot("source")
-			sourceReal, err := resolveBasePath(source)
-			if err != nil {
-				t.Fatal(err)
-			}
-			originalLink, originalSync := linkNode, syncNodeFile
-			t.Cleanup(func() {
-				linkNode, syncNodeFile = originalLink, originalSync
-			})
-			synced, syncs := false, 0
-			syncErr := errors.New("adopted copy sync failed")
-			syncNodeFile = func(paths ...string) error {
-				syncs++
-				if len(paths) != 1 || filepath.Dir(paths[0]) != nodesDir(f.data) ||
-					!numberedStage(filepath.Base(paths[0]), ".adopt-", "") {
-					t.Fatalf("synced the source instead of its new inode: %v", paths)
-				}
-				if failSync {
-					return syncErr
-				}
-				if err := originalSync(paths...); err != nil {
-					return err
-				}
-				synced = true
-				return nil
-			}
-			linkNode = func(src, dst string) error {
-				if src == sourceReal {
-					return &os.LinkError{Op: "link", Old: src, New: dst, Err: syscall.EXDEV}
-				}
-				if !synced {
-					t.Fatal("adopted copy was published before its file sync")
-				}
-				return originalLink(src, dst)
-			}
-			node, err := f.e.adoptNode(source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+	for _, linkErr := range []error{syscall.EXDEV, syscall.EOPNOTSUPP} {
+		for _, failSync := range []bool{false, true} {
+			name := linkErr.Error() + "/rename-after-sync"
 			if failSync {
-				if !errors.Is(err, syncErr) || len(nodeEntries(t, f.data)) != 0 {
-					t.Fatalf("failed file sync published a node: %s, %v", node, err)
-				}
-			} else {
+				name = linkErr.Error() + "/sync-failure"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newNodeFixture(t)
+				source := f.freshRoot("source")
+				before, err := os.ReadFile(source)
 				if err != nil {
 					t.Fatal(err)
 				}
-				before, err := os.Stat(source)
+				sourceInfo, err := os.Stat(source)
 				if err != nil {
 					t.Fatal(err)
 				}
-				after, err := os.Stat(node)
-				if err != nil || os.SameFile(before, after) {
-					t.Fatalf("cross-filesystem adoption did not publish a copied inode: %v", err)
+				originalLink, originalSync := linkNode, syncNodeFile
+				originalRename, originalDirSync := renameNode, syncNodeDir
+				t.Cleanup(func() {
+					linkNode, syncNodeFile = originalLink, originalSync
+					renameNode, syncNodeDir = originalRename, originalDirSync
+				})
+				var events []string
+				links, syncs, renames := 0, 0, 0
+				syncErr := errors.New("adopted copy sync failed")
+				syncNodeFile = func(paths ...string) error {
+					syncs++
+					if len(paths) != 1 || filepath.Dir(paths[0]) != nodesDir(f.data) ||
+						!numberedStage(filepath.Base(paths[0]), ".adopt-", "") {
+						t.Fatalf("synced the source instead of its new inode: %v", paths)
+					}
+					events = append(events, "file-sync")
+					if failSync {
+						return syncErr
+					}
+					return originalSync(paths...)
 				}
-			}
-			if syncs != 1 {
-				t.Fatalf("fallback copy crossed %d file-sync barriers, want one", syncs)
-			}
-		})
+				linkNode = func(src, dst string) error {
+					links++
+					return &os.LinkError{Op: "link", Old: src, New: dst, Err: linkErr}
+				}
+				renameNode = func(src, dst string) error {
+					if !slices.Equal(events, []string{"file-sync"}) {
+						t.Fatalf("copied inode renamed before its file sync: %v", events)
+					}
+					assertNodePendingBeforeLink(t, src, dst)
+					events = append(events, "metadata")
+					fi, err := os.Stat(src)
+					if err != nil || os.SameFile(sourceInfo, fi) {
+						t.Fatalf("rename did not publish a private copied inode: %v", err)
+					}
+					k, ok := keyOf(fi)
+					if !ok || filepath.Base(dst) != nodeName(k) {
+						t.Fatalf("copied node used the source's identity: %s", dst)
+					}
+					if _, err := os.Lstat(dst); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("copy was exposed before rename: %v", err)
+					}
+					renames++
+					events = append(events, "rename")
+					return originalRename(src, dst)
+				}
+				syncNodeDir = func(dir string) error {
+					if renames != 1 {
+						t.Fatalf("publication directory synced before rename: %v", events)
+					}
+					events = append(events, "directory-sync")
+					return originalDirSync(dir)
+				}
+				node, err := f.e.adoptNode(source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+				if failSync {
+					if !errors.Is(err, syncErr) || len(nodeEntries(t, f.data)) != 0 || renames != 0 {
+						t.Fatalf("failed file sync published a node: %s, %v", node, err)
+					}
+					entries, readErr := os.ReadDir(nodesDir(f.data))
+					if readErr != nil || len(entries) != 0 {
+						t.Fatalf("failed file sync exposed metadata or staging files: %v, %v", entries, readErr)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !slices.Equal(events, []string{"file-sync", "metadata", "rename", "directory-sync", "directory-sync"}) {
+						t.Fatalf("wrong copied-node durability order: %v", events)
+					}
+					after, err := os.Stat(node)
+					if err != nil || os.SameFile(sourceInfo, after) {
+						t.Fatalf("cross-filesystem adoption did not publish a copied inode: %v", err)
+					}
+					payload, err := os.ReadFile(node)
+					if err != nil || !bytes.Equal(payload, before) {
+						t.Fatalf("copied adoption changed the payload: %v", err)
+					}
+					if names := nodeEntries(t, f.data); len(names) != 1 || names[0] != filepath.Base(node) {
+						t.Fatalf("successful copy left publication stages: %v", names)
+					}
+				}
+				if syncs != 1 || links != 1 {
+					t.Fatalf("copy fallback crossed %d file-sync and %d hard-link calls, want one each", syncs, links)
+				}
+				after, err := os.ReadFile(source)
+				if err != nil || !bytes.Equal(after, before) {
+					t.Fatalf("adoption damaged its source: %v", err)
+				}
+			})
+		}
 	}
 }
 
@@ -2251,5 +2304,597 @@ func TestSnapshotCatalogDoesNotTrustNestedDirectoryAliases(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("GC removed helper state while ignoring its metadata: %v", err)
 		}
+	}
+}
+
+func checkNodePendingBeforeLink(pin, node string) error {
+	p, err := readNodePublication(nodePendingPath(pin))
+	if err != nil {
+		return err
+	}
+	if p.Node != filepath.Base(node) {
+		return errors.New("pending record names another node")
+	}
+	var m nodeMetadata
+	found, err := readDaemonMetadata(nodeMetadataPath(node), &m)
+	if err != nil {
+		return err
+	}
+	if !found || m.Format != p.Format || !slices.Equal(m.Backing, p.Backing) {
+		return errors.New("final node metadata was not committed before publication")
+	}
+	return nil
+}
+
+func assertNodePendingBeforeLink(t *testing.T, pin, node string) {
+	t.Helper()
+	if err := checkNodePendingBeforeLink(pin, node); err != nil {
+		t.Fatalf("node link preceded its durable pending/metadata records: %v", err)
+	}
+}
+
+func nodeStoreEntries(t *testing.T, data string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(nodesDir(data))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(entries))
+	for i, de := range entries {
+		names[i] = de.Name()
+	}
+	return names
+}
+
+func TestNodePublicationRecoversExternalSnapshotCrash(t *testing.T) {
+	const crashEnv = "BHATTI_TEST_NODE_PUBLICATION_CRASH"
+	if boundary := os.Getenv(crashEnv); boundary != "" {
+		data, source, overlay := os.Getenv("BHATTI_TEST_NODE_DATA"), os.Getenv("BHATTI_TEST_NODE_SOURCE"), os.Getenv("BHATTI_TEST_NODE_OVERLAY")
+		e := &Engine{cfg: Config{DataDir: data}}
+		fi, err := os.Stat(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, ok := keyOf(fi)
+		if !ok {
+			t.Fatal("external snapshot has no identity")
+		}
+		node := filepath.Join(nodesDir(data), nodeName(k))
+		originalLink, originalSync := linkNode, syncNodeDir
+		linkNode = func(src, dst string) error {
+			if dst != node {
+				return originalLink(src, dst)
+			}
+			assertNodePendingBeforeLink(t, src, dst)
+			if _, err := os.Stat(overlay); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("overlay exists before node commit: %v", err)
+			}
+			if boundary == "before-link" {
+				os.Exit(77)
+			}
+			if err := originalLink(src, dst); err != nil {
+				return err
+			}
+			if boundary == "after-link" {
+				os.Exit(77)
+			}
+			return nil
+		}
+		syncNodeDir = func(dir string) error {
+			if err := originalSync(dir); err != nil {
+				return err
+			}
+			if boundary == "after-directory-sync" {
+				if _, err := os.Stat(overlay); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("overlay exists before the durable node commit returns: %v", err)
+				}
+				os.Exit(77)
+			}
+			return nil
+		}
+		unlock, err := lockBases(data, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unlock()
+		if _, err := e.layerOn(overlay, source, false, "qcow2"); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("publisher did not stop at its crash boundary")
+	}
+	for _, boundary := range []string{"before-link", "after-link", "after-directory-sync"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newNodeFixture(t)
+			parent := f.snapshot("u1", "parent", f.freshRoot("source"))
+			root := f.resume("child", parent)
+			ancestor := backingOf(t, root)
+			unrelated := f.snapshot("u1", "unrelated", f.freshRoot("unrelated"))
+			external := filepath.Join(t.TempDir(), "rootfs.qcow2")
+			if err := cloneFile(root, external); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(external)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.RemoveAll(filepath.Join(f.data, "sandboxes")); err != nil {
+				t.Fatal(err)
+			}
+			overlay := filepath.Join(t.TempDir(), "overlay.qcow2")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestNodePublicationRecoversExternalSnapshotCrash$")
+			cmd.Env = append(os.Environ(), crashEnv+"="+boundary, "BHATTI_TEST_NODE_DATA="+f.data,
+				"BHATTI_TEST_NODE_SOURCE="+external, "BHATTI_TEST_NODE_OVERLAY="+overlay)
+			out, err := cmd.CombinedOutput()
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 77 {
+				t.Fatalf("crash subprocess did not reach %s: %v\n%s", boundary, err, out)
+			}
+			if _, err := os.Stat(overlay); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("crashed publisher exposed an overlay: %v", err)
+			}
+			stages := nodeStoreEntries(t, f.data)
+			if refs, err := diskRefs(f.data); err != nil || len(refs) == 0 {
+				t.Fatalf("pending external publication poisoned disk references: %v, %v", refs, err)
+			}
+			if removed, err := GCImages(f.data, nil, true); err != nil || len(removed) != 0 {
+				t.Fatalf("dry GC lost the pending graph: %v, %v", removed, err)
+			}
+			if !slices.Equal(stages, nodeStoreEntries(t, f.data)) {
+				t.Fatal("dry GC reconciled or deleted crash state")
+			}
+			restarted := &Engine{cfg: f.e.cfg}
+			if removed, err := GCImages(f.data, nil, false); err != nil || len(removed) != 0 {
+				t.Fatalf("restart GC lost external snapshot ancestors: %v, %v", removed, err)
+			}
+			fi, err := os.Stat(external)
+			if err != nil {
+				t.Fatal(err)
+			}
+			k, ok := keyOf(fi)
+			if !ok {
+				t.Fatal("external snapshot has no identity")
+			}
+			node := filepath.Join(nodesDir(f.data), nodeName(k))
+			if names := nodeEntries(t, f.data); len(names) != 2 {
+				t.Fatalf("reconciliation retained stages or lost a node: %v", names)
+			}
+			for _, path := range []string{node, ancestor} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("recovery lost metadata-backed ancestor %s: %v", path, err)
+				}
+				var m nodeMetadata
+				if found, err := readDaemonMetadata(nodeMetadataPath(path), &m); err != nil || !found {
+					t.Fatalf("recovered node has no metadata: %s, %v", path, err)
+				}
+			}
+			owned, err := ownedNodeKeys(f.data, "u2")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if owned[k] || restarted.authorizedBacking(&VM{UserID: "u2"}, node, owned) == nil {
+				t.Fatal("pending/global node metadata conferred another owner's authority")
+			}
+			if err := restarted.RemoveSnapshot(context.Background(), unrelated); err != nil {
+				t.Fatalf("external publication poisoned unrelated snapshot deletion: %v", err)
+			}
+			after, err := os.ReadFile(external)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("recovery changed its external snapshot: %v", err)
+			}
+			if err := os.Remove(external); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || !slices.Equal(removed, []string{node}) {
+				t.Fatalf("external publication was not reclaimable after its last holder: %v, %v", removed, err)
+			}
+			if err := restarted.RemoveSnapshot(context.Background(), parent); err != nil {
+				t.Fatalf("recovered ancestry poisoned eventual snapshot deletion: %v", err)
+			}
+			if entries := nodeStoreEntries(t, f.data); len(entries) != 0 {
+				t.Fatalf("reclaimed publication retained stale metadata or pins: %v", entries)
+			}
+			if removed, err := GCImages(f.data, nil, false); err != nil || !slices.Equal(removed, []string{f.base}) {
+				t.Fatalf("recovered publication permanently pinned its base: %v, %v", removed, err)
+			}
+		})
+	}
+}
+
+func TestNodePublicationDirectorySyncFailureExposesNoOverlay(t *testing.T) {
+	f := newNodeFixture(t)
+	source := filepath.Join(t.TempDir(), "raw.img")
+	writeFile(t, source, bytes.Repeat([]byte{1}, 4096))
+	dst := filepath.Join(t.TempDir(), "root.qcow2")
+	oldSync := syncNodeDir
+	t.Cleanup(func() { syncNodeDir = oldSync })
+	syncErr := errors.New("node directory sync failed")
+	syncNodeDir = func(string) error { return syncErr }
+	if _, err := f.e.layerOn(dst, source, false, "raw"); !errors.Is(err, syncErr) {
+		t.Fatalf("publication ignored its directory barrier: %v", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed publication exposed an overlay: %v", err)
+	}
+	syncNodeDir = oldSync
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+		t.Fatalf("failed directory sync was not recoverable: %v, %v", removed, err)
+	}
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 1 {
+		t.Fatalf("failed publisher left a permanent pin: %v, %v", removed, err)
+	}
+	if entries := nodeStoreEntries(t, f.data); len(entries) != 0 {
+		t.Fatalf("failed publisher left stale metadata: %v", entries)
+	}
+}
+
+func TestNodePublicationSameInodeConcurrentPublishers(t *testing.T) {
+	for _, secondKind := range []string{"layer", "adopt"} {
+		for _, failFirst := range []bool{false, true} {
+			name := secondKind + "/both-commit"
+			if failFirst {
+				name = secondKind + "/first-fails"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newNodeFixture(t)
+				source := filepath.Join(t.TempDir(), "snapshot.qcow2")
+				if err := cloneFile(f.freshRoot("source"), source); err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.ReadFile(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.RemoveAll(filepath.Join(f.data, "sandboxes")); err != nil {
+					t.Fatal(err)
+				}
+				fi, err := os.Stat(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				k, ok := keyOf(fi)
+				if !ok {
+					t.Fatal("snapshot has no identity")
+				}
+				node := filepath.Join(nodesDir(f.data), nodeName(k))
+				firstAtLink, releaseFirst := make(chan struct{}), make(chan struct{})
+				firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+				firstPin := ""
+				failed := errors.New("first publisher failed after another committed")
+				oldLink := linkNode
+				t.Cleanup(func() { linkNode = oldLink })
+				linkNode = func(src, dst string) error {
+					if dst == node {
+						first := firstPin == ""
+						if first {
+							firstPin = src
+							close(firstAtLink)
+							<-releaseFirst
+						}
+						if err := checkNodePendingBeforeLink(src, dst); err != nil {
+							return err
+						}
+						if first && failFirst {
+							return failed
+						}
+					}
+					return oldLink(src, dst)
+				}
+				firstRoot := filepath.Join(t.TempDir(), "first.qcow2")
+				secondRoot := filepath.Join(t.TempDir(), "second.qcow2")
+				go func() {
+					unlock, err := lockBases(f.data, false)
+					if err == nil {
+						defer unlock()
+						_, err = f.e.layerOn(firstRoot, source, false, "qcow2")
+					}
+					firstDone <- err
+				}()
+				<-firstAtLink
+				go func() {
+					unlock, err := lockBases(f.data, false)
+					if err == nil {
+						defer unlock()
+						if secondKind == "adopt" {
+							_, err = f.e.adoptNode(source, "qcow2", []diskLayer{{Path: f.base, Format: "raw"}})
+						} else {
+							_, err = f.e.layerOn(secondRoot, source, false, "qcow2")
+						}
+					}
+					secondDone <- err
+				}()
+				secondErr := <-secondDone
+				committed, statErr := os.Stat(node)
+				var m nodeMetadata
+				found, metadataErr := readDaemonMetadata(nodeMetadataPath(node), &m)
+				close(releaseFirst)
+				firstErr := <-firstDone
+				if secondErr != nil || statErr != nil || !os.SameFile(fi, committed) ||
+					metadataErr != nil || !found || m.Format != "qcow2" {
+					t.Fatalf("shared-lock publisher waited for or lost another's commit: %v, %v, %v", secondErr, statErr, metadataErr)
+				}
+				if failFirst {
+					if !errors.Is(firstErr, failed) {
+						t.Fatalf("first publisher did not report its failure: %v", firstErr)
+					}
+					if _, err := os.Stat(firstRoot); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("failed publisher exposed an overlay: %v", err)
+					}
+				} else if firstErr != nil {
+					t.Fatal(firstErr)
+				}
+				if refs, err := diskRefs(f.data); err != nil || len(refs[k]) == 0 {
+					t.Fatalf("one publisher's failure poisoned another's graph: %v, %v", refs, err)
+				}
+				if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+					t.Fatalf("failure cleanup removed a concurrent commit: %v, %v", removed, err)
+				}
+				if entries := nodeStoreEntries(t, f.data); len(entries) != 2 {
+					t.Fatalf("concurrent publication left private pending state: %v", entries)
+				}
+				after, err := os.ReadFile(source)
+				if err != nil || !bytes.Equal(before, after) {
+					t.Fatalf("concurrent publication changed its source: %v", err)
+				}
+				for _, path := range []string{source, firstRoot, secondRoot} {
+					if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+						t.Fatal(err)
+					}
+				}
+				linkNode = oldLink
+				if removed, err := SweepNodes(f.data, false); err != nil || !slices.Equal(removed, []string{node}) {
+					t.Fatalf("concurrent publication was not eventually reclaimable: %v, %v", removed, err)
+				}
+				if entries := nodeStoreEntries(t, f.data); len(entries) != 0 {
+					t.Fatalf("concurrent publication left stale metadata: %v", entries)
+				}
+			})
+		}
+	}
+}
+
+func TestSweepNodesReclaimsAllHistoricalAliases(t *testing.T) {
+	for _, format := range []string{"qcow2", "raw"} {
+		for _, holder := range []string{"none", "hardlink", "recorded-overlay", "symlink", "relocated-store-hardlink"} {
+			t.Run(format+"/"+holder, func(t *testing.T) {
+				f := newNodeFixture(t)
+				source := filepath.Join(t.TempDir(), "ancestor.raw")
+				writeFile(t, source, bytes.Repeat([]byte{1}, 4096))
+				ancestor, err := f.e.adoptNode(source, "raw", []diskLayer{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(source); err != nil {
+					t.Fatal(err)
+				}
+				source = filepath.Join(t.TempDir(), "layer.img")
+				if err := createQcow2OverlayOn(source, ancestor, "raw", 4096); err != nil {
+					t.Fatal(err)
+				}
+				backing := []diskLayer{}
+				if format == "qcow2" {
+					backing = []diskLayer{{Path: ancestor, Format: "raw"}}
+				}
+				node, err := f.e.adoptNode(source, format, backing)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(source); err != nil {
+					t.Fatal(err)
+				}
+				alias := filepath.Join(nodesDir(f.data), "historical-device-inode.img")
+				if err := os.Link(node, alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.e.recordNodeMetadata(alias, format, backing); err != nil {
+					t.Fatal(err)
+				}
+				var release, directoryAlias string
+				switch holder {
+				case "hardlink", "relocated-store-hardlink":
+					release = filepath.Join(t.TempDir(), "held.img")
+					if err := os.Link(alias, release); err != nil {
+						t.Fatal(err)
+					}
+					if holder == "relocated-store-hardlink" {
+						outside := filepath.Join(t.TempDir(), "store")
+						if err := os.Rename(nodesDir(f.data), outside); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Symlink(outside, nodesDir(f.data)); err != nil {
+							t.Fatal(err)
+						}
+						// This second route to the same physical directory is
+						// store-only, not another regular name or external root.
+						directoryAlias = filepath.Join(nodesDir(f.data), "directory-alias")
+						if err := os.Symlink(".", directoryAlias); err != nil {
+							t.Fatal(err)
+						}
+					}
+				case "recorded-overlay":
+					root := f.freshRoot("holder")
+					if err := createQcow2OverlayOn(root, alias, format, 4096); err != nil {
+						t.Fatal(err)
+					}
+					spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2"}
+					if err := f.e.recordDiskBacking(&spec); err != nil {
+						t.Fatal(err)
+					}
+					writeRecord(vmRecord{ID: "holder", UserID: "u1", SandboxDir: filepath.Dir(root), BaseSpec: spec})
+					release = filepath.Dir(root)
+				case "symlink":
+					release = filepath.Join(f.data, "images", "held.img")
+					if err := os.Symlink(alias, release); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want := []string{}
+				if holder == "none" {
+					want = []string{ancestor, node, alias}
+				} else if format == "raw" {
+					// These bytes resemble qcow2, but raw metadata is terminal.
+					want = []string{ancestor}
+				}
+				slices.Sort(want)
+				before := nodeStoreEntries(t, f.data)
+				if removed, err := SweepNodes(f.data, true); err != nil || !slices.Equal(removed, want) {
+					t.Fatalf("dry sweep misclassified store aliases: %v, %v; want %v", removed, err, want)
+				}
+				if !slices.Equal(before, nodeStoreEntries(t, f.data)) {
+					t.Fatal("dry sweep mutated store aliases or their metadata")
+				}
+				if removed, err := SweepNodes(f.data, false); err != nil || !slices.Equal(removed, want) {
+					t.Fatalf("live sweep misclassified store aliases: %v, %v; want %v", removed, err, want)
+				}
+				for _, path := range want {
+					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("unreachable alias survived inode-group sweep: %s, %v", path, err)
+					}
+					if _, err := os.Lstat(nodeMetadataPath(path)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("reclaimed alias retained metadata: %s, %v", path, err)
+					}
+				}
+				if holder != "none" {
+					for _, path := range []string{node, alias} {
+						if _, err := os.Stat(path); err != nil {
+							t.Fatalf("genuine holder lost a store alias: %s, %v", path, err)
+						}
+					}
+					if err := os.RemoveAll(release); err != nil {
+						t.Fatal(err)
+					}
+					want = []string{node, alias}
+					if format == "qcow2" {
+						want = append(want, ancestor)
+					}
+					slices.Sort(want)
+					if removed, err := SweepNodes(f.data, false); err != nil || !slices.Equal(removed, want) {
+						t.Fatalf("released holder left historical aliases pinned: %v, %v; want %v", removed, err, want)
+					}
+				}
+				if directoryAlias != "" {
+					if err := os.Remove(directoryAlias); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if entries := nodeStoreEntries(t, f.data); len(entries) != 0 {
+					t.Fatalf("inode-group sweep left stale metadata: %v", entries)
+				}
+			})
+		}
+	}
+}
+
+func TestNodePublicationFileSyncFailureExposesNoNode(t *testing.T) {
+	f := newNodeFixture(t)
+	source := filepath.Join(t.TempDir(), "raw.img")
+	payload := bytes.Repeat([]byte{1}, 4096)
+	writeFile(t, source, payload)
+	dst := filepath.Join(t.TempDir(), "root.qcow2")
+	oldSync := syncNodeFile
+	t.Cleanup(func() { syncNodeFile = oldSync })
+	syncErr := errors.New("linked node file sync failed")
+	syncs := 0
+	syncNodeFile = func(paths ...string) error {
+		syncs++
+		if len(paths) != 1 || !numberedStage(filepath.Base(paths[0]), ".publish-", "") {
+			t.Fatalf("linked node did not sync its private pin: %v", paths)
+		}
+		return syncErr
+	}
+	if _, err := f.e.layerOn(dst, source, false, "raw"); !errors.Is(err, syncErr) {
+		t.Fatalf("linked publication ignored its file barrier: %v", err)
+	}
+	if syncs != 1 {
+		t.Fatalf("linked publication crossed %d file barriers", syncs)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file-sync failure exposed an overlay: %v", err)
+	}
+	if entries := nodeStoreEntries(t, f.data); len(entries) != 0 {
+		t.Fatalf("file-sync failure exposed a node or metadata: %v", entries)
+	}
+	after, err := os.ReadFile(source)
+	if err != nil || !bytes.Equal(after, payload) {
+		t.Fatalf("file-sync failure changed the source: %v", err)
+	}
+}
+
+func TestAdoptNodeReconcilesCopiedPublication(t *testing.T) {
+	for _, renamed := range []bool{false, true} {
+		name := "before-rename"
+		if renamed {
+			name = "after-rename"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newNodeFixture(t)
+			dir := nodesDir(f.data)
+			pin := filepath.Join(dir, ".adopt-123")
+			payload := bytes.Repeat([]byte("raw-data"), 512)
+			writeFile(t, pin, payload)
+			if err := syncNodeFile(pin); err != nil {
+				t.Fatal(err)
+			}
+			fi, err := os.Stat(pin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			k, ok := keyOf(fi)
+			if !ok {
+				t.Fatal("copied node has no identity")
+			}
+			node := filepath.Join(dir, nodeName(k))
+			p := nodePublication{Node: filepath.Base(node), Format: "raw", Backing: []diskLayer{}}
+			// Construct the durable crash state exactly; no returned-error
+			// cleanup runs, and after rename the private pin no longer exists.
+			if err := writeDaemonMetadata(nodePendingPath(pin), p); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.e.recordNodeMetadata(node, p.Format, p.Backing); err != nil {
+				t.Fatal(err)
+			}
+			if renamed {
+				if err := os.Rename(pin, node); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root := f.freshRoot("holder")
+			if err := createQcow2OverlayOn(root, node, "raw", uint64(len(payload))); err != nil {
+				t.Fatal(err)
+			}
+			spec := VMSpec{RootDisk: root, RootDiskFormat: "qcow2", Backing: []diskLayer{{Path: node, Format: "raw"}}}
+			writeRecord(vmRecord{ID: "holder", UserID: "u1", SandboxDir: filepath.Dir(root), BaseSpec: spec})
+			before := nodeStoreEntries(t, f.data)
+			if removed, err := SweepNodes(f.data, true); err != nil || len(removed) != 0 {
+				t.Fatalf("dry sweep lost a pending copied node: %v, %v", removed, err)
+			}
+			if !slices.Equal(before, nodeStoreEntries(t, f.data)) {
+				t.Fatal("dry sweep modified a copied publication")
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || len(removed) != 0 {
+				t.Fatalf("copied publication was not recovered: %v, %v", removed, err)
+			}
+			after, err := os.ReadFile(node)
+			if err != nil || !bytes.Equal(after, payload) {
+				t.Fatalf("copied publication lost its inode payload: %v", err)
+			}
+			if entries := nodeStoreEntries(t, f.data); len(entries) != 2 {
+				t.Fatalf("copied publication retained pending state: %v", entries)
+			}
+			if err := os.RemoveAll(filepath.Dir(root)); err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := SweepNodes(f.data, false); err != nil || !slices.Equal(removed, []string{node}) {
+				t.Fatalf("copied publication was not eventually reclaimable: %v, %v", removed, err)
+			}
+			if entries := nodeStoreEntries(t, f.data); len(entries) != 0 {
+				t.Fatalf("copied publication retained stale metadata: %v", entries)
+			}
+		})
 	}
 }
