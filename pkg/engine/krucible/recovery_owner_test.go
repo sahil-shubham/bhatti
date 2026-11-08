@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func writeOwnerlessLegacyVM(t *testing.T, e *Engine, id string) string {
@@ -164,5 +165,36 @@ func TestRecoverOwnerRejectsDifferentOwnerWithoutChanges(t *testing.T) {
 func TestRecoverOwnerRejectsUnknownSandbox(t *testing.T) {
 	if err := (&Engine{}).RecoverOwner("missing", "owner-a"); err == nil {
 		t.Fatal("missing sandbox accepted an owner")
+	}
+}
+
+// TestRecoverOwnerWaitsForLifecyclePersistence: an adopted helper's death
+// watcher persists the record holding launchMu. Owner recovery must not write
+// the same record meanwhile: the two writers would share its temp file.
+func TestRecoverOwnerWaitsForLifecyclePersistence(t *testing.T) {
+	e, vm := recoverOwnerTestVM(t)
+	before, err := os.ReadFile(stateFilePath(vm.SandboxDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm.launchMu.Lock() // the watcher, mid-persist
+	done := make(chan error, 1)
+	go func() { done <- e.RecoverOwner(vm.ID, "owner-a") }()
+	select {
+	case err := <-done:
+		vm.launchMu.Unlock()
+		t.Fatalf("owner recovery ran while a lifecycle write held the record (err %v)", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if after, err := os.ReadFile(stateFilePath(vm.SandboxDir)); err != nil || !bytes.Equal(after, before) {
+		vm.launchMu.Unlock()
+		t.Fatalf("the record was written during a lifecycle write (err %v)", err)
+	}
+	vm.launchMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := readRecord(t, vm.SandboxDir); got.UserID != "owner-a" {
+		t.Fatalf("owner after the lifecycle write finished = %q, want owner-a", got.UserID)
 	}
 }

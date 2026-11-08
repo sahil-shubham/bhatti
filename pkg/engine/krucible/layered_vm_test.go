@@ -337,8 +337,7 @@ func TestKrucibleForkLayersOverACopyOfTheSource(t *testing.T) {
 		t.Fatalf("mke2fs volume: %v: %s", err, out)
 	}
 	vol := engine.ResolvedVolume{FilePath: volPath, DriveID: "vol0", Name: "data", Mount: "/data"}
-	// Owned, as every sandbox the server makes is: on a root daemon an
-	// owner-less sandbox gets private copies instead of layers.
+	// Owned, as every sandbox the server makes is.
 	src, err := ke.Create(ctx, engine.SandboxSpec{Name: "layerfork", UserID: "layerfork-owner", CPUs: 1, MemoryMB: 512, DiskSizeMB: 1024, ResolvedVolumes: []engine.ResolvedVolume{vol}})
 	if err != nil {
 		t.Fatalf("Create: %v", err)

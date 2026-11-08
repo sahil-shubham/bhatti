@@ -151,6 +151,11 @@ func (e *Engine) RecoverOwner(id, userID string) error {
 	if err != nil {
 		return err
 	}
+	// Every record write holds launchMu: an adopted helper exiting now has its
+	// death watcher persist the same record, and two writers would share the
+	// temp file.
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
 	vm.mu.Lock()
 	if vm.UserID == userID {
 		vm.mu.Unlock()
