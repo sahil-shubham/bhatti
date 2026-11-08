@@ -78,19 +78,16 @@ func TestNodeGroupReservationsSurviveRestartAndLastVM(t *testing.T) {
 	}
 }
 
-func TestNodeGroupAnonymousOwnersUseSandboxIdentity(t *testing.T) {
+func TestNodeGroupAnonymousOwnersShareStorageScope(t *testing.T) {
 	e := nodeGroupTestEngine(t)
 	a := requireNodeGID(t, e, &VM{ID: "a"})
 	b := requireNodeGID(t, e, &VM{ID: "b"})
-	named := requireNodeGID(t, e, &VM{ID: "unrelated", UserID: "a"})
-	if a == b || a == named || b == named {
-		t.Fatalf("anonymous or named owner namespaces merged: %d %d %d", a, b, named)
+	named := requireNodeGID(t, e, &VM{ID: "unrelated", UserID: "anonymous"})
+	if a != b || a == named {
+		t.Fatalf("anonymous storage scope was split or merged with named owner: %d %d %d", a, b, named)
 	}
-	if again := requireNodeGID(t, &Engine{cfg: e.cfg, dropVMM: true}, &VM{ID: "a"}); again != a {
+	if again := requireNodeGID(t, &Engine{cfg: e.cfg, dropVMM: true}, &VM{}); again != a {
 		t.Fatalf("anonymous identity changed across restart: %d -> %d", a, again)
-	}
-	if _, err := e.nodeGIDFor(&VM{}); err == nil {
-		t.Fatal("an anonymous VM without a sandbox identity got a shared group")
 	}
 }
 
