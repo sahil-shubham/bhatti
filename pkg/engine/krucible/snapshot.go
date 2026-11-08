@@ -323,10 +323,9 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 
 // ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
 // (the server's `snapshotResumer` capability): its root and volumes are disks
-// of its own layered over the snapshot's (nodes.go), or private chain copies for
-// root-daemon empty owners; it restores RAM/device/vCPU state and reuses the
-// in-guest token (the restored guest enforces it from RAM). ownerUserID homes
-// the new sandbox on the owner's shared netd — a fork/restore is an
+// of its own layered over the snapshot's (nodes.go); it restores RAM/device/vCPU
+// state and reuses the in-guest token (the restored guest enforces it from RAM).
+// ownerUserID homes the new sandbox on the owner's shared netd — a fork/restore is an
 // INDEPENDENT sandbox of the same owner, so it must join that owner's fabric
 // (and get a fresh, distinct IP there), not spin up an isolated netd it
 // shares with nothing.
@@ -480,8 +479,7 @@ func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte
 // Fork checkpoints a running sandbox to a temporary directory, restores a
 // second VM from it, then removes the directory. The new VM privately maps
 // memory.bin: unlinking it does not invalidate an already running restore. Its
-// disks stay as layers retained by the node store, or private chain copies
-// when a root daemon cannot establish the child's named owner.
+// disks stay as layers retained by the node store.
 func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (info engine.SandboxInfo, err error) {
 	// Fast, friendly refusal: a --mount sandbox can't be memory-forked (libkrun
 	// can't restore a virtio-fs device from a memory snapshot). Check up front so

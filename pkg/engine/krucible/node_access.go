@@ -192,7 +192,7 @@ func (e *Engine) nodeGIDFor(vm *VM) (uint32, error) {
 		return 0, nil
 	}
 	vm.mu.Lock()
-	owner := ownerKeyFor(vm.UserID, vm.ID)
+	owner := ownerKeyFor(vm.UserID, "anonymous")
 	vm.mu.Unlock()
 	lock, err := lockNodeGroups(e.cfg.DataDir)
 	if err != nil {
@@ -562,7 +562,7 @@ func (e *Engine) nodeProvenance(nodes map[fileKey]string) (map[fileKey]string, e
 		if !found {
 			continue
 		}
-		owner := ownerKeyFor(rec.UserID, rec.ID)
+		owner := ownerKeyFor(rec.UserID, "anonymous")
 		if !validNodeOwner(owner) {
 			return nil, fmt.Errorf("%s: invalid node owner", path)
 		}

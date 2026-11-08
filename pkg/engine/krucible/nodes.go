@@ -608,41 +608,6 @@ func moveOrClone(ctx context.Context, src, dst string, own bool, format string) 
 	return nil
 }
 
-// Empty-owner helpers cannot inherit another sandbox's node group. Copy the
-// entire chain, not just its top disk, before granting destination-only access.
-func (e *Engine) copyNodeDisk(ctx context.Context, dst, src string, own bool, format string) (string, error) {
-	chain, err := readDiskChain(src, format, nil)
-	if err != nil {
-		return "", err
-	}
-	if err := moveOrClone(ctx, src, dst, own, format); err != nil {
-		return "", err
-	}
-	gid, err := e.nodeGIDFor(&VM{ID: filepath.Base(filepath.Dir(dst))})
-	if err != nil {
-		return "", err
-	}
-	for i := len(chain) - 1; i >= 0; i-- {
-		copy, err := copyLegacyDisk(ctx, filepath.Dir(dst), chain[i].Path)
-		if err != nil {
-			return "", err
-		}
-		if chain[i].Format == "qcow2" && i+1 < len(chain) {
-			if err := setQcow2Backing(copy, chain[i+1].Path); err != nil {
-				return "", err
-			}
-		}
-		if err := setNodeAccess(copy, gid); err != nil {
-			return "", err
-		}
-		chain[i].Path = copy
-	}
-	if len(chain) > 0 {
-		return format, setQcow2Backing(dst, chain[0].Path)
-	}
-	return format, nil
-}
-
 // walkNodeImages also follows linked disk directories: a data directory moved
 // onto another disk, or an images/volume directory linked out of it, must not
 // make the nodes its disks name look unused. Root-level daemon state is still
@@ -1634,9 +1599,9 @@ func (e *Engine) RemoveSnapshot(ctx context.Context, snapDir string) error {
 	return nil
 }
 
-// prepareNodeRoot makes a resumed or forked sandbox's root disk in sandboxDir:
-// an overlay over the snapshot's disk, or a private copy of its whole chain.
-func (e *Engine) prepareNodeRoot(ctx context.Context, sandboxDir, disk string, own bool, sourceFormat string, private bool) (root, format, base string, err error) {
+// prepareNodeRoot makes a resumed or forked sandbox's root disk in sandboxDir
+// as an overlay over the snapshot's disk.
+func (e *Engine) prepareNodeRoot(ctx context.Context, sandboxDir, disk string, own bool, sourceFormat string) (root, format, base string, err error) {
 	if !rootQcow2() {
 		return "", "", "", fmt.Errorf("a snapshot restores onto a qcow2 root, and KRUCIBLE_ROOT_RAW is set")
 	}
@@ -1646,20 +1611,16 @@ func (e *Engine) prepareNodeRoot(ctx context.Context, sandboxDir, disk string, o
 	}
 	defer unlock()
 	root = filepath.Join(sandboxDir, "root.qcow2")
-	layer := e.layerOn
-	if private {
-		layer = e.copyNodeDisk
-	}
-	if format, err = layer(ctx, root, disk, own, sourceFormat); err != nil {
+	if format, err = e.layerOn(ctx, root, disk, own, sourceFormat); err != nil {
 		return "", "", "", fmt.Errorf("layer the root disk over the snapshot's: %w", err)
 	}
 	return root, format, disk, nil
 }
 
 // layerRestoredVolumes attaches each frozen volume of the snapshot being
-// restored to spec: an overlay, or a private copy of its whole chain. Even a
-// read-only volume never opens the frozen source itself in the helper.
-func (e *Engine) layerRestoredVolumes(ctx context.Context, sandboxDir string, spec *VMSpec, vols []restoreVol, private bool) error {
+// restored to spec as an overlay. Even a read-only volume never opens the
+// frozen source itself in the helper.
+func (e *Engine) layerRestoredVolumes(ctx context.Context, sandboxDir string, spec *VMSpec, vols []restoreVol) error {
 	if len(vols) == 0 {
 		return nil
 	}
@@ -1668,26 +1629,12 @@ func (e *Engine) layerRestoredVolumes(ctx context.Context, sandboxDir string, sp
 		return fmt.Errorf("lock base images: %w", err)
 	}
 	defer unlock()
-	layer := e.layerOn
-	if private {
-		layer = e.copyNodeDisk
-	}
 	for _, rv := range vols {
 		idx := len(spec.Volumes)
 		dst := filepath.Join(sandboxDir, fmt.Sprintf("restorevol%d.img", idx))
-		format, err := layer(ctx, dst, rv.path, rv.owned, rv.format)
+		format, err := e.layerOn(ctx, dst, rv.path, rv.owned, rv.format)
 		if err != nil {
 			return fmt.Errorf("restore volume %d: %w", idx, err)
-		}
-		// Confinement must not give a private read-only copy the shared GID.
-		if private && rv.readOnly {
-			gid, err := e.nodeGIDFor(&VM{ID: filepath.Base(sandboxDir)})
-			if err == nil {
-				err = setNodeAccess(dst, gid)
-			}
-			if err != nil {
-				return err
-			}
 		}
 		spec.Volumes = append(spec.Volumes, VMVolume{BlockID: fmt.Sprintf("vol%d", idx), Path: dst, Format: format, ReadOnly: rv.readOnly})
 	}

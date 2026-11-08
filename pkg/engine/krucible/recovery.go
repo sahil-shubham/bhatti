@@ -144,6 +144,30 @@ func writeRecord(rec vmRecord) {
 	}
 }
 
+// RecoverOwner fills ownership omitted by historical engine records from the
+// server's durable sandbox row before the VM is launched again.
+func (e *Engine) RecoverOwner(id, userID string) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	vm.mu.Lock()
+	if vm.UserID == userID {
+		vm.mu.Unlock()
+		return nil
+	}
+	if vm.UserID != "" {
+		owner := vm.UserID
+		vm.mu.Unlock()
+		return fmt.Errorf("sandbox %q already belongs to %q, not %q", id, owner, userID)
+	}
+	vm.UserID = userID
+	rec := vm.toRecordLocked()
+	vm.mu.Unlock()
+	writeRecord(rec)
+	return nil
+}
+
 // vmFromRecord reconstructs the in-memory VM from a durable record (runtime
 // fields left nil; the caller decides alive/dead and sets Agent/Status).
 func vmFromRecord(rec vmRecord) *VM {

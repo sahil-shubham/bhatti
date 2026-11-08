@@ -47,10 +47,10 @@ func layeredSnapshot(t *testing.T) (f *nodeFixture, dir string, m krucibleSnapMa
 		t.Fatal(err)
 	}
 	var spec VMSpec
-	if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "raw"}}, false); err != nil {
+	if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "raw"}}); err != nil {
 		t.Fatal(err)
 	}
-	root, _, _, err := f.e.prepareNodeRoot(t.Context(), sb, filepath.Join(first, "rootfs.qcow2"), false, "qcow2", false)
+	root, _, _, err := f.e.prepareNodeRoot(t.Context(), sb, filepath.Join(first, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestLayeredSnapshotMovesToAnotherHost(t *testing.T) {
 	// what is layered over it keeps it from being deleted.
 	sb := filepath.Join(b.cfg.DataDir, "sandboxes", "x")
 	os.MkdirAll(sb, 0o700)
-	root, _, _, err := b.prepareNodeRoot(t.Context(), sb, filepath.Join(dest, "rootfs.qcow2"), false, "qcow2", false)
+	root, _, _, err := b.prepareNodeRoot(t.Context(), sb, filepath.Join(dest, "rootfs.qcow2"), false, "qcow2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestLayeredArchiveRebuildsMultipleGenerations(t *testing.T) {
 	f, first, m := layeredSnapshot(t)
 	root := f.resume("next", first)
 	var spec VMSpec
-	if err := f.e.layerRestoredVolumes(t.Context(), filepath.Dir(root), &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "qcow2"}}, false); err != nil {
+	if err := f.e.layerRestoredVolumes(t.Context(), filepath.Dir(root), &spec, []restoreVol{{path: filepath.Join(first, "vol0.img"), format: "qcow2"}}); err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(f.data, "snapshots", "u1", "third")

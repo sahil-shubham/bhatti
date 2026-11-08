@@ -523,6 +523,7 @@ func (s *Server) Shutdown(sig string) {
 // purpose (or before this restart) and stays that way.
 func (s *Server) RecoverSandboxes(ctx context.Context) {
 	initOf, _ := s.engine.(interface{ HasInit(id string) (bool, bool) })
+	ownerOf, _ := s.engine.(interface{ RecoverOwner(id, userID string) error })
 	sandboxes, err := s.store.ListAllSandboxes(ctx)
 	if err != nil {
 		slog.Warn("recover sandboxes: list", "error", err)
@@ -531,6 +532,12 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 	for _, sb := range sandboxes {
 		if sb.Status == "destroyed" {
 			continue
+		}
+		// Historical owners are known even when the engine cannot report a VM.
+		if ownerOf != nil && sb.CreatedBy != "" {
+			if err := ownerOf.RecoverOwner(sb.EngineID, sb.CreatedBy); err != nil {
+				slog.Warn("sandbox.owner_recovery_failed", "sandbox_id", sb.ID, "engine_id", sb.EngineID, "error", err)
+			}
 		}
 		info, err := s.engine.Status(ctx, sb.EngineID)
 		if err != nil {

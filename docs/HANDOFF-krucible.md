@@ -131,8 +131,8 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
   fix for virtio-fs snapshot restore). (3) the unified-node DAG/listing UX.
 
 **Snapshot nodes and disk authority (2026-11-08):**
-- **Disk preparation is independent of the saved delta.** An owner-assigned resume
-  makes a qcow2 overlay over each immutable snapshot disk, rather than copying it.
+- **Disk preparation is independent of the saved delta.** A normal resume makes a
+  qcow2 overlay over each immutable snapshot disk, rather than copying that disk.
   The node store names those disks by `<DataDir>/nodes/<dev>-<ino>.img` hard links;
   clones share the saved blocks but write only their own overlays. An incompatible
   filesystem, a relative backing name, a raw disk whose size is not sector-aligned,
@@ -236,12 +236,11 @@ the guest-visible virtual counter (`KVM_REG_ARM_TIMER_CNT`, once on vCPU 0) —
 - **Confinement and the remaining admission limit.** A root Linux daemon assigns
   node disks durable, owner-scoped synthetic groups, disjoint from helper and netd
   identity ranges. A node is daemon-only before publication; only its owner's
-  group receives read access. Historical empty owners cannot be distinguished
-  from genuine anonymous callers: on root Linux they therefore restore roots
-  and volumes by private copy, including private backing ancestors, and never
-  read node-store files. Their groups remain per-sandbox, not one merged scope.
-  Non-root behavior is unchanged. Forks inherit the source's storage owner even
-  without a NIC, without starting a gateway. Reusing a node with correct
+  group receives read access. Server recovery restores missing engine owners
+  from SQLite's `CreatedBy` before thermal management or listeners start.
+  Engine-only owner-less callers share one anonymous storage principal and
+  layer over retained nodes normally. Forks inherit the source's storage owner
+  even without a NIC, without starting a gateway. Reusing a node with correct
   permissions never transiently revokes its owner's read access.
   Private nodes are never opened to the universal helper group, even without
   Landlock. This owner-scoped DAC guarantee applies to root Linux, not non-root
