@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -497,13 +496,8 @@ func (e *Engine) Fork(ctx context.Context, sandboxID, newName string) (info engi
 	vm.mu.Lock()
 	hasMount := len(vm.baseSpec.Mounts) > 0
 	networked := vm.netIP != ""
+	ownerUserID := vm.UserID
 	vm.mu.Unlock()
-	// The fork belongs to the source's owner and must join the same shared netd
-	// (netdKey is "u:<userID>" on the net backend; "" or "s:<id>" otherwise).
-	ownerUserID := strings.TrimPrefix(vm.netdKey, "u:")
-	if !strings.HasPrefix(vm.netdKey, "u:") {
-		ownerUserID = ""
-	}
 	if hasMount {
 		return engine.SandboxInfo{}, fmt.Errorf("cannot fork a sandbox with a virtio-fs --mount (the device cannot be memory-restored); use a filesystem snapshot (snapshot create --type filesystem) then create --snapshot")
 	}
