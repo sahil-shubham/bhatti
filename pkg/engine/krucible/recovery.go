@@ -340,6 +340,19 @@ func (e *Engine) reclaimUnrecordedSandboxes() error {
 		// Reclamation needs proof of disuse, not proof that a process is
 		// adoptable: old helper names and symlinked data paths remain live.
 		for argIndex, arg := range args {
+			if !filepath.IsAbs(arg) {
+				clean := filepath.Clean(arg)
+				if filepath.Base(clean) == "vmspec.json" {
+					for _, dir := range abandoned {
+						if filepath.Base(filepath.Dir(clean)) == filepath.Base(dir) {
+							// Another daemon may have launched from a different
+							// working directory; an ambiguous live reference is
+							// not permission to reclaim or kill its process.
+							return fmt.Errorf("unrecorded sandbox %s still has helper %d; preserve its disks", dir, pid)
+						}
+					}
+				}
+			}
 			fi, err := os.Stat(arg)
 			if err != nil {
 				continue

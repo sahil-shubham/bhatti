@@ -679,6 +679,11 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.SocketDir == "" {
 		cfg.SocketDir = "/tmp/bhatti-kr"
 	}
+	dataDir, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("krucible: resolve data dir: %w", err)
+	}
+	cfg.DataDir = dataDir
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "sandboxes"), 0700); err != nil {
 		return nil, fmt.Errorf("krucible: create data dir: %w", err)
 	}
