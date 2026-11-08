@@ -192,8 +192,7 @@ func (e *Engine) nodeGIDFor(vm *VM) (uint32, error) {
 		return 0, nil
 	}
 	vm.mu.Lock()
-	// Anonymous engine callers share storage, not per-sandbox network identity.
-	owner := ownerKeyFor(vm.UserID, "anonymous")
+	owner := ownerKeyFor(vm.UserID, vm.ID)
 	vm.mu.Unlock()
 	lock, err := lockNodeGroups(e.cfg.DataDir)
 	if err != nil {
@@ -563,7 +562,7 @@ func (e *Engine) nodeProvenance(nodes map[fileKey]string) (map[fileKey]string, e
 		if !found {
 			continue
 		}
-		owner := ownerKeyFor(rec.UserID, "anonymous")
+		owner := ownerKeyFor(rec.UserID, rec.ID)
 		if !validNodeOwner(owner) {
 			return nil, fmt.Errorf("%s: invalid node owner", path)
 		}

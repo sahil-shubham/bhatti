@@ -7,8 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
 
 // rootReseedStorageEngine exercises production storage DAC preparation without
@@ -50,40 +54,204 @@ func rootReseedStorageEngine(t *testing.T) *Engine {
 	return e
 }
 
-func TestAnonymousSnapshotRepeatedRestoreWithNodeDAC(t *testing.T) {
-	e := rootReseedStorageEngine(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	source, err := e.Create(ctx, noNetworkSpec("anonymous-source"))
+func nodeAccessLayeredSnapshot(t *testing.T, e *Engine, owner string) (string, *VM) {
+	t.Helper()
+	ctx := t.Context()
+	spec := noNetworkSpec(owner + "-source")
+	spec.UserID = owner
+	volume := filepath.Join(e.cfg.DataDir, "volumes", owner+".img")
+	writeFile(t, volume, bytes.Repeat([]byte("private volume"), 512))
+	readOnlyVolume := filepath.Join(e.cfg.DataDir, "volumes", owner+"-readonly.img")
+	writeFile(t, readOnlyVolume, bytes.Repeat([]byte("private read-only volume"), 512))
+	spec.ResolvedVolumes = []engine.ResolvedVolume{
+		{FilePath: volume, Mount: "/data"},
+		{FilePath: readOnlyVolume, Mount: "/readonly", ReadOnly: true},
+	}
+	source, err := e.Create(ctx, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent := filepath.Join(e.cfg.DataDir, "snapshots")
-	if _, err := e.Checkpoint(ctx, source.ID, "", 0, "reusable", parent); err != nil {
+	parent := filepath.Join(e.cfg.DataDir, "snapshots", owner)
+	if _, err := e.Checkpoint(ctx, source.ID, owner, 0, "first", parent); err != nil {
 		t.Fatal(err)
 	}
-	snap := filepath.Join(parent, "reusable")
-	var firstGID uint32
-	for i := range 2 {
-		restored, err := e.ResumeFromManifestJSON(ctx, snap, nil, fmt.Sprintf("anonymous-%d", i), "")
+	layered, err := e.ResumeFromManifestJSON(ctx, filepath.Join(parent, "first"), nil, owner+"-layered", owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Checkpoint(ctx, layered.ID, owner, 0, "second", parent); err != nil {
+		t.Fatal(err)
+	}
+	vm, err := e.getVM(layered.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(parent, "second"), vm
+}
+
+func privateSandboxReadPlan(t *testing.T, e *Engine, vm *VM) ([]string, nodeDACCredentials) {
+	t.Helper()
+	if vm.UserID != "" || len(vm.baseSpec.Backing) == 0 {
+		t.Fatalf("fixture lost empty ownership or root chain: %+v", vm.baseSpec)
+	}
+	gid := requireNodeGID(t, e, vm)
+	paths := privateDACChain(vm.baseSpec, e.cfg.BaseImage)
+	for _, path := range paths {
+		if !within(vm.SandboxDir, path) || within(nodesDir(e.cfg.DataDir), path) {
+			t.Fatalf("empty-owner helper retained a non-private ancestor: %s", path)
+		}
+		assertNodeMode(t, path, gid, 0o640)
+	}
+	paths = append(paths, vm.baseSpec.RootDisk)
+	for _, volume := range vm.baseSpec.Volumes {
+		if volume.Format == "qcow2" && len(volume.Backing) == 0 {
+			t.Fatalf("fixture lost volume backing: %+v", volume)
+		}
+		if volume.ReadOnly {
+			assertNodeMode(t, volume.Path, gid, 0o640)
+		}
+		paths = append(paths, volume.Path)
+	}
+	for _, path := range paths {
+		fi, err := os.Stat(path)
 		if err != nil {
-			t.Fatalf("anonymous restore %d: %v", i+1, err)
+			t.Fatal(err)
+		}
+		if fi.Sys().(*syscall.Stat_t).Nlink != 1 {
+			t.Fatalf("empty-owner disk is a hard link rather than a private copy: %s", path)
+		}
+	}
+	return paths, nodePolicyCredentials(t, filepath.Join(vm.SandboxDir, "vmm.policy"))
+}
+
+func TestAnonymousLayeredRestoreAndForkUsePrivateCopies(t *testing.T) {
+	e := rootReseedStorageEngine(t)
+	binary := nodeDACTestBinary(t, e.cfg.DataDir)
+	type sandbox struct {
+		vm    *VM
+		read  []string
+		creds nodeDACCredentials
+	}
+	var sandboxes []sandbox
+	var sourceNodes []string
+	var named *VM
+	for _, owner := range []string{"owner-a", "owner-b"} {
+		snapshot, parent := nodeAccessLayeredSnapshot(t, e, owner)
+		named = parent
+		nodes := privateDACChain(parent.baseSpec, e.cfg.BaseImage)
+		if len(nodes) < 3 {
+			t.Fatalf("fixture lacks named root and volume nodes: %v", nodes)
+		}
+		sourceNodes = append(sourceNodes, nodes...)
+		gid := requireNodeGID(t, e, parent)
+		restored, err := e.ResumeFromManifestJSON(t.Context(), snapshot, nil, owner+"-anonymous", "")
+		if err != nil {
+			t.Fatalf("restore named owner's layered snapshot anonymously: %v", err)
 		}
 		vm, err := e.getVM(restored.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		gid := requireNodeGID(t, e, vm)
-		if i == 0 {
-			firstGID = gid
-		} else if gid != firstGID {
-			t.Fatalf("restore changed anonymous node group: %d -> %d", firstGID, gid)
+		if len(vm.baseSpec.Volumes) != 2 || len(vm.baseSpec.Backing) != len(parent.baseSpec.Backing) {
+			t.Fatalf("restore lost captured volume: %+v", vm.baseSpec)
 		}
-		for _, path := range privateDACChain(vm.baseSpec, e.cfg.BaseImage) {
-			assertNodeMode(t, path, gid, 0o640)
+		read, creds := privateSandboxReadPlan(t, e, vm)
+		if slices.Contains(creds.Groups, gid) {
+			t.Fatal("empty-owner restore inherited its named source's node group")
 		}
-		if err := e.Destroy(ctx, restored.ID); err != nil {
-			t.Fatal(err)
+		for _, node := range nodes {
+			assertNodeMode(t, node, gid, 0o640)
+		}
+		sandboxes = append(sandboxes, sandbox{vm, read, creds})
+		if owner == "owner-a" {
+			first := filepath.Join(filepath.Dir(snapshot), "first")
+			raw, err := e.ResumeFromManifestJSON(t.Context(), first, nil, "anonymous-raw-volumes", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rawVM, err := e.getVM(raw.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rawVM.baseSpec.Volumes) != 2 || rawVM.baseSpec.Volumes[1].Format != "raw" {
+				t.Fatal("fixture lacks a restored raw read-only volume")
+			}
+			read, creds := privateSandboxReadPlan(t, e, rawVM)
+			sandboxes = append(sandboxes, sandbox{rawVM, read, creds})
+		}
+	}
+	if requireNodeGID(t, e, sandboxes[0].vm) == requireNodeGID(t, e, sandboxes[1].vm) {
+		t.Fatal("empty-owner restores share a node group")
+	}
+	child, err := e.Fork(t.Context(), sandboxes[0].vm.ID, "anonymous-fork")
+	if err != nil {
+		t.Fatalf("fork an empty-owner layered restore: %v", err)
+	}
+	fork, err := e.getVM(child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fork.baseSpec.Volumes) != 2 {
+		t.Fatal("fork lost the restored volume")
+	}
+	read, creds := privateSandboxReadPlan(t, e, fork)
+	sandboxes = append(sandboxes, sandbox{fork, read, creds})
+	image := filepath.Join(e.cfg.DataDir, "images", "global.ext4")
+	if err := e.SaveImage(t.Context(), named.ID, image); err != nil {
+		t.Fatal(err)
+	}
+	spec := noNetworkSpec("anonymous-from-global-image")
+	spec.BaseImage = image
+	created, err := e.Create(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("create anonymously from a global typed layered image: %v", err)
+	}
+	vm, err := e.getVM(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, creds = privateSandboxReadPlan(t, e, vm)
+	sandboxes = append(sandboxes, sandbox{vm, read, creds})
+	for i, sb := range sandboxes {
+		denied := slices.Clone(sourceNodes)
+		for j, other := range sandboxes {
+			if i != j {
+				if requireNodeGID(t, e, sb.vm) == requireNodeGID(t, e, other.vm) {
+					t.Fatal("empty-owner restore, fork or create shares a node group")
+				}
+				denied = append(denied, other.read...)
+			}
+		}
+		runNodeDAC(t, binary, sb.creds, nodeDACPlan{Read: sb.read, Denied: denied})
+	}
+}
+
+func TestUnprivilegedAnonymousRestoreKeepsNodeLayering(t *testing.T) {
+	e := fakeReseedEngine(t, "supported")
+	e.caps.Pause = true
+	snapshot, parent := nodeAccessLayeredSnapshot(t, e, "owner")
+	restored, err := e.ResumeFromManifestJSON(t.Context(), snapshot, nil, "anonymous", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm, err := e.getVM(restored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vm.baseSpec.Backing) != len(parent.baseSpec.Backing)+1 ||
+		len(vm.baseSpec.Volumes) != 2 ||
+		len(vm.baseSpec.Volumes[0].Backing) != len(parent.baseSpec.Volumes[0].Backing)+1 {
+		t.Fatalf("non-root restore stopped layering: %+v", vm.baseSpec)
+	}
+	for _, path := range privateDACChain(vm.baseSpec, e.cfg.BaseImage) {
+		if !within(nodesDir(e.cfg.DataDir), path) {
+			t.Fatalf("non-root restore copied its ancestor: %s", path)
+		}
+	}
+	for i, volume := range vm.baseSpec.Volumes {
+		if len(volume.Backing) != len(parent.baseSpec.Volumes[i].Backing)+1 ||
+			volume.ReadOnly != parent.baseSpec.Volumes[i].ReadOnly {
+			t.Fatalf("non-root volume restore changed: %+v", volume)
 		}
 	}
 }
@@ -123,7 +291,12 @@ func TestImportedDirectSnapshotMigrationKeepsOwnerUnassigned(t *testing.T) {
 			}
 			gid := requireNodeGID(t, e, vm)
 			chain := privateDACChain(vm.baseSpec, e.cfg.BaseImage)
-			if len(vm.baseSpec.Backing) < 3 || len(vm.baseSpec.Volumes) != 1 {
+			wantDepth := 3
+			if owner == "" {
+				wantDepth = 2
+				privateSandboxReadPlan(t, e, vm)
+			}
+			if len(vm.baseSpec.Backing) < wantDepth || len(vm.baseSpec.Volumes) != 1 {
 				t.Fatalf("restore lost imported layered root or volume: %+v", vm.baseSpec)
 			}
 			for _, path := range chain {

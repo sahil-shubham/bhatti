@@ -943,7 +943,8 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	// snapshot's device set (so a memory restore's RAM view of its disks stays
 	// valid), as a disk of this sandbox's own over it. The captured config
 	// already carries the guest mount points, so no cdVolumes entry is needed.
-	if err = e.layerRestoredVolumes(ctx, sandboxDir, &baseSpec, opts.restoreVolumes); err != nil {
+	privateDisks := e.dropVMM && spec.UserID == ""
+	if err = e.layerRestoredVolumes(ctx, sandboxDir, &baseSpec, opts.restoreVolumes, privateDisks); err != nil {
 		return info, err
 	}
 
@@ -955,7 +956,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		var rootBacking []diskLayer
 		var perr error
 		if opts.nodeDisk != "" {
-			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(ctx, sandboxDir, opts.nodeDisk, opts.nodeOwned, opts.nodeFormat)
+			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(ctx, sandboxDir, opts.nodeDisk, opts.nodeOwned, opts.nodeFormat, privateDisks)
 		} else {
 			rootImg, rootFormat, rootBase, rootBacking, perr = e.prepareRootDisk(ctx, sandboxDir, spec)
 		}
@@ -1655,6 +1656,13 @@ func (e *Engine) prepareRootDisk(ctx context.Context, sandboxDir string, spec en
 			if err != nil {
 				return "", "", "", nil, fmt.Errorf("normalize legacy image: %w", err)
 			}
+		}
+		if e.dropVMM && spec.UserID == "" {
+			_, err = e.copyNodeDisk(ctx, root, source, source != base, metadata.format)
+			if err == nil {
+				backing, err = readDiskChain(root, metadata.format, nil)
+			}
+			return root, metadata.format, base, backing, err
 		}
 		if source != base {
 			if err := os.Rename(source, root); err != nil {

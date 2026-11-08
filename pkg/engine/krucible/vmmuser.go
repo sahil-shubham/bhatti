@@ -432,7 +432,7 @@ func (e *Engine) confineLaunch(ctx context.Context, vm *VM, spec VMSpec, specPat
 			return err
 		}
 		if private {
-			if mode&0o222 != 0 {
+			if mode&0o222 != 0 && owner != 0 {
 				return fmt.Errorf("%s is an immutable private node", path)
 			}
 			return e.nodeReadable(path, nodeGID)

@@ -100,7 +100,7 @@ func (f *nodeFixture) resume(id, snapDir string) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	root, format, _, err := f.e.prepareNodeRoot(f.t.Context(), dir, filepath.Join(snapDir, "rootfs.qcow2"), false, "qcow2")
+	root, format, _, err := f.e.prepareNodeRoot(f.t.Context(), dir, filepath.Join(snapDir, "rootfs.qcow2"), false, "qcow2", false)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -566,7 +566,7 @@ func TestRestoredVolumesAreOverlays(t *testing.T) {
 		{path: filepath.Join(snap, "vol0.img"), format: "raw"},
 		{path: filepath.Join(snap, "vol1.img"), format: "raw", readOnly: true},
 		{path: filepath.Join(snap, "vol2.img"), format: "raw"},
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +718,7 @@ func TestConfineLaunchReadiesAVolumesChain(t *testing.T) {
 	sb := filepath.Join(f.data, "sandboxes", "a")
 	os.MkdirAll(sb, 0o700)
 	spec := VMSpec{RootDisk: f.freshRoot("a"), RootDiskFormat: "qcow2"}
-	if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{{path: filepath.Join(snap, "vol0.img"), format: "raw"}}); err != nil {
+	if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{{path: filepath.Join(snap, "vol0.img"), format: "raw"}}, false); err != nil {
 		t.Fatal(err)
 	}
 	node := backingOf(t, spec.Volumes[0].Path)
@@ -1249,7 +1249,7 @@ func TestSweepNodesReclaimsCrashedStages(t *testing.T) {
 	if err := os.MkdirAll(sb, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	root, format, _, err := f.e.prepareNodeRoot(t.Context(), sb, disk, true, "qcow2")
+	root, format, _, err := f.e.prepareNodeRoot(t.Context(), sb, disk, true, "qcow2", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2179,7 +2179,7 @@ func TestRestoredVolumeOwnershipIsPerDisk(t *testing.T) {
 			if err := f.e.layerRestoredVolumes(t.Context(), sb, &spec, []restoreVol{
 				{path: source, format: format},
 				{path: private, format: format, owned: true},
-			}); err != nil {
+			}, false); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := os.Stat(source); err != nil {

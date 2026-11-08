@@ -298,7 +298,7 @@ func TestRecoveryReclaimsUnrecordedClone(t *testing.T) {
 	source := f.freshRoot("source")
 	snap := f.snapshot("u1", "saved", source)
 	spec, _ := sandboxPaths(t, f.e, "interrupted")
-	root, _, _, err := f.e.prepareNodeRoot(t.Context(), filepath.Dir(spec), filepath.Join(snap, "rootfs.qcow2"), false, "qcow2")
+	root, _, _, err := f.e.prepareNodeRoot(t.Context(), filepath.Dir(spec), filepath.Join(snap, "rootfs.qcow2"), false, "qcow2", false)
 	if err != nil {
 		t.Fatal(err)
 	}

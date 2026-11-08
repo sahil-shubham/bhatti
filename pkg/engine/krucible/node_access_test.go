@@ -78,16 +78,49 @@ func TestNodeGroupReservationsSurviveRestartAndLastVM(t *testing.T) {
 	}
 }
 
-func TestNodeGroupAnonymousOwnersShareStorageScope(t *testing.T) {
+func TestNodeGroupAnonymousOwnersHaveSandboxScope(t *testing.T) {
 	e := nodeGroupTestEngine(t)
 	a := requireNodeGID(t, e, &VM{ID: "a"})
 	b := requireNodeGID(t, e, &VM{ID: "b"})
 	named := requireNodeGID(t, e, &VM{ID: "unrelated", UserID: "anonymous"})
-	if a != b || a == named {
-		t.Fatalf("anonymous storage scope was split or merged with named owner: %d %d %d", a, b, named)
+	if a == b || a == named || b == named {
+		t.Fatalf("empty-owner sandboxes share a storage scope: %d %d %d", a, b, named)
 	}
-	if again := requireNodeGID(t, &Engine{cfg: e.cfg, dropVMM: true}, &VM{}); again != a {
-		t.Fatalf("anonymous identity changed across restart: %d -> %d", a, again)
+	if again := requireNodeGID(t, &Engine{cfg: e.cfg, dropVMM: true}, &VM{ID: "a"}); again != a {
+		t.Fatalf("sandbox identity changed across restart: %d -> %d", a, again)
+	}
+}
+
+func TestNodeProvenanceEmptyOwnersRetainSandboxScope(t *testing.T) {
+	f := newNodeFixture(t)
+	nodes, expected := map[fileKey]string{}, map[fileKey]string{}
+	for _, id := range []string{"a", "b"} {
+		disk := filepath.Join(f.data, "sandboxes", id, "root.img")
+		writeFile(t, disk, []byte("private disk "+id))
+		node, err := f.e.nodeLink(disk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, ok := keyOf(fi)
+		if !ok {
+			t.Fatal("node has no inode identity")
+		}
+		nodes[key], expected[key] = node, ownerKeyFor("", id)
+		writeRecord(vmRecord{ID: id, SandboxDir: filepath.Dir(disk),
+			BaseSpec: VMSpec{RootDisk: disk, RootDiskFormat: "raw", Backing: []diskLayer{}}})
+	}
+	owners, err := f.e.nodeProvenance(nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, scope := range expected {
+		if owners[key] != scope {
+			t.Fatalf("historical empty owner merged into %q, want %q", owners[key], scope)
+		}
 	}
 }
 
@@ -701,14 +734,14 @@ func nodeDACVM(t *testing.T, f *nodeFixture, owner, id string, layered bool) (*V
 			t.Fatal(err)
 		}
 		var parent VMSpec
-		if err := f.e.layerRestoredVolumes(t.Context(), parentDir, &parent, []restoreVol{{path: source, format: "raw"}}); err != nil {
+		if err := f.e.layerRestoredVolumes(t.Context(), parentDir, &parent, []restoreVol{{path: source, format: "raw"}}, false); err != nil {
 			t.Fatal(err)
 		}
 		frozen := filepath.Join(snapshot, "vol1.img")
 		if err := cloneFile(t.Context(), parent.Volumes[0].Path, frozen); err != nil {
 			t.Fatal(err)
 		}
-		if err := f.e.layerRestoredVolumes(t.Context(), vm.SandboxDir, &spec, []restoreVol{{path: frozen, format: "qcow2"}}); err != nil {
+		if err := f.e.layerRestoredVolumes(t.Context(), vm.SandboxDir, &spec, []restoreVol{{path: frozen, format: "qcow2"}}, false); err != nil {
 			t.Fatal(err)
 		}
 	}
