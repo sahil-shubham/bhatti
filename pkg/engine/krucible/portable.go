@@ -1203,6 +1203,8 @@ func (e *Engine) keptBasePath(sum, name string) string {
 	return filepath.Join(basesDir(e.cfg.DataDir), baseName(stem, sum))
 }
 
+var linkBase = os.Link
+
 // keepBase moves a base image that arrived in an archive (already checked
 // against sum, its sha256) into the bases directory, where later imports find
 // it. A base there is never replaced: one already under the name is used if it
@@ -1218,15 +1220,15 @@ func (e *Engine) keepBase(src, sum, name string) (string, error) {
 		return "", fmt.Errorf("import: %w", err)
 	}
 	// Link, not rename: it never replaces a file already there.
-	err := os.Link(src, dst)
+	err := linkBase(src, dst)
 	if err != nil && !errors.Is(err, fs.ErrExist) {
-		// Another filesystem: copy beside the bases first, then publish.
+		// Hard links unavailable: copy beside the bases, then publish by rename.
 		tmp := filepath.Join(dir, "."+filepath.Base(dst)+".partial")
 		if cerr := cloneFile(src, tmp); cerr != nil {
 			os.Remove(tmp)
 			return "", fmt.Errorf("import: keep base image: %w", errors.Join(err, cerr))
 		}
-		err = os.Link(tmp, dst)
+		err = os.Rename(tmp, dst)
 		os.Remove(tmp)
 		if err != nil && !errors.Is(err, fs.ErrExist) {
 			return "", fmt.Errorf("import: keep base image: %w", err)

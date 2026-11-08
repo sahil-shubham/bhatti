@@ -1347,14 +1347,14 @@ func TestLayeredSnapshotImportsWithoutHardlinks(t *testing.T) {
 			}
 			b := portableEngine(t, "", "exit 0")
 			base := b.keptBasePath(am.Base.SHA256, am.Base.Name)
-			if err := os.MkdirAll(filepath.Dir(base), 0o700); err != nil {
-				t.Fatal(err)
+			mustNotExist(t, base)
+			oldLink, oldBaseLink := linkNode, linkBase
+			t.Cleanup(func() { linkNode, linkBase = oldLink, oldBaseLink })
+			baseLinks := 0
+			linkBase = func(src, dst string) error {
+				baseLinks++
+				return &os.LinkError{Op: "link", Old: src, New: dst, Err: linkErr}
 			}
-			if err := cloneFile(f.base, base); err != nil {
-				t.Fatal(err)
-			}
-			oldLink := linkNode
-			t.Cleanup(func() { linkNode = oldLink })
 			links := 0
 			linkNode = func(src, dst string) error {
 				links++
@@ -1389,8 +1389,8 @@ func TestLayeredSnapshotImportsWithoutHardlinks(t *testing.T) {
 				}
 				roots, volumes, snapshots = append(roots, root), append(volumes, volume), append(snapshots, dest)
 			}
-			if links != 4 || roots[0] == roots[1] || volumes[0] == volumes[1] {
-				t.Fatalf("no-link imports reused nodes or retried hard links: links=%d roots=%v volumes=%v", links, roots, volumes)
+			if links != 4 || baseLinks != 1 || roots[0] == roots[1] || volumes[0] == volumes[1] {
+				t.Fatalf("no-link imports reused nodes or retried hard links: links=%d baseLinks=%d roots=%v volumes=%v", links, baseLinks, roots, volumes)
 			}
 			if err := b.RemoveSnapshot(context.Background(), snapshots[0]); err != nil {
 				t.Fatal(err)
