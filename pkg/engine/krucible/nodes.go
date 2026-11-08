@@ -1141,6 +1141,12 @@ func diskRefs(dataDir string) (map[fileKey][]string, error) {
 		}
 		backing, err := legacyChain(r.path, r.owner, false)
 		if err != nil {
+			var refused *backingAuthorizationRefusal
+			// A gap is already unrestorable; other inspection errors cannot
+			// establish that it is safe to discard this graph's references.
+			if !errors.As(err, &refused) && !errors.Is(err, fs.ErrNotExist) {
+				return nil, err
+			}
 			ignoredSnapshots[dir] = true
 			slog.Warn("krucible.snapshot.incomplete_ignored", "path", dir, "error", err)
 			continue

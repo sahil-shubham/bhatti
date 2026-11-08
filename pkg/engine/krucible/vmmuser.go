@@ -718,6 +718,14 @@ func (e *Engine) validateSnapshotBacking(vm *VM, spec VMSpec) error {
 	return nil
 }
 
+type backingAuthorizationRefusal struct {
+	path string
+}
+
+func (e *backingAuthorizationRefusal) Error() string {
+	return fmt.Sprintf("backs onto %s, which isn't an authorized image or this owner's snapshot node", e.path)
+}
+
 func (e *Engine) authorizedBacking(vm *VM, path string, owned map[fileKey]bool) error {
 	if e.vmmBaseAllowed(vm, path) {
 		return nil
@@ -729,7 +737,7 @@ func (e *Engine) authorizedBacking(vm *VM, path string, owned map[fileKey]bool) 
 	if key, ok := keyOf(fi); ok && owned[key] {
 		return nil
 	}
-	return fmt.Errorf("backs onto %s, which isn't an authorized image or this owner's snapshot node", path)
+	return &backingAuthorizationRefusal{path: path}
 }
 
 // vmmBaseAllowed reports whether a helper may read the image at path because
