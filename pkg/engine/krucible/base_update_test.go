@@ -20,14 +20,13 @@ import (
 )
 
 // TestKrucibleBaseUpdateKeepsSandboxes is the update that used to destroy
-// every sandbox on a host. A sandbox made on the tier image as an older
-// install laid it out (a plain file every root names by its tier path)
-// writes 40 MB and stops; the tier is then updated to a rebuild of the same
-// tree (a fresh mke2fs -d, as a release build makes it) the way the installer
-// does it, and the daemon restarts. The old sandbox must boot with its data
-// intact and a filesystem e2fsck finds clean, and a new sandbox must get the
-// new image. Overwriting the tier file in place instead (what install.sh
-// used to do) fails all of it.
+// every sandbox on a host. A sandbox made from a plain tier image must name
+// its immutable base from creation. It writes 40 MB and stops; the tier is
+// then updated to a rebuild of the same tree (a fresh mke2fs -d, as a release
+// build makes it) the way the installer does it, and the daemon restarts. The
+// old sandbox must boot with its data intact and a filesystem e2fsck finds
+// clean, and a new sandbox must get the new image. Overwriting the tier file
+// in place instead (what install.sh used to do) fails all of it.
 func TestKrucibleBaseUpdateKeepsSandboxes(t *testing.T) {
 	for _, tool := range []string{"qemu-img", "e2fsck", "mke2fs"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -72,6 +71,11 @@ func TestKrucibleBaseUpdateKeepsSandboxes(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	id := info.ID
+	root := filepath.Join(dataDir, "sandboxes", id, "root.qcow2")
+	oldBase, err := resolveBasePath(tier)
+	if err != nil || oldBase == tier || backingOf(t, root) != oldBase || !within(basesDir(dataDir), oldBase) {
+		t.Fatalf("new root must name an immutable tier base: base=%q root backing=%q, err=%v", oldBase, backingOf(t, root), err)
+	}
 	payload := make([]byte, 40<<20)
 	rand.Read(payload)
 	if err := eng1.FileWrite(ctx, id, "/workspace/payload.bin", "0644", int64(len(payload)), bytes.NewReader(payload)); err != nil {
@@ -82,9 +86,8 @@ func TestKrucibleBaseUpdateKeepsSandboxes(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 	eng1.Shutdown()
-	root := filepath.Join(dataDir, "sandboxes", id, "root.qcow2")
-	if got := backingOf(t, root); got != tier {
-		t.Fatalf("pre-migration root names %q, want the tier path %s (the layout being upgraded)", got, tier)
+	if got := backingOf(t, root); got != oldBase {
+		t.Fatalf("stopped root names %q, want its original immutable base %s", got, oldBase)
 	}
 
 	// The release's image: the same tree, rebuilt, plus a marker to tell it by.

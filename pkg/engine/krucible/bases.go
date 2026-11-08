@@ -37,6 +37,30 @@ func tierNames(dataDir string) ([]string, error) {
 	return filepath.Glob(filepath.Join(dataDir, "images", "rootfs-*.ext4"))
 }
 
+// regularTier identifies an unmigrated tier, not an ordinary named image.
+func regularTier(dataDir, base string) (os.FileInfo, error) {
+	tiers, err := tierNames(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, tier := range tiers {
+		path, err := filepath.Abs(tier)
+		if err != nil {
+			return nil, err
+		}
+		if path == base {
+			fi, err := os.Lstat(base)
+			if err != nil {
+				return nil, err
+			}
+			if fi.Mode().IsRegular() {
+				return fi, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 // resolveBasePath returns the absolute path of the file p leads to,
 // following symlinks in its last element only: a tier name resolves to the
 // base it points at now, while the directories on the way are kept as given,

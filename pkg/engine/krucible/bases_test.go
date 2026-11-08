@@ -2,16 +2,19 @@ package krucible
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 )
@@ -285,33 +288,139 @@ func TestGCImagesKeepsWhatIsNamed(t *testing.T) {
 	}
 }
 
-// TestNewRootNamesTheBaseNotTheTier: a sandbox created from a tier name (the
-// engine's base image, or an image the server picked) gets a root naming the
-// base the tier points at, so re-pointing the tier later leaves it alone.
+// A regular tier must become immutable before the root and its authoritative
+// chain name it; later installer migration must not need to rewrite either.
 func TestNewRootNamesTheBaseNotTheTier(t *testing.T) {
+	for _, source := range []string{"default", "explicit", "growth"} {
+		t.Run(source, func(t *testing.T) {
+			data := t.TempDir()
+			tier := filepath.Join(data, "images", "rootfs-minimal-"+runtime.GOARCH+".ext4")
+			old := writeBase(t, tier, 1)
+			base := filepath.Join(basesDir(data), baseName(strings.TrimSuffix(filepath.Base(tier), ".ext4"), fileSum(t, tier)))
+			e := &Engine{cfg: Config{DataDir: data, BaseImage: tier, BlockRoot: true}}
+			spec := engine.SandboxSpec{}
+			if source != "default" {
+				spec.BaseImage = tier
+			}
+			if source == "growth" {
+				spec.DiskSizeMB = 64
+			}
+			dir := filepath.Join(data, "sandboxes", "new")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			root, format, got, backing, err := e.prepareRootDisk(t.Context(), dir, spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if format != "qcow2" || got != base || backingOf(t, root) != base ||
+				len(backing) != 1 || backing[0] != (diskLayer{Path: base, Format: "raw"}) {
+				t.Fatalf("root %s (%s) names %q, base %q, chain %+v; want %s", root, format, backingOf(t, root), got, backing, base)
+			}
+			if resolved, err := resolveBasePath(tier); err != nil || resolved != base {
+				t.Fatalf("tier resolves to %q (%v), want %s", resolved, err, base)
+			}
+			if err := validateRecordedDisk(root, format, backing); err != nil {
+				t.Fatalf("new root's recorded chain: %v", err)
+			}
+			if m, err := MigrateImages(data); err != nil || len(m.Moved)+len(m.Rewritten) != 0 {
+				t.Fatalf("installer migration changed a new root: %+v, %v", m, err)
+			}
+			newBase := flipTier(t, data, tier, bytes.Repeat([]byte{7}, len(old)))
+			if err := validateRecordedDisk(root, format, backing); err != nil || backingOf(t, root) != base {
+				t.Fatalf("tier update changed the old root or its recorded chain: %v", err)
+			}
+			if got, err := os.ReadFile(base); err != nil || !bytes.Equal(got, old) {
+				t.Fatalf("tier update changed the old base: %v", err)
+			}
+			freshDir := filepath.Join(data, "sandboxes", "fresh")
+			if err := os.MkdirAll(freshDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fresh, _, got, _, err := e.prepareRootDisk(t.Context(), freshDir, spec)
+			if err != nil || got != newBase || backingOf(t, fresh) != newBase {
+				t.Fatalf("fresh root didn't select updated base %s: %q, %v", newBase, got, err)
+			}
+		})
+	}
+}
+
+func TestRootTierMigrationCollisionFailsPreparationAndCreate(t *testing.T) {
+	for _, operation := range []string{"prepare", "create"} {
+		t.Run(operation, func(t *testing.T) {
+			data := t.TempDir()
+			tier := filepath.Join(data, "images", "rootfs-test-"+runtime.GOARCH+".ext4")
+			original := writeBase(t, tier, 1)
+			base := filepath.Join(basesDir(data), baseName(strings.TrimSuffix(filepath.Base(tier), ".ext4"), fileSum(t, tier)))
+			other := writeBase(t, base, 2)
+			e := &Engine{cfg: Config{DataDir: data, SocketDir: filepath.Join(data, "sockets"), BaseImage: tier, BlockRoot: true}}
+			dir := filepath.Join(data, "sandboxes", "new")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if operation == "prepare" {
+				_, _, _, _, err = e.prepareRootDisk(t.Context(), dir, engine.SandboxSpec{})
+			} else {
+				_, err = e.Create(t.Context(), engine.SandboxSpec{})
+			}
+			if err == nil || !strings.Contains(err.Error(), "migrate root tier") || !strings.Contains(err.Error(), "holds other contents") {
+				t.Fatalf("tier migration collision was not the refusal reason: %v", err)
+			}
+			mustNotExist(t, filepath.Join(dir, "root.qcow2"))
+			if got, err := os.ReadFile(tier); err != nil || !bytes.Equal(got, original) {
+				t.Fatalf("failed tier migration changed the tier: %v", err)
+			}
+			if got, err := os.ReadFile(base); err != nil || !bytes.Equal(got, other) {
+				t.Fatalf("failed tier migration changed the colliding base: %v", err)
+			}
+		})
+	}
+}
+
+func TestSharedRootPreparationRefusesUnmigratedTier(t *testing.T) {
 	data := t.TempDir()
-	tier := filepath.Join(data, "images", "rootfs-minimal-"+runtime.GOARCH+".ext4")
+	tier := filepath.Join(data, "images", "rootfs-test-"+runtime.GOARCH+".ext4")
 	writeBase(t, tier, 1)
-	if _, err := MigrateImages(data); err != nil {
+	e := &Engine{cfg: Config{DataDir: data, BaseImage: tier, BlockRoot: true}}
+	dir := filepath.Join(data, "sandboxes", "new")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	base, err := resolveBasePath(tier)
-	if err != nil || base == tier {
-		t.Fatalf("tier resolves to %q (%v)", base, err)
+	unlock, err := lockBasesCtx(t.Context(), data, false)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer unlock()
+	_, _, _, _, err = e.prepareRootDiskShared(t.Context(), dir, engine.SandboxSpec{})
+	if err == nil || !strings.Contains(err.Error(), "unmigrated root tier") {
+		t.Fatalf("already-shared preparation accepted a mutable tier: %v", err)
+	}
+	mustNotExist(t, filepath.Join(dir, "root.qcow2"))
+}
+
+func TestRootTierMigrationRequiresExclusiveLease(t *testing.T) {
+	data := t.TempDir()
+	tier := filepath.Join(data, "images", "rootfs-test-"+runtime.GOARCH+".ext4")
+	writeBase(t, tier, 1)
 	e := &Engine{cfg: Config{DataDir: data, BaseImage: tier, BlockRoot: true}}
-	for i, spec := range []engine.SandboxSpec{{}, {BaseImage: tier}, {BaseImage: tier, DiskSizeMB: 64}} {
-		dir := filepath.Join(data, "sandboxes", "new", string(rune('a'+i)))
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		root, format, got, _, err := e.prepareRootDisk(t.Context(), dir, spec)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if format != "qcow2" || got != base || backingOf(t, root) != base {
-			t.Fatalf("spec %+v: root %s (%s) backs onto %q, base %q; want %s", spec, root, format, backingOf(t, root), got, base)
-		}
+	dir := filepath.Join(data, "sandboxes", "new")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockBasesCtx(t.Context(), data, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, _, _, err := e.prepareRootDisk(ctx, dir, engine.SandboxSpec{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("tier migration didn't wait for the exclusive bases lease: %v", err)
+	}
+	mustNotExist(t, filepath.Join(dir, "root.qcow2"))
+	if fi, err := os.Lstat(tier); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("tier changed under an existing shared lease: %v", err)
 	}
 }
 

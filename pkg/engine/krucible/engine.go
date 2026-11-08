@@ -801,6 +801,11 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 	if err := gateway.ValidateWire(*spec.NetPolicy); err != nil {
 		return info, fmt.Errorf("create sandbox net policy: %w", err)
 	}
+	if e.cfg.BlockRoot && opts.nodeDisk == "" {
+		if err := e.migrateRootTier(ctx, spec); err != nil {
+			return info, err
+		}
+	}
 	// Reconciliation may remove an unrecorded directory only while no
 	// creator can still be building its first durable VM record.
 	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
@@ -958,7 +963,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		if opts.nodeDisk != "" {
 			rootImg, rootFormat, rootBase, perr = e.prepareNodeRoot(ctx, sandboxDir, opts.nodeDisk, opts.nodeOwned, opts.nodeFormat, privateDisks)
 		} else {
-			rootImg, rootFormat, rootBase, rootBacking, perr = e.prepareRootDisk(ctx, sandboxDir, spec)
+			rootImg, rootFormat, rootBase, rootBacking, perr = e.prepareRootDiskShared(ctx, sandboxDir, spec)
 		}
 		if perr != nil {
 			return info, perr
@@ -1560,6 +1565,37 @@ func (e *Engine) resolveBase(spec engine.SandboxSpec) (string, error) {
 	return base, nil
 }
 
+// Migrate before taking a creation lease: upgrading its shared lock deadlocks.
+func (e *Engine) migrateRootTier(ctx context.Context, spec engine.SandboxSpec) error {
+	base, err := e.resolveBase(spec)
+	if err != nil {
+		return err
+	}
+	fi, err := regularTier(e.cfg.DataDir, base)
+	if err != nil || fi == nil {
+		return err
+	}
+	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, true)
+	if err != nil {
+		return fmt.Errorf("migrate root tier: %w", err)
+	}
+	defer unlock()
+	base, err = e.resolveBase(spec)
+	if err != nil {
+		return err
+	}
+	fi, err = regularTier(e.cfg.DataDir, base)
+	if err != nil {
+		return err
+	}
+	if fi != nil {
+		if _, err := tierToBase(e.cfg.DataDir, base, fi); err != nil {
+			return fmt.Errorf("migrate root tier %s: %w", base, err)
+		}
+	}
+	return nil
+}
+
 func (e *Engine) rootImageMetadata(base, ownerID string) (diskMetadata, bool, error) {
 	vm := &VM{UserID: ownerID}
 	if !e.vmmBaseAllowed(vm, base) {
@@ -1615,13 +1651,26 @@ func (e *Engine) rootImageMetadata(base, ownerID string) (diskMetadata, bool, er
 // It holds the bases lock shared from picking the base until the disk names
 // it, so GC can't remove the base in between.
 func (e *Engine) prepareRootDisk(ctx context.Context, sandboxDir string, spec engine.SandboxSpec) (root, format, base string, backing []diskLayer, err error) {
+	if err := e.migrateRootTier(ctx, spec); err != nil {
+		return "", "", "", nil, err
+	}
 	unlock, err := lockBasesCtx(ctx, e.cfg.DataDir, false)
 	if err != nil {
 		return "", "", "", nil, fmt.Errorf("lock base images: %w", err)
 	}
 	defer unlock()
+	return e.prepareRootDiskShared(ctx, sandboxDir, spec)
+}
+
+// prepareRootDiskShared requires the caller's shared bases lease.
+func (e *Engine) prepareRootDiskShared(ctx context.Context, sandboxDir string, spec engine.SandboxSpec) (root, format, base string, backing []diskLayer, err error) {
 	if base, err = e.resolveBase(spec); err != nil {
 		return "", "", "", nil, err
+	}
+	if fi, err := regularTier(e.cfg.DataDir, base); err != nil {
+		return "", "", "", nil, fmt.Errorf("inspect root tier: %w", err)
+	} else if fi != nil {
+		return "", "", "", nil, fmt.Errorf("unmigrated root tier %s: migrate before acquiring the shared bases lease", base)
 	}
 	metadata, trusted, err := e.rootImageMetadata(base, spec.UserID)
 	if err != nil {
