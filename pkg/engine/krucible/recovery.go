@@ -176,13 +176,21 @@ func (e *Engine) RecoverOwner(id, userID string) error {
 // vmFromRecord reconstructs the in-memory VM from a durable record (runtime
 // fields left nil; the caller decides alive/dead and sets Agent/Status).
 func vmFromRecord(rec vmRecord) *VM {
+	// The guest's address says which subnet its gateway serves. A fork's or a
+	// resume's record used to say 0 whatever it was, and recovery builds the
+	// owner's gateway from the first record it reads: on the wrong subnet, the
+	// gateway refuses every new sandbox of that owner.
+	subnet := rec.SubnetIdx
+	if idx, ok := netSubnetIndexFor(rec.NetIP); ok {
+		subnet = idx
+	}
 	return &VM{
 		ID: rec.ID, Name: rec.Name, UserID: rec.UserID, createPending: rec.Pending,
 		SandboxDir: rec.SandboxDir, SockDir: rec.SockDir,
 		ControlUDS: rec.ControlUDS, ForwardUDS: rec.ForwardUDS, CtlSockUDS: rec.CtlSockUDS,
 		MemMiB: rec.MemMiB, Thermal: rec.Thermal, Status: rec.Status, Token: rec.Token,
 		baseSpec: rec.BaseSpec, logPath: rec.LogPath,
-		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: rec.SubnetIdx, netIP: rec.NetIP, sandboxRef: rec.SandboxRef,
+		HelperPID: rec.HelperPID, netdKey: rec.NetdKey, subnetIdx: subnet, netIP: rec.NetIP, sandboxRef: rec.SandboxRef,
 		vmmUID: rec.VMMUID, netPolicy: rec.NetPolicy,
 		scope: placedScope{unit: rec.CgroupUnit, partial: rec.CgroupPartial},
 	}

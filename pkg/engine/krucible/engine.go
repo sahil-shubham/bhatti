@@ -104,6 +104,26 @@ func netGuestIndexFor(ip string) (int, bool) {
 	return idx, idx >= 0 && idx < netGuestSlots
 }
 
+// netSubnetIndexFor is the subnet a guest address is on: X in 100.64.X.Y.
+func netSubnetIndexFor(ip string) (int, bool) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is4() {
+		return 0, false
+	}
+	a := addr.As4()
+	return int(a[2]), a[0] == 100 && a[1] == 64
+}
+
+// netSubnetIndex is the subnet a new sandbox's address comes from: its owner's
+// gateway's, which an earlier sandbox may have started on another subnet than
+// the one this spec asks for. A resume or fork asks for none.
+func netSubnetIndex(inst *netdInstance, requested int) int {
+	if inst != nil {
+		return inst.subnetIdx
+	}
+	return requested
+}
+
 // netdInstance is one owner's shared bhatti-netd gateway process. It is spawned
 // detached (survives a daemon restart) and identified by pid so recovery can
 // re-adopt it instead of respawning onto a socket it still holds.
@@ -1027,7 +1047,7 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		baseSpec:   baseSpec,
 		logPath:    filepath.Join(sandboxDir, "vmm.log"),
 		netdKey:    netdKey,
-		subnetIdx:  spec.SubnetIndex,
+		subnetIdx:  netSubnetIndex(netInst, spec.SubnetIndex),
 		netIP:      netIP,
 		netPolicy:  spec.NetPolicy,
 		sandboxRef: spec.SandboxID,

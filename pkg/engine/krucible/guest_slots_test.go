@@ -122,3 +122,39 @@ func TestDestroyFreesItsGuestSlot(t *testing.T) {
 		t.Fatalf("acquire after destroying the sandbox at %s: slot %d, %v", ips[40], idx, err)
 	}
 }
+
+// agni-02, 2026-11-10: a resumed copy's record said subnet 0 while its address
+// and its owner's gateway were on 100.64.1.0/24. Recovery built the owner's
+// gateway from that record, and the gateway then refused every new sandbox of
+// the owner (100.64.0.x is not on its subnet). Whichever record recovery reads
+// first, the gateway is on the subnet its guests' addresses are on.
+func TestRecoveredGatewayKeepsItsGuestsSubnet(t *testing.T) {
+	const owner = "u:usr_b727140a"
+	copyRec := vmRecord{ID: "copy", NetdKey: owner, SubnetIdx: 0, NetIP: "100.64.1.189"}
+	created := vmRecord{ID: "created", NetdKey: owner, SubnetIdx: 1, NetIP: "100.64.1.2"}
+	for _, order := range [][]vmRecord{{copyRec, created}, {created, copyRec}} {
+		e := slotEngine(t)
+		for _, rec := range order {
+			e.readoptNetd(vmFromRecord(rec))
+		}
+		inst, idx, err := e.acquireNetd(owner, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ip := netGuestIPFor(inst.subnetIdx, idx); !strings.HasPrefix(ip, "100.64.1.") {
+			t.Fatalf("recovered %s first: a new sandbox got %s, off its gateway's 100.64.1.0/24", order[0].ID, ip)
+		}
+	}
+}
+
+// A copy joins its owner's gateway on whatever subnet it serves, and its
+// record must say so: a resume or fork asks for subnet 0.
+func TestCopyRecordsItsGatewaysSubnet(t *testing.T) {
+	inst := &netdInstance{subnetIdx: 1}
+	if got := netSubnetIndex(inst, 0); got != 1 {
+		t.Fatalf("subnet recorded for a copy on a 100.64.1.0/24 gateway = %d, want 1", got)
+	}
+	if got := netSubnetIndex(nil, 3); got != 3 {
+		t.Fatalf("subnet recorded without a gateway = %d, want the requested 3", got)
+	}
+}
