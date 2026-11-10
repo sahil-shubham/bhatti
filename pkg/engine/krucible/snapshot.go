@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sahil-shubham/bhatti/pkg/agent/proto"
+	"github.com/sahil-shubham/bhatti/pkg/configdrive"
 	"github.com/sahil-shubham/bhatti/pkg/engine"
 	"github.com/sahil-shubham/bhatti/pkg/gateway"
 )
@@ -311,6 +312,11 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 		Token: token, KernelImage: spec.KernelImage, Backing: rootBacking,
 		Mounts: snapMounts, Volumes: snapVols, NetPolicy: snapNet,
 	}
+	if snapType == "memory" {
+		if err := recordGuestBoot(vm.SandboxDir, finalDir); err != nil {
+			return nil, fmt.Errorf("checkpoint: boot settings: %w", err)
+		}
+	}
 	if err := writeSnapshotManifest(finalDir, m); err != nil {
 		return nil, fmt.Errorf("checkpoint: manifest: %w", err)
 	}
@@ -319,6 +325,24 @@ func (e *Engine) checkpointLocked(ctx context.Context, sandboxID, snapName, snap
 	}
 	slog.Info("krucible snapshot created", "id", sandboxID, "name", snapName, "type", snapType, "dir", finalDir, "volumes", len(snapVols), "mounts", len(snapMounts))
 	return m, nil
+}
+
+// recordGuestBoot keeps the source's guestBoot with a memory snapshot. A
+// source with no boot config (from before configs moved host-side) has none.
+func recordGuestBoot(sandboxDir, snapDir string) error {
+	raw, err := os.ReadFile(filepath.Join(sandboxDir, "config.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var cfg configdrive.SandboxConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return fmt.Errorf("parse config.json: %w", err)
+	}
+	return writeDaemonMetadata(filepath.Join(snapDir, snapshotBootFile),
+		guestBoot{Env: cfg.Env, Files: cfg.Files, Init: cfg.Init})
 }
 
 // ResumeFromManifestJSON creates a NEW sandbox restored from a memory snapshot
@@ -447,6 +471,7 @@ func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte
 	if err := e.validateDiskBacking(owner, source); err != nil {
 		return engine.SandboxInfo{}, fmt.Errorf("snapshot backing: %w", err)
 	}
+	// No CACert: the server owns the CA a copy inherits and sets it with SetCACert.
 	spec := engine.SandboxSpec{
 		Name:     newName,
 		CPUs:     float64(m.Vcpus),
@@ -473,6 +498,15 @@ func (e *Engine) resume(ctx context.Context, snapDir string, manifestJSON []byte
 	}
 	opts.snapshotDir = snapDir
 	opts.forcedToken = m.Token
+	// Snapshots taken before boot settings were recorded, and imports, have none.
+	var boot guestBoot
+	found, err := readDaemonMetadata(filepath.Join(snapDir, snapshotBootFile), &boot)
+	if err != nil {
+		return engine.SandboxInfo{}, fmt.Errorf("snapshot boot settings: %w", err)
+	}
+	if found {
+		opts.boot = &boot
+	}
 	return e.create(ctx, spec, opts)
 }
 

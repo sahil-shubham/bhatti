@@ -777,6 +777,8 @@ type createOpts struct {
 	nodeFormat string
 	// A private staged root can be moved at the depth cap instead of copied.
 	nodeOwned bool
+	// boot is what a memory copy's boot config keeps from its source.
+	boot *guestBoot
 }
 
 // restoreVol is a frozen volume image (from a snapshot dir) to re-attach to a
@@ -1004,6 +1006,9 @@ func (e *Engine) create(ctx context.Context, spec engine.SandboxSpec, opts creat
 		// config drive: write it host-side as config.json (no mke2fs; never on a
 		// guest disk). Restore reuses the saved in-guest token.
 		cfg := buildSandboxConfig(id, name, token, spec, cdMounts, cdVolumes, cdNet)
+		if opts.boot != nil {
+			cfg.Env, cfg.Files, cfg.Init = opts.boot.Env, opts.boot.Files, opts.boot.Init
+		}
 		cfgJSON, merr := json.MarshalIndent(cfg, "", "  ")
 		if merr != nil {
 			return info, fmt.Errorf("marshal config: %w", merr)

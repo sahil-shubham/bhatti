@@ -7,9 +7,28 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/sahil-shubham/bhatti/pkg/configdrive"
 )
 
 const snapshotManifestFile = "manifest.json"
+
+// snapshotBootFile holds a memory snapshot's guestBoot: daemon metadata like
+// the manifest, readable by the daemon alone (its env can hold credentials a
+// user passed in). Like the manifest it stays out of exports, whose archive
+// has no member for it yet, so a copy resumed from an imported snapshot
+// cold-boots without its source's env, files and --init.
+const snapshotBootFile = "boot.json"
+
+// guestBoot is what a memory copy's boot config keeps from its source: the
+// settings its restored guest came back with, which lohar applies again at
+// every cold boot. The copy's identity, network, devices and CA are its own
+// (the server sets the CA it inherits with SetCACert).
+type guestBoot struct {
+	Env   map[string]string                 `json:"env,omitempty"`
+	Files map[string]configdrive.ConfigFile `json:"files,omitempty"`
+	Init  string                            `json:"init,omitempty"`
+}
 
 // The local manifest is the daemon's disk-format and provenance record. It is
 // published only after the copied disks or imported graph have been validated;
