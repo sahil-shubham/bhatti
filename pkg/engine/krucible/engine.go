@@ -2037,3 +2037,34 @@ func (e *Engine) HasInit(id string) (hasInit, known bool) {
 	}
 	return cfg.Init != "", true
 }
+
+// SetCACert implements engine.CACertSetter. A running guest read its boot
+// config when it booted, so the CA takes effect at its next cold boot. This is
+// the one rewrite of a boot config after create, so it is synced like the
+// daemon's other records: a torn config.json would leave the sandbox unbootable.
+func (e *Engine) SetCACert(_ context.Context, id, certPEM string) error {
+	vm, err := e.getVM(id)
+	if err != nil {
+		return err
+	}
+	// Launches read config.json under launchMu.
+	vm.launchMu.Lock()
+	defer vm.launchMu.Unlock()
+	path := filepath.Join(vm.SandboxDir, "config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config.json: %w", err)
+	}
+	var cfg configdrive.SandboxConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return fmt.Errorf("parse config.json: %w", err)
+	}
+	if cfg.CACert == certPEM {
+		return nil
+	}
+	cfg.CACert = certPEM
+	if err := writeDaemonMetadata(path, cfg); err != nil {
+		return fmt.Errorf("write config.json: %w", err)
+	}
+	return nil
+}

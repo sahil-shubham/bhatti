@@ -551,6 +551,13 @@ func (s *Server) RecoverSandboxes(ctx context.Context) {
 				s.store.UpdateSandboxHasInit(detached(ctx), sb.ID, has)
 			}
 		}
+		// The boot config names the CA the broker signs with. Copies made
+		// before copies' boot configs did, and any copy whose boot config
+		// couldn't be updated when it was made, would drop that CA at their
+		// next cold boot.
+		if ca, err := s.store.GetSandboxCA(ctx, sb.ID); err == nil && ca.UserID == sb.CreatedBy {
+			s.bootWithCA(ctx, sb, ca.CertPEM)
+		}
 		switch {
 		case info.Status == "running":
 			if err := s.checkStoredMounts(sb.EngineID); err != nil {

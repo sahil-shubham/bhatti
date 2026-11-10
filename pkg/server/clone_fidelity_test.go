@@ -77,6 +77,7 @@ func (c *cloneEngine) Fork(ctx context.Context, id, newName string) (engine.Sand
 		return info, err
 	}
 	spec.Name = newName
+	spec.CACert = "" // the engine builds a copy's boot config without a CA (krucible resume)
 	c.remember(info.EngineID, spec)
 	return info, nil
 }
@@ -122,6 +123,29 @@ func (c *cloneEngine) ResumeFromManifestJSON(ctx context.Context, dir string, ma
 	}
 	c.remember(info.EngineID, engine.SandboxSpec{Name: name, CPUs: float64(m.Vcpus), MemoryMB: m.MemMiB, NetPolicy: m.NetPolicy})
 	return info, nil
+}
+
+// SetCACert is the engine recording the CA a guest installs at its next cold boot.
+func (c *cloneEngine) SetCACert(_ context.Context, id, certPEM string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	spec, ok := c.specs[id]
+	if !ok {
+		return fmt.Errorf("sandbox %q not found", id)
+	}
+	spec.CACert = certPEM
+	c.specs[id] = spec
+	return nil
+}
+
+// bootCA is the CA a cold boot of the sandbox installs.
+func (c *cloneEngine) bootCA(t *testing.T, id string) string {
+	t.Helper()
+	spec, ok := c.specOf(id)
+	if !ok {
+		t.Fatalf("engine has no sandbox %q", id)
+	}
+	return spec.CACert
 }
 
 func (c *cloneEngine) ExportSnapshot(_ context.Context, w io.Writer, dir string, manifest []byte, _ engine.SnapshotExport) error {
@@ -975,5 +999,60 @@ func TestRecordedSnapshotNeverMixesInTheLiveSource(t *testing.T) {
 	}
 	if _, err := srv.store.GetSandboxCA(t.Context(), bare.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("the live source's CA leaked in: %v", err)
+	}
+}
+
+// TestCopiesColdBootTrustingTheCATheBrokerSignsWith: a fork or a memory
+// resume comes back trusting its source's CA, and the broker signs its TLS
+// leaves with that CA. The engine builds a copy's boot config without a CA, and
+// lohar removes a CA the boot config doesn't name, so the server must name it
+// there, or the copy's first cold boot (a stop and start) breaks every
+// substituted HTTPS call. A disk-only resume has no CA on either side. Copies
+// made before this get their CA when the daemon starts.
+func TestCopiesColdBootTrustingTheCATheBrokerSignsWith(t *testing.T) {
+	srv, ts, eng := setupClone(t, 8, 16384)
+	src := createBrowser(t, ts, "src", map[string]any{"secret_grants": ghGrant})
+	signsWith := func(id string) string {
+		t.Helper()
+		ca, err := srv.store.GetSandboxCA(t.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			return ""
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ca.CertPEM
+	}
+	srcCA := signsWith(src.ID)
+	if srcCA == "" || eng.bootCA(t, src.EngineID) != srcCA {
+		t.Fatal("control: a created sandbox boots without the CA the broker signs with")
+	}
+
+	var fork, memory, disk clonedJSON
+	expect(t, doReq(t, ts, "POST", "/sandboxes", map[string]any{"name": "fork", "from": "src"}), 201, &fork)
+	expect(t, doReq(t, ts, "POST", "/sandboxes/"+src.ID+"/checkpoint", map[string]any{"name": "mem"}), 201, nil)
+	expect(t, doReq(t, ts, "POST", "/sandboxes/"+src.ID+"/checkpoint", map[string]any{"name": "disk", "type": "filesystem"}), 201, nil)
+	expect(t, doReq(t, ts, "DELETE", "/sandboxes/"+src.ID, nil), 200, nil)
+	expect(t, doReq(t, ts, "POST", "/snapshots/mem/resume", map[string]any{"name": "memory"}), 201, &memory)
+	expect(t, doReq(t, ts, "POST", "/snapshots/disk/resume", map[string]any{"name": "disk"}), 201, &disk)
+	for _, c := range []clonedJSON{fork, memory} {
+		if got := eng.bootCA(t, c.EngineID); got != srcCA || signsWith(c.ID) != srcCA {
+			t.Fatalf("%s cold-boots trusting %q while the broker signs with %q; want its source's CA on both", c.Name, got, signsWith(c.ID))
+		}
+	}
+	if got := eng.bootCA(t, disk.EngineID); got != "" || signsWith(disk.ID) != "" {
+		t.Fatalf("a disk-only resume boots trusting %q and the broker signs with %q; want neither", got, signsWith(disk.ID))
+	}
+
+	// A copy from before: its boot config never named the CA it inherited.
+	if err := eng.SetCACert(t.Context(), fork.EngineID, ""); err != nil {
+		t.Fatal(err)
+	}
+	srv.RecoverSandboxes(t.Context())
+	if got := eng.bootCA(t, fork.EngineID); got != srcCA {
+		t.Fatalf("after a daemon start the older copy cold-boots trusting %q, want %q", got, srcCA)
+	}
+	if got := eng.bootCA(t, disk.EngineID); got != "" {
+		t.Fatalf("a daemon start gave the disk-only resume a CA: %q", got)
 	}
 }

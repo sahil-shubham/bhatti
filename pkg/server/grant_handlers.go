@@ -206,6 +206,8 @@ func (s *Server) inheritSubstitution(ctx context.Context, userID string, to stor
 		ca.SandboxID, ca.UserID, ca.CreatedAt = to.ID, userID, time.Now()
 		if err := s.store.PutSandboxCA(ctx, ca); err != nil {
 			slog.Warn("sandbox.ca_inherit", "from", from, "to", to.ID, "error", err)
+		} else {
+			s.bootWithCA(ctx, to, ca.CertPEM)
 		}
 	}
 	now := time.Now().UTC()
@@ -226,6 +228,18 @@ func (s *Server) inheritSubstitution(ctx context.Context, userID string, to stor
 		made = append(made, copied)
 	}
 	return made
+}
+
+// bootWithCA records certPEM in the sandbox's boot config, so a cold boot keeps
+// the CA its guest trusts and the broker signs with (engine.CACertSetter).
+func (s *Server) bootWithCA(ctx context.Context, sb store.Sandbox, certPEM string) {
+	setter, ok := s.engine.(engine.CACertSetter)
+	if !ok {
+		return
+	}
+	if err := setter.SetCACert(ctx, sb.EngineID, certPEM); err != nil {
+		slog.Warn("sandbox.ca_boot_config", "sandbox", sb.ID, "engine_id", sb.EngineID, "error", err)
+	}
 }
 
 // inheritFromSandbox is inheritSubstitution from a live source.

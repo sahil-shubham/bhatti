@@ -202,6 +202,16 @@ type ForkEngine interface {
 	Fork(ctx context.Context, sandboxID, newName string) (SandboxInfo, error)
 }
 
+// CACertSetter is optionally implemented by engines that keep a sandbox's boot
+// config: SetCACert makes certPEM the CA its guest installs at every cold boot.
+// A copy (a fork or a memory-snapshot resume) comes back trusting its source's
+// CA, but the engine builds its boot config without one, and the guest agent
+// removes a CA its boot config doesn't name. The server sets the CA it gave the
+// copy, the one the credential broker signs with.
+type CACertSetter interface {
+	SetCACert(ctx context.Context, id, certPEM string) error
+}
+
 // SessionAttacher is optionally implemented by engines that support
 // reconnecting to existing TTY sessions.
 //
